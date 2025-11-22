@@ -1,5 +1,4 @@
 import torch
-import aiter
 import pyhip
 
 torch.cuda.set_device(4)
@@ -10,7 +9,8 @@ HQ = 32
 HK = 4
 S = 128
 KV_LEN = 45694
-#KV_LEN = 512
+#KV_LEN = 45694//256*256
+#KV_LEN = 256
 DT = torch.bfloat16
 BLOCK_SIZE = 1
 BLOCK_NUM = B * KV_LEN + 1000
@@ -97,6 +97,7 @@ def test_aiter(query,
     return out
 
 if 0:
+    import aiter
     out_ref = None
     # if 0:
     #     torch.save({
@@ -131,7 +132,7 @@ if 0:
 # pa hip
 def div_up(x, y):
     return (x + y - 1) // y
-KV_PART_SIZE = 256 * 4
+KV_PART_SIZE = 256 * 2
 # -g -ggdb -O1
 hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=}")
 pa = hip.pa
@@ -141,6 +142,7 @@ my_out = torch.empty([B, HQ, S], dtype=DT)
 my_max = torch.empty([B, HQ, div_up(KV_LEN, KV_PART_SIZE), 1], dtype=torch.float32) * 5
 my_sum = torch.empty([B, HQ, div_up(KV_LEN, KV_PART_SIZE), 1], dtype=torch.float32) * 6
 qk_out = torch.ones([B, HK, HQ // HK, div_up(KV_LEN, KV_PART_SIZE) * KV_PART_SIZE], dtype=torch.float32)
+#print(f'{query.data_ptr()=:x} {key_caches[-1].data_ptr()=:x} {value_caches[-1].data_ptr()=:x} {kv_indptrs[-1].data_ptr()=:x} {kv_page_indices_[-1].data_ptr()=:x} {my_out_seg.data_ptr()=:x} {my_max.data_ptr()=:x}, {my_sum.data_ptr()=:x}')
 pa([B, HK, div_up(KV_LEN, KV_PART_SIZE)], [256], query.data_ptr(), key_caches[-1].data_ptr(), value_caches[-1].data_ptr(), kv_indptrs[-1].data_ptr(), kv_page_indices_[-1].data_ptr(), my_out_seg.data_ptr(), qk_out.data_ptr(), my_max.data_ptr(), my_sum.data_ptr())
 pa_reduce([B, HQ], [256], kv_indptrs[-1].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), div_up(KV_LEN, KV_PART_SIZE))
 #assert torch.allclose(out, my_out), "pa acc is wrong"

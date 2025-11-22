@@ -51,6 +51,15 @@ using DWORDX4 = int32x4_t;
 
 #define NUM_THREADS 256
 
+template<uint16_t cnt>
+__device__ void s_waitcnt_vmcnt() {
+    asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
+}
+template<uint16_t cnt>
+__device__ void s_waitcnt_lgkmcnt() {
+    asm volatile ("s_waitcnt lgkmcnt(%0)\n"::"i"(cnt));
+}
+
 template <typename Object, std::enable_if_t<std::is_trivially_copyable_v<Object>, int> = 0>
 __device__ inline auto amd_wave_read_first_lane(const Object& obj)
 {
@@ -84,22 +93,10 @@ __device__ inline auto amd_wave_read_first_lane(const Object& obj)
     return out;
 }
 
-__device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride) {
-    DWORDX4 data;
-    //volatile int dummy[40] = {0};
-    int lane_offset = threadIdx.x * sizeof(DWORDX4);
-    int soff = soffset;
-    auto r = amd_wave_read_first_lane(buffer.descriptor);
-    asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
-        :[vdst]"=v"(data)
-        :[vaddr]"v"(lane_offset), [srsrc]"s"(r), [soffset]"s"(soff));
-    return data;
-}
-
 template<typename T>
 __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, bool is_asm=false) {
     T v;
-    if (is_asm) {
+    if (1||is_asm) {
         auto r = amd_wave_read_first_lane(buffer.descriptor);
         asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
             :[vdst]"=v"(v)
@@ -111,9 +108,45 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
 }
 
 template<typename T>
+__device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset, int coffset, bool is_asm=false) {
+    T v;
+    if (1||is_asm) {
+        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+        r.x         = __builtin_amdgcn_readfirstlane(r.x);
+        r.y         = __builtin_amdgcn_readfirstlane(r.y);
+        r.z         = __builtin_amdgcn_readfirstlane(r.z);
+        r.w         = __builtin_amdgcn_readfirstlane(r.w);
+
+        //auto r = amd_wave_read_first_lane(buffer.descriptor);
+        asm volatile("buffer_load_dword %[vdst], %[vaddr], %[srsrc], 0 offen offset:%[coffset]\n"
+            :[vdst]"=v"(v)
+            :[vaddr]"v"(voffset), [srsrc]"s"(r), [coffset]"n"(coffset)
+            : "memory");
+    } else {
+        v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
+    }
+    return v;
+}
+
+
+template<typename T>
+__device__ T global_load_dword(void* addr, int voffset, int coffset, bool is_asm=false) {
+    T v;
+    if (1 || is_asm) {
+        // global_load_dword v22, v[18:19], off 
+        asm volatile("global_load_dword %[vdst], %[vaddr], off offset:%[coffset]\n"
+                :[vdst]"=v"(v)
+                :[vaddr]"v"((char*)addr + voffset), [coffset]"n"(coffset));
+    } else {
+        v = *(T*)((char*)addr + voffset + coffset);
+    }
+    return v;
+}
+
+template<typename T>
 __device__ T global_load_dwordx4(void* addr, uint64_t voffset, bool is_asm=false) {
     T v;
-    if (is_asm) {
+    if (1||is_asm) {
         asm volatile("global_load_dwordx4 %[vdst], %[vaddr], off\n"
                 :[vdst]"=v"(v)
                 :[vaddr]"v"((char*)addr + voffset));
@@ -123,21 +156,20 @@ __device__ T global_load_dwordx4(void* addr, uint64_t voffset, bool is_asm=false
     return v;
 }
 
-__device__ void amdgcn_mfma_f32_16x16x16bf16(bfloat16x4 a, bfloat16x4 b, float32x4& c) {
-    c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
-    // asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, %3\n"
-    //             : "+v"(c)
-    //             : "v"(a), "v"(b), "v"(c)
-    //             :);
-}
-
-template<uint16_t cnt>
-__device__ void s_waitcnt_vmcnt() {
-    asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
-}
-template<uint16_t cnt>
-__device__ void s_waitcnt_lgkmcnt() {
-    asm volatile ("s_waitcnt lgkmcnt(%0)\n"::"i"(cnt));
+__device__ void amdgcn_mfma_f32_16x16x16bf16(bfloat16x4 a, bfloat16x4 b, float32x4& c, bool is_first=false) {
+    if (is_first) {
+        c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+        // asm volatile("v_mfma_f32_16x16x16bf16_1k %0, %1, %2, 0\n"
+        //             : "+v"(c)
+        //             : "v"(a), "v"(b)
+        //             :);
+    } else {
+        c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+        // asm volatile("v_mfma_f32_16x16x16bf16_1k %0, %1, %2, %3\n"
+        //             : "+v"(c)
+        //             : "v"(a), "v"(b), "v"(c)
+        //             :);    
+    }
 }
 
 #ifndef HQ
@@ -215,7 +247,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     query += b * q_b_stride + hq * q_h_stride;
     key_cache += hk * S;
     value_cache += hk * S;
-    uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
+    uint last_kv_idx = kv_indptr[b + 1];
+    uint kv_len = last_kv_idx - kv_indptr[b];
     if (kv_part * KV_PART_SIZE >= kv_len) return;
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
     uint kv_len_end = std::min(kv_len_start + KV_PART_SIZE, kv_len);
@@ -248,52 +281,69 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
 #endif
         }
     }
-    //s_waitcnt_vmcnt<0>();
+
     __shared__ __bf16 buff_lds[16 * S * 4];
     share_buf_t share_buf(buff_lds);
     float32x4 vout[S / 64 * 4] = {0};
     auto cur_max = prev_max;
     float cur_sum;
-
-    for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
-        uint64_t k_offsets[KV_PART_SIZE_WARP / 4];
+    BufferResource idx_buf(kv_page_indices, last_kv_idx * sizeof(uint));
+    compile_time_loop<KV_PART_SIZE / KV_MIN_PART_SIZE>([&] (uint part_idx) {
+        uint k_idxs[KV_PART_SIZE_WARP / 4];
         auto cur_kv_len_start = kv_len_start + part_idx * KV_MIN_PART_SIZE;
-        if (BLOCK_SIZE == 1) {
-            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+        if constexpr (BLOCK_SIZE == 1) {
+            compile_time_loop<KV_PART_SIZE_WARP / 4>([&] (uint n) {
+    #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
-    #if FAKE_K_IDX
-                k_offsets[n] = HK * S * sizeof(__bf16) * (global_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_idxs[n] = global_row_id + 1;
     #else
-                k_offsets[n] = (uint64_t)(kv_page_indices[global_row_id]) * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+                //k_idxs[n] = global_load_dword<uint>(kv_page_indices, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
     #endif
-            }
+            });
         }
+        //s_waitcnt_vmcnt<KV_PART_SIZE_WARP / 4 - 2>();
+        s_waitcnt_vmcnt<0>();
+        __builtin_amdgcn_sched_barrier(0);
         // key -> reg
         float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
 
         bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
+        compile_time_loop<KV_PART_SIZE_WARP / 4>([&] (uint n) {
+            auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+            k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
+        });
+        auto fetch_v = [&] (uint n) {
+            uint64_t offset = (uint64_t)(k_idxs[n]) * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
+        };
 
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, k_offsets[n]);
-        }
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, k_offsets[n], false);
-        }
         __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+        s_waitcnt_vmcnt<KV_PART_SIZE_WARP / 4 - 4>();
+        compile_time_loop<KV_PART_SIZE_WARP / 16>([&] (uint n) {
+            s_waitcnt_vmcnt<KV_PART_SIZE_WARP / 4>();
+            fetch_v(4 * n + 0);
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 2];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 3];
 
-            for (int k = 0; k < S / 32; k++) {
+            fetch_v(4 * n + 1);
+            auto fma_qk = [&] (uint k) {
                 auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + k * 32 + fma_col_id * 8]);
-                amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
+                amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n], k == 0 && n == 0);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
-            }
+            };
+            fma_qk(0);
+            fetch_v(4 * n + 2);
+            fma_qk(1);
+            fetch_v(4 * n + 3);
+            fma_qk(2);
+            fma_qk(3);
+
             acc[n] *= SCALE;
-        }
+        });
         // for debug
         if (qk_ptr) {
             // [B, HK, HQ / HK, stride]
@@ -344,6 +394,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         }
         //s_waitcnt_vmcnt<0>();
         __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
+        s_waitcnt_vmcnt<0>();
         //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
         for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
             *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 0];
@@ -389,7 +440,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         }
         prev_max = cur_max;
         prev_sum = cur_sum;
-    }
+    });
     __syncthreads();
     // cross max/sum
     if (fma_col_id == 0) {
