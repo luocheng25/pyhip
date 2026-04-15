@@ -28,7 +28,7 @@ REDUCE_K = model_dim
 BLOCK_QUANT = 256
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{BLOCK_QUANT=} -D{REDUCE_K=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{BLOCK_QUANT=} -D{REDUCE_K=} -DIS_QUANT1=1")
 quant = hip.quant
 
 def int8_ptpc(a):
@@ -58,7 +58,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 M, model_dim, 1
                 )
         else:
-            hip.quant1([2*div_up(M, ROW_PER_BLOCK1)], [64], 
+            hip.quant1([div_up(M, ROW_PER_BLOCK1)], [256], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 topk_ids.data_ptr(),
                 M
