@@ -40,7 +40,7 @@ union BufferResource {
         : address(buffer_address),
           range(buffer_size),
           config(0x00020000U) {}
-    
+
     __device__ __inline__ constexpr void set_base(void* buffer_address) {
         address = buffer_address;
     }
@@ -324,6 +324,41 @@ __device__ float32x2 mul_f32x2(float f0_0, float f0_1, float f2) {
     return out;
 }
 
+__device__ float wave_reduce_max(float cur_max) {
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:8 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:4 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:2 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:1 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_bcast:15 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_bcast:31 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    float max_s;
+    asm ("v_readlane_b32 %0, %1, 63; \n\t"
+                :"=s"(max_s)
+                :"v"(cur_max)
+                :);
+    cur_max = max_s;
+    return cur_max;
+}
+
 template<uint16_t cnt>
 __device__ void s_waitcnt_vmcnt() {
     asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
@@ -347,7 +382,7 @@ constexpr void compile_time_loop_impl(F&& f, std::index_sequence<Is...>) {
 
 template<size_t N, typename F>
 constexpr void compile_time_loop(F&& f) {
-    compile_time_loop_impl(std::forward<F>(f), 
+    compile_time_loop_impl(std::forward<F>(f),
                           std::make_index_sequence<N>{});
 }
 
@@ -357,7 +392,7 @@ constexpr void compile_time_loop(F&& f) {
 #define ROW_PER_BLOCK 4
 #endif
 
-//__launch_bounds__(NUM_THREADS, 2) 
+//__launch_bounds__(NUM_THREADS, 2)
 __global__ void quant(
             __bf16* x,                  // [M, S]
             float* smooth_scale,        // [E, S]
@@ -471,9 +506,9 @@ __global__ void __launch_bounds__(256, 1)quant2(
     BufferResource x_out_res(x_out, 0xffffffff);
     auto load_token = [&](bfloat16x8& x_val, uint tok_id, uint topk_id, uint i) {
         // x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
-        x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 
+        x_val = buffer_load_dwordx4<bfloat16x8>(x_res,
             0,
-            (tok_id * TOPK * S + topk_id * S) * sizeof(__bf16), 
+            (tok_id * TOPK * S + topk_id * S) * sizeof(__bf16),
             i * 8 * sizeof(__bf16),
             (int)amd_buffer_coherence_enum::SYSTEM_NT1);//0x1f);
     };
@@ -544,10 +579,10 @@ __global__ void __launch_bounds__(256, 1)quant2(
         //         qv[j] = val + 0.5f;
         //     }
 
-        //     buffer_store_dwordx2(qv, 
-        //         x_out_res, 
-        //         0, 
-        //         tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8, 
+        //     buffer_store_dwordx2(qv,
+        //         x_out_res,
+        //         0,
+        //         tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8,
         //         0,
         //         amd_buffer_coherence_enum::SYSTEM_NT1);
         //     // p_x_out[i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE] = qv;
@@ -555,7 +590,7 @@ __global__ void __launch_bounds__(256, 1)quant2(
         #pragma unroll
         for (int i = 0; i < ITEM_PER_LANE; i++) {
             uint32x2_t qv;
-            float32x2 result[4]; 
+            float32x2 result[4];
             result[0] = mul_f32x2(x_smooth[i][0], x_smooth[i][1], inv_row_scale);
             result[1] = mul_f32x2(x_smooth[i][2], x_smooth[i][3], inv_row_scale);
             result[2] = mul_f32x2(x_smooth[i][4], x_smooth[i][5], inv_row_scale);
@@ -563,10 +598,10 @@ __global__ void __launch_bounds__(256, 1)quant2(
             qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
             qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
-            buffer_store_dwordx2(qv, 
-                x_out_res, 
-                0, 
-                tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8, 
+            buffer_store_dwordx2(qv,
+                x_out_res,
+                0,
+                tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8,
                 0,
                 amd_buffer_coherence_enum::SYSTEM_NT1);
         }
@@ -617,8 +652,8 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
     //__shared__ __bf16 lds[QUANT1_K];
     float32x8 x_org_buf[QUANT1_K / THREADS / 8];
     float32x8 x_smooth_buf[QUANT1_K / THREADS / 8];
-    __shared__ uint expert_ids_lds[TOPK];
-    __shared__ float max_wave[4+30*1024];
+    __shared__ uint expert_ids_lds[TOPK + 1];
+    __shared__ float max_wave[TOPK * 4+1*15*1024];
     if (threadIdx.x < TOPK) {
         expert_ids_lds[threadIdx.x] = expert_ids[(m_block < M ? m_block : 0)* ROW_PER_BLOCK1 * TOPK + threadIdx.x];
     }
@@ -627,9 +662,12 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
     BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK1 * TOPK * S, m_block < M ? TOPK * S * sizeof(char) : 0);
     BufferResource smooth_scale_res(smooth_scale, 0xffffffff);//M * S * sizeof(float));
     float32x8 scale_buf[2][QUANT1_K / THREADS / 8];
+    uint next_e_id;
+    float row_scales[TOPK];
 
     auto load_smooth = [&] (uint topk_id) {
-        auto expert_id = expert_ids_lds[topk_id];
+        auto expert_id = next_e_id;
+        next_e_id = expert_ids_lds[topk_id + 1];
         #pragma unroll
         for (int i = 0; i < QUANT1_K / THREADS / 8; i++) {
             //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
@@ -667,14 +705,15 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
                 cur_max = fmaxf(cur_max, abs(tmp));
             }
         }
-        cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+        //cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+        cur_max = wave_reduce_max(cur_max);
         if (THREADS == 256) {
             if (lane_c == 0) {
-                max_wave[wave_id] = cur_max;
+                max_wave[topk_id * 4 + wave_id] = cur_max;
             }
             __syncthreads();
             for (int i = 0; i < 4; i++) {
-                cur_max = fmaxf(cur_max, max_wave[i]);
+                cur_max = fmaxf(cur_max, max_wave[topk_id * 4 + i]);
             }
         }
 
@@ -694,15 +733,17 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
             qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
             buffer_store_dwordx2(qv, 
-                x_out_res, 
-                token_id_in_block * TOPK * S + topk_id * S, 
+                x_out_res,
+                token_id_in_block * TOPK * S + topk_id * S,
                 (i * THREADS + threadIdx.x) * 8, 
                 0,
                 amd_buffer_coherence_enum::SYSTEM_NT1);
         }
-        x_quant_scale[token_id * TOPK + topk_id] = row_scale;
-        if (THREADS == 256)
-            __syncthreads();
+        //if (threadIdx.x == 0)
+        // x_quant_scale[token_id * TOPK + topk_id] = row_scale;
+        row_scales[topk_id] = row_scale;
+        // if (THREADS == 256)
+        //     __syncthreads();
         // if (threadIdx.x == 0) {
         //     x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
         // }
@@ -726,7 +767,11 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
                 x_org_buf[i][j] = tmp[j];
             }
         }
+        asm volatile("; end");
+        next_e_id = expert_ids_lds[0];
         load_smooth(0);
+
+        asm volatile("; smooth pre");
         __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for (int topk_id = 0; topk_id < TOPK - 1; topk_id++) {
@@ -736,6 +781,9 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
         }
         __builtin_amdgcn_sched_barrier(0);
         loop_row(p_x, token_id, t, TOPK - 1);
+    }
+    if (threadIdx.x < TOPK) {
+        x_quant_scale[m_block * TOPK + threadIdx.x] = row_scales[threadIdx.x];
     }
 }
 #endif
@@ -783,9 +831,74 @@ __global__ void __launch_bounds__(256, 1) reduce_i8(
         for (int j = 0; j < 16; j++) {
             result_bf[j / 8][j % 8] = result[j];
         }
-        buffer_store_dwordx4(result_bf[0], x_out_res, 0, 
+        buffer_store_dwordx4(result_bf[0], x_out_res, 0,
             (i * 16) * sizeof(__bf16), 0, amd_buffer_coherence_enum::SYSTEM_NT1);
         buffer_store_dwordx4(result_bf[1], x_out_res, 0,
             (i * 16 + 8) * sizeof(__bf16), 0, amd_buffer_coherence_enum::SYSTEM_NT1);
     }
+}
+
+__global__ void test(float* x, float* out) {
+        float cur_max = x[threadIdx.x];
+        asm ("v_max_f32_dpp %0, %1, %2 row_shr:8 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+        out[threadIdx.x + 64 * 0] = cur_max;
+        asm ("v_max_f32_dpp %0, %1, %2 row_shr:4 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+
+        out[threadIdx.x + 64 * 1] = cur_max;
+        asm ("v_max_f32_dpp %0, %1, %2 row_shr:2 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+        out[threadIdx.x + 64 * 2] = cur_max;
+        asm ("v_max_f32_dpp %0, %1, %2 row_shr:1 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+        out[threadIdx.x + 64 * 3] = cur_max;
+        // float max = cur_max;
+        asm ("v_max_f32_dpp %0, %1, %2 row_bcast:15 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+        out[threadIdx.x + 64 * 4] = cur_max;
+        asm ("v_max_f32_dpp %0, %1, %2 row_bcast:31 bound_ctrl:0; \n\t"
+                    :"=v"(cur_max)
+                    :"v"(cur_max), "v"(cur_max)
+                    :);
+        out[threadIdx.x + 64 * 5] = cur_max;
+        float max_s;
+        asm ("v_readlane_b32 %0, %1, 48; \n\t"
+                    :"=s"(max_s)
+                    :"v"(cur_max)
+                    :);
+        cur_max = max_s;
+        out[threadIdx.x + 64 * 6] = cur_max;
+       // // asm volatile("v_mov_b32 %0, %1\n\t"
+        // //             :"=v"(max)
+        // //             :"v"(cur_max)
+        // //             :);
+        // // if (threadIdx.x == 0 || threadIdx.x == 16)
+        // //     printf("b %d cur %f max %f\n", threadIdx.x, cur_max, max);
+        // asm volatile ("v_permlane16_swap_b32 %0, %1; s_nop 40;\n\t"
+        //             :"+v"(max), "+v"(cur_max)
+        //             :
+        //             :);
+        // // if (threadIdx.x == 0 || threadIdx.x == 16)
+        // //     printf("a %d cur %f max %f\n", threadIdx.x, cur_max, max);
+        // cur_max = fmaxf(cur_max, max);
+        // out[threadIdx.x + 64 * 4] = cur_max;
+
+        // max = cur_max;
+        // asm volatile ("v_permlane32_swap_b32 %0, %1; s_nop 40;\n\t"
+        //             :"+v"(max), "+v"(cur_max)
+        //             :
+        //             :);
+        // cur_max = fmaxf(cur_max, max);
+        out[threadIdx.x + 64 * 5] = cur_max;
 }
