@@ -658,28 +658,32 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
         expert_ids_lds[threadIdx.x] = expert_ids[(m_block < M ? m_block : 0)* ROW_PER_BLOCK1 * TOPK + threadIdx.x];
     }
     // __bf16 x_smooth_buf[QUANT1_K / 64 / 8][8];
-    BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK1 * S, m_block < M ?  S * sizeof(__bf16) : 0);
-    BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK1 * TOPK * S, m_block < M ? TOPK * S * sizeof(char) : 0);
+    BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK1 * S, m_block < M ?  1*S * sizeof(__bf16) : 0);
+    BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK1 * TOPK * S, m_block < M ? 1*TOPK * S * sizeof(char) : 0);
     BufferResource smooth_scale_res(smooth_scale, 0xffffffff);//M * S * sizeof(float));
     float32x8 scale_buf[2][QUANT1_K / THREADS / 8];
     uint next_e_id;
     float row_scales[TOPK];
+    uint smooth_offsets[QUANT1_K / THREADS / 8];
 
     auto load_smooth = [&] (uint topk_id) {
         auto expert_id = next_e_id;
         next_e_id = expert_ids_lds[topk_id + 1];
+        for (int i = 0; i < QUANT1_K / THREADS / 8; i++) {
+            smooth_offsets[i] = (expert_id * S) * sizeof(float) + (threadIdx.x + i * THREADS) * 8 * sizeof(float);
+        }
         #pragma unroll
         for (int i = 0; i < QUANT1_K / THREADS / 8; i++) {
             //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
             float32x4 tmp[2];
             tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
                  0,
-                 (expert_id * S) * sizeof(float) + (threadIdx.x + i * THREADS) * 8 * sizeof(float),
+                 smooth_offsets[i],
                  0,
                  (int)amd_buffer_coherence_enum::glc);
             tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
                  0,
-                 (expert_id * S) * sizeof(float) + (threadIdx.x + i * THREADS) * 8 * sizeof(float) + 4 * sizeof(float),
+                 smooth_offsets[i] + 4 * sizeof(float),
                  0,
                  (int)amd_buffer_coherence_enum::glc);
             scale_buf[topk_id & 1][i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
@@ -775,9 +779,156 @@ __global__ __launch_bounds__(THREADS, 1) void quant1(
         __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for (int topk_id = 0; topk_id < TOPK - 1; topk_id++) {
-            load_smooth(topk_id + 1);
             __builtin_amdgcn_sched_barrier(0);
-            loop_row(p_x, token_id, t, topk_id);
+            //load_smooth(topk_id + 1);
+            //{
+                auto expert_id = next_e_id;
+                next_e_id = expert_ids_lds[topk_id + 1 + 1];
+                for (int i = 0; i < QUANT1_K / THREADS / 8; i++) {
+                    smooth_offsets[i] = (expert_id * S) * sizeof(float) + (threadIdx.x + i * THREADS) * 8 * sizeof(float);
+                }
+                float32x4 tmp[2];
+                tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                        0,
+                        smooth_offsets[0],
+                        0,
+                        (int)amd_buffer_coherence_enum::glc);
+                // #pragma unroll
+                // for (int i = 0; i < QUANT1_K / THREADS / 8; i++) {
+                //     //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
+                //     tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                //         0,
+                //         smooth_offsets[i],
+                //         0,
+                //         (int)amd_buffer_coherence_enum::glc);
+                //     tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                //         0,
+                //         smooth_offsets[i] + 4 * sizeof(float),
+                //         0,
+                //         (int)amd_buffer_coherence_enum::glc);
+                //     scale_buf[(topk_id + 1) & 1][i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
+                // }
+            //}
+            //loop_row(p_x, token_id, t, topk_id);
+            {
+                uint token_id_in_block = t;
+                float cur_max = -FLT_MAX;
+                // if (topk_id < TOPK) {
+                //     load_smooth(topk_id + 1);
+                //     __builtin_amdgcn_sched_barrier(0);
+                // }
+                # pragma unroll
+                for (int i = 0; i < S / 8 / THREADS; i++) {
+                    auto& scale = scale_buf[topk_id & 1][i];
+                    auto x_val = x_org_buf[i];
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        auto tmp = (scale[j] * x_val[j]);
+                        //lds[(i * 64 + threadIdx.x) * 8 + j] = tmp;
+                        x_smooth_buf[i][j] = tmp;
+                        cur_max = fmaxf(cur_max, abs(tmp));
+                    }
+                    if (i == 1) {
+                    }
+                }
+                {
+                    __builtin_amdgcn_sched_barrier(0);
+                    asm volatile("; before smooth load");
+                        tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                            0,
+                            smooth_offsets[0] + 4 * sizeof(float),
+                            0,
+                            (int)amd_buffer_coherence_enum::glc);
+                        scale_buf[(topk_id + 1) & 1][0] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
+
+                }
+                //cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+                cur_max = wave_reduce_max(cur_max);
+                if (THREADS == 256) {
+                    if (lane_c == 0) {
+                        max_wave[topk_id * 4 + wave_id] = cur_max;
+                    }
+                    tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                        0,
+                        smooth_offsets[1],
+                        0,
+                        (int)amd_buffer_coherence_enum::glc);
+                    __syncthreads();
+                    for (int i = 0; i < 4; i++) {
+                        cur_max = fmaxf(cur_max, max_wave[topk_id * 4 + i]);
+                    }
+                }
+
+                auto row_scale = cur_max / 128.0f;
+                row_scale = fmaxf(row_scale, 1e-6f);
+                auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
+                //charx8* p_x_out = reinterpret_cast<charx8*>(x_out + token_id * TOPK * S + topk_id * S);
+                {
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+                #pragma unroll
+                for (int i = 0; i < S / 8 / THREADS; i++) {
+                    float32x2 result[4];
+                    uint32x2_t qv;
+                    result[0] = mul_f32x2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
+                    result[1] = mul_f32x2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
+                    result[2] = mul_f32x2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
+                    result[3] = mul_f32x2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
+                    if (i == 1) {
+                        tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                            0,
+                            smooth_offsets[1] + 4 * sizeof(float),
+                            0,
+                            (int)amd_buffer_coherence_enum::glc);
+                        scale_buf[(topk_id + 1) & 1][1] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
+                        //__builtin_amdgcn_sched_barrier(0);
+                    }
+                    qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+                    qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+                    //p_x_out[i * 64 + threadIdx.x] = qv;
+                    buffer_store_dwordx2(qv, 
+                        x_out_res,
+                        token_id_in_block * TOPK * S + topk_id * S,
+                        (i * THREADS + threadIdx.x) * 8, 
+                        0,
+                        amd_buffer_coherence_enum::SYSTEM_NT1);
+
+                }
+                //if (threadIdx.x == 0)
+                // x_quant_scale[token_id * TOPK + topk_id] = row_scale;
+                row_scales[topk_id] = row_scale;
+                // if (THREADS == 256)
+                //     __syncthreads();
+                // if (threadIdx.x == 0) {
+                //     x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+                // }
+
+            }
+            
+#define SGB_VMEM_read_0x0020 0x0020
+#define SGB_MFMA_0x0008      0x0008
+#define SGB_DS_read_0x0100   0x0100
+#define SGB_DS_write_0x0200  0x0200
+#define SGB_VALU_0x2         0x2
+#define SGB_SALU_0x4         0x4
+#define SGB_VMEM_write_0x40   0x40
+#define SGB_NON_MEM_0x1      0x1
+#define SGB_VMEM_0x10         0x10
+            // __builtin_amdgcn_sched_group_barrier(SGB_VALU_0x2, 2, 1);
+            // for (int i = 0; i < 4; i++) {
+            //     __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 1);
+            //     __builtin_amdgcn_sched_group_barrier(SGB_VALU_0x2, 1, 0);
+            // }
+            asm volatile("; ref %0 %1\n\t"
+                        :
+                         : "v"(smooth_offsets[0]), "v"(smooth_offsets[1])
+                         : );
+            // for (int i = 0; i < 4; i++) {
+            //     __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+            //     __builtin_amdgcn_sched_group_barrier(SGB_VALU_0x2, 1, 0);
+            // }
+            //__builtin_amdgcn_sched_group_barrier(SGB_VALU_0x2, 1000000, 1);
+            __builtin_amdgcn_sched_barrier(0);
         }
         __builtin_amdgcn_sched_barrier(0);
         loop_row(p_x, token_id, t, TOPK - 1);

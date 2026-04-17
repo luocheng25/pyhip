@@ -41,7 +41,8 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
               "QUANT1_K":model_dim,
               "QUANT2_K":model_dim,
               "REDUCE_K":model_dim,
-              "BLOCK_QUANT":256,}
+              "BLOCK_QUANT":256,
+              "IS_QUANT1":1 if is_gemm1 else 0,}
     device = x.device
     DEBUG = False
     if DEBUG:
@@ -59,7 +60,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 )
             x_quant_scale.is_sorted = True
         else:
-            hip.quant1([2*div_up(M, kwargs["ROW_PER_BLOCK1"])], [64], 
+            hip.quant1([div_up(M, kwargs["ROW_PER_BLOCK1"])], [256], 
                 x, smooth_scale, x_quant, x_quant_scale, 
                 topk_ids, M, **kwargs)
             x_quant_scale.is_sorted = False
@@ -343,7 +344,7 @@ def fused_moe_gelu_sqi8(
             a2, a2_scale = smoothquant_per_tok(a2_v, a2_smooth_scale, topk)
 
     # quantize output to int8 in unit of 1x256
-    oquant_block_size = 256
+    oquant_block_size = 0
 
     # only ref supports this so-far
     moe_gemm = moe_gemm_ref if oquant_block_size > 0 else moe_gemm_jit
