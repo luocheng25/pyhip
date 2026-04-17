@@ -652,6 +652,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
     float32x8 x_org_buf[QUANT1_K / 64 / 8];
     float32x8 x_smooth_buf[QUANT1_K / 64 / 8];
     __shared__ uint expert_ids_lds[TOPK];
+    __shared__ float smooth_scale_lds[QUANT1_K];
     if (threadIdx.x < TOPK) {
         expert_ids_lds[threadIdx.x] = expert_ids[(m_block < M ? m_block : 0) * ROW_PER_BLOCK1 * TOPK + threadIdx.x];
     }
@@ -664,7 +665,6 @@ __global__ __launch_bounds__(64, 1) void quant1(
         //auto p_smooth_scale = smooth_scale + expert_ids_lds[topk_id] * S;
         auto p_smooth_scale = smooth_scale + expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S;
         float cur_max = -FLT_MAX;
-        float32x8 scale_buf[QUANT1_K / 64 / 8];
         auto e_id = expert_ids_lds[topk_id];
         if (e_id & 1) {
             if (blockIdx.x < M) {
@@ -675,25 +675,14 @@ __global__ __launch_bounds__(64, 1) void quant1(
                 return;
             }
         }
+        __amdgpu_buffer_rsrc_t buf_r = __builtin_amdgcn_make_buffer_rsrc(smooth_scale + e_id * S, 0, smooth_scale_res.range, smooth_scale_res.config);
         #pragma unroll
-        for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
-            //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
-            float32x4 tmp[2];
-            tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
-                 0,
-                 (e_id * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float),
-                 0,
-                 (int)amd_buffer_coherence_enum::glc);
-            tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
-                 0,
-                 (e_id * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float) + 4 * sizeof(float),
-                 0,
-                 (int)amd_buffer_coherence_enum::glc);
-            scale_buf[i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
+        for (int i = 0; i < QUANT1_K / 64 / 4; i++) {
+            __builtin_amdgcn_raw_ptr_buffer_load_lds(buf_r, (smooth_scale_lds + i * 64 * 4), 16, threadIdx.x * 16 + i * 64 * 16, 0, 0, (int)amd_buffer_coherence_enum::glc);
         }
         # pragma unroll
         for (int i = 0; i < S / 8 / 64; i++) {
-            auto& scale = scale_buf[i];
+            auto scale = ((float32x8*)smooth_scale_lds)[i * 64 + threadIdx.x];//scale_buf[i];
             auto x_val = x_org_buf[i];
             #pragma unroll
             for (int j = 0; j < 8; j++) {
