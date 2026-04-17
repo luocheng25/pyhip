@@ -598,6 +598,42 @@ __global__ void __launch_bounds__(256, 1)quant2(
     loop();
 }
 
+__device__ float wave_reduce_max(float cur_max) {
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:8 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:4 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:2 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_shr:1 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_bcast:15 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    asm ("v_max_f32_dpp %0, %1, %2 row_bcast:31 bound_ctrl:0; \n\t"
+                :"=v"(cur_max)
+                :"v"(cur_max), "v"(cur_max)
+                :);
+    float max_s;
+    asm ("v_readlane_b32 %0, %1, 63; \n\t"
+                :"=s"(max_s)
+                :"v"(cur_max)
+                :);
+    cur_max = max_s;
+    return cur_max;
+}
+
+
 __global__ __launch_bounds__(64, 1) void quant1(
             __bf16* x,                  // [M, S]
             float* smooth_scale,        // [E, S]
@@ -617,7 +653,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
     float32x8 x_smooth_buf[QUANT1_K / 64 / 8];
     __shared__ uint expert_ids_lds[TOPK];
     if (threadIdx.x < TOPK) {
-        expert_ids_lds[threadIdx.x] = expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + threadIdx.x];
+        expert_ids_lds[threadIdx.x] = expert_ids[(m_block < M ? m_block : 0) * ROW_PER_BLOCK1 * TOPK + threadIdx.x];
     }
     // __bf16 x_smooth_buf[QUANT1_K / 64 / 8][8];
     BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK1 * S, 0xffffffff);
@@ -629,7 +665,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
         auto p_smooth_scale = smooth_scale + expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S;
         float cur_max = -FLT_MAX;
         float32x8 scale_buf[QUANT1_K / 64 / 8];
-        auto e_id = expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id];
+        auto e_id = expert_ids_lds[topk_id];
         if (e_id & 1) {
             if (blockIdx.x < M) {
                 return;
@@ -667,7 +703,8 @@ __global__ __launch_bounds__(64, 1) void quant1(
                 cur_max = fmaxf(cur_max, abs(tmp));
             }
         }
-        cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+        //cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+        cur_max = wave_reduce_max(cur_max);
         auto row_scale = cur_max / 128.0f;
         row_scale = fmaxf(row_scale, 1e-6f);
         auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
