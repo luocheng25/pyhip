@@ -82,7 +82,7 @@ def wei_is_fp8(weight_type):
 
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, fp8_ptpc=True):
     INTER_SIZE_TP = INTER_SIZE // TP
-    BUF_COPY = 32
+    BUF_COPY = 4
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
@@ -257,29 +257,32 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             grid = sorted_expert_ids.shape[0]
             if B * TOPK <= E:
                 grid = B * TOPK
-            moe_gemm_batch([N1 // 32, grid], [256],
-                            w1.dtype, True,
-                            hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
+            with cudaPerf(0, B*TOPK*N1*K1, name=f"up") as p:
+                moe_gemm_batch([N1 // 32, grid], [256],
+                                w1.dtype, True,
+                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
             # moe_gemm_batch([N2 // 32, grid], [64],
             #                 w1.dtype, False,
             #                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
             num_CU = torch.cuda.get_device_properties().multi_processor_count
-            BLOCK_N = 1024
+            BLOCK_N = 1024*4*2
             if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU:
                 BLOCK_TILE_SIZE_M = 16
-                BLOCK_TILE_SIZE_N = 16
+                BLOCK_TILE_SIZE_N = 16*2
                 assert N2 % BLOCK_N == 0
                 use_atomic_write = B < 8
                 NUM_STAGES = 3
                 gemm2_out = cur_out
                 if not use_atomic_write:
                     gemm2_out = torch.empty([B, TOPK, HIDDEN_SIZE], dtype=torch.bfloat16)
-                moe_2stage_down_loopn([N2 // BLOCK_N, grid], [256],
-                                w1.dtype, TOPK, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-                                w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc, BLOCK_N, use_atomic_write, NUM_STAGES)
+                with cudaPerf(0, B*TOPK*N2*K2, name=f"down") as p:
+                    moe_2stage_down_loopn([N2 // BLOCK_N, grid], [256],
+                                    w1.dtype, TOPK, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                    gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                                    w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc, BLOCK_N, use_atomic_write, NUM_STAGES)
                 if not use_atomic_write:
                     cur_out = torch.sum(gemm2_out, dim=1)
+                    cur_out = cur_out.reshape(B, N2 // 32, 4, 2, 4).permute(0, 1, 3, 2, 4).reshape(B, N2)
 
             else:
                 BLOCK_TILE_SIZE_M = 16
@@ -660,12 +663,12 @@ def show_perf(perflist):
 def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
     perf = []
-    if is_arch_type('942'):
-        perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
-    else:
-        perf.append(entry_common('aiter', batch, prec=[torch.bfloat16], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
-    # fix TILE_M=16, TILE_N=32
-    perf.append(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
+    # if is_arch_type('942'):
+    #     perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    # else:
+    #     perf.append(entry_common('aiter', batch, prec=[torch.bfloat16], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    # # fix TILE_M=16, TILE_N=32
+    # perf.append(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
     perf.append(entry_common('16x32_2s_b', batch=batch, prec=[get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
 
@@ -689,7 +692,7 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
 if __name__ == '__main__':
     TILE_M = 16
     TILE_N = 64
-    HIDDEN_SIZE = 4096
+    HIDDEN_SIZE = 4096*8
     INTER_SIZE = 1024
     TP = 8
 
@@ -703,9 +706,10 @@ if __name__ == '__main__':
     #with torchPerf():
     #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
     if 1:
-        test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         batch = [1, 2, 4, 8, 12, 16, 32]
         #batch = [1, 2, 4]
+        batch = [32]
         test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         # batch = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
         # batch = [1, 2, 4, 8, 16, 32,64,128, 256]

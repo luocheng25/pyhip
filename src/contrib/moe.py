@@ -812,7 +812,7 @@ def moe_2stage_down_loopn(J:JIT,
     # grid: [N2 // BLOCK_N, sorted_expert_ids.shape[0]], [256]
     assert weight_dtype == torch.bfloat16 or weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz
     assert fp8_ptpc, "only fp8 ptpc supported"
-    assert BLOCK_TILE_SIZE_N == 16, "BLOCK_TILE_SIZE_N should be 16"
+    assert BLOCK_TILE_SIZE_N % 16 == 0, "BLOCK_TILE_SIZE_N should be multiple of 16"
     if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         if fp8_ptpc:
             assert K % 64 == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'
@@ -936,8 +936,12 @@ def moe_2stage_down_loopn(J:JIT,
     buff_b = J.Buffer(p_weight, 0xffffffff)
     voffset_b = J.gpr(B_horz, 'vu32')
     voffset_b[0] = lane_id * 16 # + BLOCK_TILE_SIZE_N * 4 * blk_n * stride_B
+    for n in range(1, B_horz):
+        voffset_b[n] = n * 16 * stride_B + voffset_b[0]
+
     # scale
-    scale_lds = J.alloc_lds(BLOCK_N * 4 * 1)
+    #scale_lds = J.alloc_lds(BLOCK_N * 4 * 1)
+    scale_lds = J.alloc_lds(32*1024)
     p_w_scale[:] += s_e_id * (N * sizeof_f32) + BLOCK_N * sizeof_f32 * J.blockIdx.x # + BLOCK_TILE_SIZE_N * sizeof_f32 * warp_id
     voffset_scale = J.gpr(B_horz, 'vu32')
     voffset_scale[0] = J.threadIdx.x * J.sizeof_f32
@@ -945,23 +949,28 @@ def moe_2stage_down_loopn(J:JIT,
     m0base[0] = warp_id * (64 * J.sizeof_f32) + scale_lds
     for i in range(BLOCK_N // 1024):
         J.s_mov_b32("m0", m0base)
-        J.global_load_lds_dword(voffset_scale, p_w_scale)
+        J.global_load_lds_dword(voffset_scale[0], p_w_scale)
         J.s_mov_b32("m0", m0base + 256 * 4 * 1)
-        J.global_load_lds_dword(voffset_scale + 256 * 4 * 1, p_w_scale)
+        J.global_load_lds_dword(voffset_scale[0] + 256 * 4 * 1, p_w_scale)
         J.s_mov_b32("m0", m0base + 256 * 4 * 2)
-        J.global_load_lds_dword(voffset_scale + 256 * 4 * 2, p_w_scale)
+        J.global_load_lds_dword(voffset_scale[0] + 256 * 4 * 2, p_w_scale)
         J.s_mov_b32("m0", m0base + 256 * 4 * 3)
-        J.global_load_lds_dword(voffset_scale + 256 * 4 * 3, p_w_scale)
+        J.global_load_lds_dword(voffset_scale[0] + 256 * 4 * 3, p_w_scale)
         m0base[0] += 1024 * 4
         voffset_scale[0] += 1024 * 4
-    voffset_scale[0] = lane_div_16 * (4 * sizeof_f32) + warp_id * (4 * 4 * sizeof_f32)
+    voffset_scale[0] = lane_div_16 * (4 * sizeof_f32) + warp_id * (BLOCK_TILE_SIZE_N // 16 * 4 * 4 * sizeof_f32)
+    for n in range(1, B_horz):
+        voffset_scale[n] = voffset_scale[0] + n * 4 * 4 * sizeof_f32
+
     # output
     if atomic_write:
         p_output[:] += BLOCK_N * sizeof_bf16 * J.blockIdx.x + BLOCK_TILE_SIZE_N * sizeof_bf16 * warp_id
     else:
         buff_c = J.Buffer(p_output, M * (TOPK * N * sizeof_bf16))
-        voffset_output = J.gpr(1, 'vu32')
-        voffset_output[0] = BLOCK_N * sizeof_bf16 * J.blockIdx.x + BLOCK_TILE_SIZE_N * sizeof_bf16 * warp_id + lane_div_16 * (4 * sizeof_bf16)     
+        voffset_output = J.gpr(B_horz, 'vu32')
+        voffset_output[0] = BLOCK_N * sizeof_bf16 * J.blockIdx.x + BLOCK_TILE_SIZE_N * sizeof_bf16 * warp_id + lane_div_16 * (8 * sizeof_bf16)
+        for n in range(1, B_horz//2):
+            voffset_output[n] = voffset_output[0] + n * 32 * sizeof_bf16
 
     s_cvt_bf16_bias_dup = J.gpr(2, "su32")
     s_cvt_bf16_bias_dup[0] = 0x00008000
@@ -989,6 +998,16 @@ def moe_2stage_down_loopn(J:JIT,
         nonlocal read_stage
         v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
         v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
+        def mfma():
+            for k in range(K // 16 // 4):
+                for i in range(2):
+                    for n in range(B_horz):
+                        for m in range(A_vert):
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[k, m, i, 0], 0 if k == 0 and i == 0 else C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[k, m, i, 1], C_reg[n, m])
+
+        first_fma = True
+        gen = mfma()
         for k in range(K // 16 // 4):
             for i in range(2):
                 for n in range(B_horz):
@@ -1010,51 +1029,67 @@ def moe_2stage_down_loopn(J:JIT,
                         J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[read_stage, k, n, i, j], mod='src0_sel:WORD_1')
                         J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
                         J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
+                        if first_fma:
+                            first_fma = False
+                        else:
+                            next(gen)
+        next(gen)
                 # 2, A_vert, A_rep=2, 2, 2
-                for n in range(B_horz):
-                    for m in range(A_vert):
-                        J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[k, m, i, 0], 0 if k == 0 and i == 0 else C_reg[n, m])
-                        J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[k, m, i, 1], C_reg[n, m])
+                #for n in range(B_horz):
+                    # for m in range(A_vert):
+                    #     J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[k, m, i, 0], 0 if k == 0 and i == 0 else C_reg[n, m])
+                    #     J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[k, m, i, 1], C_reg[n, m])
                         # if blk_n == 0:
                         #     J.debug_log(C_reg[n, m], torch.float32, message=f'{k=} {i=}')
                         #     J.debug_log(v_w_bf16[n], torch.bfloat16, message=f'{k=} {i=}')
                         #     J.debug_log(A_reg[k,m,i], torch.bfloat16, message=f'{k=} {i=}')
 
 
+        lane_div_16_4xbf16 = J.gpr(lane_div_16 * (4 * sizeof_bf16))
+        if atomic_write:
+            p_output[:] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
+        # should be 7 nop to get result of mfma
+        read_stage = (read_stage + 1) % STAGES
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        #J.s_nop(1)
+        creg_low = J.gpr(B_horz // 2, 2, 2, "vbf16x2", align=2)
         for m in range(A_vert):
-            n = 0 # B_horz == 1
-            if m == 0:
-                lane_div_16_4xbf16 = J.gpr(lane_div_16 * (4 * sizeof_bf16))
-            if atomic_write:
-                vaddr = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16_4xbf16 + n * 4 * (BLOCK_TILE_SIZE_N * sizeof_bf16))
-                p_output[:] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
-            else:
-                vaddr = J.gpr(v_token_id[m] * (N * TOPK * sizeof_bf16) + v_topk_id[m] * (N * sizeof_bf16) + voffset_output[0])
-                voffset_output[0] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
-            if m == 0:
-                # should be 7 nop to get result of mfma
-                read_stage = (read_stage + 1) % STAGES
-                voffset_b[0] += BLOCK_TILE_SIZE_N * get_k_bytes(K) * 4
-                voffset_scale[0] += 4 * (4 * 4 * sizeof_f32)
-                J.s_waitcnt(mod=f"lgkmcnt(0)")
-                J.s_nop(1)
+            for n in range(B_horz):
+                # if m == 0:
+                #     lane_div_16_4xbf16 = J.gpr(lane_div_16 * (4 * sizeof_bf16))
+                # if atomic_write:
+                #     vaddr = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16_4xbf16 + n * 4 * (BLOCK_TILE_SIZE_N * sizeof_bf16))
+                #     # p_output[:] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
+                # else:
+                #     vaddr = J.gpr(v_token_id[m] * (N * TOPK * sizeof_bf16) + v_topk_id[m] * (N * sizeof_bf16) + voffset_output[n])
+                #     voffset_output[n] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
+                if m == 0:
+                    # should be 7 nop to get result of mfma
+                    # read_stage = (read_stage + 1) % STAGES
+                    voffset_b[n] += BLOCK_TILE_SIZE_N * get_k_bytes(K) * 4
+                    voffset_scale[n] += 4 * (BLOCK_TILE_SIZE_N // 16 * 4 * 4 * sizeof_f32)
+                    # J.s_waitcnt(mod=f"lgkmcnt(0)")
+                    # J.s_nop(1)
 
-            J.v_pk_mul_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_w_scale[n, 0:1])
-            J.v_pk_mul_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_w_scale[n, 2:3])
+                J.v_pk_mul_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_w_scale[n, 0:1])
+                J.v_pk_mul_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_w_scale[n, 2:3])
 
-            creg_low = J.gpr(2, "vbf16x2", align=2)
-            J.v_pk_fma_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_weight[m], s_cvt_bf16_bias_dup)
-            J.v_pk_fma_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_weight[m], s_cvt_bf16_bias_dup)
-            J.pk_f32_to_bf16(creg_low[0], C_reg[n, m, 0], C_reg[n, m, 1])
-            J.pk_f32_to_bf16(creg_low[1], C_reg[n, m, 2], C_reg[n, m, 3])
+                J.v_pk_fma_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_weight[m], s_cvt_bf16_bias_dup)
+                J.v_pk_fma_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_weight[m], s_cvt_bf16_bias_dup)
+                J.pk_f32_to_bf16(creg_low[n // 2, n % 2, 0], C_reg[n, m, 0], C_reg[n, m, 1])
+                J.pk_f32_to_bf16(creg_low[n // 2, n % 2, 1], C_reg[n, m, 2], C_reg[n, m, 3])
 
-            if atomic_write:
-                with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
-                    #J.debug_log(creg_low[0], torch.bfloat16)
-                    J.global_atomic_pk_add_bf16(vaddr, creg_low[0], p_output, mod=f'offset:{0 - BLOCK_TILE_SIZE_N * sizeof_bf16 * 4}')
-                    J.global_atomic_pk_add_bf16(vaddr, creg_low[1], p_output, mod=f'offset:{4 - BLOCK_TILE_SIZE_N * sizeof_bf16 * 4}')
-            else:
-                buff_c.store_dwordx2(creg_low, vaddr, 0)
+                # if atomic_write:
+                #     with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
+                #         #J.debug_log(creg_low[0], torch.bfloat16)
+                #         J.global_atomic_pk_add_bf16(vaddr, creg_low[0], p_output, mod=f'offset:{0 - BLOCK_TILE_SIZE_N * sizeof_bf16 * 4}')
+                #         J.global_atomic_pk_add_bf16(vaddr, creg_low[1], p_output, mod=f'offset:{4 - BLOCK_TILE_SIZE_N * sizeof_bf16 * 4}')
+                # else:
+                #     buff_c.store_dwordx2(creg_low, vaddr, 0)
+                if n % 2 == 1:
+                    vaddr = J.gpr(v_token_id[m] * (N * TOPK * sizeof_bf16) + v_topk_id[m] * (N * sizeof_bf16) + voffset_output[n // 2])
+                    voffset_output[n // 2] += BLOCK_TILE_SIZE_N * sizeof_bf16 * 4
+                    buff_c.store_dwordx4(creg_low[n // 2], vaddr, 0)
 
     # beginning of loop
     for blk_n in range(STAGES - 1):
@@ -1070,9 +1105,10 @@ def moe_2stage_down_loopn(J:JIT,
                 soffset_kb[0] += 1024
         write_stage = (write_stage + 1) % STAGES
         v_w_scale = J.gpr(B_horz, 4, 'vf32')
-        J.ds_read_b128(v_w_scale, voffset_scale)
-        wait_cnt = K // 16 // 4 * (STAGES - 1)
-        wait_cnt += blk_n * (2 if atomic_write else 1)
+        for n in range(B_horz):
+            J.ds_read_b128(v_w_scale[n], voffset_scale[n])
+        wait_cnt = K // 16 // 4 * (STAGES - 1) * B_horz
+        wait_cnt += blk_n * B_horz // 2 * (2 if atomic_write else 1)
         J.s_waitcnt(mod=f"vmcnt({wait_cnt})")
 
         loop_body()
@@ -1083,9 +1119,9 @@ def moe_2stage_down_loopn(J:JIT,
     full_loop_cnt = (full_loop_end - (STAGES - 1)) // STAGES
 
     # rolled loop to avoid big code size
-    # with J.While(s_i[0] < full_loop_cnt) as loop:
-    #     s_i[0] += 1
-    for _ in range(full_loop_cnt):
+    with J.While(s_i[0] < full_loop_cnt) as loop:
+        s_i[0] += 1
+    # for _ in range(full_loop_cnt):
         for _ in range(STAGES):
             if K // 16 // 4 <= 4:
                 for k in range(K // 16 // 4):
@@ -1099,9 +1135,10 @@ def moe_2stage_down_loopn(J:JIT,
                     soffset_kb[0] += 1024
             write_stage = (write_stage + 1) % STAGES
             v_w_scale = J.gpr(B_horz, 4, 'vf32')
-            J.ds_read_b128(v_w_scale, voffset_scale)
-            wait_cnt = K // 16 // 4 * (STAGES - 1)
-            wait_cnt += (STAGES - 1) * (2 if atomic_write else 1)
+            for n in range(B_horz):
+                J.ds_read_b128(v_w_scale[n], voffset_scale[n])
+            wait_cnt = K // 16 // 4 * (STAGES - 1) * B_horz
+            wait_cnt += (STAGES - 1) * B_horz // 2 * (2 if atomic_write else 1)
             J.s_waitcnt(mod=f"vmcnt({wait_cnt})")
 
             loop_body()
@@ -1120,9 +1157,10 @@ def moe_2stage_down_loopn(J:JIT,
                 soffset_kb[0] += 1024
         write_stage = (write_stage + 1) % STAGES
         v_w_scale = J.gpr(B_horz, 4, 'vf32')
-        J.ds_read_b128(v_w_scale, voffset_scale)
-        wait_cnt = K // 16 // 4 * (STAGES - 1)
-        wait_cnt += (STAGES - 1) * (2 if atomic_write else 1)
+        for n in range(B_horz):
+            J.ds_read_b128(v_w_scale[n], voffset_scale[n])
+        wait_cnt = K // 16 // 4 * (STAGES - 1) * B_horz
+        wait_cnt += (STAGES - 1) * B_horz // 2 * (2 if atomic_write else 1)
         J.s_waitcnt(mod=f"vmcnt({wait_cnt})")
 
         loop_body()
@@ -1131,9 +1169,10 @@ def moe_2stage_down_loopn(J:JIT,
     assert BLOCK_N // BLOCK_TILE_SIZE_N // 4 >= (STAGES - 1) * 3
     for blk_n in range(STAGES - 1):
         v_w_scale = J.gpr(B_horz, 4, 'vf32')
-        J.ds_read_b128(v_w_scale, voffset_scale)
+        for n in range(B_horz):
+            J.ds_read_b128(v_w_scale[n], voffset_scale[n])
         prefetch_cnt = STAGES - 1 - 1 - blk_n
-        wait_cnt = K // 16 // 4 * prefetch_cnt + (2 if atomic_write else 1) * (STAGES - 1 - blk_n)
+        wait_cnt = K // 16 // 4 * prefetch_cnt * B_horz + (2 if atomic_write else 1) * (STAGES - 1 - blk_n) * B_horz
         J.s_waitcnt(mod=f"vmcnt({wait_cnt})")
 
         loop_body()
