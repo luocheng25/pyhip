@@ -1145,6 +1145,13 @@ def xcd_swizzle(J, blk1d, num_blocks, num_oc_blocks, NUM_XCD, NUM_CU_PER_XCD):
     num_groupped_blocks = num_blocks // NUM_CU * NUM_CU
     blk_m = J.gpr("su32")
     blk_n = J.gpr("su32")
+    def shuffle(x):
+        x = x ^ (x >> 5)
+        x = x ^ (x >> 3)
+        return x
+    blk1d = shuffle(blk1d)
+    # with J.If(blk1d >= num_blocks):
+    #     blk1d -= num_blocks
     if 0 and num_oc_blocks == 16:
         # in unit of 4x8 [256x256] blocks
         with J.If(blk1d < num_groupped_blocks) as If:
@@ -1161,7 +1168,7 @@ def xcd_swizzle(J, blk1d, num_blocks, num_oc_blocks, NUM_XCD, NUM_CU_PER_XCD):
             If.Else()
             blk_m[0] = blk1d // num_oc_blocks
             blk_n[0] = blk1d - blk_m * num_oc_blocks
-    elif num_oc_blocks <= 4:
+    elif 0 and num_oc_blocks <= 4:
         with J.If(blk1d < num_groupped_blocks) as If:
             blk_base = (blk1d // NUM_CU) * NUM_CU
             cu_id = blk1d - blk1d // NUM_CU * NUM_CU

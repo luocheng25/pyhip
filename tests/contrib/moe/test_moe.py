@@ -808,6 +808,6 @@ if __name__ == '__main__':
         batch = [i * 1024 for i in range(1, 9)] + [8192*2, 8192*4, 8192*8]
         #batch = [i * 6553 for i in range(1, 11)]
         #entry_common('mxn_2s', batch=batch, prec=[get_fp8type()], TILE_M=64, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
-        test_perf(batch, TILE_M=64, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
+        test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
 
 
