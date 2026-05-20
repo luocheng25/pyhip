@@ -482,10 +482,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
 
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
-                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
-                               w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-                               None, w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0])
+                id_buf = torch.zeros(64, dtype=torch.int32)
+                with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
+                    moe_2stage_gateup([80], [256],
+                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                id_buf.data_ptr(), hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                                None, w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0])
                 gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=hidden_states.device)
                 moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                             w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
@@ -516,9 +518,11 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                         TILE_M, 
                                         sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids, TOPK)
                 else:
+                    id_buf = torch.zeros(64, dtype=torch.int32)
                     with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
-                        moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
+                        moe_2stage_gateup([80], [256],
                                     w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                    id_buf, 
                                     hidden_states_q, w1, 
                                     gemm1_out, 
                                     sorted_ids, 
@@ -807,7 +811,8 @@ if __name__ == '__main__':
         #batch = [i * 8192 for i in range(1, 11)]
         batch = [i * 1024 for i in range(1, 9)] + [8192*2, 8192*4, 8192*8]
         #batch = [i * 6553 for i in range(1, 11)]
-        #entry_common('mxn_2s', batch=batch, prec=[get_fp8type()], TILE_M=64, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
-        test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
+        #batch = [6553, 8192]
+        #entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=128, TILE_N=256, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
+        test_perf(batch, TILE_M=128, TILE_N=256, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
 
 
