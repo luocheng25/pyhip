@@ -443,15 +443,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 use_prefill = B > 32 and TILE_M >= 64 and TILE_M % 64 == 0
                 _gateup_wave = os.environ.get("MOE_GATEUP_WAVE", "2x2")
                 if use_prefill:
-                    gateup_alg = 'prefill_1x4' if _gateup_wave == '1x4' else 'prefill_2x2'
+                    gateup_alg = {
+                        '1x4': 'prefill_1x4',
+                        '2x2_simple': 'prefill_2x2_simple',
+                    }.get(_gateup_wave, 'prefill_2x2')
                 else:
                     gateup_alg = 'splitk'
-                gateup_tn = 128 if gateup_alg in ('prefill_2x2', 'prefill_1x4') else TILE_N
+                gateup_tn = 128 if gateup_alg in ('prefill_2x2', 'prefill_1x4', 'prefill_2x2_simple') else TILE_N
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tn), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
-                if gateup_alg in ('prefill_2x2', 'prefill_1x4'):
+                if gateup_alg in ('prefill_2x2', 'prefill_1x4', 'prefill_2x2_simple'):
                     # The prefill (native fp8 MFMA) gateup needs an fp8 input plus its
                     # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
                     # bf16 passes through with a dummy scale (unused by the bf16 kernel path).
