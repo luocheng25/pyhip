@@ -1,0 +1,149 @@
+bench_gemm_core.py — PERFORMANCE RECORD (2026-07-03)
+=====================================================
+GPU            : MI308X (gfx942 / CDNA3), wave64
+Bench state    : tk=128 A-load FIXED 2026-07-03 (bf16 g2r_tv_layout -> value=16 for
+                 TILE_K=128 in BOTH 1x4 and 1x4a). tk=64 path unchanged. Base was
+                 backups/bench_gemm_core_2026-07-02_headread_128bwrite_251T.py
+Measures       : CORE-ONLY main-loop latency (raw accumulator store; NO
+                 silu / dequant / CShuffle / scatter epilogue)
+Dtype          : bf16 only (weight_dtype hardcoded in build())
+Waves          : 1x4  = B-first MFMA (weight is MFMA A-operand)
+                 1x4a = A-first MFMA (reference/older ordering)
+Problem        : N1=256, K1=4096  (gateup gate+up fused)
+Run command    : FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py \
+                   waves=1x4,1x4a bms=64,128 bns=128,256 \
+                   batches=4096,8192,16384,32768 tk=<64|128>
+
+ACCURACY (accuracy-first policy)
+--------------------------------
+* This bench performs NO internal correctness check (it stores raw accumulators).
+* tk=64  : the 1x4 core mirrors the accuracy-verified moe_gemm_splitk prefill_1x4
+           (calc_diff 2e-5 via test_moe fly_splitk_2s, re-confirmed 2026-07-03). VALID.
+* tk=128 : FIXED & VALID (2026-07-03). The bf16 A-load g2r_tv_layout is now value=16
+           ( ((8,8,4),16),((512,1,8),32) ) for TILE_K=128 -> covers the full 32x128 A
+           sub-tile (two 128b loads); value=8 kept for TILE_K=64. Correctness by
+           correspondence: the 1x4 core is identical to the accuracy-verified
+           moe_gemm_splitk prefill_1x4 bf16 tk=128 (calc_diff 2e-5). Cross-check: the
+           fixed bench reproduces the same perf pattern (tk=128 wins only at
+           BM128/BN256), matching moe_gemm_splitk.
+
+
+==========================  tk=64  (VALID)  ==========================
+wave  BM    BN    B         latency(us)   TFLOPS
+1x4   64    128   4096         1466.2      234.3
+1x4   64    128   8192         2995.4      229.4
+1x4   64    128   16384        6133.9      224.1
+1x4   64    128   32768       13032.4      210.9
+1x4   64    256   4096         1403.6      244.8   <- 1x4 peak
+1x4   64    256   8192         2809.8      244.6
+1x4   64    256   16384        5711.6      240.6
+1x4   64    256   32768       12668.6      217.0
+1x4   128   128   4096         1531.0      224.4
+1x4   128   128   8192         3066.1      224.1
+1x4   128   128   16384        6287.6      218.6
+1x4   128   128   32768       14710.3      186.9
+1x4   128   256   4096         1624.3      211.5
+1x4   128   256   8192         3336.4      206.0
+1x4   128   256   16384        6970.1      197.2
+1x4   128   256   32768       16692.1      164.7
+1x4a  64    128   4096         1662.0      206.7
+1x4a  64    128   8192         3283.5      209.3
+1x4a  64    128   16384        6679.7      205.8
+1x4a  64    128   32768       14609.3      188.2
+1x4a  64    256   4096         1633.0      210.4
+1x4a  64    256   8192         3162.4      217.3
+1x4a  64    256   16384        6365.5      215.9
+1x4a  64    256   32768       15057.2      182.6
+1x4a  128   128   4096         1744.4      197.0
+1x4a  128   128   8192         3407.8      201.7
+1x4a  128   128   16384        7347.6      187.1
+1x4a  128   128   32768       17903.0      153.5
+1x4a  128   256   4096         2223.2      154.5
+1x4a  128   256   8192         4493.7      152.9
+1x4a  128   256   16384        9261.9      148.4
+1x4a  128   256   32768       23627.3      116.3
+
+tk=64  1x4 vs 1x4a  (ratio = 1x4/1x4a latency; <1 => 1x4 faster)
+  BM   BN      B       1x4      1x4a    ratio
+  64  128   4096    1466.2    1662.0    0.882
+  64  128   8192    2995.4    3283.5    0.912
+  64  128  16384    6133.9    6679.7    0.918
+  64  128  32768   13032.4   14609.3    0.892
+  64  256   4096    1403.6    1633.0    0.860
+  64  256   8192    2809.8    3162.4    0.888
+  64  256  16384    5711.6    6365.5    0.897
+  64  256  32768   12668.6   15057.2    0.841
+ 128  128   4096    1531.0    1744.4    0.878
+ 128  128   8192    3066.1    3407.8    0.900
+ 128  128  16384    6287.6    7347.6    0.856
+ 128  128  32768   14710.3   17903.0    0.822
+ 128  256   4096    1624.3    2223.2    0.731
+ 128  256   8192    3336.4    4493.7    0.742
+ 128  256  16384    6970.1    9261.9    0.753
+ 128  256  32768   16692.1   23627.3    0.706
+
+
+===============  tk=128  (FIXED 2026-07-03 — VALID)  ===============
+tk=128  1x4 per-config core-only latency / TFLOPS
+wave  BM    BN    B         latency(us)   TFLOPS
+1x4   64    128   4096         1518.5      226.3
+1x4   64    128   8192         3100.6      221.6
+1x4   64    128   16384        6317.3      217.6
+1x4   64    128   32768       14103.4      194.9
+1x4   64    256   4096         1530.4      224.5
+1x4   64    256   8192         3084.4      222.8
+1x4   64    256   16384        6278.2      218.9
+1x4   64    256   32768       14750.3      186.4
+1x4   128   128   4096         1904.7      180.4
+1x4   128   128   8192         3854.6      178.3
+1x4   128   128   16384        8136.6      168.9
+1x4   128   128   32768       19986.2      137.5
+1x4   128   256   4096         1524.8      225.3   <- tk128 > tk64 here (197.2)
+1x4   128   256   8192         3190.3      215.4
+1x4   128   256   16384        6429.4      213.8
+1x4   128   256   32768       15228.7      180.5
+
+tk=128  1x4 vs 1x4a  (ratio = 1x4/1x4a latency; <1 => 1x4 faster)
+  BM   BN      B       1x4      1x4a    ratio
+  64  128   4096    1518.5    1642.0    0.925
+  64  128   8192    3100.6    3430.6    0.904
+  64  128  16384    6317.3    6887.8    0.917
+  64  128  32768   14103.4   15861.1    0.889
+  64  256   4096    1530.4    2429.0    0.630
+  64  256   8192    3084.4    4910.6    0.628
+  64  256  16384    6278.2   10002.3    0.628
+  64  256  32768   14750.3   23648.8    0.624
+ 128  128   4096    1904.7    2631.2    0.724
+ 128  128   8192    3854.6    5288.1    0.729
+ 128  128  16384    8136.6   10705.8    0.760
+ 128  128  32768   19986.2   23104.2    0.865
+ 128  256   4096    1524.8    2110.0    0.723
+ 128  256   8192    3190.3    4242.3    0.752
+ 128  256  16384    6429.4    8497.3    0.757
+ 128  256  32768   15228.7   22232.7    0.685
+
+Fix effect (value=8 buggy -> value=16 correct): the fix adds the previously-missing
+half of the A-load, so latency rises slightly, e.g. B=4096:
+  BM64/BN128  1452.7 -> 1518.5 us (+4.5%)   BM64/BN256  1368.3 -> 1530.4 us (+11.8%)
+  BM128/BN128 1862.3 -> 1904.7 us (+2.3%)   BM128/BN256 1507.7 -> 1524.8 us (+1.1%)
+
+
+KEY FINDINGS
+------------
+tk=64 (VALID):
+* 1x4 (B-first) beats 1x4a (A-first) in EVERY config: ratio 0.71-0.92
+  (1x4 ~25-30% faster at the largest tile BM128/BN256).
+* 1x4 peak = 244.8 TFLOPS @ BM64/BN256/B4096; best tile is BM64/BN256 (240-245 TF).
+  (Backup name "251T" ~ this peak; run-to-run variance ~2-3%.)
+* 1x4 worst tile = BM128/BN256 (164-211 TF). Throughput sags at B=32768
+  (occupancy / L2 pressure) across all tiles.
+* BM=64 tiles are the sweet spot for this core (keeps all 4 waves productive).
+
+tk=64 vs tk=128 (both VALID, 1x4, TFLOPS @ B=16384):
+  BM64 /BN128 : tk64 224.1  >  tk128 217.6
+  BM64 /BN256 : tk64 240.6  >  tk128 218.9
+  BM128/BN128 : tk64 218.6  >  tk128 168.9
+  BM128/BN256 : tk64 197.2  <  tk128 213.8   <- tk128 wins ONLY here
+* Same pattern as moe_gemm_splitk: a larger TILE_K helps only at the largest tile
+  (BM128/BN256); elsewhere tk=64 wins (tk=128 doubles A-LDS -> lower occupancy).
+* 1x4 still beats 1x4a at tk=128 (ratio 0.62-0.92).
