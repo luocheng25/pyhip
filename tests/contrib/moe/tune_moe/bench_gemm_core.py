@@ -1035,17 +1035,61 @@ def build(wave, N, K, BM, BN, tile_k=64):
 
 
 _CACHE = {}
-BUF_COPY = 10  # rotate input buffers to flush L2 cache
+_FLY_CACHE = {}
+BUF_COPY = 10  # rotate input buffers to flush L2 cache between iterations
+
+
+def _bench_fly(BM, BN, M, tile_k):
+    """Benchmark preshuffle_gemm_v2 with same BUF_COPY rotation."""
+    flydsl_root = os.path.join(os.path.dirname(__file__), "../../../../../FlyDSL")
+    if flydsl_root not in sys.path:
+        sys.path.insert(0, flydsl_root)
+    from kernels.preshuffle_gemm_v2 import compile_preshuffle_gemm_v2
+    from tests.utils import shuffle_weight
+
+    key = (BM, BN, M, tile_k)
+    if key not in _FLY_CACHE:
+        a_list, b_list, c_list = [], [], []
+        sa = torch.empty(0, dtype=torch.float32, device="cuda")
+        sb = torch.empty(0, dtype=torch.float32, device="cuda")
+        for _ in range(BUF_COPY):
+            a_list.append(torch.rand(M, K1, dtype=torch.bfloat16))
+            b_raw = torch.rand(N1, K1, dtype=torch.bfloat16)
+            b_list.append(shuffle_weight(b_raw, layout=(16, 16)))
+            c_list.append(torch.zeros(M, N1, dtype=torch.bfloat16))
+        jit = compile_preshuffle_gemm_v2(
+            N=N1, K=K1, tile_m=BM, tile_n=BN, tile_k=tile_k,
+            in_dtype="bf16", out_dtype="bf16",
+        )
+        args0 = (c_list[0].view(-1), a_list[0].view(-1), b_list[0].view(-1), sa, sb, M, N1, STREAM)
+        fn = flyc.compile(jit, *args0)
+        _FLY_CACHE[key] = (fn, a_list, b_list, c_list, sa, sb)
+    fn, a_list, b_list, c_list, sa, sb = _FLY_CACHE[key]
+    for i in range(10):
+        j = i % BUF_COPY
+        fn(c_list[j].view(-1), a_list[j].view(-1), b_list[j].view(-1), sa, sb, M, N1, STREAM)
+    torch.cuda.synchronize()
+    p = cudaPerf(name="", verbose=0)
+    for i in range(20):
+        j = i % BUF_COPY
+        with p:
+            fn(c_list[j].view(-1), a_list[j].view(-1), b_list[j].view(-1), sa, sb, M, N1, STREAM)
+    us = p.dt() * 1e6
+    tflops = (2 * M * HIDDEN * INTER_TP * 2) / (us * 1e-6) / 1e12
+    return us, tflops
 
 
 def bench_one(wave, BM, BN, B, tile_k=64):
     M = div_up(B, BM) * BM
-    key = (BM, BN, M)
+    if wave == "fly":
+        return _bench_fly(BM, BN, M, tile_k)
+    key = (wave, BM, BN, M)
     if key not in _CACHE:
         a = [(torch.randn([M, K1], dtype=torch.bfloat16) + 1) * 0.001 for _ in range(BUF_COPY)]
         w = [torch.randn([N1, K1], dtype=torch.bfloat16) for _ in range(BUF_COPY)]
         nblk = (N1 // BN) * (M // BM)
-        out = [torch.empty([nblk * 256 * _MAX_VALS_PER_THREAD], dtype=torch.float32) for _ in range(BUF_COPY)]
+        out_dtype = torch.float32
+        out = [torch.empty([nblk * 256 * _MAX_VALS_PER_THREAD], dtype=out_dtype) for _ in range(BUF_COPY)]
         _CACHE[key] = (a, w, out)
     a, w, out = _CACHE[key]
     jit = build(wave, N1, K1, BM, BN, tile_k)
