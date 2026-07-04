@@ -8,7 +8,15 @@ bench = 双 GEMM (gate+up) B-first; fly = preshuffle_gemm_v2 单 GEMM A-first.
 | 版本 | 64×256×64 | VGPR | 64×128×128 | VGPR | SGPR |
 |---|---|---|---|---|---|
 | 基线 | 239T | 172 | 219T | 169 | 96 |
+| 基线优化 | 268T | 154 | 196T | 169 | 96 |
 | fly | 275T | 144 | 262T | 138 | 24 |
+
+## 优化方案
+
+### 基线优化: preshuffle_v2 scheduler + CShuffle bf16 epilogue
+1. hot_loop_scheduler 改为 preshuffle_v2 gfx942 模式: dsrd(2)+mfma(1)+mfma(1) header + 均匀 vmem+mfma_group+dsrd+mfma_group+dswr 循环 + sched_barrier(0) 末尾
+2. epilogue 从 f32 global_store 改为 bf16 CShuffle via LDS + buffer_store_dwordx4
+- 64×256×64: 239→268 (+29T), VGPR 172→154
 
 ## 复现
 

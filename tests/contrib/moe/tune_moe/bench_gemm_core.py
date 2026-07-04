@@ -703,31 +703,38 @@ def build(wave, N, K, BM, BN, tile_k=64):
             lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
             def hot_loop_scheduler():
-                # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
-                # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
-                mfma_cnt = 2 * mfma_per_gemm
-                n_vmem = mem_a_cnt + 2 * mem_b_cnt   # A g2r + B gate/up g2r (buffer_load)
-                n_dswr = mem_a_cnt                    # A staging -> LDS store (ds_write)
-                n_dsrd = lds_a_cnt                    # A LDS -> register full tile (ds_read)
-                used = 0
+                # preshuffle_gemm_v2 gfx942 scheduler: header dsrd(2)+mfma(1)+mfma(1),
+                # then uniform groups vmem+mfma_group+dsrd+mfma_group+dswr(tail).
+                mfma_group = _n_reps
+                m_repeat = 2 * _m_reps  # gate + up
+                tile_m = TILE_M
+                num_a_loads = mem_a_cnt
+                mfma_total = (k_iters * 2) * m_repeat * mfma_group
+                mfma_per_iter = 2 * mfma_group
+                sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
+
                 rocdl.sched_dsrd(2)
-                for _ in range_constexpr(n_vmem):
-                    rocdl.sched_dsrd(1)
+                rocdl.sched_mfma(1)
+                if const_expr(tile_m == 16):
                     rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(4)
-                    used += 4
-                for _ in range_constexpr(n_dsrd - n_vmem - 2):
+                rocdl.sched_mfma(1)
+                if const_expr(tile_m == 16):
+                    rocdl.sched_vmem(1)
+
+                dswr_tail = num_a_loads
+                dstr_advance = 2
+                if const_expr(dswr_tail > sche_iters):
+                    dswr_tail = sche_iters
+                dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
+
+                for sche_i in range_constexpr(sche_iters):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(mfma_group)
                     rocdl.sched_dsrd(1)
-                    rocdl.sched_mfma(1)
-                    used += 1
-                rocdl.sched_mfma(mfma_cnt - n_dswr * 2 - used)
-                used += 3
-                for _ in range_constexpr(n_dswr):
-                    rocdl.sched_dswr(1)
-                    rocdl.sched_mfma(2)
-                    used += 2
-                if const_expr(mfma_cnt - used > 0):
-                    rocdl.sched_mfma(mfma_cnt - used)
+                    rocdl.sched_mfma(mfma_group)
+                    if const_expr(sche_i >= dswr_start - 1):
+                        rocdl.sched_dswr(1)
+                rocdl.sched_barrier(0)
 
             def pipeline_stage(read_i, k_next, do_prefetch):
                 write_i = read_i ^ 1
@@ -1004,19 +1011,104 @@ def build(wave, N, K, BM, BN, tile_k=64):
         if not isinstance(frags, tuple):
             frags = (frags,)
 
-        num_n_blocks = N // BLOCK_TILE_SIZE_N
-        out = fx.make_view(_as_ptr(p_out), fx.make_layout(1, 1))
-        base = ((blk_m * num_n_blocks + blk_n) * 256 + tid) * _MAX_VALS_PER_THREAD
-        off = 0
-        for frag in frags:
-            mr = fx.size(fx.get_shape(frag)[1]).to_py_value()
-            nr = fx.size(fx.get_shape(frag)[2]).to_py_value()
-            for mm in range_constexpr(mr):
-                for nn in range_constexpr(nr):
-                    vec = frag[None, mm, nn].load()
-                    for j in range_constexpr(vec.numel):
-                        out[base + off] = vec[j]
-                        off += 1
+        # ---- Epilogue: f32->bf16 CShuffle via LDS then buffer_store_dwordx4 ----
+        if const_expr(wave == "1x4"):
+            c_gate_frag, c_up_frag = frags[0], frags[1]
+            contiguous_n = BLOCK_TILE_SIZE_N // 2
+            round_bit = fx.Uint32(0x8000)
+            def _cvt_f32_to_bf16(c_frag):
+                c_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
+                c_bf16.store(
+                    ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16)
+                    .to(fx.Uint16)
+                    .bitcast(fx.BFloat16)
+                )
+                return c_bf16
+            c_gate_bf16 = _cvt_f32_to_bf16(c_gate_frag)
+            c_up_bf16 = _cvt_f32_to_bf16(c_up_frag)
+
+            # Reconstruct tiled_mma for make_tiled_copy_C
+            _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+            _k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
+            _tiled_mma = fx.make_tiled_mma(
+                _mma_atom,
+                fx.make_layout((4, 1, 1), (1, 0, 0)),
+                fx.make_tile(None, None, _k_perm),
+            )
+
+            # CShuffle: ds_write 64b (4 bf16/lane), barrier, ds_read 128b (8 bf16/lane)
+            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+            swz_c = fx.SwizzleType.get(3, 3, 3)
+            lds_c_store = fx.make_view(
+                cshuf_ptr,
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)),
+                ),
+            )
+            lds_c = fx.make_view(
+                cshuf_ptr,
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)),
+                ),
+            )
+            c_rw_copy = fx.make_tiled_copy(
+                cshuf_atom_r,
+                fx.make_layout(((16, 16), 8), ((1, 16), 256)),
+                fx.make_tile(16, contiguous_n),
+            )
+
+            # Output: bf16 buffer with 128b (buffer_store_dwordx4) writes
+            num_n_blocks = N // BLOCK_TILE_SIZE_N
+            p_out_bf16 = fx.recast_iter(fx.BFloat16, _as_ptr(p_out))
+            out_base = (blk_m * num_n_blocks + blk_n) * 256 * _MAX_VALS_PER_THREAD
+            buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            c_out_view = fx.make_view(
+                p_out_bf16 + out_base,
+                fx.make_layout((BLOCK_TILE_SIZE_M, contiguous_n), (contiguous_n, 1)),
+            )
+            c_out_buf = fx.rocdl.make_buffer_tensor(c_out_view, max_size=False)
+            c_rw_slice = c_rw_copy.get_slice(tid)
+            pC_g = c_rw_slice.partition_D(c_out_buf)
+
+            gpu.barrier()
+            store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
+            # Gate: LDS write → barrier → LDS read → global store
+            fx.copy(cshuf_atom_w, store_c.retile(c_gate_bf16), store_c.partition_D(lds_c_store))
+            gpu.barrier()
+            rd = fx.make_fragment_like(c_rw_slice.partition_S(lds_c))
+            fx.copy(cshuf_atom_r, c_rw_slice.partition_S(lds_c), rd)
+            fx.copy(buf_atom_w128, rd, pC_g)
+
+            gpu.barrier()
+            # Up: same flow, offset output
+            c_out_view2 = fx.make_view(
+                p_out_bf16 + out_base + contiguous_n * BLOCK_TILE_SIZE_M,
+                fx.make_layout((BLOCK_TILE_SIZE_M, contiguous_n), (contiguous_n, 1)),
+            )
+            c_out_buf2 = fx.rocdl.make_buffer_tensor(c_out_view2, max_size=False)
+            pC_g2 = c_rw_slice.partition_D(c_out_buf2)
+            fx.copy(cshuf_atom_w, store_c.retile(c_up_bf16), store_c.partition_D(lds_c_store))
+            gpu.barrier()
+            fx.copy(cshuf_atom_r, c_rw_slice.partition_S(lds_c), rd)
+            fx.copy(buf_atom_w128, rd, pC_g2)
+        else:
+            num_n_blocks = N // BLOCK_TILE_SIZE_N
+            out = fx.make_view(_as_ptr(p_out), fx.make_layout(1, 1))
+            base = ((blk_m * num_n_blocks + blk_n) * 256 + tid) * _MAX_VALS_PER_THREAD
+            off = 0
+            for frag in frags:
+                mr = fx.size(fx.get_shape(frag)[1]).to_py_value()
+                nr = fx.size(fx.get_shape(frag)[2]).to_py_value()
+                for mm in range_constexpr(mr):
+                    for nn in range_constexpr(nr):
+                        vec = frag[None, mm, nn].load()
+                        for j in range_constexpr(vec.numel):
+                            out[base + off] = vec[j]
+                            off += 1
 
     @flyc.jit
     def launch(p_input: fx.Pointer, p_weight: fx.Pointer, p_out: fx.Pointer,
@@ -1113,47 +1205,57 @@ def bench_one(wave, BM, BN, B, tile_k=64):
 
 
 def _filters(argv):
-    f = {"waves": ["1x4", "1x4a"], "bms": [64, 128], "bns": [128, 256],
-         "batches": [4096, 8192, 16384, 32768], "tk": 64}
+    # Default: 3 standard tiles (64×256×64, 64×128×64, 64×128×128)
+    f = {"waves": ["1x4", "fly"], "tiles": [(64, 256, 64), (64, 128, 64), (64, 128, 128)],
+         "batches": [4096], "bms": None, "bns": None, "tk": None}
     for a in argv:
         if "=" in a:
             k, v = a.split("=", 1)
-            if k == "tk":
+            if k == "tiles":
+                # e.g. tiles=64x256x64,64x128x128
+                f["tiles"] = [tuple(int(x) for x in t.split("x")) for t in v.split(",")]
+            elif k == "tk":
                 f["tk"] = int(v)
-            elif k in f:
-                f[k] = [int(x) for x in v.split(",")] if k != "waves" else v.split(",")
+            elif k == "waves":
+                f["waves"] = v.split(",")
+            elif k in ("bms", "bns", "batches"):
+                f[k] = [int(x) for x in v.split(",")]
+    # If bms/bns/tk specified, override tiles
+    if f["bms"] is not None or f["bns"] is not None or f["tk"] is not None:
+        bms = f["bms"] or [64]
+        bns = f["bns"] or [256]
+        tk = f["tk"] or 64
+        f["tiles"] = [(bm, bn, tk) for bm in bms for bn in bns]
     return f
 
 
 def main():
     f = _filters(sys.argv[1:])
-    tk = f["tk"]
     rows = {}
     for wave in f["waves"]:
-        for BM in f["bms"]:
-            for BN in f["bns"]:
-                for B in f["batches"]:
-                    us, tfl = bench_one(wave, BM, BN, B, tk)
-                    rows[(wave, BM, BN, B)] = (us, tfl)
-                    print(f"{wave:<5} BM={BM:<4} BN={BN:<4} B={B:<6} TK={tk:<4} "
-                          f"{us:8.1f} us  {tfl:7.1f} TFLOPS", flush=True)
+        for BM, BN, TK in f["tiles"]:
+            for B in f["batches"]:
+                us, tfl = bench_one(wave, BM, BN, B, TK)
+                rows[(wave, BM, BN, TK, B)] = (us, tfl)
+                print(f"{wave:<5} BM={BM:<4} BN={BN:<4} TK={TK:<4} B={B:<6} "
+                      f"{us:8.1f} us  {tfl:7.1f} TFLOPS", flush=True)
     waves = f["waves"]
     print("\n=== core-only latency us by wave" +
           (" (ratio = col0/col1)" if len(waves) == 2 else "") + " ===")
-    hdr = f"{'BM':>4}{'BN':>5}{'B':>7}" + "".join(f"{w:>10}" for w in waves)
+    hdr = f"{'tile':>14}{'B':>7}" + "".join(f"{w:>10}" for w in waves)
     if len(waves) == 2:
         hdr += f"{'ratio':>9}"
     print(hdr)
-    for BM in f["bms"]:
-        for BN in f["bns"]:
-            for B in f["batches"]:
-                cells = [rows.get((w, BM, BN, B)) for w in waves]
-                if any(c is None for c in cells):
-                    continue
-                line = f"{BM:>4}{BN:>5}{B:>7}" + "".join(f"{c[0]:>10.1f}" for c in cells)
-                if len(waves) == 2:
-                    line += f"{cells[0][0] / cells[1][0]:>9.3f}"
-                print(line)
+    for BM, BN, TK in f["tiles"]:
+        for B in f["batches"]:
+            cells = [rows.get((w, BM, BN, TK, B)) for w in waves]
+            if any(c is None for c in cells):
+                continue
+            tile_str = f"{BM}x{BN}x{TK}"
+            line = f"{tile_str:>14}{B:>7}" + "".join(f"{c[0]:>10.1f}" for c in cells)
+            if len(waves) == 2:
+                line += f"{cells[0][0] / cells[1][0]:>9.3f}"
+            print(line)
 
 
 if __name__ == "__main__":
