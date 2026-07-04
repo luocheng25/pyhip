@@ -10,6 +10,7 @@ bench = 双 GEMM (gate+up) B-first; fly = preshuffle_gemm_v2 单 GEMM A-first.
 | 基线 | 239T | 172 | 219T | 169 | 96 |
 | 基线优化 | 268T | 154 | 196T | 169 | 96 |
 | 方案1 ping-pong | 238T | 208 | 206T | 200 | 96 |
+| 方案2 计算/读写分步 | 254T | 186 | 203T | 208 | 96 |
 | fly | 275T | 144 | 262T | 138 | 24 |
 
 ## 优化方案
@@ -23,6 +24,11 @@ bench = 双 GEMM (gate+up) B-first; fly = preshuffle_gemm_v2 单 GEMM A-first.
 将 A staging fragment 拆为 ping/pong 双 buffer，消除 ds_write→buffer_load RAW 依赖。
 - **缺点**: VGPR +36 (172→208, 64×256×64), +31 (169→200, 64×128×128)
 - 性能无改善 (239→238), 因 VGPR 增加降低 occupancy 抵消了消除依赖的收益
+
+### 方案2: 计算/读写分步 (sched_barrier + s_setprio)
+sched_barrier(0) 隔离 gemm 计算块 + s_setprio(1) 提升首条 mfma 优先级 + 手动展开首条 mfma。
+- 64×256×64: 239→254 (+15T), VGPR 186
+- 核心: sched_barrier(0) 让 LLVM 将 buffer_load 提前到 s_barrier 前发射, vmcnt 从 (1) 变为 (7)
 
 ## 复现
 
