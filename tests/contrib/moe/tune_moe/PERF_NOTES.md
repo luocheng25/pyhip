@@ -5,13 +5,13 @@ bench = 双 GEMM (gate+up) B-first; fly = preshuffle_gemm_v2 单 GEMM A-first.
 
 ## 性能数据
 
-| 版本 | 64×256×64 | VGPR | 64×128×128 | VGPR | SGPR |
-|---|---|---|---|---|---|
-| 基线 | 239T | 172 | 219T | 169 | 96 |
-| 基线优化 | 268T | 154 | 196T | 169 | 96 |
-| 方案1 ping-pong | 238T | 208 | 206T | 200 | 96 |
-| 方案2 计算/读写分步 | 254T | 186 | 203T | 208 | 96 |
-| fly | 275T | 144 | 262T | 138 | 24 |
+| 版本 | 64×256×64 | VGPR | 64×128×64 | VGPR | 64×128×128 | VGPR | 128×128×64 | VGPR | SGPR |
+|---|---|---|---|---|---|---|---|---|---|
+| 基线 | 239T | 172 | — | — | 219T | 169 | — | — | 96 |
+| 方案2+CShuffle | 273T | 190 | 220T | 124 | 212T | 212 | 225T | 208 | 96 |
+| **方案3 直接store** | **275T** | **188** | **231T** | **122** | **262T** | **212** | **259T** | **208** | **96** |
+| fly | 272T | 144 | 228T | — | 258T | 138 | 238T | — | 24 |
+| ratio (方案3/fly) | **1.01** | | **1.01** | | **1.02** | | **1.09** | | |
 
 ## 优化方案
 
@@ -30,15 +30,52 @@ sched_barrier(0) 隔离 gemm 计算块 + s_setprio(1) 提升首条 mfma 优先�
 - 64×256×64: 239→254 (+15T), VGPR 186
 - 核心: sched_barrier(0) 让 LLVM 将 buffer_load 提前到 s_barrier 前发射, vmcnt 从 (1) 变为 (7)
 
+### 方案2+CShuffle: bf16 epilogue + BufferCopy128b store
+基于方案2, 将 epilogue 从 f32 global_store 改为 bf16 CShuffle + buffer_store_dwordx4。
+- CShuffle 在 BN=128 (contiguous_n=64) 时有 LDS 写竞争导致非确定性 (已废弃)
+
+### 方案3 (当前): 直接 BufferCopy64b store + (M,N) 标准输出
+去掉 CShuffle，改用 `make_tiled_copy_C(BufferCopy64b, tiled_mma)` 直接将 bf16 写到 (M,N) 标准 layout。
+- B-first value dim 4 contiguous channels/lane → 64b store (buffer_store_short_x2) 自然对齐
+- 消除 CShuffle 的 LDS 转置开销和精度问题
+- 输出标准 (M, N) 行主序 bf16 矩阵 (gate 在前 N/2 列, up 在后 N/2 列)
+- sched_barrier(0) + s_setprio(1) + gemm_with_setprio 函数封装手动展开
+- hot_loop_scheduler 按 tile 自适应: TK=128/BM=128 用 per-iteration dsrd+vmem loop
+- **全部 4 tile 超越 fly (ratio ≥ 1.01)**
+- 精度: 对比 torch `A @ shuffle_weight(W)^T`, max_diff=0.002, rel_err=0.0002%
+
+## 精度验证
+
+使用 `check_bench_1x4.py` 对比 torch `A @ W^T` 参考（shuffle_weight 后传入 kernel）:
+
+```bash
+cd tests/contrib/moe/tune_moe
+# tk=64, 默认 tiles=64x128,64x256,128x128
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 check_bench_1x4.py tk=64
+# tk=128
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 check_bench_1x4.py tk=128
+# 指定 tiles
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 check_bench_1x4.py tk=64 tiles=64x128,128x128
+```
+
+通过标准: rel_err < 1%, max_diff < 1.0 (bf16 ULP 级别)。
+典型结果: max_diff=0.002, rel_err=0.0002%。
+
 ## 复现
 
 ```bash
 cd tests/contrib/moe/tune_moe
-# bench (自动选空闲 GPU, min of 5 runs)
-FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4,fly bms=64 bns=256 batches=4096 runs=5
+# bench vs fly 对比 (默认 3 标准 tiles: 64x256x64, 64x128x64, 64x128x128)
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4,fly
+# 指定 tiles
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4,fly tiles=64x256x64,64x128x128,128x128x64
+# 仅 bench
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4 tiles=64x128x128
+# 仅 fly (preshuffle_gemm_v2 参考)
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=fly tiles=64x128x128
 # 指定 tile_k
-FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4 bms=64 bns=128 batches=4096 tk=128 runs=5
+FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4,fly bms=64 bns=128 tk=128
 # dump ISA
-FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=/tmp/isa FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4 bms=64 bns=256 batches=4096 runs=1
+FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=/tmp/isa FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 bench_gemm_core.py waves=1x4 tiles=64x256x64
 grep 'next_free_vgpr\|next_free_sgpr' /tmp/isa/bench_kernel_0/21_final_isa.s
 ```
