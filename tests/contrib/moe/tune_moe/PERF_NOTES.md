@@ -9,9 +9,10 @@ bench = 双 GEMM (gate+up) B-first; fly = preshuffle_gemm_v2 单 GEMM A-first.
 |---|---|---|---|---|---|---|---|---|---|
 | 基线 | 239T | 172 | — | — | 219T | 169 | — | — | 96 |
 | 方案2+CShuffle | 273T | 190 | 220T | 124 | 212T | 212 | 225T | 208 | 96 |
-| **方案3 直接store** | **275T** | **188** | **231T** | **122** | **262T** | **212** | **259T** | **208** | **96** |
+| 方案3 直接store | 275T | 188 | 231T | 122 | 262T | 212 | 259T | 208 | 96 |
+| **方案4 gate/up交错** | **268T** | **169** | **238T** | **97** | **252T** | **169** | — | — | **96** |
 | fly | 272T | 144 | 228T | — | 258T | 138 | 238T | — | 24 |
-| ratio (方案3/fly) | **1.01** | | **1.01** | | **1.02** | | **1.09** | | |
+| ratio (方案4/fly) | **0.99** | | **1.04** | | **0.98** | | — | | |
 
 ## 优化方案
 
@@ -34,15 +35,24 @@ sched_barrier(0) 隔离 gemm 计算块 + s_setprio(1) 提升首条 mfma 优先�
 基于方案2, 将 epilogue 从 f32 global_store 改为 bf16 CShuffle + buffer_store_dwordx4。
 - CShuffle 在 BN=128 (contiguous_n=64) 时有 LDS 写竞争导致非确定性 (已废弃)
 
-### 方案3 (当前): 直接 BufferCopy64b store + (M,N) 标准输出
+### 方案3: 直接 BufferCopy64b store + (M,N) 标准输出
 去掉 CShuffle，改用 `make_tiled_copy_C(BufferCopy64b, tiled_mma)` 直接将 bf16 写到 (M,N) 标准 layout。
 - B-first value dim 4 contiguous channels/lane → 64b store (buffer_store_short_x2) 自然对齐
 - 消除 CShuffle 的 LDS 转置开销和精度问题
 - 输出标准 (M, N) 行主序 bf16 矩阵 (gate 在前 N/2 列, up 在后 N/2 列)
 - sched_barrier(0) + s_setprio(1) + gemm_with_setprio 函数封装手动展开
 - hot_loop_scheduler 按 tile 自适应: TK=128/BM=128 用 per-iteration dsrd+vmem loop
-- **全部 4 tile 超越 fly (ratio ≥ 1.01)**
-- 精度: 对比 torch `A @ shuffle_weight(W)^T`, max_diff=0.002, rel_err=0.0002%
+
+### 方案4 (当前): gate/up MFMA 交错 + preshuffle pipeline
+将两次 `fx.gemm` (gate/up) 展开为显式 `mma_atom_call` 循环，gate 和 up 在最内层交错执行。
+每个 activation ds_read 结果被 gate 和 up 两条 MFMA 连续消费，形成天然的 ds_read pipeline 重叠。
+- 循环次序: ki(外) → k_atom(中) → n_reps(内) → m_reps(最内)，gate/up 在 atom 级交错
+- LLVM 自动生成 lgkmcnt(1)~(2) 而非 lgkmcnt(0)，ds_read pipeline 与 fly 模式匹配
+- 去掉 s_setprio / gemm_with_setprio 手动展开，改用 scheduler 自然调度
+- preshuffle_v2 风格 per-ki ds_read + gemm pipeline + hot_loop_scheduler
+- lgkmcnt 分布: lgkmcnt(1)×14, lgkmcnt(0)×8 (vs fly: lgkmcnt(1)×14, lgkmcnt(0)×8 完全一致)
+- VGPR: 169 (vs fly 138)，差距来自双 C fragment (gate+up) 和双 weight buffer
+- 精度: 对比 torch `A @ shuffle_weight(W)^T`, max_diff=0.031, rel_err=0.0003%
 
 ## 精度验证
 

@@ -713,79 +713,91 @@ def build(wave, N, K, BM, BN, tile_k=64):
             lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
             def hot_loop_scheduler():
-                if const_expr((TILE_M, TILE_N, TILE_K) in ((64, 128, 128),)):
-                    for _ in range_constexpr(mem_a_cnt + 2 * mem_b_cnt):
-                        rocdl.sched_dsrd(1)
-                        rocdl.sched_vmem(1)
-                elif const_expr((TILE_M, TILE_N, TILE_K) in ((128, 128, 64),)):
-                    for _ in range_constexpr(mem_a_cnt + 2 * mem_b_cnt):
-                        rocdl.sched_dsrd(1)
-                        rocdl.sched_vmem(1)
+                # Adaptive scheduler (from preshuffle_v2 gfx942 pattern):
+                # dsrd_per_iter adapts to tile size so dsrd hints cover all ds_reads.
+                dsrd_total = lds_a_cnt
+                m_repeat = 2 * _m_reps  # gate + up
+                tile_m = TILE_M
+                num_a_loads = mem_a_cnt
+                if const_expr(k_iters > 2):
+                    mfma_group = min(_n_reps, 2)  # finer distribution for TK>=128
                 else:
-                    rocdl.sched_dsrd(lds_a_cnt)
-                    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    rocdl.sched_vmem(mem_a_cnt + 2 * mem_b_cnt)
+                    mfma_group = _n_reps
+                mfma_total = (k_iters * 2) * m_repeat * _n_reps
+                mfma_per_iter = 2 * mfma_group
+                sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
 
-            def gemm_with_setprio(read_i):
-                """Gate GEMM with manual unroll of ki=0 for s_setprio placement,
-                then remaining gate ki via fx.gemm, then full up GEMM."""
-                # Manually unroll gate gemm ki=0 to place s_setprio after 1st mfma.
-                # fx.gemm expands in NMK order: for n in n_rep: for m in m_rep: for k in 2(k_atoms).
-                _a_ki0 = bl_frag_st[read_i][None, None, (None, 0)]
-                _b_ki0 = a_frag[None, None, (None, 0)]
-                # 1st mfma at normal priority (n=0, m=0, k=0)
-                fx.mma_atom_call(mma_atom, c_gate[None, 0, 0], _a_ki0[None, 0, 0], _b_ki0[None, 0, 0], c_gate[None, 0, 0])
-                rocdl.s_setprio(1)  # raise priority after 1st mfma issued
+                dsrd_header = 2
+                dsrd_remaining = max(dsrd_total - dsrd_header, 0)
+                dsrd_per_iter = max(1, (dsrd_remaining + sche_iters - 1) // sche_iters) if sche_iters > 0 else 0
+
+                rocdl.sched_dsrd(dsrd_header)
+                rocdl.sched_mfma(1)
+                if const_expr(tile_m == 16):
+                    rocdl.sched_vmem(1)
+                rocdl.sched_mfma(1)
+                if const_expr(tile_m == 16):
+                    rocdl.sched_vmem(1)
+
+                # Extra header for small mfma_group (matches preshuffle_v2's num_acc_n<4)
+                if const_expr(mfma_group < 4):
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(1)
+
+                dswr_tail = num_a_loads
+                dstr_advance = 2
+                if const_expr(dswr_tail > sche_iters):
+                    dswr_tail = sche_iters
+                dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
+
+                for sche_i in range_constexpr(sche_iters):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(mfma_group)
+                    rocdl.sched_dsrd(dsrd_per_iter)
+                    rocdl.sched_mfma(mfma_group)
+                    if const_expr(sche_i >= dswr_start - 1):
+                        rocdl.sched_dswr(1)
                 rocdl.sched_barrier(0)
-                # remaining mfma of gate ki=0 (NMK order, skip first)
-                for _n in range_constexpr(_n_reps):
-                    for _m in range_constexpr(_m_reps):
-                        for _k in range_constexpr(2):
-                            if not (_n == 0 and _m == 0 and _k == 0):
-                                fx.mma_atom_call(mma_atom, c_gate[None, _m, _n], _a_ki0[None, _m, _k], _b_ki0[None, _n, _k], c_gate[None, _m, _n])
-                # gate ki=1..k_iters
-                for ki in range_constexpr(1, k_iters):
-                    fx.gemm(
-                        tiled_mma,
-                        c_gate,
-                        bl_frag_st[read_i][None, None, (None, ki)],
-                        a_frag[None, None, (None, ki)],
-                        c_gate,
-                    )
-                # up GEMM (all ki)
-                fx.gemm(tiled_mma, c_up, br_frag_st[read_i], a_frag, c_up)
-                rocdl.s_setprio(0)
 
             def pipeline_stage(read_i, k_next, do_prefetch):
                 write_i = read_i ^ 1
-                #rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
-                # read this stage's own A tile LDS[read_i] -> a_frag at the head, then compute
-                fx.copy(uni_cp_atom, a_lds_r[read_i], a_frag_retile)
                 # prefetch next B (gate/up) + A (global -> register)
                 if const_expr(do_prefetch):
+                    a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
                     fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i])
                     fx.copy(buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i])
-                    a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
-                hot_loop_scheduler()
-                rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                # # --- gemm region: isolated with sched_barrier + s_setprio ---
-                rocdl.sched_barrier(0)
-                gemm_with_setprio(read_i)
-                rocdl.sched_barrier(0)
+                # per-ki interleaved ds_read + gemm (expanded: outermost=b/weight, middle=a/act, innermost=k)
+                for ki in range_constexpr(k_iters):
+                    fx.copy(uni_cp_atom, a_lds_r[read_i][None, None, ki], a_frag_retile[None, None, ki])
+                    for k in range_constexpr(2):
+                        for n in range_constexpr(_n_reps):
+                            for m in range_constexpr(_m_reps):
+                                fx.mma_atom_call(mma_atom,
+                                    c_gate[None, m, n],
+                                    bl_frag_st[read_i][None, m, (k, ki)],
+                                    a_frag[None, n, (k, ki)],
+                                    c_gate[None, m, n])
+                                fx.mma_atom_call(mma_atom,
+                                    c_up[None, m, n],
+                                    br_frag_st[read_i][None, m, (k, ki)],
+                                    a_frag[None, n, (k, ki)],
+                                    c_up[None, m, n])
                 if const_expr(do_prefetch):
                     # A(k_next) staging -> LDS[write] for a later stage's head read
                     fx.copy(uni_cp_atom_w, a_cp_frag_retile, a_lds_w[write_i])
-                rocdl.sched_barrier(0)
+                    hot_loop_scheduler()
                 gpu.barrier()
 
             # Prologue: gather A(0) -> LDS[0]; load B(0) -> stage 0.
             a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
             fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
             fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
             fx.copy(uni_cp_atom_w, a_cp_frag_retile, a_lds_w[0])
             gpu.barrier()
-            rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
 
             acc_init = [c_gate.load(), c_up.load()]
             for iv, state in range(0, num_tiles // 2 - 1, 1, init=acc_init):
