@@ -121,7 +121,7 @@ def quant_expert_weights(w1, quant_type, dtype):
         return w1_qt, w1s, w1_ref
     assert 0, quant_type
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc'):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', tile_k=None):
     INTER_SIZE_TP = INTER_SIZE // TP
     # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
     # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
@@ -454,10 +454,11 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     gateup_alg = 'prefill_1x4' if _gateup_wave == '1x4' else 'prefill_2x2'
                 else:
                     gateup_alg = 'splitk'
-                gateup_tn = 128 if gateup_alg in ('prefill_2x2', 'prefill_1x4') else TILE_N
+                gateup_tn = TILE_N if gateup_alg in ('prefill_2x2', 'prefill_1x4') else TILE_N
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tn), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
+                    ('tile_k', tile_k),
                 )
                 if gateup_alg in ('prefill_2x2', 'prefill_1x4'):
                     # The prefill (native fp8 MFMA) gateup needs an fp8 input plus its
@@ -772,7 +773,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=64, TP=8, run_count=10, quant_type='ptpc'):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=64, TP=8, run_count=10, quant_type='ptpc', tile_k=None):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -790,7 +791,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
             else:
                 key = f'{i}'
                 
-            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type)
+            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, tile_k=tile_k)
         quan_type=""
         if wei_is_fp8(weight_type):
             if quant_type == 'ptpc':
@@ -946,26 +947,79 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
     gc.collect()
 
 if __name__ == '__main__':
-    TILE_M = 64
-    TILE_N = 128
     HIDDEN_SIZE = 4096
-    INTER_SIZE = 1024*2
+    INTER_SIZE = 1024
     TP = 8
+    E = 512
+    TOPK = 10
+    NUM_PERF_RUNS = 3  # run 3 times, report best
 
     init_env()
-    # entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, quant_type='block')
-    #entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-    #entry_common('mxn_2s', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-    #entry_common('aiter', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    #entry_common('mxn_2s', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    #with torchPerf():
-    #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
-    if 0:
-        run_acc_test(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        test_small_batch_perf(batch=[1, 2, 4, 8, 12, 16, 32, 64], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        test_perf(batch=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    prec = [torch.bfloat16]
-    prec = [get_fp8type()]
-    prec = [torch.bfloat16, get_fp8type()]
-    test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+
+    # === accuracy + perf test for all tile configs ===
+    acc_batch = [1, 4, 17, 8192]
+    perf_batch = [1024, 2048, 4096, 8192, 16384]
+
+    configs = {
+        'bf16': {
+            'prec': [torch.bfloat16],
+            'tiles': [(64,256,64), (64,128,128), (128,128,64)],
+            'quant_type': 'ptpc',
+        },
+        'fp8_ptpc': {
+            'prec': [get_fp8type()],
+            'tiles': [(64,256,128), (64,128,128), (64,128,256), (128,128,128)],
+            'quant_type': 'ptpc',
+        },
+        'fp8_per_tensor': {
+            'prec': [get_fp8type()],
+            'tiles': [(64,256,128), (64,128,128), (64,128,256), (128,128,128)],
+            'quant_type': 'per_tensor',
+        },
+    }
+
+    # --- accuracy ---
+    print("=" * 60)
+    print("ACCURACY TEST")
+    print("=" * 60)
+    for cfg_name, cfg in configs.items():
+        for BM, BN, BK in cfg['tiles']:
+            print(f"\n--- {cfg_name} {BM}x{BN}x{BK} ---")
+            _FLY_COMPILED_CACHE.clear()
+            entry_common('fly_splitk_2s', batch=acc_batch, prec=list(cfg['prec']),
+                         TILE_M=BM, TILE_N=BN, HIDDEN_SIZE=HIDDEN_SIZE,
+                         INTER_SIZE=INTER_SIZE, TP=TP, E=E, TOPK=TOPK,
+                         run_count=0, quant_type=cfg['quant_type'], tile_k=BK)
+
+    # --- perf (3 runs, best) ---
+    print("\n" + "=" * 60)
+    print("PERFORMANCE TEST (best of 3 runs)")
+    print("=" * 60)
+    all_results = {}
+    for cfg_name, cfg in configs.items():
+        for BM, BN, BK in cfg['tiles']:
+            key = f"{cfg_name} {BM}x{BN}x{BK}"
+            best = {}
+            for run_i in range(NUM_PERF_RUNS):
+                _FLY_COMPILED_CACHE.clear()
+                perf = entry_common('fly_splitk_2s', batch=perf_batch,
+                                    prec=list(cfg['prec']),
+                                    TILE_M=BM, TILE_N=BN, HIDDEN_SIZE=HIDDEN_SIZE,
+                                    INTER_SIZE=INTER_SIZE, TP=TP, E=E, TOPK=TOPK,
+                                    run_count=10, quant_type=cfg['quant_type'], tile_k=BK)
+                # extract results
+                for ktype, prec_dict in perf.items():
+                    for prec_name, batch_dict in prec_dict.items():
+                        for b, data in batch_dict.items():
+                            bkey = int(b.split()[0]) if isinstance(b, str) else b
+                            if bkey not in best or data['latency'] < best[bkey]['latency']:
+                                best[bkey] = data
+            all_results[key] = best
+
+    # --- print summary ---
+    print(f"\n{'config':<28} {'B':>6} {'us':>9} {'TFLOPS':>8}")
+    print("-" * 55)
+    for key, batch_data in all_results.items():
+        for b in sorted(batch_data.keys()):
+            d = batch_data[b]
+            print(f"{key:<28} {b:>6} {d['latency']:>9.1f} {d['flops']:>8.1f}")
