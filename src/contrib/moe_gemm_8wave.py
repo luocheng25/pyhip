@@ -540,9 +540,17 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
 
         J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
+        use_balanced_lds_reads = (wg_M == 256 and gate_up)
+        if use_balanced_lds_reads:
+            # Seed the steady-state pipeline with B[k=0, gate]. Region 3 of
+            # each loop_body preloads the corresponding tile for the next k.
+            ds_readB(tic, 0)
+
         def loop_body(k, loop_cnt):
             nonlocal tic, toc
-            ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
+            # Region 0: compute k/row0/gate; complete A[k+1] in LDS.
+            if not use_balanced_lds_reads:
+                ds_readB(tic, 0)
             ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
 
             if use_f32_blockscales_128:
@@ -560,6 +568,7 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             # after this s_barrier, lgkmcnt(8) ensures all 8-waves has finished
             # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
+            # Region 1: compute k/row0/up; prefetch A[k+2,row0].
             ds_readB(tic, 1)
             J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
@@ -568,6 +577,7 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             J.emit(mfma(1))
             J.s_setprio(0); J.s_barrier()
 
+            # Region 2: compute k/row1/gate; prefetch B[k+2,gate].
             ds_readA(tic, 1)
             if use_f32_blockscales_128: ds_read_scaleA(lds_scaleA[tic], 1)
             J.emit(vm_loadB(tic,0))                         # vm_load_cnt_b
@@ -577,9 +587,13 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             J.emit(mfma(2))
             J.s_setprio(0); J.s_barrier()
 
+            # Region 3: compute k/row1/up; finish the next LDS tile, then
+            # preload B[k+1,gate] into the unused B[0] register bank.
             J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
             if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
+            if use_balanced_lds_reads:
+                ds_readB(toc, 0)
 
             J.s_setprio(1)
             J.emit(mfma(3))
