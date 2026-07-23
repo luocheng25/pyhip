@@ -11,6 +11,7 @@ from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
 import logging
+import os
 
 from aiter.fused_moe import (
     fused_topk,
@@ -63,6 +64,7 @@ def do_test_fmoe(
     diff_thr=1e-4,
     ep_size=1,
 ):
+    act_scale_per_token = bool(int(os.getenv("MOE_ACT_SCALE_PER_TOKEN", "0")))
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
@@ -156,11 +158,11 @@ def do_test_fmoe(
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
-        a1_qt, a1_scale = aiter.pertoken_quant(
-            input.view(token, -1, 128), quant_dtype=AQDType
-        )
+        a1_quant_input = input if act_scale_per_token else input.view(token, -1, 128)
+        a1_qt, a1_scale = aiter.pertoken_quant(a1_quant_input, quant_dtype=AQDType)
         a1_qt = a1_qt.view(token, model_dim)
-        a1_scale = a1_scale.squeeze(-1)
+        if not act_scale_per_token:
+            a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
@@ -282,10 +284,14 @@ def do_test_fmoe(
 
         # ######################## stage 2 start ###########
         if qType == aiter.QuantType.per_128x128:
-            a2_qt, a2_scale = aiter.pertoken_quant(
-                out1_ref.view(token, -1, 128), quant_dtype=AQDType
-            )
-            a2_scale = a2_scale.view(token, topk, -1)
+            if act_scale_per_token:
+                a2_qt, a2_scale = aiter.pertoken_quant(
+                    out1_ref.view(token * topk, -1), quant_dtype=AQDType)
+                a2_scale = a2_scale.view(token, topk, 1)
+            else:
+                a2_qt, a2_scale = aiter.pertoken_quant(
+                    out1_ref.view(token, -1, 128), quant_dtype=AQDType)
+                a2_scale = a2_scale.view(token, topk, -1)
         elif (
             qType == aiter.QuantType.per_1x32
             and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
@@ -297,6 +303,9 @@ def do_test_fmoe(
             a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
         a2_qt = a2_qt.view(token, topk, -1)
 
+        a2_scale_ref = a2_scale
+        if qType == aiter.QuantType.per_128x128 and act_scale_per_token:
+            a2_scale_ref = a2_scale.expand(token, topk, inter_dim // 128)
         out2_ref = torch_moe_stage2(
             a2_qt,
             w1_qt,  # E, inter_dim*2, model_dim
@@ -306,7 +315,7 @@ def do_test_fmoe(
             dtype=dtype,
             quant_type=qType,
             w2_scale=w2_scale,
-            a2_scale=a2_scale,
+            a2_scale=a2_scale_ref,
             w2_bias=exp_bias2,
             doweight=not doweight_stage1,
         )

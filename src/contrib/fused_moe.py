@@ -27,6 +27,10 @@ from .moe_gemm_ref import moe_gemm_ref
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 USE_GLUON2 = int(os.getenv("USE_GLUON2", "0"))
 VERBOSE = int(os.getenv("VERBOSE", "0"))
+MOE_ACT_SCALE_PER_TOKEN = int(os.getenv("MOE_ACT_SCALE_PER_TOKEN", "0"))
+MOE_8WAVE_ADAPTIVE_WG_M = int(os.getenv("MOE_8WAVE_ADAPTIVE_WG_M", "0"))
+assert MOE_ACT_SCALE_PER_TOKEN in [0, 1]
+assert MOE_8WAVE_ADAPTIVE_WG_M in [0, 1]
 
 __all__ = [
     "fused_moe"
@@ -273,9 +277,11 @@ def fused_moe(
         device=device,
     )
 
+    act_scale_per_token = quant_type == aiter.QuantType.per_128x128 and bool(MOE_ACT_SCALE_PER_TOKEN)
     if quant_type == aiter.QuantType.per_128x128:
-        # 128x128 block-scale quant on weights, 1x128 per-token quant on act
-        act_quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+        # Weight scales stay 128x128; activation scales are configurable.
+        act_quant_func = aiter.get_hip_quant(
+            aiter.QuantType.per_Token if act_scale_per_token else aiter.QuantType.per_1x128)
     else:
         act_quant_func = aiter.get_hip_quant(quant_type)
 
@@ -372,18 +378,26 @@ def fused_moe(
         )
     debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out, token_num, topk, block_size_M, estimated_tokens_per_expert)
 
-    a1, a1_scale = act_quant_func(
-        hidden_states,
-        scale=a1_scale,
-        quant_dtype=q_dtype_a,
-        num_rows=num_local_tokens,
-        transpose_scale=True
-    )
+    if act_scale_per_token:
+        a1, a1_scale = act_quant_func(
+            hidden_states,
+            scale=a1_scale,
+            quant_dtype=q_dtype_a,
+            num_rows=num_local_tokens,
+        )
+    else:
+        a1, a1_scale = act_quant_func(
+            hidden_states,
+            scale=a1_scale,
+            quant_dtype=q_dtype_a,
+            num_rows=num_local_tokens,
+            transpose_scale=True
+        )
 
     if VERBOSE:
         print("\ta1        :", list(a1.shape), a1.dtype)                # [token_num, model_dim]        torch.float8_e4m3fn
         if a1_scale is not None:
-            print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)    # [token_num, model_dim//128]   torch.float32
+            print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)    # [token_num, 1]   torch.float32
 
     """
     ratio = a1_scale.element_size() // a1.element_size()
@@ -418,7 +432,7 @@ def fused_moe(
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
-            if USE_GLUON2:
+            if USE_GLUON2 and not act_scale_per_token:
                 BLOCK_TILE_SIZE_M = block_size_M
                 BLOCK_TILE_SIZE_N = block_size_N
                 grid = sorted_expert_ids.shape[0]
@@ -433,7 +447,7 @@ def fused_moe(
             else:
                 moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
                         a1.element_size() * a1.numel() > (1<<32),
-                        AB_dtype, wg_M, wg_N,
+                    AB_dtype, act_scale_per_token, bool(MOE_8WAVE_ADAPTIVE_WG_M), wg_M, wg_N,
                         E, inter_dim*2, model_dim, 
                         True, w1_is_shuffled, topk,
                         sorted_ids.data_ptr(),
@@ -445,14 +459,23 @@ def fused_moe(
                         a2.data_ptr(),
                         token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
-    a2, a2_scale = act_quant_func(
-        a2, #a2.view(token_num*topk, -1),
-        scale=a2_scale,
-        quant_dtype=q_dtype_a,
-        num_rows=num_local_tokens,
-        num_rows_factor=topk,
-        transpose_scale=True
-    )
+    if act_scale_per_token:
+        a2, a2_scale = act_quant_func(
+            a2,
+            scale=a2_scale,
+            quant_dtype=q_dtype_a,
+            num_rows=num_local_tokens,
+            num_rows_factor=topk,
+        )
+    else:
+        a2, a2_scale = act_quant_func(
+            a2, #a2.view(token_num*topk, -1),
+            scale=a2_scale,
+            quant_dtype=q_dtype_a,
+            num_rows=num_local_tokens,
+            num_rows_factor=topk,
+            transpose_scale=True
+        )
     a2 = a2.view(token_num, topk, inter_dim)
 
     w2_scale = w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
@@ -466,7 +489,7 @@ def fused_moe(
     if VERBOSE:
         print("\ta2        :", list(a2.shape), a2.dtype)                # [token_num, topk, inter_dim]        torch.float8_e4m3fn
         if a2_scale is not None:
-            print("\ta2_scale  :", list(a2_scale.shape), a2_scale.dtype)    # [token_num, topk, inter_dim//128]   torch.float32
+            print("\ta2_scale  :", list(a2_scale.shape), a2_scale.dtype)    # [token_num, topk, 1]   torch.float32
 
     assert model_dim % wg_N == 0
     num_oc_blocks = model_dim//wg_N
@@ -491,7 +514,7 @@ def fused_moe(
             else:
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
-            if inter_dim <= 256 and w2_is_shuffled:
+            if inter_dim <= 256 and w2_is_shuffled and not act_scale_per_token:
                 moe_gemm_down_tp([1, num_e_blocks], [4*64],
                                 stage2_out.element_size() * stage2_out.numel() > (1<<32),
                                 AB_dtype, wg_M, 64,
@@ -506,7 +529,7 @@ def fused_moe(
                                 stage2_out.data_ptr(),
                                 token_num)
             else:
-                if USE_GLUON2:
+                if USE_GLUON2 and not act_scale_per_token:
                     BLOCK_TILE_SIZE_M = block_size_M
                     BLOCK_TILE_SIZE_N = block_size_N
                     grid = sorted_expert_ids.shape[0]
@@ -521,7 +544,7 @@ def fused_moe(
                 else:
                     moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
                                     a2.element_size() * a2.numel() > (1<<32), 
-                                    AB_dtype, wg_M, wg_N,
+                                    AB_dtype, act_scale_per_token, bool(MOE_8WAVE_ADAPTIVE_WG_M), wg_M, wg_N,
                                     E, model_dim, inter_dim, 
                                     False, w2_is_shuffled, topk,
                                     sorted_ids.data_ptr(),
