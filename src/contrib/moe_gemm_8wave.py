@@ -126,8 +126,7 @@ loader函数如何单独调试正确性？可以从实现最简单的moe_gemm开
 
 
 
-def _get_block_indices(J, OC, wg_N, num_blocks):
-    blk1d = J.blockIdx.x
+def _get_block_indices(J, blk1d, OC, wg_N, num_blocks):
     NUM_CU = 256
     num_oc_blocks = J.div(OC, wg_N)
     num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
@@ -153,7 +152,7 @@ def _get_block_indices(J, OC, wg_N, num_blocks):
 
 @jit(with_debug_log=False)
 def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
-                   AB_dtype, adaptive_wg_m, wg_M, wg_N,
+                   AB_dtype, adaptive_wg_m, dyn, wg_M, wg_N,
                    NUM_EXPERTS, OC, IC, 
                    gate_up, bpreshuffle, TOPK,
                    sorted_ids:"uint*",
@@ -163,6 +162,7 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
                    weight:"void*",pScaleB:"void*",
                    input:"void*", pScaleA:"void*",
                    output:"void*",
+                   p_id:"void*",
                    num_tokens:"uint",
                    num_blocks:"uint"):
     num_warps = 8
@@ -171,50 +171,108 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
     assert wg_M in [128, 256]
     assert gate_up
 
-    blk_m, blk_n = _get_block_indices(J, OC, wg_N, num_blocks)
-
-    expert_id = J.gpr(1, 'su32')
-    J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
     max_id = J.gpr(1, 'su32')
     J.s_load_dword(max_id, num_valid_ids, 0)
     J.s_waitcnt(mod=f"lgkmcnt(0)")
+    wg_m_shift = 7 if wg_M == 128 else 8
+    num_oc_blocks = J.div(OC, wg_N)
+    num_valid_blocks = J.gpr("su32", (max_id[0] >> wg_m_shift) * num_oc_blocks)
 
-    J.debug_setup((blk_m[0] == 0) & (blk_n[0] == 0) & (J.warp_id[0] == 0))
-    with J.If(blk_m[0] * wg_M >= max_id[0]):
-        J.s_endpgm()
-    
-    sorted_ids[:] += blk_m * (wg_M * J.sizeof_u32)
-    sorted_weights[:] += blk_m * (wg_M * J.sizeof_u32)
-
+    if dyn:
+        lds_task_id = J.alloc_lds(J.sizeof_u32 * 64)
     lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
     lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
-    if gate_up:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
+
+    def run_task(task_id):
+        if dyn:
+            task_m = J.gpr("su32", task_id // num_oc_blocks)
+            blk_n = J.gpr("su32", task_id - task_m * num_oc_blocks)
+            task_wg_M = wg_M
+            blk_m = task_m
+            row_base = J.gpr("su32", blk_m * wg_M)
+        else:
+            task_wg_M = wg_M
+            blk_m, blk_n = _get_block_indices(J, task_id, OC, wg_N, num_blocks)
+            row_base = J.gpr("su32", blk_m * wg_M)
+
+        cur_sorted_ids = J.gpr(2, 'su32')
+        cur_sorted_ids[:] = sorted_ids[:] + row_base * J.sizeof_u32
+        task_valid = row_base[0] < max_id[0]
+
+        with J.If(task_valid):
+            expert_id = J.gpr(1, 'su32')
+            J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
+
+            cur_weight = J.gpr(2, 'su32')
+            cur_scaleB = J.gpr(2, 'su32')
+            cur_weight[0] = weight[0]
+            cur_weight[1] = weight[1]
+            cur_scaleB[0] = pScaleB[0]
+            cur_scaleB[1] = pScaleB[1]
+
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.debug_setup((blk_m[0] == 0) & (blk_n[0] == 0) & (J.warp_id[0] == 0))
+
+            J.wg_load_lds(lds_sorted_ids, cur_sorted_ids, task_wg_M * J.sizeof_u32,
+                          num_warps=num_warps, wait_barrier=True)
+
+            if adaptive_wg_m and wg_M == 256:
+                vrows = J.gpr("vu32")
+                vaddr = J.gpr("vu32", 128 * J.sizeof_u32 + lds_sorted_ids)
+                J.ds_read_b32(vrows, vaddr)
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                srow = J.gpr("su32")
+                J.v_readfirstlane_b32(srow, vrows)
+                with J.If((srow[0] >> 24) == TOPK) as If:
+                    _emit_moe_gemm_8wave_g1u1(
+                        J, is_input_over_4GB, AB_dtype, 128, wg_N, OC, IC,
+                        gate_up, bpreshuffle, TOPK, cur_weight, cur_scaleB,
+                        input, pScaleA, output, num_tokens, blk_m, blk_n,
+                        expert_id, lds_sorted_ids, lds_sorted_weights)
+
+                    If.Else()
+                    _emit_moe_gemm_8wave_g1u1(
+                        J, is_input_over_4GB, AB_dtype, wg_M, wg_N, OC, IC,
+                        gate_up, bpreshuffle, TOPK, cur_weight, cur_scaleB,
+                        input, pScaleA, output, num_tokens, blk_m, blk_n,
+                        expert_id, lds_sorted_ids, lds_sorted_weights)
+            else:
+                _emit_moe_gemm_8wave_g1u1(
+                    J, is_input_over_4GB, AB_dtype, task_wg_M, wg_N, OC, IC,
+                    gate_up, bpreshuffle, TOPK, cur_weight, cur_scaleB,
+                    input, pScaleA, output, num_tokens, blk_m, blk_n,
+                    expert_id, lds_sorted_ids, lds_sorted_weights)
+
+    if dyn:
+        task_id = J.gpr(1, 'su32')
+        v_task_id = J.gpr(1, 'vu32')
+        v_task_addr = J.gpr('vu32', 0)
+        with J.While():
+            task_id[0] = 0xffffffff
+            J.s_barrier()
+            with J.If(J.warp_id[0] == 0):
+                J.s_atomic_inc(task_id, p_id, 0, mod='glc')
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                v_task_id[0] = task_id[0]
+                J.ds_write_b32(v_task_addr, v_task_id, mod=f"offset:{lds_task_id}")
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()
+            J.ds_read_b32(v_task_id, v_task_addr, mod=f"offset:{lds_task_id}")
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.v_readfirstlane_b32(task_id, v_task_id)
+            J.s_barrier()
+
+            with J.If(task_id[0] >= num_valid_blocks[0]):
+                J.s_endpgm()
+
+            run_task(task_id)
+            J.s_waitcnt(mod="vmcnt(0)")
+            J.s_barrier()
     else:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
-        J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
+        run_task(J.blockIdx.x)
 
-    if adaptive_wg_m and wg_M == 256:
-        vrows = J.gpr("vu32")
-        vaddr = J.gpr("vu32", 128 * J.sizeof_u32 + lds_sorted_ids)
-        J.ds_read_b32(vrows, vaddr)
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        srow = J.gpr("su32")
-        J.v_readfirstlane_b32(srow, vrows)
-        with J.If((srow[0] >> 24) == TOPK):
-            _emit_moe_gemm_8wave_g1u1(
-                J, is_input_over_4GB, AB_dtype, 128, wg_N, OC, IC,
-                gate_up, bpreshuffle, TOPK, weight, pScaleB, input, pScaleA,
-                output, num_tokens, blk_m, blk_n, expert_id,
-                lds_sorted_ids, lds_sorted_weights)
-            J.s_endpgm()
-
-    _emit_moe_gemm_8wave_g1u1(
-        J, is_input_over_4GB, AB_dtype, wg_M, wg_N, OC, IC,
-        gate_up, bpreshuffle, TOPK, weight, pScaleB, input, pScaleA,
-        output, num_tokens, blk_m, blk_n, expert_id,
-        lds_sorted_ids, lds_sorted_weights)
-
+    if dyn:
+        J.free_lds(lds_task_id)
     J.free_lds(lds_sorted_ids)
     J.free_lds(lds_sorted_weights)
 
@@ -336,7 +394,11 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             J.s_mov_b32("m0", lds + J.warp_id[0] * (64 * 4 * J.sizeof_f32))
             scale_half = J.warp_id[0] // J.div(wg_M, 64)
             voff = J.gpr("vu32", voffset_scaleA[0] + (bk + scale_half * 4) * J.sizeof_u32)
-            buff_sa.load_dwordx4(None, voff, 0)
+            if wg_M == num_warps * 64:
+                buff_sa.load_dwordx4(None, voff, 0)
+            else:
+                with J.ExecMask(J.threadIdx.x[0] < wg_M * 2):
+                    buff_sa.load_dwordx4(None, voff, 0)
 
         # scale of B(weights) are very small, can be all loaded into LDS
         pScaleB[:] += expert_id * J.div(OC, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32

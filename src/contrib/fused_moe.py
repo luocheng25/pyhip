@@ -29,6 +29,8 @@ USE_GLUON2 = int(os.getenv("USE_GLUON2", "0"))
 VERBOSE = int(os.getenv("VERBOSE", "0"))
 MOE_8WAVE_ADAPTIVE_WG_M = int(os.getenv("MOE_8WAVE_ADAPTIVE_WG_M", "0"))
 assert MOE_8WAVE_ADAPTIVE_WG_M in [0, 1]
+MOE_8WAVE_DYN = int(os.getenv("MOE_8WAVE_DYN", "0"))
+assert MOE_8WAVE_DYN in [0, 1]
 
 __all__ = [
     "fused_moe"
@@ -434,9 +436,12 @@ def fused_moe(
                                     hidden_states, w1, a2, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
                                     w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
             else:
-                moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
+                dyn = bool(MOE_8WAVE_DYN)
+                p_id = torch.zeros(64, dtype=torch.int32, device=device) if dyn else None
+                grid = 256 if dyn else num_oc_blocks * num_e_blocks
+                moe_gemm_8wave_g1u1([grid], [8*64],
                         a1.element_size() * a1.numel() > (1<<32),
-                    AB_dtype, bool(MOE_8WAVE_ADAPTIVE_WG_M), wg_M, wg_N,
+                    AB_dtype, bool(MOE_8WAVE_ADAPTIVE_WG_M), dyn, wg_M, wg_N,
                         E, inter_dim*2, model_dim, 
                         True, w1_is_shuffled, topk,
                         sorted_ids.data_ptr(),
@@ -446,6 +451,7 @@ def fused_moe(
                         w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
                         a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
                         a2.data_ptr(),
+                        None if p_id is None else p_id.data_ptr(),
                         token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
     a2, a2_scale = act_quant_func(
@@ -524,7 +530,7 @@ def fused_moe(
                 else:
                     moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
                                     a2.element_size() * a2.numel() > (1<<32), 
-                                    AB_dtype, bool(MOE_8WAVE_ADAPTIVE_WG_M), wg_M, wg_N,
+                                    AB_dtype, bool(MOE_8WAVE_ADAPTIVE_WG_M), False, wg_M, wg_N,
                                     E, model_dim, inter_dim, 
                                     False, w2_is_shuffled, topk,
                                     sorted_ids.data_ptr(),
@@ -534,6 +540,7 @@ def fused_moe(
                                     w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                                     a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                                     stage2_out.data_ptr(),
+                                    None,
                                     token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
         if 1:

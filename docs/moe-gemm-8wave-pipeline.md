@@ -23,6 +23,30 @@ Only `0` and `1` are accepted. The value is passed as the compile-time
 `adaptive_wg_m` argument, so enabled and disabled kernels have separate JIT
 cache keys.
 
+Stage-1 persistent scheduling is controlled independently:
+
+```bash
+# Default: launch one workgroup for every statically assigned output tile.
+MOE_8WAVE_DYN=0 python tests/contrib/moe/test_fused_moe.py ...
+
+# Launch one persistent workgroup per CU and claim tiles dynamically.
+MOE_8WAVE_DYN=1 python tests/contrib/moe/test_fused_moe.py ...
+```
+
+Dynamic mode launches 256 workgroups. Wave 0 of each workgroup claims a linear
+tile ID with `s_atomic_inc`, broadcasts it through LDS, and all eight waves
+execute the tile before claiming another. The loop exits when the claimed ID
+reaches the valid block count derived from `num_valid_ids`. The atomic return
+SGPR must be initialized to `0xffffffff` before every claim because it is also
+the wrap limit operand of `s_atomic_inc`; leaving it undefined can wrap the
+global counter early and make the persistent loop repeat tasks indefinitely.
+
+The host allocates a fresh zeroed `p_id` counter for each dynamic stage-1
+dispatch. Stage 2 remains static and continues to use `moe_gemm_down_tp` for
+the profiled `inter_dim=256` case. `MOE_8WAVE_DYN` and
+`MOE_8WAVE_ADAPTIVE_WG_M` are independent compile-time switches and therefore
+produce four separate JIT variants.
+
 ## Compile-time dimensions
 
 ```text
@@ -403,6 +427,283 @@ this experiment are stored under:
 
 The temporary scalar implementation and profiling switch were removed after
 collection; the repository source remains dwordx4-only.
+
+### Controlled static versus dynamic scheduler comparison (unaligned baseline)
+
+On 2026-07-23, all four combinations of static/dynamic scheduling and
+adaptive/non-adaptive `wg_M` were measured with ordinary rocprof kernel
+tracing. GPU utilization, VRAM use, and KFD processes were checked immediately
+before collection. All eight GPUs were idle, so physical GPU 6 was selected
+instead of GPU 0. No ATT or PMC collection was enabled.
+
+These measurements predate the task-ID LDS alignment fix described below. The
+dynamic kernel reserved only four bytes before `lds_sorted_ids`, shifting the
+entire GEMM LDS layout by four bytes. They are retained as the unaligned
+baseline, not as the performance of the final aligned implementation.
+
+Each variant was precompiled into a separate JIT cache, then measured in four
+process-level rounds using a rotating order. Every process produced seven
+`moe_gemm_8wave_g1u1` dispatches, giving 28 kernel samples per variant. The
+workload and duration calculation were the same as the controlled scaleA
+comparison above. Wrapper `last-time-us` values are reported separately and
+include the complete fused MoE operation.
+
+| Variant | Samples | Kernel mean (us) | Kernel median (us) | Min (us) | Max (us) | Stddev (us) | Wrapper mean (us) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| static | 28 | 512.581 | 508.685 | 503.205 | 547.645 | 11.734 | 1778.919 |
+| dyn | 28 | 1734.841 | 1741.337 | 1652.176 | 1834.258 | 48.471 | 2975.615 |
+| static + adaptive | 28 | 510.535 | 505.525 | 497.525 | 547.486 | 12.553 | 1782.095 |
+| dyn + adaptive | 28 | 1599.128 | 1590.955 | 1552.375 | 1676.176 | 36.290 | 2840.497 |
+
+For this large, balanced workload, dynamic scheduling regressed median gate-up
+kernel time by `1232.652 us` (`242.32%`) without adaptive dispatch and by
+`1085.430 us` (`214.71%`) with adaptive dispatch. Adaptive dispatch improved
+dynamic median time by `150.382 us` (`8.64%`), while static adaptive dispatch
+was effectively neutral at `-3.160 us` (`-0.62%`). The dynamic wrapper
+regressions closely track the gate-up kernel regressions, so allocating the
+small `p_id` tensor is not the dominant cost in this measurement.
+
+Rocprof reported 128 VGPRs, 112 SGPRs, zero scratch, and 512
+threads/workgroup. Static grids contained 917504 threads; dynamic grids
+contained 131072 threads, corresponding to 256 persistent workgroups. Every
+correctness and profiling run produced `logits_diff=4.3373e-06`. Later ATT
+analysis localized this regression to the shifted LDS layout rather than the
+global counter itself.
+
+The `wg_M=128` scaleA producer mask was also tested with and without
+`early_skip=False` after fixing the atomic wrap limit. Both forms completed the
+small and target dynamic-plus-adaptive workloads with identical accuracy. In a
+28-dispatch target comparison, default early-skip differed from
+`early_skip=False` by `+0.22%` in mean kernel time and `-0.10%` in median kernel
+time, which is within run-to-run noise. The final source therefore retains the
+default early-skip behavior; it was not part of the dynamic correctness fix.
+
+Raw traces, stats, run logs, and precompiled caches from the final scheduler
+comparison are stored under:
+
+```text
+/tmp/pyhip-dyn-sched-final-20260723/
+```
+
+### Dynamic scheduler ATT analysis (unaligned baseline)
+
+On 2026-07-24, the non-adaptive dynamic scheduler and its static control were
+profiled with Advanced Thread Trace (ATT). This is separate from the ordinary
+rocprof timing comparison above. All GPUs were checked immediately before
+collection and were idle, so physical GPU 6 was used. The imported `pyhip`
+module path and generated grids were also checked before collection: dynamic
+used 256 workgroups (131072 threads), while static used 1792 workgroups
+(917504 threads).
+
+Both variants were freshly compiled into separate JIT caches. ATT selected the
+fifth of seven `moe_gemm_8wave_g1u1` dispatches, target CU 1, all four shader
+engines, and all four SIMDs:
+
+```bash
+rocprofv3 --att --att-library-path <decoder-lib-directory> \
+    --kernel-trace \
+    --kernel-include-regex '.*moe_gemm_8wave_g1u1.*' \
+    --kernel-iteration-range '[5]' \
+    --att-target-cu 1 \
+    --att-shader-engine-mask 0xf \
+    --att-simd-select 0xf \
+    --att-buffer-size 0x18000000 \
+    -d <output-directory> -o trace -f csv -- \
+    python tests/contrib/moe/test_fused_moe.py \
+        -dim 6144,256 -t 16384 -a silu -s f \
+        -e 384 -k 8 -p t -q 5 -j
+```
+
+The system rocprofiler-sdk 1.1.0 did not include the separate trace decoder.
+The official `rocprof-trace-decoder` 0.1.6 manylinux archive was extracted
+under `/tmp` and supplied through `--att-library-path`; its SHA256 was verified
+against the release metadata. Both captures produced four `.att` files and a
+decoded UI directory without `Data Lost` or decoder errors. Both runs produced
+`logits_diff=4.3373e-06`.
+
+ATT `Latency`, `Stall`, and `Idle` are cumulative cycles over traced waves, not
+kernel wall time. On gfx9, `Latency = Stall + Issue`; `Idle` is reported
+separately. The selected dispatches measured 1745.177 us for dynamic and
+502.365 us for static in the accompanying kernel trace.
+
+| Metric | Dynamic | Static | Dynamic / static |
+|---|---:|---:|---:|
+| Traced wave timelines | 32 | 232 | 0.138x |
+| Instruction hits | 2672536 | 2681666 | 0.997x |
+| Cumulative latency (cycles) | 124828448 | 25399372 | 4.915x |
+| Cumulative stall (cycles) | 114887836 | 15331664 | 7.493x |
+| Issue cycles | 9940612 | 10067708 | 0.987x |
+| Idle cycles | 900532 | 927084 | 0.971x |
+| Stall / latency | 92.04% | 60.36% | |
+| Latency / instruction hit | 46.708 | 9.471 | 4.932x |
+
+The nearly identical hit and issue counts show that dynamic mode did not spend
+most of its extra time executing additional GEMM instructions. The time moved
+into stalls. Instruction-unit distribution was:
+
+| Unit | Dyn latency | Dyn stall | Dyn cycles/hit | Static latency | Static cycles/hit | Cycles/hit ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `s_barrier` | 39.82% | 43.26% | 657.868 | 16.90% | 57.474 | 11.45x |
+| `ds_read_b128` | 25.26% | 26.67% | 142.533 | 9.72% | 11.159 | 12.77x |
+| `ds_read_b32` | 16.64% | 17.75% | 218.935 | 5.43% | 14.580 | 15.02x |
+| `s_waitcnt lgkmcnt` | 5.76% | 6.25% | 189.180 | 1.28% | 8.529 | 22.18x |
+| Other VALU | 8.83% | 4.10% | 7.078 | 46.76% | 7.614 | 0.93x |
+| MFMA | 1.48% | 0.57% | 6.253 | 7.00% | 6.031 | 1.04x |
+| VMEM load | 0.80% | 0.60% | 12.848 | 5.30% | 17.216 | 0.75x |
+| `s_waitcnt vmcnt` | 0.36% | 0.39% | 43.645 | 1.87% | 46.672 | 0.94x |
+
+Barrier and LDS-read instructions account for 81.71% of dynamic latency and
+87.68% of dynamic stall. They account for 94.28% of the added stall cycles
+relative to static. VMEM and MFMA latency per hit did not regress materially.
+
+The direct task-claim path was not the dominant cost. Across the traced four
+workgroups, `s_atomic_inc` executed 28 times and accumulated 124 latency cycles
+with zero stall. It contributed approximately 0.0001% of total dynamic latency.
+The full claim range, including three barriers, LDS broadcast, waits, and exit
+check, contributed 0.139%; task mapping/setup contributed 0.211%; and the
+post-task `vmcnt(0)`, barrier, and backedge contributed 0.132%.
+
+Using equivalent PC ranges for the generated GEMM-and-output body, dynamic and
+static executed 2663308 and 2666186 instruction hits respectively. Dynamic body
+latency was 4.981x static and body stall was 7.633x static. Each traced dynamic
+workgroup completed six valid tasks and one terminal claim. All six valid task
+ordinals had 91.93%-92.13% stall, so the effect was present on the first task
+and did not grow across persistent iterations.
+
+ATT therefore falsified the hypothesis that global atomic contention itself
+dominated this regression. It localized the slowdown to barrier and LDS issue
+behavior inside the otherwise identical GEMM body. The aligned experiment below
+subsequently identified the four-byte shift of the GEMM LDS allocations as the
+controlling difference.
+
+Raw `.att` files, decoded UI directories, instruction stats, kernel traces,
+logs, and machine-readable summaries are stored under:
+
+```text
+/tmp/pyhip-dyn-att-20260724/
+```
+
+### LDS-aligned dynamic scheduler re-profile
+
+On 2026-07-24, the dynamic task broadcast allocation was changed from four
+bytes to 256 bytes:
+
+```python
+lds_task_id = J.alloc_lds(J.sizeof_u32 * 64)
+```
+
+The broadcast value remains at LDS offset zero. The change moves
+`lds_sorted_ids` and all following GEMM allocations from offset 4 to offset
+256. Generated ISA confirms that the first sorted-ID DMA `m0` base changed
+from `4 + warp_offset` to `256 + warp_offset`; the GEMM LDS offsets then move
+by 252 bytes while the task broadcast instructions remain unchanged. Raw
+dynamic LDS usage increased from 149892 to 150144 bytes; rocprof reported
+150528 allocated bytes. Occupancy remained two waves/SIMD, with 128 VGPRs, 112
+SGPRs, zero scratch, and one workgroup per CU.
+
+All GPUs were checked before measurement and were idle. Physical GPU 6 was used
+instead of GPU 0. Each compile-time combination was precompiled into a separate
+JIT cache, then four process-level rounds were collected in a rotating order
+with ordinary `rocprofv3 --stats --kernel-trace`. ATT was not enabled. Every
+process produced seven gate-up dispatches, giving 28 samples per variant. All
+16 runs produced `logits_diff=4.3373e-06`.
+
+| Variant | Samples | Kernel mean (us) | Kernel median (us) | Min (us) | Max (us) | Stddev (us) | Wrapper median (us) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| static | 28 | 511.923 | 509.905 | 503.286 | 537.686 | 7.539 | 1784.151 |
+| dyn, 256-byte aligned | 28 | 525.238 | 524.926 | 508.686 | 540.486 | 9.404 | 1799.808 |
+| static + adaptive | 28 | 508.214 | 504.326 | 497.125 | 548.686 | 12.284 | 1769.363 |
+| dyn + adaptive, 256-byte aligned | 28 | 554.257 | 553.606 | 546.566 | 564.366 | 4.634 | 1825.708 |
+
+Aligned dynamic scheduling is `13.316 us` (`2.60%`) slower by mean and
+`15.020 us` (`2.95%`) slower by median than static. Aligned dynamic plus
+adaptive is `46.043 us` (`9.06%`) slower by mean and `49.280 us` (`9.77%`)
+slower by median than static plus adaptive. Static adaptive dispatch changed
+the mean by `-3.708 us` (`-0.72%`), while enabling adaptive dispatch with dyn
+changed it by `+29.019 us` (`+5.52%`).
+
+A 30000-resample bootstrap over dispatch samples gave these 95% confidence
+intervals for the mean delta:
+
+```text
+dyn - static:                         +13.316 us  [ +8.872, +17.636]
+dyn+adaptive - static+adaptive:       +46.043 us  [+40.887, +50.402]
+static+adaptive - static:              -3.708 us  [ -8.716,  +1.797]
+dyn+adaptive - dyn:                   +29.019 us  [+25.223, +32.789]
+```
+
+The static adaptive interval crosses zero, so its small improvement is not
+statistically convincing. Paired per-round median deltas were consistently
+positive for dyn versus static (`+7.720`, `+11.080`, `+15.721`, and
+`+24.601 us`) and dyn plus adaptive versus static plus adaptive (`+49.361`,
+`+49.520`, `+42.640`, and `+52.960 us`).
+
+Rocprof reported 150016 bytes LDS for both static variants and 150528 bytes for
+both dynamic variants. All variants used 128 VGPRs, 112 SGPRs, zero scratch,
+and 512 threads per workgroup. Static grids contained 917504 threads; dynamic
+grids contained 131072 threads, or 256 persistent workgroups. Raw traces,
+kernel/domain stats, logs, summaries, and the reproducible command are stored
+under:
+
+```text
+rocprof-dyn-adaptive-compare/
+```
+
+The aligned non-adaptive dynamic kernel was then captured with the same ATT
+settings as the unaligned run: fifth dispatch, target CU 1, four shader engines,
+and all four SIMDs. The selected aligned dispatch measured 528.722 us. Four
+`.att` files and the decoded UI directory were generated without `Data Lost` or
+decoder errors.
+
+| ATT metric | Unaligned dyn | Aligned dyn | Static | Aligned / unaligned | Aligned / static |
+|---|---:|---:|---:|---:|---:|
+| Instruction hits | 2675732 | 2678288 | 2681666 | 1.001x | 0.999x |
+| Cumulative latency (cycles) | 124888968 | 29884520 | 25399372 | 0.239x | 1.177x |
+| Cumulative stall (cycles) | 114934756 | 19884828 | 15331664 | 0.173x | 1.297x |
+| Issue cycles | 9954212 | 9999692 | 10067708 | 1.005x | 0.993x |
+| Stall / latency | 92.03% | 66.54% | 60.36% | | |
+| Latency / instruction hit | 46.675 | 11.158 | 9.471 | 0.239x | 1.178x |
+| Mean traced-wave lifetime (cycles) | 3932026 | 967498 | 113475 | 0.246x | 8.526x |
+
+The instruction count and issue time remain unchanged. Alignment removes the
+large LDS and barrier stalls:
+
+| Unit | Unaligned cycles/hit | Aligned cycles/hit | Static cycles/hit | Aligned / unaligned | Aligned / static |
+|---|---:|---:|---:|---:|---:|
+| `s_barrier` | 658.232 | 91.211 | 57.474 | 0.139x | 1.587x |
+| `ds_read_b128` | 142.486 | 11.212 | 11.159 | 0.079x | 1.005x |
+| `ds_read_b32` | 218.917 | 14.584 | 14.580 | 0.067x | 1.000x |
+| `s_waitcnt lgkmcnt` | 188.890 | 7.773 | 8.529 | 0.041x | 0.911x |
+| `s_waitcnt vmcnt` | 47.691 | 62.971 | 46.672 | 1.320x | 1.349x |
+| Other VALU | 7.059 | 7.715 | 7.614 | 1.093x | 1.013x |
+| MFMA | 6.255 | 6.033 | 6.031 | 0.965x | 1.000x |
+| VMEM load | 13.032 | 38.358 | 17.216 | 2.943x | 2.228x |
+
+The aligned `ds_read_b128`, `ds_read_b32`, `lgkmcnt`, MFMA, and VALU costs are
+at or near static levels. The remaining aligned gap is concentrated in
+barriers, VMEM loads, and VMEM waits. Across the equivalent GEMM-and-output
+body, aligned latency is 23.6% of the unaligned value and aligned stall is
+16.9% of the unaligned value. Compared with static, the aligned body has 1.176x
+latency and 1.292x stall.
+
+Each traced aligned persistent workgroup still executed six valid tasks and one
+terminal claim. Valid-task stall rates were 64.97%, 63.13%, 64.51%, 69.30%,
+69.99%, and 65.74%, versus approximately 92% for every unaligned task. The
+improvement therefore applies throughout the persistent loop rather than only
+to initialization or termination.
+
+The 256-byte reservation should be retained. The four-byte task allocation
+shifted an LDS layout whose loaders and swizzles assume aligned bases, causing
+severe LDS read serialization and barrier imbalance. The global atomic remains
+negligible; after alignment, its 28 traced executions accumulated 132 latency
+cycles and zero stall.
+
+Aligned raw ATT data, decoded UI output, timing rounds, generated ISA, and
+machine-readable summaries are stored under:
+
+```text
+/tmp/pyhip-dyn-att-aligned-20260724/
+```
 
 ### Historical scaleA comparisons
 
