@@ -50,7 +50,7 @@ def tb_swizzle(J, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:i
     return M_out, N_out
 
 
-def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
+def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0, mfma_MN=16):
     """
     return loaders for loading a [M, K] u8-tile data from VMEM (with stride of vm_stride)
     into [M, K] u8-LDS-tile and from LDS into VGPRs
@@ -104,8 +104,17 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
     num_rows_per_load = J.div(64, num_lanes_per_row)
     warp_m_off = J.warp_id[0] * num_rows_per_load
 
-    def swizzle(row, col):
-        return (col ^ row) % num_lanes_per_row
+    if mfma_MN == 32:
+        # 32x32x64 的 MFMA operand 每 lane 用 row=lane%32(32 行)读取。CDNA4 的 ds_read_b128
+        # 把 64 lane 分成 4 组各 16 lane、64 个 bank(16 个 lane-bank)，冲突只在组内看。
+        # 用 (col ^ row) 时同组内多 lane 落到同一 lane-bank -> 4-way bank conflict；
+        # 改用 (col ^ (row>>1)) 可让每组 16 lane 落到 16 个不同 lane-bank -> 零冲突。
+        # 该 swizzle 仍是按列组的自反置换(XOR row 相关常量)，写放置与读查找一致。
+        def swizzle(row, col):
+            return (col ^ (row >> 1)) % num_lanes_per_row
+    else:
+        def swizzle(row, col):
+            return (col ^ row) % num_lanes_per_row
 
     row = J.threadIdx.x // num_lanes_per_row
     col = J.threadIdx.x % num_lanes_per_row
@@ -156,26 +165,30 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
     vm_offset_inc = K
     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
 
-def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
+def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0, mfma_MN=16):
     """
     return loaders for loading a [M, K] u8-tile data from VMEM (with stride of vm_stride)
     into [M, K] u8-LDS-tile and from LDS into VGPRs
 
-    data in VMEM was pre-shuffled in input-format of MFMA_16x16x?
-            x = x.reshape(M//16, 16, K//64, 4, 4).permute(0,2,3,1,4).contiguous()
+    data in VMEM was pre-shuffled in input-format of MFMA_{mfma_MN}x{mfma_MN}x?
+            x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L).permute(0,2,3,1,4).contiguous()
 
+    mfma_MN 可为 16(默认, 16x16x128) 或 32(32x32x64)。返回的 ds_read_1kb 仅适配 16x16；
+    32x32 情况下调用方需要自定义 ds_read（LDS 布局仍为每 block 1KB, block(nb,kb) 位于 (nb*nbK+kb)*1024）。
     """
-    # preshuffled data are in blocked layout [M//16,K//64] x [16,64]
+    # 每个 pre-shuffle block 覆盖 mfma_K_bytes 字节的 K
+    mfma_K_bytes = (64 // mfma_MN) * 16   # 16x16 -> 64; 32x32 -> 32
+    # preshuffled data are in blocked layout [M//mfma_MN, K//mfma_K_bytes] x 1KB-block
     # both in vmem or LDS
-    stride_1kb = J.div(16*vm_stride, 1024)
-    nbK = J.div(K, 64) # number of 16x64 blocks along K dimension
+    stride_1kb = J.div(vm_stride, mfma_K_bytes)   # 全 K 下相邻 N-block 的跨度(单位 1KB)
+    nbK = J.div(K, mfma_K_bytes) # tile 内沿 K 的 block 数
     warp_k = J.warp_id[0] % nbK
     warp_m = J.warp_id[0] // nbK
     vmem_warp_off = warp_m * (stride_1kb * 1024) + warp_k * 1024
     vmem_voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + vmem_warp_off)
     lds_warp_off = J.gpr("su32", warp_m * (nbK * 1024) + warp_k * 1024)
 
-    voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + (warp_row0 // 16) * (nbK * 1024))
+    voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + (warp_row0 // mfma_MN) * (nbK * 1024))
     voff2 = J.gpr("vu32", voff[0] + 64*1024)
     def ds_read_1kb(lds, vdst, m, k):
         offset = lds + m*(nbK * 1024) + k*1024
@@ -186,7 +199,7 @@ def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
             voffset = voff
         J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
 
-    vm_load_cnt = J.div(J.div(M, 16), J.div(num_warps, nbK))
+    vm_load_cnt = J.div(J.div(M, mfma_MN), J.div(num_warps, nbK))
 
     def vm_load(lds_offset, buff, vm_offset):
         J.s_mov_b32("m0", lds_warp_off + lds_offset)
@@ -201,11 +214,11 @@ def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
     vm_offset_inc = nbK * 1024
     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_1kb
 
-def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0):
+def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0, mfma_MN=16):
     if use_pre_shuffle:
-        return get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0)
+        return get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0, mfma_MN=mfma_MN)
     else:
-        return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0)
+        return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0, mfma_MN=mfma_MN)
 
 def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sorted_ids, TOPK, num_tokens, input, is_input_over_4GB):
     """

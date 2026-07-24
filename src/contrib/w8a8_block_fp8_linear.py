@@ -85,6 +85,7 @@ def w8a8_block_fp8_linear(
     num_block_N = pyhip.div_up(N, wg_N)
     gemm_8wave_fp8bf16fp16([num_block_M * num_block_N],[64*8],
                     "fp8", b_preshuffle, use_f32_blockscales_128,
+                    True,   # use_mfma_32x32
                     wg_M, wg_N, N, K,
                     q_input.data_ptr(),
                     weight.data_ptr(),

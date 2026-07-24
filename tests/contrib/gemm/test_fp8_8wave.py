@@ -14,7 +14,7 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("K", [256])
 @pytest.mark.parametrize("bpreshuffle", [True, False])
 @pytest.mark.parametrize("AB_dtype", ["fp8", "bf16","fp16"])
-def test(M, N, K, AB_dtype, bpreshuffle):
+def test(M, N, K, AB_dtype, bpreshuffle, use_mfma_32x32=True):
     out_dtype = torch.bfloat16
     if AB_dtype == "fp8":
         in_dtype = torch.float8_e4m3fn
@@ -46,10 +46,12 @@ def test(M, N, K, AB_dtype, bpreshuffle):
     num_block_N = pyhip.div_up(N, wg_N)
 
     if bpreshuffle:
-        w = pyhip.pre_shuffle(w, mfma_MN=16)
+        # fp8 使用 32x32x64 MFMA(use_mfma_32x32=True) 时需 mfma_MN=32 的 pre-shuffle；否则 16x16 用 mfma_MN=16
+        w = pyhip.pre_shuffle(w, mfma_MN=(32 if (AB_dtype == "fp8" and use_mfma_32x32) else 16))
         # w = shuffle_weight(w, layout=(16, 16))
 
     gemm_8wave_fp8bf16fp16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
+                   use_mfma_32x32,
                    wg_M, wg_N, N, K, x.data_ptr(), w.data_ptr(), y1.data_ptr(),
                    None, None, M)
 
@@ -85,6 +87,7 @@ def test(M, N, K, AB_dtype, bpreshuffle):
     for i in range(32):
         with pyhip.cudaPerf(M*N*K*2, name=f"gemm_8wave_fp8bf16fp16-{M}_{N}_{K}_{bpreshuffle=}"):
             gemm_8wave_fp8bf16fp16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
+                           use_mfma_32x32,
                            wg_M, wg_N, N, K,
                            As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(),
                            None, None, M)
@@ -106,6 +109,7 @@ if __name__ == "__main__":
     AB_dtype = "fp8"
     #test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False); assert 0
     #M,N,K = 512,512,8192
+    test(M=16384,N=3584,K=6144, AB_dtype=AB_dtype, bpreshuffle = True); assert 0
     test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = False)
     test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = True)
 

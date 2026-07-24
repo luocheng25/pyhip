@@ -114,7 +114,7 @@ def txest_gemm(dtype, m, n, k, ck_preshuffle=True):
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("n", [256, 256*6])
 @pytest.mark.parametrize("m", [32, 256, 2400])
-def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
+def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True, use_mfma_32x32=True):
     output_dtype = dtypes.bf16
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -150,7 +150,7 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
 
     ck_kernel = aiter.gemm_a8w8_blockscale_bpreshuffle if ck_preshuffle else aiter.gemm_a8w8_blockscale
     di = 0
-    for i in range(num_repeats):
+    for i in range(100): #num_repeats):
         with pyhip.cudaPerf(flops, rw_bytes, name=f"ck_kernel_{di}") as p0:
             out_ck = ck_kernel(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype)
             di = (di + 1) % BUF_COPY
@@ -175,10 +175,14 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
     num_block_M = pyhip.div_up(m, wg_M)
     num_block_N = pyhip.div_up(n, wg_N)
     out_jit = torch.empty((m, n), dtype=output_dtype, device=x.device)
+    # jit 使用 pyhip 的 pre_shuffle 布局（与 ck/asm 的 shuffle_weight 不同）；32x32 用 mfma_MN=32, 16x16 用 16
+    _jit_mn = 32 if use_mfma_32x32 else 16
+    Bs_jit = [(pyhip.pre_shuffle(weight, mfma_MN=_jit_mn) if ck_preshuffle else weight).clone() for _ in range(BUF_COPY)]
     for i in range(num_repeats):
         with pyhip.cudaPerf(m*n*k*2, rw_bytes, name=f"asmjit_kernel_{di}") as p0:
             gemm_8wave_fp8bf16fp16([num_block_N * num_block_M],[64*8], "fp8", ck_preshuffle, True,
-                            wg_M, wg_N, n, k, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
+                            use_mfma_32x32,
+                            wg_M, wg_N, n, k, As[di].data_ptr(), Bs_jit[di].data_ptr(), out_jit.data_ptr(),
                             ATscales[di].data_ptr(), Bscales[di].data_ptr(), m)
 
         di = (di + 1) % BUF_COPY
@@ -226,9 +230,11 @@ if __name__ == "__main__":
     #M,N,K=32768,9216,4096
     # pyhip_gemm_a8w8_blockscale:  torch.bfloat16 torch.float8_e4m3fn torch.Size([32, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096]) [128, 128] True
     M,N,K=32,1024,4096 
+    M,N,K=16384,3584,6144
+    #M,N,K=16384,256*16,8192*8
     #M,N,K=256,256,128
     #test_gemm(dtypes.bf16, M, N, K, True)
-    test_perf(M,N,K, num_repeats=16, ck_preshuffle=False)
+    test_perf(M,N,K, num_repeats=10, ck_preshuffle=True, use_mfma_32x32=True)
     print(M,N,K)
 """
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
