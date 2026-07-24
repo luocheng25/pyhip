@@ -399,7 +399,7 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
         MFMA_FIFO_CNT = nrM * nrN
         # circular fifo buffer for post-processing
         # prepare scales for next round
-        mfma_fifo_scale = J.gpr(2, nrM, "vf32")
+        mfma_fifo_scale = J.gpr(2, J.div(nrM, 2), 2, "vf32", align=2)
         mfma_fifo = J.gpr(MFMA_FIFO_CNT, 4, "vf32")
         mfma_fifo_scale[...] = 0
         mfma_fifo[...] = 0
@@ -414,13 +414,12 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             fifo_read_id = 0
             fifo_write_id = 0
             for m in range(nrM):
+                scale_mod = "op_sel_hi:[1,0,1]" if m % 2 == 0 else "op_sel:[0,1,0]"
                 for n in range(nrN):
                     if n == 0:
-                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[b_index]
-                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        mfma_fifo_scale[c_index%2, m//2, m%2] = mfma_scaleA[m] * mfma_scaleB[b_index]
+                    J.v_pk_fma_f32(mfma_C[mfma_fifo_c_index, m, n, 0:1], mfma_fifo[fifo_read_id, 0:1], mfma_fifo_scale[mfma_fifo_c_index % 2, m//2], mfma_C[mfma_fifo_c_index, m, n, 0:1], mod=scale_mod)
+                    J.v_pk_fma_f32(mfma_C[mfma_fifo_c_index, m, n, 2:3], mfma_fifo[fifo_read_id, 2:3], mfma_fifo_scale[mfma_fifo_c_index % 2, m//2], mfma_C[mfma_fifo_c_index, m, n, 2:3], mod=scale_mod)
                     fifo_read_id += 1
 
                     J.v_mfma_f32_16x16x128_f8f6f4(mfma_fifo[fifo_write_id % MFMA_FIFO_CNT], mfma_B[b_index, n], mfma_A[m], 0)
@@ -431,12 +430,11 @@ def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
         def mfma_tail():
             fifo_read_id = 0
             for m in range(nrM):
+                scale_mod = "op_sel_hi:[1,0,1]" if m % 2 == 0 else "op_sel:[0,1,0]"
                 for n in range(nrN):
                     if mfma_fifo_c_index is not None:
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_pk_fma_f32(mfma_C[mfma_fifo_c_index, m, n, 0:1], mfma_fifo[fifo_read_id, 0:1], mfma_fifo_scale[mfma_fifo_c_index % 2, m//2], mfma_C[mfma_fifo_c_index, m, n, 0:1], mod=scale_mod)
+                        J.v_pk_fma_f32(mfma_C[mfma_fifo_c_index, m, n, 2:3], mfma_fifo[fifo_read_id, 2:3], mfma_fifo_scale[mfma_fifo_c_index % 2, m//2], mfma_C[mfma_fifo_c_index, m, n, 2:3], mod=scale_mod)
                         fifo_read_id += 1
     elif AB_dtype == "bf16":
         def mfma(c_index):

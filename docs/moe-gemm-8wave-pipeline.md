@@ -83,9 +83,15 @@ One `mfma(c_index)` emits:
 
 ```text
 8  v_mfma_f32_16x16x128_f8f6f4          # nrM * nrN
-32 v_fmac_f32                            # nrM * nrN * 4 accumulators
+16 v_pk_fma_f32                          # nrM * nrN * 2 packed accumulator pairs
 4  v_mul_f32                             # scaleA * scaleB, once per m
 ```
+
+Each `v_pk_fma_f32` updates two adjacent FP32 accumulators. The 16 packed
+instructions therefore perform the same 32 accumulator updates as the former
+scalar `v_fmac_f32` sequence. Scale values are stored in aligned VGPR pairs;
+`op_sel_hi:[1,0,1]` broadcasts the low element for even `m`, and
+`op_sel:[0,1,0]` broadcasts the high element for odd `m`.
 
 `yield 16` is a `J.emit` scheduling hint and does not emit an instruction.
 
@@ -128,7 +134,7 @@ def loop_body(k):
     vm_to_lds_A(toc, row1)                      # 2 buffer_load_dwordx4, A[k+1,row1]
     advance_vm_offsets_to(k + 2)
     wait_lgkm(); barrier()
-    mfma_fifo_step(c0)                          # 8 MFMA + 32 FMAC + 4 MUL
+    mfma_fifo_step(c0)                          # 8 MFMA + 16 packed FMA + 4 MUL
     barrier()
 
     # Region 1 --------------------------------------------------------------
@@ -136,7 +142,7 @@ def loop_body(k):
     Breg[up] = lds_read_B(tic, up)               # 4 ds_read_b128, B[k,up]
     vm_to_lds_A(tic, row0)                       # 2 buffer_load_dwordx4, A[k+2,row0]
     barrier(); wait_lgkm()
-    mfma_fifo_step(c1)                           # 8 MFMA + 32 FMAC + 4 MUL
+    mfma_fifo_step(c1)                           # 8 MFMA + 16 packed FMA + 4 MUL
     barrier()
 
     # Region 2 --------------------------------------------------------------
@@ -145,7 +151,7 @@ def loop_body(k):
     scaleA[row1] = lds_read_scaleA(tic, row1)    # 4 ds_read_b32, scaleA[k,row1]
     vm_to_lds_B(tic, gate)                       # 2 buffer_load_dwordx4, B[k+2,gate]
     barrier(); wait_lgkm()
-    mfma_fifo_step(c2)                           # 8 MFMA + 32 FMAC + 4 MUL
+    mfma_fifo_step(c2)                           # 8 MFMA + 16 packed FMA + 4 MUL
     barrier()
 
     # Region 3 --------------------------------------------------------------
@@ -156,7 +162,7 @@ def loop_body(k):
         vm_to_lds_scaleA(old_scale_buffer, k + 9) # 1 dwordx4, eight K stages
     wait_vmcnt_threshold(); barrier()
     Breg[gate] = lds_read_B(toc, gate)            # 4 ds_read_b128, B[k+1,gate]
-    mfma_fifo_step(c3)                            # 8 MFMA + 32 FMAC + 4 MUL
+    mfma_fifo_step(c3)                            # 8 MFMA + 16 packed FMA + 4 MUL
     if scaleA_prefetched:
         wait_scale_vmcnt0()                       # direct-to-LDS completion
     barrier()
@@ -180,9 +186,9 @@ iteration.
 | LDS to scaleB registers | `ds_read_b32` | 2 |
 | **All LDS reads** | | **34** |
 | MFMA | `v_mfma_f32_16x16x128_f8f6f4` | 32 |
-| Accumulation | `v_fmac_f32` | 128 |
+| Packed accumulation | `v_pk_fma_f32` | 64 |
 | Scale products | `v_mul_f32` | 16 |
-| **FMAC including scale MUL** | | **144** |
+| **Packed FMA including scale MUL** | | **80** |
 | VM to LDS A | `buffer_load_dwordx4` | 4 |
 | VM to LDS B | `buffer_load_dwordx4` | 4 |
 | VM to LDS scaleA | `buffer_load_dwordx4` | 1 every eight loops |
@@ -200,9 +206,9 @@ iteration.
 | LDS to scaleA registers | 384 |
 | LDS to scaleB registers | 96 |
 | MFMA | 1536 |
-| FMAC | 6144 |
+| Packed FMA | 3072 |
 | Scale MUL | 768 |
-| FMAC including scale MUL | 6912 |
+| Packed FMA including scale MUL | 3840 |
 | VM load A | 192 |
 | VM load B | 192 |
 | VM load scaleA inside loop bodies | 4 |
@@ -244,7 +250,7 @@ Each later scaleA refill is newer than the matrix loads in Region 3, so its
 partial wait intentionally leaves it pending; that refill still requires the
 post-`mfma(3)` `vmcnt(0)` before the existing end-of-iteration barrier.
 
-The MFMA FIFO tail adds 32 `v_fmac_f32` instructions after the K loop.
+The MFMA FIFO tail adds 16 `v_pk_fma_f32` instructions after the K loop.
 
 ## Validation and performance
 
@@ -295,6 +301,73 @@ The mean change is `-0.280 us` (`-0.05%`) and the median change is `-3.360 us`
 performance-neutral until a larger repeated benchmark shows otherwise. Kernel
 resources are unchanged: 128 reported VGPRs, 112 SGPRs, and 137728 bytes LDS
 per workgroup.
+
+### Controlled scalar FMAC versus packed FMA comparison
+
+On 2026-07-24, the MFMA FIFO accumulation was changed from four scalar
+`v_fmac_f32` instructions to two `v_pk_fma_f32` instructions per FIFO entry.
+The scalar baseline and packed variant were built from the same `5f6589e`
+revision in separate source trees and fresh JIT caches. The optimized packed
+layout uses VOP3P operand selection to broadcast scales without extra
+`v_mov_b32` instructions.
+
+Generated `IC=6144`, `wg_M=256` ISA changed as follows:
+
+| Variant | `v_fmac_f32` | `v_pk_fma_f32` | `v_mov_b32` | MFMA |
+|---|---:|---:|---:|---:|
+| Scalar baseline | 6176 | 0 | 205 | 1536 |
+| Packed FMA | 0 | 3088 | 205 | 1536 |
+
+Both variants used 128 VGPRs, 112 SGPRs, 150016 bytes LDS, zero scratch, 512
+threads/workgroup, grid size 917504, and two waves/SIMD occupancy. Both
+produced `logits_diff=4.3373e-06` on the target workload.
+
+Four interleaved ordinary rocprof rounds were collected on idle physical GPU 6.
+Each process produced seven `moe_gemm_8wave_g1u1` dispatches, giving 28 samples
+per variant. ATT was not enabled.
+
+| Variant | Samples | Mean (us) | Median (us) | Min (us) | Max (us) | Stddev (us) | Wrapper mean (us) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Scalar `v_fmac_f32` | 28 | 510.145 | 509.005 | 503.086 | 524.606 | 4.941 | 1770.195 |
+| Packed `v_pk_fma_f32` | 28 | 582.799 | 578.927 | 559.326 | 638.607 | 22.670 | 1838.247 |
+
+Packed FMA regressed mean kernel time by `72.654 us` (`14.24%`) and median
+time by `69.922 us` (`13.74%`). Paired per-round median regressions were
+`70.801`, `68.361`, `70.600`, and `71.442 us`. A 30000-resample bootstrap gave
+a 95% confidence interval of `[64.688, 81.677] us` for the mean regression.
+Reducing static instruction count therefore did not improve this schedule;
+VOP3P issue behavior is slower than the scalar FMAC sequence in this pipeline.
+
+Follow-up PMC collection with `SQ_VALU_MFMA_COEXEC_CYCLES` identified the
+mechanism. Across 21 dispatches per variant, scalar FMAC covered `52.875%` of
+MFMA busy cycles with co-issued VALU work, while packed FMA covered only
+`7.703%`. `SQ_INSTS_MFMA` and the measured 32 busy cycles per MFMA were
+unchanged. A fixed-ISA microbenchmark further showed that two scalar FMACs
+co-execute for about eight cycles per MFMA, whereas one equivalent
+`v_pk_fma_f32` co-executes for zero cycles and incurs about 32 additional device
+cycles when placed directly after MFMA. LLVM addresses this case by unpacking
+packed FP32 operations in the MFMA shadow into scalar operations during its
+pre-emit peephole pass; PyHIP's inline assembly is opaque to that transform.
+See [MFMA and VALU co-issue on gfx950](mfma-valu-coissue.md) for counter scope,
+the distance scan, scripts, raw-data paths, and upstream references.
+
+`MOE_8WAVE_ADAPTIVE_WG_M=1` failed the target correctness threshold in both
+the scalar baseline and packed variant on this `5f6589e` branch, with the
+scalar baseline already reporting maximum absolute delta 2096. This adaptive
+failure is not introduced by packed FMA, but it prevents claiming adaptive-path
+coverage for this experiment.
+
+The target `preshuffle=false` command also reaches the existing stage-2 call to
+`moe_gemm_8wave_g1u1(gate_up=False)` and stops at this kernel's `assert
+gate_up` in both the scalar baseline and packed variant. It therefore does not
+provide additional packed-FMA correctness coverage on this branch.
+
+Raw ordinary rocprof traces, stats, logs, and precompiled variants are stored
+under:
+
+```text
+/tmp/pyhip-pkfma-opsel-compare-20260724/
+```
 
 ### Eight-stage dwordx4 scaleA result
 
