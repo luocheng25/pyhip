@@ -1,0 +1,157 @@
+[
+  {
+    "name": "triton",
+    "sample_count": 70,
+    "mean_elapsed_ms": 191.04872501918248,
+    "mean_h3_tflops": 149.98806232030861,
+    "mean_sclk_mhz": 1801.7130325814535,
+    "mean_power_w": 590.9689223057643,
+    "peak": {
+      "index": 22,
+      "h3_tflops": 150.77865937842643,
+      "elapsed_ms": 190.0359649658203
+    },
+    "floor": {
+      "index": 10,
+      "h3_tflops": 144.01913002403612,
+      "elapsed_ms": 198.95529174804688
+    },
+    "peak_to_floor_drop_percent": 4.483080949423446,
+    "correlation_tflops_sclk": 0.4848764299852494,
+    "correlation_tflops_power": 0.3239970337232681,
+    "high_threshold_tflops": 148.4128241043898,
+    "high_runs": [
+      [
+        1,
+        9
+      ],
+      [
+        11,
+        29
+      ],
+      [
+        31,
+        35
+      ],
+      [
+        37,
+        53
+      ],
+      [
+        55,
+        69
+      ]
+    ],
+    "high_run_starts": [
+      1,
+      11,
+      31,
+      37,
+      55
+    ],
+    "dispatch_intervals": [
+      10,
+      20,
+      6,
+      18
+    ],
+    "time_intervals_seconds": [
+      1.9187778229825199,
+      3.821086397045292,
+      1.1547640989301726,
+      3.4419734730618075
+    ],
+    "complete_cycles": [],
+    "incomplete_tail": null,
+    "cycle_detected": false,
+    "throttle_delta": {
+      "accumulation_counter": null,
+      "ppt_accumulated": null,
+      "prochot_accumulated": null,
+      "socket_thermal_accumulated": null,
+      "vr_thermal_accumulated": null,
+      "hbm_thermal_accumulated": null
+    }
+  },
+  {
+    "name": "asm_mi308",
+    "sample_count": 70,
+    "mean_elapsed_ms": 191.3771726335798,
+    "mean_h3_tflops": 149.72667555854719,
+    "mean_sclk_mhz": 1794.186274509804,
+    "mean_power_w": 538.1863973659639,
+    "peak": {
+      "index": 5,
+      "h3_tflops": 150.29326109533858,
+      "elapsed_ms": 190.64971923828125
+    },
+    "floor": {
+      "index": 39,
+      "h3_tflops": 144.98715782678218,
+      "elapsed_ms": 197.62693786621094
+    },
+    "peak_to_floor_drop_percent": 3.530499790799313,
+    "correlation_tflops_sclk": -0.027557182123652792,
+    "correlation_tflops_power": 0.06739003643966583,
+    "high_threshold_tflops": 148.43612495134383,
+    "high_runs": [
+      [
+        0,
+        8
+      ],
+      [
+        10,
+        14
+      ],
+      [
+        16,
+        38
+      ],
+      [
+        40,
+        42
+      ],
+      [
+        44,
+        64
+      ],
+      [
+        66,
+        69
+      ]
+    ],
+    "high_run_starts": [
+      0,
+      10,
+      16,
+      40,
+      44,
+      66
+    ],
+    "dispatch_intervals": [
+      10,
+      6,
+      24,
+      4,
+      22
+    ],
+    "time_intervals_seconds": [
+      1.913132690009661,
+      1.1518900470109656,
+      4.606771026970819,
+      0.7690824290039018,
+      4.2253170349868014
+    ],
+    "complete_cycles": [],
+    "incomplete_tail": null,
+    "cycle_detected": false,
+    "throttle_delta": {
+      "accumulation_counter": null,
+      "ppt_accumulated": null,
+      "prochot_accumulated": null,
+      "socket_thermal_accumulated": null,
+      "vr_thermal_accumulated": null,
+      "hbm_thermal_accumulated": null
+    }
+  }
+]

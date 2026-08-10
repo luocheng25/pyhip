@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "profile": "artifacts/h3-fp8-auto/profile-auto-fp8.json",
+  "bf16_profile": "artifacts/h3-five-kernel/profile-auto-flydsl.json",
+  "implementations": [
+    {
+      "name": "8wave_varlen_fp8",
+      "fp8": {
+        "sample_count": 70,
+        "mean_elapsed_ms": 88.84929853166852,
+        "min_elapsed_ms": 83.36201477050781,
+        "max_elapsed_ms": 99.89242553710938,
+        "mean_h3_tflops": 324.1829364359536,
+        "min_h3_tflops": 286.84224932137084,
+        "max_h3_tflops": 343.7221150438067,
+        "tflops_cv_percent": 7.026783246522567,
+        "mean_sclk_mhz": 1686.3516666666667,
+        "mean_power_w": 541.1863888888889,
+        "max_power_w": 600.0,
+        "max_junction_c": 84.0,
+        "max_mem_c": 47.0,
+        "mean_tflops_vs_bf16_percent": 74.26629568855677,
+        "mean_latency_vs_bf16_percent": -43.89390787452182
+      },
+      "bf16_baseline_name": "8wave_32x32",
+      "bf16": {
+        "sample_count": 70,
+        "mean_elapsed_ms": 158.359449332101,
+        "min_elapsed_ms": 112.17597961425781,
+        "max_elapsed_ms": 179.6154327392578,
+        "mean_h3_tflops": 186.02732969967016,
+        "min_h3_tflops": 159.52620325686163,
+        "max_h3_tflops": 255.4322960206188,
+        "tflops_cv_percent": 17.947851365689143,
+        "mean_sclk_mhz": 1254.112870951411,
+        "mean_power_w": 431.9387758436708,
+        "max_power_w": 600.0,
+        "max_junction_c": 69.0,
+        "max_mem_c": 46.0
+      }
+    },
+    {
+      "name": "4wave_varlen_fp8",
+      "fp8": {
+        "sample_count": 70,
+        "mean_elapsed_ms": 89.01360778808593,
+        "min_elapsed_ms": 84.29546356201172,
+        "max_elapsed_ms": 100.0024642944336,
+        "mean_h3_tflops": 323.39158837913186,
+        "min_h3_tflops": 286.52661945278606,
+        "max_h3_tflops": 339.91589606898873,
+        "tflops_cv_percent": 6.5994602103186555,
+        "mean_sclk_mhz": 1695.0153174603174,
+        "mean_power_w": 563.5666666666667,
+        "max_power_w": 617.0,
+        "max_junction_c": 85.0,
+        "max_mem_c": 47.0,
+        "mean_tflops_vs_bf16_percent": 76.81107500042404,
+        "mean_latency_vs_bf16_percent": -44.53770885895651
+      },
+      "bf16_baseline_name": "4wave_varlen",
+      "bf16": {
+        "sample_count": 70,
+        "mean_elapsed_ms": 160.49392471313476,
+        "min_elapsed_ms": 121.74321746826172,
+        "max_elapsed_ms": 181.82533264160156,
+        "mean_h3_tflops": 182.90233707269542,
+        "min_h3_tflops": 157.58732633648498,
+        "max_h3_tflops": 235.3590501967955,
+        "tflops_cv_percent": 16.34439510513721,
+        "mean_sclk_mhz": 1321.2145360183702,
+        "mean_power_w": 467.9308137648999,
+        "max_power_w": 616.0,
+        "max_junction_c": 73.0,
+        "max_mem_c": 47.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+implementation,auto_tflops,best_requested_sclk_mhz,best_tflops,best_vs_auto_percent,best_actual_sclk_mhz,auto_cv_percent,best_cv_percent
+triton,149.988,1800,150.505,0.345,1802.4,0.750,0.443
+asm_mi308,149.727,1800,150.097,0.247,1798.1,0.554,0.287
+asm_mi300,172.129,1800,172.491,0.211,1479.7,11.858,12.244
+8wave_32x32,186.027,1800,186.223,0.105,1245.8,17.948,17.998
+4wave_varlen,182.902,1800,182.886,-0.009,1321.8,16.344,16.216
+analysis_output=artifacts/h3-frequency-sweep/frequency-sweep-analysis.json

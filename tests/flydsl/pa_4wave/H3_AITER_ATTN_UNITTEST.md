@@ -63,30 +63,3 @@ ASM 二进制有 MI300 和 MI308 两套，aiter 在 `csrc/cpp_itfs/mha_fwd.cu:63
 cp /sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI300/*.co \
    /sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/       # 原件备份在 MI308.orig/
 ```
-
-## 与 FlyDSL 4-wave 的同机复测
-
-`test_pa_prefill.py`新增`PA_CASE=h3`，使用相同segments、heads、dtype、scale和
-`3 warmup + 10 CUDA-event samples + statistics.median`协议。两边TFLOPS均按
-`sum(4*S_i^2*D*H)=28.653368 TFLOP`计算。
-
-当前物理GPU4（`fclk=1300MHz,mclk=900MHz`）同一进程、同一输入结果：
-
-| 实现 | median | TFLOPS |
-|---|---:|---:|
-| FlyDSL 4-wave paged varlen | 181.464 ms | 157.901 |
-| AITER Triton varlen | 202.460 ms | 141.526 |
-| AITER ASM group RTNA | 190.815 ms | 150.163 |
-| AITER ASM split RTNA | 182.247 ms | 157.223 |
-
-按吞吐计算，FlyDSL比Triton高11.57%、比group RTNA高5.15%、比split RTNA高0.43%；
-按延迟计算则分别降低10.37%、4.90%和0.43%。绝对值与上表历史数据不可直接横比：镜像、
-AITER二进制和GPU时钟不同；同机表用于实现间公平比较。
-
-仅作跨环境参考：当前FlyDSL `157.901T`比上表历史Triton `149.5T`高5.6%、比历史
-MI308 group RTNA `148.8T`高6.1%，但比替换MI300 `.co`后的历史group RTNA
-`165.0T`低4.3%。该比较不控制镜像、二进制和时钟，不能替代同机表。
-
-接入过程中修复了FlyDSL K手工寻址的多KV-head page stride：物理page跨度需要乘
-`num_kv_heads`。修复后真实H3整包cosine为`0.9999973`、max-abs为`2.44e-4`，7-token
-tail cosine为`1.0000001`、max-abs为`0`。

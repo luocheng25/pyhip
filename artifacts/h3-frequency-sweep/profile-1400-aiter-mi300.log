@@ -1,0 +1,84 @@
+preflight,physical_gpu=4,bdf=0001:0b:00.0,busy=0,vram_mib=283.8,processes=0,dpm=perf_determinism
+config,physical_gpu=4,bdf=0001:0b:00.0,warmup=3,iters=70,impls=asm_mi300,h3_flops=28653368031232
+environment,gpu=AMD Instinct MI308X,arch=gfx942:sramecc+:xnack-,power_cap_w=650.0,numa_balancing=1
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+/sgl-workspace/aiter/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+[aiter] import [module_fmha_v3_varlen_fwd] under /sgl-workspace/aiter/aiter/jit/module_fmha_v3_varlen_fwd.so
+[aiter] type hints mismatch, override to --> fmha_v3_varlen_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, max_seqlen_q: int, max_seqlen_k: int, min_seqlen_q: int, dropout_p: float, softmax_scale: float, logits_soft_cap: float, zero_tensors: bool, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, how_v3_bf16_cvt: int, out: Optional[torch.Tensor] = None, block_table: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None, cu_seqlens_q_padded: Optional[torch.Tensor] = None, cu_seqlens_k_padded: Optional[torch.Tensor] = None) -> List[torch.Tensor]
+[aiter] pciChipId: 0x74a2, CU count: 80
+[aiter] LoadKernel: _ZN5aiter30fmha_fwd_hd128_bf16_rtna_groupE hsaco: /sgl-workspace/aiter/hsa//gfx942/fmha_v3_fwd/MI308/fwd_hd128_bf16_rtna_group.co
+sample,impl,index,elapsed_ms,native_tflops,h3_tflops,sclk_mean_mhz,sclk_min_mhz,sclk_max_mhz,power_mean_w,power_max_w,junction_max_c,mem_max_c,sensor_count
+sample,asm_mi300,0,175.766,163.020,163.020,1409.8,1407.0,1415.0,360.1,418.0,61.0,48.0,17
+sample,asm_mi300,1,175.455,163.309,163.309,1405.9,1405.0,1407.0,439.4,461.0,63.0,48.0,17
+sample,asm_mi300,2,178.680,160.361,160.361,1395.1,1376.0,1405.0,451.3,463.0,65.0,48.0,17
+sample,asm_mi300,3,175.765,163.021,163.021,1398.1,1392.0,1402.0,453.8,468.0,66.0,49.0,17
+sample,asm_mi300,4,175.481,163.285,163.285,1403.4,1402.0,1404.0,457.4,471.0,68.0,49.0,17
+sample,asm_mi300,5,175.404,163.356,163.356,1404.7,1404.0,1405.0,458.5,473.0,69.0,49.0,17
+sample,asm_mi300,6,175.449,163.314,163.314,1405.0,1405.0,1405.0,459.6,474.0,70.0,49.0,17
+sample,asm_mi300,7,175.529,163.240,163.240,1404.6,1404.0,1405.0,458.8,473.0,71.0,49.0,18
+sample,asm_mi300,8,175.526,163.243,163.243,1404.0,1404.0,1404.0,459.4,473.0,72.0,49.0,17
+sample,asm_mi300,9,175.471,163.294,163.294,1404.0,1404.0,1404.0,459.4,473.0,73.0,49.0,17
+sample,asm_mi300,10,175.447,163.317,163.317,1404.9,1404.0,1405.0,458.9,471.0,73.0,49.0,17
+sample,asm_mi300,11,175.492,163.275,163.275,1404.5,1404.0,1405.0,458.0,471.0,74.0,49.0,17
+sample,asm_mi300,12,178.832,160.225,160.225,1392.9,1370.0,1405.0,456.6,467.0,74.0,49.0,17
+sample,asm_mi300,13,175.990,162.812,162.812,1396.9,1389.0,1401.0,455.1,471.0,74.0,49.0,18
+sample,asm_mi300,14,175.564,163.207,163.207,1402.7,1402.0,1403.0,458.8,473.0,75.0,49.0,17
+sample,asm_mi300,15,175.543,163.227,163.227,1404.0,1404.0,1404.0,460.2,474.0,75.0,49.0,17
+sample,asm_mi300,16,175.565,163.206,163.206,1404.0,1404.0,1404.0,460.3,473.0,75.0,49.0,17
+sample,asm_mi300,17,175.570,163.202,163.202,1403.9,1403.0,1404.0,460.3,473.0,76.0,49.0,17
+sample,asm_mi300,18,175.545,163.226,163.226,1404.0,1404.0,1404.0,460.3,473.0,76.0,50.0,17
+sample,asm_mi300,19,175.564,163.207,163.207,1404.0,1404.0,1404.0,460.8,473.0,76.0,50.0,17
+sample,asm_mi300,20,175.535,163.235,163.235,1404.0,1404.0,1404.0,461.0,475.0,76.0,50.0,17
+sample,asm_mi300,21,175.486,163.280,163.280,1404.0,1404.0,1404.0,461.0,475.0,76.0,50.0,17
+sample,asm_mi300,22,175.510,163.258,163.258,1404.6,1404.0,1405.0,461.6,476.0,76.0,50.0,17
+sample,asm_mi300,23,175.533,163.236,163.236,1404.0,1404.0,1404.0,460.8,474.0,76.0,50.0,17
+sample,asm_mi300,24,175.515,163.253,163.253,1404.0,1404.0,1404.0,460.4,474.0,76.0,50.0,17
+sample,asm_mi300,25,175.498,163.269,163.269,1404.0,1404.0,1404.0,460.1,474.0,76.0,50.0,17
+sample,asm_mi300,26,175.548,163.223,163.223,1404.0,1404.0,1404.0,460.9,475.0,77.0,50.0,17
+sample,asm_mi300,27,175.533,163.237,163.237,1404.0,1404.0,1404.0,461.1,474.0,77.0,50.0,17
+sample,asm_mi300,28,175.564,163.207,163.207,1404.0,1404.0,1404.0,461.6,475.0,77.0,50.0,17
+sample,asm_mi300,29,175.516,163.252,163.252,1404.0,1404.0,1404.0,460.8,473.0,77.0,50.0,17
+sample,asm_mi300,30,175.581,163.191,163.191,1403.9,1403.0,1404.0,460.8,474.0,77.0,50.0,17
+sample,asm_mi300,31,175.498,163.269,163.269,1404.0,1404.0,1404.0,461.0,474.0,77.0,50.0,17
+sample,asm_mi300,32,175.519,163.249,163.249,1404.0,1404.0,1404.0,460.7,473.0,77.0,50.0,17
+sample,asm_mi300,33,175.409,163.352,163.352,1404.6,1404.0,1405.0,460.2,474.0,77.0,50.0,17
+sample,asm_mi300,34,178.805,160.249,160.249,1394.9,1372.0,1405.0,457.1,468.0,77.0,50.0,18
+sample,asm_mi300,35,175.782,163.005,163.005,1396.4,1388.0,1401.0,457.0,471.0,77.0,50.0,17
+sample,asm_mi300,36,175.505,163.263,163.263,1403.1,1402.0,1404.0,459.6,473.0,77.0,50.0,17
+sample,asm_mi300,37,175.540,163.230,163.230,1404.0,1404.0,1404.0,459.8,472.0,77.0,50.0,17
+sample,asm_mi300,38,175.433,163.329,163.329,1404.8,1404.0,1405.0,460.5,474.0,77.0,50.0,17
+sample,asm_mi300,39,175.483,163.283,163.283,1404.4,1404.0,1405.0,460.2,474.0,77.0,50.0,17
+sample,asm_mi300,40,175.511,163.257,163.257,1404.0,1404.0,1404.0,459.2,474.0,76.0,50.0,18
+sample,asm_mi300,41,175.554,163.217,163.217,1404.0,1404.0,1404.0,459.5,472.0,76.0,50.0,17
+sample,asm_mi300,42,175.567,163.205,163.205,1404.0,1404.0,1404.0,459.3,473.0,76.0,50.0,17
+sample,asm_mi300,43,175.489,163.277,163.277,1404.0,1404.0,1404.0,460.2,474.0,76.0,50.0,17
+sample,asm_mi300,44,175.518,163.250,163.250,1404.0,1404.0,1404.0,459.9,473.0,76.0,50.0,17
+sample,asm_mi300,45,175.491,163.276,163.276,1404.0,1404.0,1404.0,459.5,472.0,76.0,49.0,17
+sample,asm_mi300,46,175.463,163.301,163.301,1404.1,1404.0,1405.0,460.1,473.0,76.0,49.0,17
+sample,asm_mi300,47,175.653,163.125,163.125,1405.0,1405.0,1405.0,459.5,473.0,76.0,49.0,17
+sample,asm_mi300,48,175.531,163.238,163.238,1404.6,1404.0,1405.0,459.2,472.0,76.0,49.0,17
+sample,asm_mi300,49,175.535,163.235,163.235,1404.0,1404.0,1404.0,457.9,473.0,76.0,49.0,18
+sample,asm_mi300,50,175.535,163.234,163.234,1404.0,1404.0,1404.0,459.5,473.0,76.0,49.0,17
+sample,asm_mi300,51,175.497,163.270,163.270,1404.1,1404.0,1405.0,459.4,473.0,76.0,49.0,17
+sample,asm_mi300,52,175.623,163.153,163.153,1403.8,1403.0,1404.0,458.6,471.0,76.0,49.0,17
+sample,asm_mi300,53,175.546,163.225,163.225,1404.0,1404.0,1404.0,458.7,472.0,76.0,49.0,17
+sample,asm_mi300,54,175.634,163.143,163.143,1403.8,1403.0,1404.0,458.5,471.0,76.0,49.0,17
+sample,asm_mi300,55,175.616,163.159,163.159,1403.0,1403.0,1403.0,459.0,471.0,76.0,49.0,17
+sample,asm_mi300,56,175.553,163.218,163.218,1404.0,1404.0,1404.0,458.5,471.0,76.0,49.0,17
+sample,asm_mi300,57,175.530,163.239,163.239,1404.0,1404.0,1404.0,458.0,472.0,75.0,49.0,17
+sample,asm_mi300,58,175.512,163.256,163.256,1404.0,1404.0,1404.0,457.3,472.0,75.0,49.0,18
+sample,asm_mi300,59,175.463,163.302,163.302,1404.0,1404.0,1404.0,457.9,471.0,75.0,49.0,17
+sample,asm_mi300,60,178.795,160.259,160.259,1394.2,1373.0,1405.0,455.1,465.0,75.0,49.0,17
+sample,asm_mi300,61,175.747,163.037,163.037,1398.2,1391.0,1402.0,454.5,469.0,75.0,49.0,17
+sample,asm_mi300,62,175.445,163.318,163.318,1403.6,1403.0,1404.0,457.2,470.0,75.0,49.0,17
+sample,asm_mi300,63,175.476,163.289,163.289,1404.5,1404.0,1405.0,457.5,471.0,75.0,49.0,17
+sample,asm_mi300,64,175.459,163.305,163.305,1404.6,1404.0,1405.0,456.3,470.0,75.0,49.0,18
+sample,asm_mi300,65,175.479,163.287,163.287,1404.6,1404.0,1405.0,457.3,471.0,75.0,49.0,17
+sample,asm_mi300,66,175.559,163.212,163.212,1404.0,1404.0,1404.0,457.5,471.0,75.0,49.0,17
+sample,asm_mi300,67,175.492,163.275,163.275,1404.1,1404.0,1405.0,457.6,471.0,75.0,48.0,17
+sample,asm_mi300,68,175.517,163.251,163.251,1404.6,1404.0,1405.0,457.2,469.0,75.0,48.0,17
+sample,asm_mi300,69,175.546,163.224,163.224,1404.0,1404.0,1404.0,457.3,470.0,75.0,48.0,17
+throttle,asm_mi300,{"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+output,/host_root/luocheng/pyhip/artifacts/h3-frequency-sweep/profile-1400-aiter-mi300.json

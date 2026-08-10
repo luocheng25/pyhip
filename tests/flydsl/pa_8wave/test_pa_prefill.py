@@ -1,12 +1,31 @@
-import torch
 import math
+import os
+import statistics
+import sys
+from pathlib import Path
 
-import aiter
-from aiter import dtypes, pertoken_quant, per_tensor_quant
+import torch
+
 import pyhip
 from dataclasses import dataclass
 
 from pa_prefill_8w32x32 import MHA
+
+FLYDSL_TEST_DIR = Path(__file__).resolve().parents[1]
+if str(FLYDSL_TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(FLYDSL_TEST_DIR))
+
+from h3_paged_inputs import (
+    FP8_DTYPE,
+    H3_FLOPS,
+    H3_HEAD_DIM,
+    H3_HEADS,
+    H3_SEGMENTS,
+    bind_h3_kernel,
+    compare_outputs,
+    h3_dequantized_sdpa_reference,
+    make_h3_paged_inputs,
+)
 
 
 def vectorize_kv_cache(
@@ -56,7 +75,7 @@ class ModelConfig:
     head_dim_qk: int
     head_dim_v: int
     page_size: int = 32
-    quant_dtype = dtypes.fp8
+    quant_dtype: torch.dtype = FP8_DTYPE
     is_causal: bool = True
 
 def test_pa_prefill(
@@ -112,6 +131,8 @@ def test_pa_prefill(
         dtype=torch.bfloat16,
     ) # [num_pages, page_size, num_kv_heads, head_dim_v]
     if quant_dtype != torch.bfloat16:
+        from aiter import per_tensor_quant, pertoken_quant
+
         q_fp8, q_descale = pertoken_quant(q_bf16, quant_dtype=quant_dtype)
         k_fp8, k_descale = per_tensor_quant(k_bf16, quant_dtype=quant_dtype)
         v_fp8, v_descale = per_tensor_quant(v_bf16, quant_dtype=quant_dtype)
@@ -233,19 +254,84 @@ def test_pa_prefill(
     assert diff < 0.001, f"big diff: {diff}"
     #verify_fp8_output()
 
-multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
-modelcfg = ModelConfig("Llama3_70B_TP8", num_qo_heads=8, num_kv_heads=1, head_dim_qk=128, head_dim_v=128)
-modelcfg = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
+def make_h3_inputs(dtype=FP8_DTYPE, inputs=None):
+    inputs = make_h3_paged_inputs(dtype=dtype) if inputs is None else inputs
+    output, launch = bind_h3_kernel(MHA, inputs)
+    return (
+        inputs.q,
+        inputs.k_packed,
+        inputs.v_packed,
+        inputs.cu_seqlens,
+        output,
+        launch,
+    )
 
-if 1:
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=3, is_causal = False)
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=13, is_causal = False)
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=23, is_causal = False)
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=53, is_causal = False)
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=83, is_causal = False)
-    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=256*10+23, is_causal = False)
 
-    test_pa_prefill(modelcfg, 4, 256*40, 256*10, is_causal = False)
+def run_h3_benchmark(dtype=FP8_DTYPE):
+    inputs = make_h3_paged_inputs(dtype=dtype)
+    _, _, _, _, output, launch = make_h3_inputs(dtype=dtype, inputs=inputs)
+    for _ in range(3):
+        launch()
+    torch.cuda.synchronize()
 
-test_pa_prefill(modelcfg, 1, 32768, 32768, is_causal=True)
+    samples_ms = []
+    for _ in range(10):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        launch()
+        stop.record()
+        stop.synchronize()
+        samples_ms.append(start.elapsed_time(stop))
+
+    median_ms = statistics.median(samples_ms)
+    tflops = H3_FLOPS / (median_ms * 1e9)
+    print(
+        f"[h3:8wave:{str(dtype).split('.')[-1]}] median={median_ms:.3f} ms "
+        f"min={min(samples_ms):.3f} ms max={max(samples_ms):.3f} ms "
+        f"tflops={tflops:.3f}"
+    )
+    assert torch.isfinite(output).all()
+    if dtype == FP8_DTYPE and os.environ.get("PA_SKIP_REFERENCE") != "1":
+        reference = h3_dequantized_sdpa_reference(inputs)
+        whole = compare_outputs(reference, output)
+        tail = compare_outputs(reference[H3_SEGMENTS[0] :], output[H3_SEGMENTS[0] :])
+        print(f"[h3:accuracy:whole] {whole}")
+        print(f"[h3:accuracy:tail] {tail}")
+        assert whole["finite"] and whole["cosine"] > 0.998
+        assert whole["rel_l2"] < 0.06
+        assert tail["finite"] and tail["cosine"] > 0.998
+    return median_ms, tflops
+
+
+def main():
+    selected = os.environ.get("PA_CASE", "all")
+    dtype_name = os.environ.get("PA_DTYPE", "fp8")
+    if dtype_name not in ("fp8", "bf16"):
+        raise ValueError(f"unknown PA_DTYPE={dtype_name!r}; expected 'fp8' or 'bf16'")
+    dtype = FP8_DTYPE if dtype_name == "fp8" else torch.bfloat16
+    if selected == "h3":
+        run_h3_benchmark(dtype)
+        return
+    if selected != "all":
+        raise ValueError(f"unknown PA_CASE={selected!r}; expected 'h3' or 'all'")
+
+    model_config = ModelConfig(
+        "MiMo_TP8",
+        num_qo_heads=16,
+        num_kv_heads=1,
+        head_dim_qk=192,
+        head_dim_v=128,
+        quant_dtype=dtype,
+    )
+    for kv_len in (3, 13, 23, 53, 83, 256 * 10 + 23):
+        test_pa_prefill(
+            model_config, 1, qo_len=256 * 40, kv_len=kv_len, is_causal=False
+        )
+    test_pa_prefill(model_config, 4, 256 * 40, 256 * 10, is_causal=False)
+    test_pa_prefill(model_config, 1, 32768, 32768, is_causal=True)
+
+
+if __name__ == "__main__":
+    main()

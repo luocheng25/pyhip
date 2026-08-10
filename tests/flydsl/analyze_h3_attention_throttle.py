@@ -48,6 +48,38 @@ def wall_start_seconds(rows):
     return starts
 
 
+def arithmetic_mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def complete_cycles(rows, starts, wall_starts):
+    cycles = []
+    for cycle_index, (begin, end) in enumerate(zip(starts, starts[1:])):
+        cycle_rows = rows[begin:end]
+        cycles.append(
+            {
+                "cycle_index": cycle_index,
+                "dispatch_start": begin,
+                "dispatch_end": end - 1,
+                "dispatch_count": len(cycle_rows),
+                "period_seconds": wall_starts[end] - wall_starts[begin],
+                "mean_elapsed_ms": arithmetic_mean(
+                    [row["elapsed_ms"] for row in cycle_rows]
+                ),
+                "mean_h3_tflops": arithmetic_mean(
+                    [row["h3_tflops"] for row in cycle_rows]
+                ),
+                "mean_sclk_mhz": arithmetic_mean(
+                    [row["sclk_mean_mhz"] for row in cycle_rows]
+                ),
+                "mean_power_w": arithmetic_mean(
+                    [row["power_mean_w"] for row in cycle_rows]
+                ),
+            }
+        )
+    return cycles
+
+
 def analyze_result(result, high_fraction):
     rows = result["dispatches"]
     if not rows:
@@ -79,12 +111,17 @@ def analyze_result(result, high_fraction):
         and bool(dispatch_intervals)
         and max(dispatch_intervals) - min(dispatch_intervals) <= 2
     )
+    cycles = complete_cycles(rows, starts, wall_starts) if cycle_detected else []
 
     peak_index = max(range(len(rows)), key=lambda index: tflops[index])
     floor_index = min(range(len(rows)), key=lambda index: tflops[index])
     return {
         "name": result["name"],
         "sample_count": len(rows),
+        "mean_elapsed_ms": arithmetic_mean([row["elapsed_ms"] for row in rows]),
+        "mean_h3_tflops": arithmetic_mean(tflops),
+        "mean_sclk_mhz": arithmetic_mean(sclk),
+        "mean_power_w": arithmetic_mean(power),
         "peak": {
             "index": peak_index,
             "h3_tflops": tflops[peak_index],
@@ -103,6 +140,12 @@ def analyze_result(result, high_fraction):
         "high_run_starts": starts,
         "dispatch_intervals": dispatch_intervals,
         "time_intervals_seconds": time_intervals,
+        "complete_cycles": cycles,
+        "incomplete_tail": (
+            {"dispatch_start": starts[-1], "dispatch_end": len(rows) - 1}
+            if cycle_detected
+            else None
+        ),
         "cycle_detected": cycle_detected,
         "throttle_delta": result.get("throttle_delta", {}),
     }
@@ -130,6 +173,7 @@ def print_analysis(analyses):
         print(f"\n[{analysis['name']}]")
         print(
             f"samples={analysis['sample_count']} "
+            f"mean={analysis['mean_elapsed_ms']:.3f}ms/{analysis['mean_h3_tflops']:.3f}T "
             f"peak={peak['h3_tflops']:.3f}T@{peak['index']}/{peak['elapsed_ms']:.3f}ms "
             f"floor={floor['h3_tflops']:.3f}T@{floor['index']}/{floor['elapsed_ms']:.3f}ms "
             f"drop={analysis['peak_to_floor_drop_percent']:.2f}%"
@@ -152,6 +196,22 @@ def print_analysis(analyses):
             + str([round(value, 4) for value in analysis["time_intervals_seconds"]])
         )
         print(f"cycle_detected={analysis['cycle_detected']}")
+        if not analysis["cycle_detected"]:
+            print("complete_cycles=none (no repeatable cycle detected)")
+        for cycle in analysis["complete_cycles"]:
+            print(
+                f"cycle={cycle['cycle_index']} "
+                f"dispatches={cycle['dispatch_start']}-{cycle['dispatch_end']} "
+                f"count={cycle['dispatch_count']} period={cycle['period_seconds']:.4f}s "
+                f"mean={cycle['mean_elapsed_ms']:.3f}ms/{cycle['mean_h3_tflops']:.3f}T "
+                f"sclk={cycle['mean_sclk_mhz']:.1f}MHz power={cycle['mean_power_w']:.1f}W"
+            )
+        if analysis["incomplete_tail"]:
+            tail = analysis["incomplete_tail"]
+            print(
+                f"incomplete_tail={tail['dispatch_start']}-{tail['dispatch_end']} "
+                "(excluded from complete-cycle summaries)"
+            )
         print(f"throttle_delta={json.dumps(analysis['throttle_delta'], sort_keys=True)}")
 
 

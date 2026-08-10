@@ -1,0 +1,34 @@
+
+[8wave_varlen_fp8]
+samples=70 mean=88.849ms/324.183T peak=343.722T@1/83.362ms floor=286.842T@10/99.892ms drop=16.55%
+corr_tflops_sclk=0.7642 corr_tflops_power=0.6250
+high_threshold=323.814T high_runs=[[0, 6], [11, 18], [23, 29], [34, 40], [46, 52], [57, 63], [68, 69]]
+dispatch_intervals=[11, 12, 11, 12, 11, 11]
+time_intervals_seconds=[0.9771, 1.0728, 0.9813, 1.0664, 0.9819, 0.9798]
+cycle_detected=True
+cycle=0 dispatches=0-10 count=11 period=0.9771s mean=88.692ms/325.089T sclk=1688.8MHz power=522.2W
+cycle=1 dispatches=11-22 count=12 period=1.0728s mean=89.258ms/322.843T sclk=1673.9MHz power=539.6W
+cycle=2 dispatches=23-33 count=11 period=0.9813s mean=89.082ms/323.512T sclk=1693.0MHz power=548.0W
+cycle=3 dispatches=34-45 count=12 period=1.0664s mean=88.727ms/324.537T sclk=1683.6MHz power=542.7W
+cycle=4 dispatches=46-56 count=11 period=0.9819s mean=89.076ms/323.209T sclk=1693.1MHz power=549.2W
+cycle=5 dispatches=57-67 count=11 period=0.9798s mean=88.911ms/323.733T sclk=1692.9MHz power=547.9W
+incomplete_tail=68-69 (excluded from complete-cycle summaries)
+throttle_delta={"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+
+[4wave_varlen_fp8]
+samples=70 mean=89.014ms/323.392T peak=339.916T@6/84.295ms floor=286.527T@20/100.002ms drop=15.71%
+corr_tflops_sclk=0.7138 corr_tflops_power=0.5927
+high_threshold=321.230T high_runs=[[0, 7], [11, 18], [23, 30], [34, 41], [46, 52], [57, 63], [68, 69]]
+dispatch_intervals=[11, 12, 11, 12, 11, 11]
+time_intervals_seconds=[0.9906, 1.0764, 0.982, 1.0713, 0.9825, 0.9826]
+cycle_detected=True
+cycle=0 dispatches=0-10 count=11 period=0.9906s mean=88.840ms/324.145T sclk=1687.1MHz power=544.1W
+cycle=1 dispatches=11-22 count=12 period=1.0764s mean=89.492ms/321.584T sclk=1690.2MHz power=563.9W
+cycle=2 dispatches=23-33 count=11 period=0.9820s mean=89.051ms/323.448T sclk=1705.0MHz power=572.3W
+cycle=3 dispatches=34-45 count=12 period=1.0713s mean=89.073ms/323.051T sclk=1689.7MHz power=564.0W
+cycle=4 dispatches=46-56 count=11 period=0.9825s mean=89.163ms/322.989T sclk=1701.1MHz power=569.3W
+cycle=5 dispatches=57-67 count=11 period=0.9826s mean=89.145ms/322.831T sclk=1703.5MHz power=570.7W
+incomplete_tail=68-69 (excluded from complete-cycle summaries)
+throttle_delta={"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+
+analysis_output=artifacts/h3-fp8-auto/analysis-auto-fp8.json

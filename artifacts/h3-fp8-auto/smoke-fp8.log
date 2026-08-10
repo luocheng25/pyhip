@@ -1,0 +1,12 @@
+preflight,physical_gpu=4,bdf=0001:0b:00.0,busy=0,vram_mib=284.1,processes=0,dpm=auto
+config,physical_gpu=4,bdf=0001:0b:00.0,warmup=1,iters=2,impls=8wave_varlen_fp8,4wave_varlen_fp8,h3_flops=28653368031232
+environment,gpu=AMD Instinct MI308X,arch=gfx942:sramecc+:xnack-,power_cap_w=650.0,numa_balancing=1
+sample,impl,index,elapsed_ms,native_tflops,h3_tflops,sclk_mean_mhz,sclk_min_mhz,sclk_max_mhz,power_mean_w,power_max_w,junction_max_c,mem_max_c,sensor_count
+sample,8wave_varlen_fp8,0,88.983,322.010,322.010,1552.9,1504.0,1612.0,344.4,419.0,53.0,44.0,8
+sample,8wave_varlen_fp8,1,83.782,342.000,342.000,1675.8,1631.0,1712.0,475.9,514.0,55.0,44.0,8
+throttle,8wave_varlen_fp8,{"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+sample,impl,index,elapsed_ms,native_tflops,h3_tflops,sclk_mean_mhz,sclk_min_mhz,sclk_max_mhz,power_mean_w,power_max_w,junction_max_c,mem_max_c,sensor_count
+sample,4wave_varlen_fp8,0,84.385,339.555,339.555,1583.1,1500.0,1649.0,355.2,436.0,56.0,44.0,8
+sample,4wave_varlen_fp8,1,83.943,341.345,341.345,1698.2,1663.0,1727.0,494.1,531.0,58.0,45.0,8
+throttle,4wave_varlen_fp8,{"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+output,artifacts/h3-fp8-auto/smoke-fp8.json

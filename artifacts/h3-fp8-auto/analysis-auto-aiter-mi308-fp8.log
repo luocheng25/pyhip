@@ -1,0 +1,22 @@
+
+[triton_fp8]
+samples=70 mean=162.697ms/176.124T peak=177.692T@34/161.253ms floor=169.037T@26/169.509ms drop=4.87%
+corr_tflops_sclk=0.1848 corr_tflops_power=-0.0232
+high_threshold=174.663T high_runs=[[0, 7], [9, 25], [27, 51], [53, 61], [63, 69]]
+dispatch_intervals=[9, 18, 26, 10]
+time_intervals_seconds=[1.4679, 2.9366, 4.2307, 1.6274]
+cycle_detected=False
+complete_cycles=none (no repeatable cycle detected)
+throttle_delta={"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+
+[asm_mi308_fp8]
+samples=70 mean=111.539ms/256.903T peak=257.612T@27/111.227ms floor=245.584T@17/116.675ms drop=4.67%
+corr_tflops_sclk=0.1742 corr_tflops_power=0.0221
+high_threshold=253.402T high_runs=[[0, 16], [18, 18], [20, 27], [29, 69]]
+dispatch_intervals=[18, 2, 9]
+time_intervals_seconds=[2.0118, 0.2251, 1.0045]
+cycle_detected=False
+complete_cycles=none (no repeatable cycle detected)
+throttle_delta={"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+
+analysis_output=artifacts/h3-fp8-auto/analysis-auto-aiter-mi308-fp8.json

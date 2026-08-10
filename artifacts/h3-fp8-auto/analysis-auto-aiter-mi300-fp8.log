@@ -1,0 +1,18 @@
+
+[asm_mi300_fp8]
+samples=70 mean=90.096ms/319.019T peak=330.317T@7/86.745ms floor=283.178T@9/101.185ms drop=14.27%
+corr_tflops_sclk=0.6863 corr_tflops_power=0.4923
+high_threshold=313.818T high_runs=[[0, 7], [11, 18], [22, 29], [33, 40], [44, 52], [55, 63], [66, 69]]
+dispatch_intervals=[11, 11, 11, 11, 11, 11]
+time_intervals_seconds=[0.9939, 0.9932, 0.9931, 0.9943, 0.994, 0.9933]
+cycle_detected=True
+cycle=0 dispatches=0-10 count=11 period=0.9939s mean=90.248ms/318.662T sclk=1715.5MHz power=528.8W
+cycle=1 dispatches=11-21 count=11 period=0.9932s mean=90.198ms/318.778T sclk=1721.5MHz power=555.7W
+cycle=2 dispatches=22-32 count=11 period=0.9931s mean=90.174ms/318.775T sclk=1721.0MHz power=558.1W
+cycle=3 dispatches=33-43 count=11 period=0.9943s mean=90.274ms/318.396T sclk=1720.8MHz power=558.8W
+cycle=4 dispatches=44-54 count=11 period=0.9940s mean=90.242ms/318.507T sclk=1722.7MHz power=559.9W
+cycle=5 dispatches=55-65 count=11 period=0.9933s mean=90.179ms/318.681T sclk=1721.3MHz power=560.1W
+incomplete_tail=66-69 (excluded from complete-cycle summaries)
+throttle_delta={"accumulation_counter": null, "hbm_thermal_accumulated": null, "ppt_accumulated": null, "prochot_accumulated": null, "socket_thermal_accumulated": null, "vr_thermal_accumulated": null}
+
+analysis_output=artifacts/h3-fp8-auto/analysis-auto-aiter-mi300-fp8.json

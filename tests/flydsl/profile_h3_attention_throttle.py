@@ -7,6 +7,7 @@
 import json
 import hashlib
 import importlib.metadata
+import importlib.util
 import os
 import platform
 import statistics
@@ -22,8 +23,12 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 PA4_DIR = HERE / "pa_4wave"
+PA8_DIR = HERE / "pa_8wave"
+ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(PA8_DIR))
 sys.path.insert(0, str(PA4_DIR))
+sys.path.insert(0, str(ROOT))
 
 H3_SEGMENTS = (63225, 7)
 H3_HEADS = 14
@@ -47,8 +52,21 @@ SOURCE_FILES = (
     HERE / "test_attn_gemm.py",
     PA4_DIR / "test_pa_prefill.py",
     PA4_DIR / "pa_prefill_4wave.py",
+    PA4_DIR / "h3_attn_kernel_test.py",
+    PA8_DIR / "test_pa_prefill.py",
+    PA8_DIR / "pa_prefill_8w32x32.py",
+    HERE / "h3_paged_inputs.py",
+    HERE / "h3_aiter_fp8.py",
     HERE.parents[1] / "src" / "contrib" / "flydsl" / "helpers.py",
 )
+AITER_ASM_NAMES = (
+    "asm_mi308",
+    "asm_mi300",
+    "asm_mi308_fp8",
+    "asm_mi300_fp8",
+)
+AITER_ASM_FILENAME = "fwd_hd128_bf16_rtna_group.co"
+AITER_ASM_FP8_FILENAME = "fwd_hd128_fp8_group.co"
 
 
 def run_command(command):
@@ -113,6 +131,73 @@ def source_hashes():
         str(path.relative_to(HERE.parents[1])): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in SOURCE_FILES
     }
+
+
+def file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def aiter_attention_binaries():
+    spec = importlib.util.find_spec("aiter")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("cannot locate AITER installation")
+    aiter_root = Path(spec.origin).resolve().parents[1]
+    fmha_root = aiter_root / "hsa" / "gfx942" / "fmha_v3_fwd"
+    mi308_reference = os.environ.get("ATTN_PROFILE_MI308_REFERENCE")
+    mi308_fp8_reference = os.environ.get("ATTN_PROFILE_MI308_FP8_REFERENCE")
+    paths = {
+        "active_mi308_path": fmha_root / "MI308" / AITER_ASM_FILENAME,
+        "mi308_source": (
+            Path(mi308_reference)
+            if mi308_reference
+            else fmha_root / "MI308" / AITER_ASM_FILENAME
+        ),
+        "mi300_source": fmha_root / "MI300" / AITER_ASM_FILENAME,
+        "active_mi308_fp8_path": fmha_root / "MI308" / AITER_ASM_FP8_FILENAME,
+        "mi308_fp8_source": (
+            Path(mi308_fp8_reference)
+            if mi308_fp8_reference
+            else fmha_root / "MI308" / AITER_ASM_FP8_FILENAME
+        ),
+        "mi300_fp8_source": fmha_root / "MI300" / AITER_ASM_FP8_FILENAME,
+    }
+    metadata = {}
+    for name, path in paths.items():
+        metadata[name] = {
+            "path": str(path),
+            "sha256": file_sha256(path) if path.is_file() else None,
+        }
+    return metadata
+
+
+def require_aiter_asm_variant(selected, metadata):
+    variants = [name for name in selected if name in AITER_ASM_NAMES]
+    if len(variants) > 1:
+        raise RuntimeError(
+            "profile asm_mi308 and asm_mi300 in separate processes so AITER cannot reuse "
+            "an already-loaded code object"
+        )
+    if not variants:
+        return
+
+    variant = variants[0]
+    is_fp8 = variant.endswith("_fp8")
+    is_mi308 = variant.startswith("asm_mi308")
+    active_key = "active_mi308_fp8_path" if is_fp8 else "active_mi308_path"
+    if is_fp8:
+        source_key = "mi308_fp8_source" if is_mi308 else "mi300_fp8_source"
+    else:
+        source_key = "mi308_source" if is_mi308 else "mi300_source"
+    active = metadata[active_key]
+    source = metadata[source_key]
+    if not active["sha256"] or not source["sha256"]:
+        raise RuntimeError(f"missing AITER ASM binary: active={active} source={source}")
+    if active["sha256"] != source["sha256"]:
+        raise RuntimeError(
+            f"{variant} requested, but AITER's active MI308 path has sha256 "
+            f"{active['sha256']} instead of {source['sha256']}; install the requested "
+            "binary before starting this process"
+        )
 
 
 def physical_gpu_index():
@@ -390,18 +475,48 @@ def bind_compiled_launch(kernel, args):
     return lambda: kernel(*args)
 
 
-def prepare_launchers(selected):
-    import test_attn_8wave_32x32_lkgv as attn_8wave_32x32
-    import test_attn_8wave_lkgv as attn_8wave_lkgv
-    import test_attn_gemm as attn_gemm
-    from test_pa_prefill import make_h3_inputs
+def bind_aiter_launch(runner, args):
+    return lambda: runner(*args)
 
+
+def install_flydsl_compatibility():
+    import flydsl.expr.typing as fly_typing
+    import pyhip
+
+    src_package = str(HERE.parents[1] / "src")
+    if src_package not in pyhip.__path__:
+        pyhip.__path__.append(src_package)
+    import pyhip.misc as pyhip_misc
+
+    if not hasattr(fly_typing, "as_ir_value"):
+        def as_ir_value(value):
+            return value.ir_value() if hasattr(value, "ir_value") else value
+
+        fly_typing.as_ir_value = as_ir_value
+    for name in pyhip_misc.__all__:
+        if not hasattr(pyhip, name):
+            setattr(pyhip, name, getattr(pyhip_misc, name))
+
+
+def prepare_launchers(selected):
+    flydsl_names = {
+        "8wave_lkgv",
+        "8wave_32x32",
+        "4wave_dense",
+        "4wave_varlen",
+        "8wave_varlen_fp8",
+        "4wave_varlen_fp8",
+    }
+    if any(name in flydsl_names for name in selected):
+        install_flydsl_compatibility()
     stream = torch.cuda.current_stream()
     launchers = {}
     if any(name in selected for name in ("8wave_lkgv", "8wave_32x32", "4wave_dense")):
         q, k, v = make_dense_inputs()
 
     if "8wave_lkgv" in selected:
+        import test_attn_8wave_lkgv as attn_8wave_lkgv
+
         output = torch.empty_like(q)
         kernel = attn_8wave_lkgv.MHA(H3_HEADS, H3_HEAD_DIM, 256, 32)
         kernel(q, k, v, output, stream)
@@ -412,6 +527,8 @@ def prepare_launchers(selected):
         )
 
     if "8wave_32x32" in selected:
+        import test_attn_8wave_32x32_lkgv as attn_8wave_32x32
+
         output = torch.empty_like(q)
         kernel = attn_8wave_32x32.MHA(H3_HEADS, H3_HEAD_DIM, 256, 32)
         kernel(q, k, v, output, stream)
@@ -422,6 +539,8 @@ def prepare_launchers(selected):
         )
 
     if "4wave_dense" in selected:
+        import test_attn_gemm as attn_gemm
+
         output = torch.empty_like(q)
         args = (q, k, v, output, stream)
         kernel = attn_gemm.fly_compiled(
@@ -433,24 +552,98 @@ def prepare_launchers(selected):
         launchers["4wave_dense"] = (bind_compiled_launch(kernel, args), DENSE_FLOPS)
 
     if "4wave_varlen" in selected:
+        from test_pa_prefill import make_h3_inputs
+
         *_, launch = make_h3_inputs()
         launch()
         torch.cuda.synchronize()
         launchers["4wave_varlen"] = (launch, H3_FLOPS)
 
+    fp8_names = {"8wave_varlen_fp8", "4wave_varlen_fp8"}
+    if any(name in fp8_names for name in selected):
+        from h3_paged_inputs import FP8_DTYPE, bind_h3_kernel, make_h3_paged_inputs
+
+        fp8_inputs = make_h3_paged_inputs(dtype=FP8_DTYPE)
+        if "8wave_varlen_fp8" in selected:
+            from pa_prefill_8w32x32 import MHA as MHA8Wave
+
+            _, launch = bind_h3_kernel(MHA8Wave, fp8_inputs)
+            launch()
+            torch.cuda.synchronize()
+            launchers["8wave_varlen_fp8"] = (launch, H3_FLOPS)
+        if "4wave_varlen_fp8" in selected:
+            from pa_prefill_4wave import MHA as MHA4Wave
+
+            _, launch = bind_h3_kernel(MHA4Wave, fp8_inputs)
+            launch()
+            torch.cuda.synchronize()
+            launchers["4wave_varlen_fp8"] = (launch, H3_FLOPS)
+
+    aiter_names = {"triton", *AITER_ASM_NAMES}
+    bf16_aiter_names = {"triton", "asm_mi308", "asm_mi300"}
+    if any(name in bf16_aiter_names for name in selected):
+        from h3_attn_kernel_test import (
+            H3_CASE,
+            make_inputs,
+            run_asm_group,
+            run_triton,
+        )
+
+        q, k, v, cu = make_inputs(H3_CASE, torch.device("cuda"))
+        scale = H3_HEAD_DIM ** -0.5
+        if "triton" in selected:
+            args = (q, k, v, cu, H3_CASE, scale, 1)
+            run_triton(*args)
+            torch.cuda.synchronize()
+            launchers["triton"] = (bind_aiter_launch(run_triton, args), H3_FLOPS)
+        for name in AITER_ASM_NAMES:
+            if name in selected and not name.endswith("_fp8"):
+                args = (q, k, v, cu, H3_CASE, scale, 1)
+                run_asm_group(*args)
+                torch.cuda.synchronize()
+                launchers[name] = (bind_aiter_launch(run_asm_group, args), H3_FLOPS)
+
+    fp8_aiter_names = {"triton_fp8", "asm_mi308_fp8", "asm_mi300_fp8"}
+    if any(name in fp8_aiter_names for name in selected):
+        from h3_aiter_fp8 import make_asm_fp8_launcher, make_triton_fp8_launcher
+        from h3_paged_inputs import make_h3_linear_fp8_inputs
+
+        fp8_inputs = make_h3_linear_fp8_inputs()
+        if "triton_fp8" in selected:
+            launch, _ = make_triton_fp8_launcher(fp8_inputs)
+            launch()
+            torch.cuda.synchronize()
+            launchers["triton_fp8"] = (launch, H3_FLOPS)
+        for name in ("asm_mi308_fp8", "asm_mi300_fp8"):
+            if name in selected:
+                launch, _ = make_asm_fp8_launcher(fp8_inputs)
+                launch()
+                torch.cuda.synchronize()
+                launchers[name] = (launch, H3_FLOPS)
+
     return launchers
 
 
 def collect_environment(physical_gpu, bdf, selected, warmup, iters):
-    import aiter
     import flydsl
     import pyhip
 
+    aiter_names = {"triton", "triton_fp8", *AITER_ASM_NAMES}
+    uses_aiter = any(name in aiter_names for name in selected)
+    aiter_spec = importlib.util.find_spec("aiter")
+    aiter_file = (
+        str(Path(aiter_spec.origin).resolve())
+        if aiter_spec is not None and aiter_spec.origin is not None
+        else "unavailable"
+    )
     pci_path = Path("/sys/bus/pci/devices") / bdf
     sensor_metadata = SensorSampler(
         bdf, float(os.environ.get("ATTN_PROFILE_SENSOR_INTERVAL_MS", "10")) / 1e3
     ).metadata
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    aiter_binaries = aiter_attention_binaries() if uses_aiter else {}
+    if uses_aiter:
+        require_aiter_asm_variant(selected, aiter_binaries)
     return {
         "python": {
             "executable": sys.executable,
@@ -463,16 +656,21 @@ def collect_environment(physical_gpu, bdf, selected, warmup, iters):
             "flydsl": package_version("flydsl"),
             "pyhip": package_version("pyhip"),
             "numpy": package_version("numpy"),
-            "aiter": package_version("aiter"),
+            "aiter": package_version("amd-aiter"),
             "flydsl_file": str(Path(flydsl.__file__).resolve()),
             "pyhip_paths": [str(Path(path).resolve()) for path in pyhip.__path__],
-            "aiter_file": str(Path(aiter.__file__).resolve()),
+            "aiter_file": aiter_file,
         },
         "repositories": {
             "pyhip": git_state(HERE.parents[1]),
             "flydsl": git_state(Path(flydsl.__file__).resolve().parents[2]),
-            "aiter": git_state(Path(aiter.__file__).resolve().parent),
+            "aiter": (
+                git_state(Path(aiter_file).parent)
+                if aiter_file != "unavailable"
+                else {"error": "unavailable"}
+            ),
         },
+        "aiter_attention_binaries": aiter_binaries,
         "source_sha256": source_hashes(),
         "gpu": {
             "physical_index": physical_gpu,
@@ -519,6 +717,28 @@ def collect_environment(physical_gpu, bdf, selected, warmup, iters):
             "selected": selected,
             "warmup": warmup,
             "iters": iters,
+            "h3_input_dtype": (
+                "fp8_e4m3fnuz"
+                if any(name.endswith("_fp8") for name in selected)
+                else "bf16"
+            ),
+            "h3_quantization": (
+                "qkv_per_tensor"
+                if any(
+                    name in {"triton_fp8", "asm_mi308_fp8", "asm_mi300_fp8"}
+                    for name in selected
+                )
+                else (
+                    "q_per_token_kv_per_tensor"
+                    if any(name in {"8wave_varlen_fp8", "4wave_varlen_fp8"} for name in selected)
+                    else None
+                )
+            ),
+            "requested_sclk_mhz": (
+                int(os.environ["ATTN_PROFILE_REQUESTED_SCLK_MHZ"])
+                if "ATTN_PROFILE_REQUESTED_SCLK_MHZ" in os.environ
+                else None
+            ),
             "sensor_interval_ms": float(
                 os.environ.get("ATTN_PROFILE_SENSOR_INTERVAL_MS", "10")
             ),
@@ -548,6 +768,16 @@ def main():
     selected = os.environ.get(
         "ATTN_PROFILE_IMPLS", "8wave_lkgv,8wave_32x32,4wave_dense,4wave_varlen"
     ).split(",")
+    flydsl_names = {
+        "8wave_lkgv",
+        "8wave_32x32",
+        "4wave_dense",
+        "4wave_varlen",
+        "8wave_varlen_fp8",
+        "4wave_varlen_fp8",
+    }
+    if any(name in flydsl_names for name in selected):
+        install_flydsl_compatibility()
     output_path = Path(
         os.environ.get("ATTN_PROFILE_OUTPUT", "/tmp/h3_attention_throttle_profile.json")
     )

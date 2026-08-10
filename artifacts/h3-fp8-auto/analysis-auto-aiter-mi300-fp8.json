@@ -1,0 +1,160 @@
+[
+  {
+    "name": "asm_mi300_fp8",
+    "sample_count": 70,
+    "mean_elapsed_ms": 90.09612404959542,
+    "mean_h3_tflops": 319.01898683797526,
+    "mean_sclk_mhz": 1719.4728174603172,
+    "mean_power_w": 553.4101190476191,
+    "peak": {
+      "index": 7,
+      "h3_tflops": 330.31727666413224,
+      "elapsed_ms": 86.74498748779297
+    },
+    "floor": {
+      "index": 9,
+      "h3_tflops": 283.17777137801744,
+      "elapsed_ms": 101.18508911132812
+    },
+    "peak_to_floor_drop_percent": 14.270977819318365,
+    "correlation_tflops_sclk": 0.686340670717346,
+    "correlation_tflops_power": 0.49225749854254597,
+    "high_threshold_tflops": 313.81844981399206,
+    "high_runs": [
+      [
+        0,
+        7
+      ],
+      [
+        11,
+        18
+      ],
+      [
+        22,
+        29
+      ],
+      [
+        33,
+        40
+      ],
+      [
+        44,
+        52
+      ],
+      [
+        55,
+        63
+      ],
+      [
+        66,
+        69
+      ]
+    ],
+    "high_run_starts": [
+      0,
+      11,
+      22,
+      33,
+      44,
+      55,
+      66
+    ],
+    "dispatch_intervals": [
+      11,
+      11,
+      11,
+      11,
+      11,
+      11
+    ],
+    "time_intervals_seconds": [
+      0.9938979729777202,
+      0.9931752110132948,
+      0.9931364080403,
+      0.9943390319822356,
+      0.9939587980043143,
+      0.9933119360357523
+    ],
+    "complete_cycles": [
+      {
+        "cycle_index": 0,
+        "dispatch_start": 0,
+        "dispatch_end": 10,
+        "dispatch_count": 11,
+        "period_seconds": 0.9938979729777202,
+        "mean_elapsed_ms": 90.24831112948331,
+        "mean_h3_tflops": 318.6623784519086,
+        "mean_sclk_mhz": 1715.5396464646467,
+        "mean_power_w": 528.8378787878787
+      },
+      {
+        "cycle_index": 1,
+        "dispatch_start": 11,
+        "dispatch_end": 21,
+        "dispatch_count": 11,
+        "period_seconds": 0.9931752110132948,
+        "mean_elapsed_ms": 90.1980868252841,
+        "mean_h3_tflops": 318.77785939534454,
+        "mean_sclk_mhz": 1721.4891414141414,
+        "mean_power_w": 555.7308080808081
+      },
+      {
+        "cycle_index": 2,
+        "dispatch_start": 22,
+        "dispatch_end": 32,
+        "dispatch_count": 11,
+        "period_seconds": 0.9931364080403,
+        "mean_elapsed_ms": 90.17434414950284,
+        "mean_h3_tflops": 318.77520579982007,
+        "mean_sclk_mhz": 1721.0272727272727,
+        "mean_power_w": 558.104292929293
+      },
+      {
+        "cycle_index": 3,
+        "dispatch_start": 33,
+        "dispatch_end": 43,
+        "dispatch_count": 11,
+        "period_seconds": 0.9943390319822356,
+        "mean_elapsed_ms": 90.27443764426492,
+        "mean_h3_tflops": 318.39607380756274,
+        "mean_sclk_mhz": 1720.7987373737376,
+        "mean_power_w": 558.8401515151514
+      },
+      {
+        "cycle_index": 4,
+        "dispatch_start": 44,
+        "dispatch_end": 54,
+        "dispatch_count": 11,
+        "period_seconds": 0.9939587980043143,
+        "mean_elapsed_ms": 90.2417325106534,
+        "mean_h3_tflops": 318.5065141413726,
+        "mean_sclk_mhz": 1722.7459595959597,
+        "mean_power_w": 559.8997474747475
+      },
+      {
+        "cycle_index": 5,
+        "dispatch_start": 55,
+        "dispatch_end": 65,
+        "dispatch_count": 11,
+        "period_seconds": 0.9933119360357523,
+        "mean_elapsed_ms": 90.17936498468572,
+        "mean_h3_tflops": 318.68084352254454,
+        "mean_sclk_mhz": 1721.3436868686867,
+        "mean_power_w": 560.1136363636365
+      }
+    ],
+    "incomplete_tail": {
+      "dispatch_start": 66,
+      "dispatch_end": 69
+    },
+    "cycle_detected": true,
+    "throttle_delta": {
+      "accumulation_counter": null,
+      "ppt_accumulated": null,
+      "prochot_accumulated": null,
+      "socket_thermal_accumulated": null,
+      "vr_thermal_accumulated": null,
+      "hbm_thermal_accumulated": null
+    }
+  }
+]

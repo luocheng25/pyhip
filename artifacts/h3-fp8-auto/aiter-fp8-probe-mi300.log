@@ -1,0 +1,13 @@
+[aiter WARNING] 2026-08-10 10:00:05.278 - MainProcess:108459 - /sgl-workspace/aiter/aiter/jit/core.py:558 - check_numa_custom_op
+WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter INFO] 2026-08-10 10:00:05.279 - MainProcess:108459 - /sgl-workspace/aiter/aiter/jit/core.py:581 - get_module_custom_op
+import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+/sgl-workspace/aiter/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+[aiter INFO] 2026-08-10 10:00:11.346 - MainProcess:108459 - /sgl-workspace/aiter/aiter/jit/core.py:581 - get_module_custom_op
+import [module_fmha_v3_varlen_fwd] under /sgl-workspace/aiter/aiter/jit/module_fmha_v3_varlen_fwd.so
+[aiter WARNING] 2026-08-10 10:00:11.348 - MainProcess:108459 - /sgl-workspace/aiter/aiter/jit/core.py:1663 - check_args
+type hints mismatch, override to --> fmha_v3_varlen_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, max_seqlen_q: int, max_seqlen_k: int, min_seqlen_q: int, dropout_p: float, softmax_scale: float, logits_soft_cap: float, zero_tensors: bool, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, how_v3_bf16_cvt: int, out: Optional[torch.Tensor] = None, block_table: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None, cu_seqlens_q_padded: Optional[torch.Tensor] = None, cu_seqlens_k_padded: Optional[torch.Tensor] = None) -> List[torch.Tensor]
+[aiter] pciChipId: 0x74a2, CU count: 80
+[aiter] LoadKernel: _ZN5aiter24fmha_fwd_hd128_fp8_groupE hsaco: /sgl-workspace/aiter/hsa//gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
+asm_mi300_fp8 dtype torch.bfloat16 shape (63232, 14, 128) {"main": {"cosine": 0.9996432065963745, "finite": true, "max_abs": 0.0030517578125, "rel_l2": 0.026749739423394203}, "tail": {"cosine": 0.9998790621757507, "finite": true, "max_abs": 0.056640625, "rel_l2": 0.01555230189114809}, "whole": {"cosine": 0.9997391104698181, "finite": true, "max_abs": 0.056640625, "rel_l2": 0.022862466052174568}}

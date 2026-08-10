@@ -1,0 +1,480 @@
+[
+  {
+    "name": "8wave_32x32",
+    "sample_count": 70,
+    "mean_elapsed_ms": 158.359449332101,
+    "mean_h3_tflops": 186.02732969967016,
+    "mean_sclk_mhz": 1254.112870951411,
+    "mean_power_w": 431.9387758436707,
+    "peak": {
+      "index": 7,
+      "h3_tflops": 255.4322960206188,
+      "elapsed_ms": 112.17597961425781
+    },
+    "floor": {
+      "index": 59,
+      "h3_tflops": 159.52620325686163,
+      "elapsed_ms": 179.6154327392578
+    },
+    "peak_to_floor_drop_percent": 37.54658054516939,
+    "correlation_tflops_sclk": 0.7698258058181361,
+    "correlation_tflops_power": 0.6861180372374213,
+    "high_threshold_tflops": 221.86516355330377,
+    "high_runs": [
+      [
+        0,
+        1
+      ],
+      [
+        7,
+        7
+      ],
+      [
+        13,
+        13
+      ],
+      [
+        19,
+        20
+      ],
+      [
+        26,
+        26
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        38,
+        39
+      ],
+      [
+        45,
+        45
+      ],
+      [
+        51,
+        51
+      ],
+      [
+        57,
+        58
+      ],
+      [
+        64,
+        64
+      ]
+    ],
+    "high_run_starts": [
+      0,
+      7,
+      13,
+      19,
+      26,
+      32,
+      38,
+      45,
+      51,
+      57,
+      64
+    ],
+    "dispatch_intervals": [
+      7,
+      6,
+      6,
+      7,
+      6,
+      6,
+      7,
+      6,
+      6,
+      7
+    ],
+    "time_intervals_seconds": [
+      1.0843899649335071,
+      0.9678066400811076,
+      0.9612219569971785,
+      1.0870647119591013,
+      0.9666894159745425,
+      0.9598107519559562,
+      1.0895708200987428,
+      0.9656122139422223,
+      0.9596921550109982,
+      1.090802839025855
+    ],
+    "complete_cycles": [
+      {
+        "cycle_index": 0,
+        "dispatch_start": 0,
+        "dispatch_end": 6,
+        "dispatch_count": 7,
+        "period_seconds": 1.0843899649335071,
+        "mean_elapsed_ms": 154.72482081821985,
+        "mean_h3_tflops": 192.12903329304885,
+        "mean_sclk_mhz": 1291.617454440984,
+        "mean_power_w": 422.4575457222516
+      },
+      {
+        "cycle_index": 1,
+        "dispatch_start": 7,
+        "dispatch_end": 12,
+        "dispatch_count": 6,
+        "period_seconds": 0.9678066400811076,
+        "mean_elapsed_ms": 161.19463602701822,
+        "mean_h3_tflops": 182.62893044698808,
+        "mean_sclk_mhz": 1245.379926718162,
+        "mean_power_w": 434.94940458506636
+      },
+      {
+        "cycle_index": 2,
+        "dispatch_start": 13,
+        "dispatch_end": 18,
+        "dispatch_count": 6,
+        "period_seconds": 0.9612219569971785,
+        "mean_elapsed_ms": 160.00053278605142,
+        "mean_h3_tflops": 184.62824830481193,
+        "mean_sclk_mhz": 1256.4441173613966,
+        "mean_power_w": 438.7246755831315
+      },
+      {
+        "cycle_index": 3,
+        "dispatch_start": 19,
+        "dispatch_end": 25,
+        "dispatch_count": 7,
+        "period_seconds": 1.0870647119591013,
+        "mean_elapsed_ms": 155.13826642717635,
+        "mean_h3_tflops": 190.6115613199749,
+        "mean_sclk_mhz": 1250.3474287150755,
+        "mean_power_w": 433.577264239029
+      },
+      {
+        "cycle_index": 4,
+        "dispatch_start": 26,
+        "dispatch_end": 31,
+        "dispatch_count": 6,
+        "period_seconds": 0.9666894159745425,
+        "mean_elapsed_ms": 160.92045211791992,
+        "mean_h3_tflops": 182.75106665384715,
+        "mean_sclk_mhz": 1248.8306694394928,
+        "mean_power_w": 433.72929416716175
+      },
+      {
+        "cycle_index": 5,
+        "dispatch_start": 32,
+        "dispatch_end": 37,
+        "dispatch_count": 6,
+        "period_seconds": 0.9598107519559562,
+        "mean_elapsed_ms": 159.75848515828451,
+        "mean_h3_tflops": 184.21804668060994,
+        "mean_sclk_mhz": 1254.9288464123024,
+        "mean_power_w": 435.48850903997965
+      },
+      {
+        "cycle_index": 6,
+        "dispatch_start": 38,
+        "dispatch_end": 44,
+        "dispatch_count": 7,
+        "period_seconds": 1.0895708200987428,
+        "mean_elapsed_ms": 155.4560045514788,
+        "mean_h3_tflops": 189.42942175743477,
+        "mean_sclk_mhz": 1248.805986497163,
+        "mean_power_w": 431.73473748473754
+      },
+      {
+        "cycle_index": 7,
+        "dispatch_start": 45,
+        "dispatch_end": 50,
+        "dispatch_count": 6,
+        "period_seconds": 0.9656122139422223,
+        "mean_elapsed_ms": 160.8018480936686,
+        "mean_h3_tflops": 182.68715335925114,
+        "mean_sclk_mhz": 1244.773559120618,
+        "mean_power_w": 430.56179441473563
+      },
+      {
+        "cycle_index": 8,
+        "dispatch_start": 51,
+        "dispatch_end": 56,
+        "dispatch_count": 6,
+        "period_seconds": 0.9596921550109982,
+        "mean_elapsed_ms": 159.746213277181,
+        "mean_h3_tflops": 183.6118789080588,
+        "mean_sclk_mhz": 1251.703081232493,
+        "mean_power_w": 432.3363970588235
+      },
+      {
+        "cycle_index": 9,
+        "dispatch_start": 57,
+        "dispatch_end": 63,
+        "dispatch_count": 7,
+        "period_seconds": 1.090802839025855,
+        "mean_elapsed_ms": 155.57300567626953,
+        "mean_h3_tflops": 188.37081449924588,
+        "mean_sclk_mhz": 1253.0978808189943,
+        "mean_power_w": 430.69459450446845
+      }
+    ],
+    "incomplete_tail": {
+      "dispatch_start": 64,
+      "dispatch_end": 69
+    },
+    "cycle_detected": true,
+    "throttle_delta": {
+      "accumulation_counter": null,
+      "ppt_accumulated": null,
+      "prochot_accumulated": null,
+      "socket_thermal_accumulated": null,
+      "vr_thermal_accumulated": null,
+      "hbm_thermal_accumulated": null
+    }
+  },
+  {
+    "name": "4wave_varlen",
+    "sample_count": 70,
+    "mean_elapsed_ms": 160.49392471313476,
+    "mean_h3_tflops": 182.90233707269536,
+    "mean_sclk_mhz": 1321.2145360183702,
+    "mean_power_w": 467.9308137648999,
+    "peak": {
+      "index": 0,
+      "h3_tflops": 235.3590501967955,
+      "elapsed_ms": 121.74321746826172
+    },
+    "floor": {
+      "index": 40,
+      "h3_tflops": 157.58732633648498,
+      "elapsed_ms": 181.82533264160156
+    },
+    "peak_to_floor_drop_percent": 33.04386374574578,
+    "correlation_tflops_sclk": 0.7962191685890141,
+    "correlation_tflops_power": 0.7271239521740398,
+    "high_threshold_tflops": 208.1389468456868,
+    "high_runs": [
+      [
+        0,
+        1
+      ],
+      [
+        6,
+        7
+      ],
+      [
+        13,
+        13
+      ],
+      [
+        19,
+        20
+      ],
+      [
+        25,
+        26
+      ],
+      [
+        31,
+        32
+      ],
+      [
+        38,
+        38
+      ],
+      [
+        44,
+        44
+      ],
+      [
+        50,
+        51
+      ],
+      [
+        56,
+        57
+      ],
+      [
+        63,
+        63
+      ],
+      [
+        69,
+        69
+      ]
+    ],
+    "high_run_starts": [
+      0,
+      6,
+      13,
+      19,
+      25,
+      31,
+      38,
+      44,
+      50,
+      56,
+      63,
+      69
+    ],
+    "dispatch_intervals": [
+      6,
+      7,
+      6,
+      6,
+      6,
+      7,
+      6,
+      6,
+      6,
+      7,
+      6
+    ],
+    "time_intervals_seconds": [
+      0.9647418989334255,
+      1.1133475820533931,
+      0.9779872560175136,
+      0.9765384190250188,
+      0.9678862359141931,
+      1.1113526260014623,
+      0.9775377330370247,
+      0.9771005139918998,
+      0.9691542360233143,
+      1.1097778480034322,
+      0.9773639020277187
+    ],
+    "complete_cycles": [
+      {
+        "cycle_index": 0,
+        "dispatch_start": 0,
+        "dispatch_end": 5,
+        "dispatch_count": 6,
+        "period_seconds": 0.9647418989334255,
+        "mean_elapsed_ms": 160.62218729654947,
+        "mean_h3_tflops": 184.52013187853888,
+        "mean_sclk_mhz": 1361.2986482471777,
+        "mean_power_w": 452.19110219845516
+      },
+      {
+        "cycle_index": 1,
+        "dispatch_start": 6,
+        "dispatch_end": 12,
+        "dispatch_count": 7,
+        "period_seconds": 1.1133475820533931,
+        "mean_elapsed_ms": 158.84970201764787,
+        "mean_h3_tflops": 184.36060466939142,
+        "mean_sclk_mhz": 1305.9289737456754,
+        "mean_power_w": 466.46397982269826
+      },
+      {
+        "cycle_index": 2,
+        "dispatch_start": 13,
+        "dispatch_end": 18,
+        "dispatch_count": 6,
+        "period_seconds": 0.9779872560175136,
+        "mean_elapsed_ms": 162.83363342285156,
+        "mean_h3_tflops": 179.60350497387253,
+        "mean_sclk_mhz": 1313.0273965141612,
+        "mean_power_w": 468.6526279956427
+      },
+      {
+        "cycle_index": 3,
+        "dispatch_start": 19,
+        "dispatch_end": 24,
+        "dispatch_count": 6,
+        "period_seconds": 0.9765384190250188,
+        "mean_elapsed_ms": 162.59118525187174,
+        "mean_h3_tflops": 180.7949477838175,
+        "mean_sclk_mhz": 1321.2154277503541,
+        "mean_power_w": 471.43681441107907
+      },
+      {
+        "cycle_index": 4,
+        "dispatch_start": 25,
+        "dispatch_end": 30,
+        "dispatch_count": 6,
+        "period_seconds": 0.9678862359141931,
+        "mean_elapsed_ms": 161.1660016377767,
+        "mean_h3_tflops": 183.24941628175608,
+        "mean_sclk_mhz": 1324.2112337553515,
+        "mean_power_w": 471.03657997775645
+      },
+      {
+        "cycle_index": 5,
+        "dispatch_start": 31,
+        "dispatch_end": 37,
+        "dispatch_count": 7,
+        "period_seconds": 1.1113526260014623,
+        "mean_elapsed_ms": 158.5723658970424,
+        "mean_h3_tflops": 184.57748331598216,
+        "mean_sclk_mhz": 1313.6542555483734,
+        "mean_power_w": 467.4795186023127
+      },
+      {
+        "cycle_index": 6,
+        "dispatch_start": 38,
+        "dispatch_end": 43,
+        "dispatch_count": 6,
+        "period_seconds": 0.9775377330370247,
+        "mean_elapsed_ms": 162.7799161275228,
+        "mean_h3_tflops": 179.34105513122304,
+        "mean_sclk_mhz": 1310.7266067538128,
+        "mean_power_w": 466.7345043572984
+      },
+      {
+        "cycle_index": 7,
+        "dispatch_start": 44,
+        "dispatch_end": 49,
+        "dispatch_count": 6,
+        "period_seconds": 0.9771005139918998,
+        "mean_elapsed_ms": 162.67898305257162,
+        "mean_h3_tflops": 179.96182330631214,
+        "mean_sclk_mhz": 1316.6837846249612,
+        "mean_power_w": 469.5573062558356
+      },
+      {
+        "cycle_index": 8,
+        "dispatch_start": 50,
+        "dispatch_end": 55,
+        "dispatch_count": 6,
+        "period_seconds": 0.9691542360233143,
+        "mean_elapsed_ms": 161.37320709228516,
+        "mean_h3_tflops": 182.43920597900077,
+        "mean_sclk_mhz": 1323.5285947712416,
+        "mean_power_w": 471.50136165577334
+      },
+      {
+        "cycle_index": 9,
+        "dispatch_start": 56,
+        "dispatch_end": 62,
+        "dispatch_count": 7,
+        "period_seconds": 1.1097778480034322,
+        "mean_elapsed_ms": 158.3248247419085,
+        "mean_h3_tflops": 185.00117679715456,
+        "mean_sclk_mhz": 1311.0377740839924,
+        "mean_power_w": 465.27815228655567
+      },
+      {
+        "cycle_index": 10,
+        "dispatch_start": 63,
+        "dispatch_end": 68,
+        "dispatch_count": 6,
+        "period_seconds": 0.9773639020277187,
+        "mean_elapsed_ms": 162.73265584309897,
+        "mean_h3_tflops": 179.07575956950336,
+        "mean_sclk_mhz": 1307.9061683006537,
+        "mean_power_w": 465.1156045751634
+      }
+    ],
+    "incomplete_tail": {
+      "dispatch_start": 69,
+      "dispatch_end": 69
+    },
+    "cycle_detected": true,
+    "throttle_delta": {
+      "accumulation_counter": null,
+      "ppt_accumulated": null,
+      "prochot_accumulated": null,
+      "socket_thermal_accumulated": null,
+      "vr_thermal_accumulated": null,
+      "hbm_thermal_accumulated": null
+    }
+  }
+]

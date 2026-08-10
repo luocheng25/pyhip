@@ -1,0 +1,2 @@
+GPU: 4
+    PERFDETERMINISM: Successfully enabled performance determinism and set GFX clock frequency to 1500 MHz

@@ -1,0 +1,6 @@
+[h3] segments=(63225, 7) heads=14 dim=128 flops=28.653368 TFLOP
+[h3:4wave:float8_e4m3fnuz] median=86.313 ms min=83.839 ms max=99.889 ms tflops=331.972
+[h3:protocol] warmup=3 samples=10 timing=CUDA-event aggregation=statistics.median
+[h3:formula] FLOPs=sum(4 * S_i^2 * head_dim * heads); TFLOPS=FLOPs/(median_ms*1e9)
+[h3:accuracy:whole] {'cosine': 0.9997391104698181, 'max_abs': 0.044921875, 'rel_l2': 0.022849585860967636, 'finite': True}
+[h3:accuracy:tail] {'cosine': 0.9998851418495178, 'max_abs': 0.044921875, 'rel_l2': 0.015163246542215347, 'finite': True}

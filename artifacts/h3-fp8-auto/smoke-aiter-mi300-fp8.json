@@ -1,0 +1,725 @@
+{
+  "schema_version": 2,
+  "environment": {
+    "python": {
+      "executable": "/opt/venv/bin/python3",
+      "version": "3.10.12 (main, May 27 2025, 17:12:29) [GCC 11.4.0]",
+      "platform": "Linux-5.10.134-18.al8.x86_64-x86_64-with-glibc2.35"
+    },
+    "packages": {
+      "torch": "2.9.0a0+git7bcbafe",
+      "torch_hip": "7.0.51831-a3e329ad8",
+      "flydsl": "0.2.0",
+      "pyhip": "0.1",
+      "numpy": "1.26.4",
+      "aiter": "0.1.14rc1.dev240+g7d604afe5",
+      "flydsl_file": "/opt/venv/lib/python3.10/site-packages/flydsl/__init__.py",
+      "pyhip_paths": [
+        "/host_root/luocheng/pyhip/src"
+      ],
+      "aiter_file": "/sgl-workspace/aiter/aiter/__init__.py"
+    },
+    "repositories": {
+      "pyhip": {
+        "root": "/host_root/luocheng/pyhip",
+        "commit": "aa324e1c752c0cef7edb1c1b73af25d4111869d6",
+        "status": "M tests/contrib/moe/run_test_fmoe.sh\n M tests/contrib/run_test.sh\n M tests/core/run_unittests.sh\nM  tests/flydsl/analyze_h3_attention_throttle.py\nA  tests/flydsl/analyze_h3_fp8_auto.py\nA  tests/flydsl/analyze_h3_frequency_sweep.py\nM  tests/flydsl/pa_4wave/H3_AITER_ATTN_UNITTEST.md\nM  tests/flydsl/pa_4wave/test_pa_prefill.py\nM  tests/flydsl/pa_8wave/pa_prefill_8w32x32.py\nM  tests/flydsl/pa_8wave/test_pa_prefill.py\nMM tests/flydsl/profile_h3_attention_throttle.py\n M tests/gluon/gemm_8wave.py"
+      },
+      "flydsl": {
+        "command": [
+          "git",
+          "-C",
+          "/opt/venv/lib/python3.10",
+          "rev-parse",
+          "--show-toplevel"
+        ],
+        "error": "Command '['git', '-C', '/opt/venv/lib/python3.10', 'rev-parse', '--show-toplevel']' returned non-zero exit status 128."
+      },
+      "aiter": {
+        "root": "/sgl-workspace/aiter",
+        "commit": "7d604afe5fa7efba63c0dce323b95d9daf2db112",
+        "status": "M hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co"
+      }
+    },
+    "aiter_attention_binaries": {
+      "active_mi308_path": {
+        "path": "/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_bf16_rtna_group.co",
+        "sha256": "3687c5610a454572e4a615ec58f05e707fdf3995e4dc932cf2219ad2fa0052ff"
+      },
+      "mi308_source": {
+        "path": "/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_bf16_rtna_group.co",
+        "sha256": "3687c5610a454572e4a615ec58f05e707fdf3995e4dc932cf2219ad2fa0052ff"
+      },
+      "mi300_source": {
+        "path": "/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_bf16_rtna_group.co",
+        "sha256": "f8d7e1dfc5301edeb83e5520e8d710798c7641a52040c33dbed77c18115813c5"
+      },
+      "active_mi308_fp8_path": {
+        "path": "/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co",
+        "sha256": "5e5b4b6891c600a0051ca0ebb3c14f415be7db8f3aa9607a18f057e244d65575"
+      },
+      "mi308_fp8_source": {
+        "path": "/host_root/luocheng/pyhip/artifacts/h3-fp8-auto/fwd_hd128_fp8_group.mi308.original.co",
+        "sha256": "5a9cfe058a455734e8ac46e740f250631b0396eb785df8e5ab2b8df2ceacbe2e"
+      },
+      "mi300_fp8_source": {
+        "path": "/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_fp8_group.co",
+        "sha256": "5e5b4b6891c600a0051ca0ebb3c14f415be7db8f3aa9607a18f057e244d65575"
+      }
+    },
+    "source_sha256": {
+      "tests/flydsl/profile_h3_attention_throttle.py": "711e54bfad20da9d2f77c5b2e489aba875ff4dd1826514a880ee7b5f3a1293eb",
+      "tests/flydsl/analyze_h3_attention_throttle.py": "4ef90dd7364479828a80f56a8f92dbedcbba2b3d6ee3b523605702b5bb310f00",
+      "tests/flydsl/test_attn_8wave_lkgv.py": "c5c27951e63672f91336cd834ca41320f6eeb2d030e1f8534f32d92a4546ba7f",
+      "tests/flydsl/test_attn_8wave_32x32_lkgv.py": "cb889045aa29cecdc5fa67afd2aeaeb111756c5e32a7fc59b82a8412bbc6540a",
+      "tests/flydsl/test_attn_gemm.py": "d04adcc6fefab42b78741562b7521dc9b0a9117dffee2a5b378a085861e76208",
+      "tests/flydsl/pa_4wave/test_pa_prefill.py": "ad7d785bf18fb820dca461d0cacd0734ff585ee6922f098695e86c3181cdf36a",
+      "tests/flydsl/pa_4wave/pa_prefill_4wave.py": "56c27bd88668945be71b22656c26b30b45f0427a1d2423b176704073e5a6b775",
+      "tests/flydsl/pa_4wave/h3_attn_kernel_test.py": "a14478197e9c7869647de885a95245fb4bc81561aaac1fe4029b5eefe388530c",
+      "tests/flydsl/pa_8wave/test_pa_prefill.py": "b202cec7b0d6dd85e6b479ac23c9365e95589b9f2b2121a212beffea6fb84fd6",
+      "tests/flydsl/pa_8wave/pa_prefill_8w32x32.py": "24fdac58a7a615c6b9640ca5c1a81af0e40e446e0fd863d33a96fb5dcbcd3492",
+      "tests/flydsl/h3_paged_inputs.py": "816de5bf22e0dc8801b928773ac61454e19b03dee7dee31eaf2a3f00bf80139c",
+      "tests/flydsl/h3_aiter_fp8.py": "4f38db788e2fff09cfa12c6ae739b489b67ea1f638978cd9b303b4929a1ffdb1",
+      "src/contrib/flydsl/helpers.py": "927afc99d8071733b56b203945c270d7b82cef957cf06d96b724f1fac83d5143"
+    },
+    "gpu": {
+      "physical_index": 4,
+      "visible_index": 0,
+      "visible_devices": "4",
+      "name": "AMD Instinct MI308X",
+      "arch": "gfx942:sramecc+:xnack-",
+      "compute_units": 80,
+      "total_memory_bytes": 206141652992,
+      "bdf": "0001:0b:00.0",
+      "numa_node": "1",
+      "dpm_force_performance_level": "auto",
+      "pp_dpm_sclk": "S: 100Mhz *\n0: 500Mhz\n1: 1850Mhz",
+      "pp_dpm_mclk": "0: 900Mhz *\n1: 1100Mhz \n2: 1300Mhz",
+      "sensor_metadata": {
+        "hwmon": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4",
+        "interval_seconds": 0.01,
+        "sensors": {
+          "sclk_mhz": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/freq1_input",
+            "label": "sclk",
+            "divisor": 1000000.0
+          },
+          "power_w": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/power1_input",
+            "label": "PPT",
+            "divisor": 1000000.0
+          },
+          "junction_c": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/temp2_input",
+            "label": "junction",
+            "divisor": 1000.0
+          },
+          "mem_c": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/temp3_input",
+            "label": "mem",
+            "divisor": 1000.0
+          }
+        },
+        "power_cap_w": 650.0
+      },
+      "amd_smi_list": {
+        "command": [
+          "amd-smi",
+          "list",
+          "--json"
+        ],
+        "stderr": "",
+        "json": [
+          {
+            "gpu": 0,
+            "bdf": "0000:0a:00.0",
+            "uuid": "8cff74a2-0000-1000-808e-2c536416f99f",
+            "kfd_id": 63420,
+            "node_id": 2,
+            "partition_id": 0
+          },
+          {
+            "gpu": 1,
+            "bdf": "0000:80:00.0",
+            "uuid": "f9ff74a2-0000-1000-8002-6b4495d49f21",
+            "kfd_id": 61531,
+            "node_id": 3,
+            "partition_id": 0
+          },
+          {
+            "gpu": 2,
+            "bdf": "0000:a4:00.0",
+            "uuid": "eaff74a2-0000-1000-80a9-001d39be7d7d",
+            "kfd_id": 60224,
+            "node_id": 4,
+            "partition_id": 0
+          },
+          {
+            "gpu": 3,
+            "bdf": "0000:c8:00.0",
+            "uuid": "70ff74a2-0000-1000-800a-e3dad2a9dd99",
+            "kfd_id": 50797,
+            "node_id": 5,
+            "partition_id": 0
+          },
+          {
+            "gpu": 4,
+            "bdf": "0001:0b:00.0",
+            "uuid": "beff74a2-0000-1000-8002-2834ccc51849",
+            "kfd_id": 61984,
+            "node_id": 6,
+            "partition_id": 0
+          },
+          {
+            "gpu": 5,
+            "bdf": "0001:81:00.0",
+            "uuid": "acff74a2-0000-1000-801d-52a224b06e01",
+            "kfd_id": 62919,
+            "node_id": 7,
+            "partition_id": 0
+          },
+          {
+            "gpu": 6,
+            "bdf": "0001:a5:00.0",
+            "uuid": "d1ff74a2-0000-1000-8030-61690497292a",
+            "kfd_id": 61148,
+            "node_id": 8,
+            "partition_id": 0
+          },
+          {
+            "gpu": 7,
+            "bdf": "0001:c9:00.0",
+            "uuid": "2dff74a2-0000-1000-8042-df502eb83ec9",
+            "kfd_id": 50161,
+            "node_id": 9,
+            "partition_id": 0
+          }
+        ]
+      },
+      "amd_smi_static": {
+        "command": [
+          "amd-smi",
+          "static",
+          "-g",
+          "4",
+          "-a",
+          "-b",
+          "-V",
+          "--json"
+        ],
+        "stderr": "",
+        "json": {
+          "gpu_data": [
+            {
+              "gpu": 4,
+              "asic": {
+                "market_name": "AMD Instinct MI308X",
+                "vendor_id": "0x1002",
+                "vendor_name": "Advanced Micro Devices Inc. [AMD/ATI]",
+                "subvendor_id": "0x1002",
+                "device_id": "0x74a2",
+                "subsystem_id": "0x74a2",
+                "rev_id": "0x00",
+                "asic_serial": "0xBE022834CCC51849",
+                "oam_id": 3,
+                "num_compute_units": 80,
+                "target_graphics_version": "gfx942"
+              },
+              "bus": {
+                "bdf": "0001:0b:00.0",
+                "max_pcie_width": "N/A",
+                "max_pcie_speed": "N/A",
+                "pcie_interface_version": "N/A",
+                "slot_type": "N/A"
+              },
+              "vbios": {
+                "name": "AMD MI308X_HW_SRIOV_CVS_4VF",
+                "build_date": "2026/02/23 18:16",
+                "part_number": "113-M3080202-101",
+                "version": "022.041.001.002.000001"
+              }
+            }
+          ]
+        }
+      },
+      "amd_smi_metric_before": {
+        "command": [
+          "amd-smi",
+          "metric",
+          "-g",
+          "4",
+          "-p",
+          "-c",
+          "-t",
+          "-l",
+          "-v",
+          "--json"
+        ],
+        "stderr": "",
+        "json": {
+          "gpu_data": [
+            {
+              "gpu": 4,
+              "power": {
+                "socket_power": {
+                  "value": 0,
+                  "unit": "W"
+                },
+                "gfx_voltage": "N/A",
+                "soc_voltage": "N/A",
+                "mem_voltage": "N/A",
+                "throttle_status": "N/A",
+                "power_management": "ENABLED"
+              },
+              "clock": {
+                "gfx_0": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_1": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_2": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_3": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_4": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_5": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_6": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "gfx_7": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "mem_0": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "vclk_0": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "vclk_1": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "vclk_2": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "vclk_3": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "dclk_0": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "dclk_1": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "dclk_2": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "dclk_3": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "fclk_0": {
+                  "clk": {
+                    "value": 1300,
+                    "unit": "MHz"
+                  },
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                },
+                "socclk_0": {
+                  "clk": "N/A",
+                  "min_clk": "N/A",
+                  "max_clk": "N/A",
+                  "clk_locked": "N/A",
+                  "deep_sleep": "N/A"
+                }
+              },
+              "temperature": {
+                "edge": "N/A",
+                "hotspot": {
+                  "value": 47,
+                  "unit": "C"
+                },
+                "mem": {
+                  "value": 41,
+                  "unit": "C"
+                }
+              },
+              "perf_level": "AMDSMI_DEV_PERF_LEVEL_AUTO",
+              "throttle": {
+                "accumulation_counter": "N/A",
+                "prochot_accumulated": "N/A",
+                "ppt_accumulated": "N/A",
+                "socket_thermal_accumulated": "N/A",
+                "vr_thermal_accumulated": "N/A",
+                "hbm_thermal_accumulated": "N/A",
+                "gfx_clk_below_host_limit_accumulated": "N/A",
+                "gfx_clk_below_host_limit_power_accumulated": "N/A",
+                "gfx_clk_below_host_limit_thermal_accumulated": "N/A",
+                "total_gfx_clk_below_host_limit_accumulated": "N/A",
+                "low_utilization_accumulated": "N/A",
+                "prochot_violation_status": "N/A",
+                "ppt_violation_status": "N/A",
+                "socket_thermal_violation_status": "N/A",
+                "vr_thermal_violation_status": "N/A",
+                "hbm_thermal_violation_status": "N/A",
+                "gfx_clk_below_host_limit_violation_status": "N/A",
+                "gfx_clk_below_host_limit_power_violation_status": "N/A",
+                "gfx_clk_below_host_limit_thermal_violation_status": "N/A",
+                "total_gfx_clk_below_host_limit_violation_status": "N/A",
+                "low_utilization_violation_status": "N/A",
+                "prochot_violation_activity": "N/A",
+                "ppt_violation_activity": "N/A",
+                "socket_thermal_violation_activity": "N/A",
+                "vr_thermal_violation_activity": "N/A",
+                "hbm_thermal_violation_activity": "N/A",
+                "gfx_clk_below_host_limit_violation_activity": "N/A",
+                "gfx_clk_below_host_limit_power_violation_activity": "N/A",
+                "gfx_clk_below_host_limit_thermal_violation_activity": "N/A",
+                "total_gfx_clk_below_host_limit_violation_activity": "N/A",
+                "low_utilization_violation_activity": "N/A"
+              }
+            }
+          ]
+        }
+      },
+      "preflight": {
+        "gpu_busy_percent": 0,
+        "vram_used_bytes": 309927936,
+        "vram_total_bytes": 206141652992,
+        "dpm_force_performance_level": "auto",
+        "running_processes": [],
+        "process_query": {
+          "command": [
+            "amd-smi",
+            "process",
+            "-g",
+            "4",
+            "-G",
+            "--json"
+          ],
+          "stderr": "",
+          "json": [
+            {
+              "gpu": 4,
+              "process_list": [
+                {
+                  "process_info": "No running processes detected"
+                }
+              ]
+            }
+          ]
+        },
+        "max_initial_vram_mib": 1024,
+        "allow_non_auto_dpm": false
+      },
+      "runtime_after_profile": {
+        "gpu_busy_percent": 2,
+        "vram_used_bytes": 2509606912,
+        "vram_total_bytes": 206141652992,
+        "dpm_force_performance_level": "auto",
+        "running_processes": [
+          {
+            "name": "N/A",
+            "pid": 423252,
+            "mem_usage": {
+              "value": 2199531520,
+              "unit": "B"
+            },
+            "cu_occupancy": 0
+          }
+        ],
+        "process_query": {
+          "command": [
+            "amd-smi",
+            "process",
+            "-g",
+            "4",
+            "-G",
+            "--json"
+          ],
+          "stderr": "",
+          "json": [
+            {
+              "gpu": 4,
+              "process_list": [
+                {
+                  "process_info": {
+                    "name": "N/A",
+                    "pid": 423252,
+                    "mem_usage": {
+                      "value": 2199531520,
+                      "unit": "B"
+                    },
+                    "cu_occupancy": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "host": {
+      "numa_balancing": "1",
+      "amd_smi_version": {
+        "command": [
+          "amd-smi",
+          "version"
+        ],
+        "stdout": "AMDSMI Tool: 26.0.0+37d158ab | AMDSMI Library version: 26.0.0 | ROCm version: 7.0.0 | amdgpu version: 6.16.13 | amd_hsmp version: N/A",
+        "stderr": ""
+      },
+      "rocm_smi_version": {
+        "command": [
+          "rocm-smi",
+          "--version"
+        ],
+        "stdout": "ROCM-SMI version: 4.0.0+1a5c7ec\nROCM-SMI-LIB version: 7.8.0",
+        "stderr": ""
+      }
+    },
+    "profile": {
+      "selected": [
+        "asm_mi300_fp8"
+      ],
+      "warmup": 1,
+      "iters": 2,
+      "h3_input_dtype": "fp8_e4m3fnuz",
+      "h3_quantization": "qkv_per_tensor",
+      "requested_sclk_mhz": null,
+      "sensor_interval_ms": 10.0,
+      "h3_segments": [
+        63225,
+        7
+      ],
+      "h3_heads": 14,
+      "h3_head_dim": 128,
+      "h3_flops": 28653368031232,
+      "dense_sequence_length": 63232,
+      "dense_flops": 28659712786432
+    }
+  },
+  "physical_gpu": 4,
+  "bdf": "0001:0b:00.0",
+  "warmup": 1,
+  "iters": 2,
+  "h3_flops": 28653368031232,
+  "results": [
+    {
+      "name": "asm_mi300_fp8",
+      "dispatches": [
+        {
+          "impl": "asm_mi300_fp8",
+          "index": 0,
+          "wall_start_seconds": 4.331802483648062e-05,
+          "wall_elapsed_ms": 87.40194397978485,
+          "elapsed_ms": 87.30878448486328,
+          "native_tflops": 328.18425087798164,
+          "h3_tflops": 328.18425087798164,
+          "sensor_count": 8,
+          "sclk_mean_mhz": 1582.75,
+          "sclk_min_mhz": 1504.0,
+          "sclk_max_mhz": 1648.0,
+          "power_mean_w": 352.875,
+          "power_max_w": 421.0,
+          "junction_max_c": 52.0,
+          "mem_max_c": 42.0
+        },
+        {
+          "impl": "asm_mi300_fp8",
+          "index": 1,
+          "wall_start_seconds": 0.08768020698335022,
+          "wall_elapsed_ms": 86.94995299447328,
+          "elapsed_ms": 86.90510559082031,
+          "native_tflops": 329.7086843912497,
+          "h3_tflops": 329.7086843912497,
+          "sensor_count": 8,
+          "sclk_mean_mhz": 1696.125,
+          "sclk_min_mhz": 1662.0,
+          "sclk_max_mhz": 1724.0,
+          "power_mean_w": 476.5,
+          "power_max_w": 512.0,
+          "junction_max_c": 54.0,
+          "mem_max_c": 42.0
+        }
+      ],
+      "throttle_before": {
+        "accumulation_counter": "N/A",
+        "prochot_accumulated": "N/A",
+        "ppt_accumulated": "N/A",
+        "socket_thermal_accumulated": "N/A",
+        "vr_thermal_accumulated": "N/A",
+        "hbm_thermal_accumulated": "N/A",
+        "gfx_clk_below_host_limit_accumulated": "N/A",
+        "gfx_clk_below_host_limit_power_accumulated": "N/A",
+        "gfx_clk_below_host_limit_thermal_accumulated": "N/A",
+        "total_gfx_clk_below_host_limit_accumulated": "N/A",
+        "low_utilization_accumulated": "N/A",
+        "prochot_violation_status": "N/A",
+        "ppt_violation_status": "N/A",
+        "socket_thermal_violation_status": "N/A",
+        "vr_thermal_violation_status": "N/A",
+        "hbm_thermal_violation_status": "N/A",
+        "gfx_clk_below_host_limit_violation_status": "N/A",
+        "gfx_clk_below_host_limit_power_violation_status": "N/A",
+        "gfx_clk_below_host_limit_thermal_violation_status": "N/A",
+        "total_gfx_clk_below_host_limit_violation_status": "N/A",
+        "low_utilization_violation_status": "N/A",
+        "prochot_violation_activity": "N/A",
+        "ppt_violation_activity": "N/A",
+        "socket_thermal_violation_activity": "N/A",
+        "vr_thermal_violation_activity": "N/A",
+        "hbm_thermal_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_power_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_thermal_violation_activity": "N/A",
+        "total_gfx_clk_below_host_limit_violation_activity": "N/A",
+        "low_utilization_violation_activity": "N/A"
+      },
+      "throttle_after": {
+        "accumulation_counter": "N/A",
+        "prochot_accumulated": "N/A",
+        "ppt_accumulated": "N/A",
+        "socket_thermal_accumulated": "N/A",
+        "vr_thermal_accumulated": "N/A",
+        "hbm_thermal_accumulated": "N/A",
+        "gfx_clk_below_host_limit_accumulated": "N/A",
+        "gfx_clk_below_host_limit_power_accumulated": "N/A",
+        "gfx_clk_below_host_limit_thermal_accumulated": "N/A",
+        "total_gfx_clk_below_host_limit_accumulated": "N/A",
+        "low_utilization_accumulated": "N/A",
+        "prochot_violation_status": "N/A",
+        "ppt_violation_status": "N/A",
+        "socket_thermal_violation_status": "N/A",
+        "vr_thermal_violation_status": "N/A",
+        "hbm_thermal_violation_status": "N/A",
+        "gfx_clk_below_host_limit_violation_status": "N/A",
+        "gfx_clk_below_host_limit_power_violation_status": "N/A",
+        "gfx_clk_below_host_limit_thermal_violation_status": "N/A",
+        "total_gfx_clk_below_host_limit_violation_status": "N/A",
+        "low_utilization_violation_status": "N/A",
+        "prochot_violation_activity": "N/A",
+        "ppt_violation_activity": "N/A",
+        "socket_thermal_violation_activity": "N/A",
+        "vr_thermal_violation_activity": "N/A",
+        "hbm_thermal_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_power_violation_activity": "N/A",
+        "gfx_clk_below_host_limit_thermal_violation_activity": "N/A",
+        "total_gfx_clk_below_host_limit_violation_activity": "N/A",
+        "low_utilization_violation_activity": "N/A"
+      },
+      "throttle_delta": {
+        "accumulation_counter": null,
+        "ppt_accumulated": null,
+        "prochot_accumulated": null,
+        "socket_thermal_accumulated": null,
+        "vr_thermal_accumulated": null,
+        "hbm_thermal_accumulated": null
+      },
+      "sensor_metadata": {
+        "hwmon": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4",
+        "interval_seconds": 0.01,
+        "sensors": {
+          "sclk_mhz": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/freq1_input",
+            "label": "sclk",
+            "divisor": 1000000.0
+          },
+          "power_w": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/power1_input",
+            "label": "PPT",
+            "divisor": 1000000.0
+          },
+          "junction_c": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/temp2_input",
+            "label": "junction",
+            "divisor": 1000.0
+          },
+          "mem_c": {
+            "path": "/sys/bus/pci/devices/0001:0b:00.0/hwmon/hwmon4/temp3_input",
+            "label": "mem",
+            "divisor": 1000.0
+          }
+        },
+        "power_cap_w": 650.0
+      }
+    }
+  ]
+}

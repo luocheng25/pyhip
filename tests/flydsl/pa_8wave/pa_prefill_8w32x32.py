@@ -15,7 +15,8 @@ from flydsl.expr.typing import Vector as Vec
 
 import pyhip.contrib.flydsl.helpers as fxh
 
-fxh.dump_ir(True)
+if os.environ.get("FLYDSL_DUMP_IR", "0") == "1":
+    fxh.dump_ir(True)
 
 import pyhip
 
