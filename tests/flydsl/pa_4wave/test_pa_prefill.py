@@ -1,5 +1,6 @@
 import math
 import os
+import statistics
 from dataclasses import dataclass
 
 import torch
@@ -47,6 +48,18 @@ BF16_REF = ModelConfig(
     "BF16_REF", num_qo_heads=1, num_kv_heads=1, head_dim_qk=128, head_dim_v=128,
     quant_dtype=torch.bfloat16,
 )
+H3_BF16 = ModelConfig(
+    "MiniMax_H3", num_qo_heads=14, num_kv_heads=14, head_dim_qk=128, head_dim_v=128,
+    quant_dtype=torch.bfloat16,
+)
+H3_SEGMENTS = (63225, 7)
+
+
+def attention_flops(segments, num_heads, head_dim_qk, head_dim_v):
+    return sum(
+        2 * length * length * (head_dim_qk + head_dim_v) * num_heads
+        for length in segments
+    )
 
 
 def run_formal_benchmark(
@@ -104,6 +117,111 @@ def run_formal_benchmark(
         f"min={samples_us[0]:.3f} us max={samples_us[-1]:.3f} us"
     )
     return median_us, median_tflops
+
+
+def make_h3_inputs():
+    """Build the real H3 varlen pack in the paged-KV ABI used by this kernel."""
+    generator = torch.Generator(device="cuda").manual_seed(1101)
+    segments = H3_SEGMENTS
+    num_qo_heads = H3_BF16.num_qo_heads
+    num_kv_heads = H3_BF16.num_kv_heads
+    head_dim = H3_BF16.head_dim_qk
+    page_size = H3_BF16.page_size
+    total_tokens = sum(segments)
+
+    shape = (total_tokens, num_qo_heads, head_dim)
+    q, k_packed, v_packed = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        for _ in range(3)
+    )
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(segments).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+
+    pages_per_sequence = [(length + page_size - 1) // page_size for length in segments]
+    num_pages = sum(pages_per_sequence)
+    k_pages = torch.zeros(
+        num_pages, page_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v_pages = torch.zeros_like(k_pages)
+    page_base = 0
+    token_base = 0
+    for length, page_count in zip(segments, pages_per_sequence):
+        padded_length = page_count * page_size
+        k_pages[page_base : page_base + page_count].view(padded_length, num_kv_heads, head_dim)[:length].copy_(
+            k_packed[token_base : token_base + length]
+        )
+        v_pages[page_base : page_base + page_count].view(padded_length, num_kv_heads, head_dim)[:length].copy_(
+            v_packed[token_base : token_base + length]
+        )
+        page_base += page_count
+        token_base += length
+
+    k_pages, v_pages = vectorize_kv_cache(
+        k_pages, v_pages, num_kv_heads, head_dim, head_dim, page_size
+    )
+    kv_page_indices = torch.nn.functional.pad(
+        torch.arange(num_pages, device="cuda", dtype=torch.int32), (0, 256)
+    )
+    kv_indptr = torch.tensor(
+        [0, *torch.tensor(pages_per_sequence).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    kv_last_page_lens = torch.tensor(
+        [(length - 1) % page_size + 1 for length in segments], device="cuda", dtype=torch.int32
+    )
+    q_descale = torch.ones(total_tokens, num_qo_heads, 1, device="cuda", dtype=torch.float32)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    output = torch.empty_like(q)
+    kernel = MHA(num_qo_heads, num_kv_heads, head_dim, head_dim, page_size, False)
+
+    def launch():
+        kernel(
+            q, k_pages, v_pages, cu_seqlens, kv_indptr, kv_page_indices,
+            max_seqlen_q=max(segments), max_seqlen_k=max(segments), causal=False,
+            q_descale=q_descale, k_descale=scale, v_descale=scale,
+            kv_last_page_lens=kv_last_page_lens, out=output,
+        )
+
+    return q, k_packed, v_packed, cu_seqlens, output, launch
+
+
+def run_h3_benchmark():
+    """Run the real MiniMax-H3 varlen pack with the AITER benchmark protocol."""
+    q, _, _, _, output, launch = make_h3_inputs()
+    segments = H3_SEGMENTS
+    num_qo_heads = H3_BF16.num_qo_heads
+    head_dim = H3_BF16.head_dim_qk
+
+    for _ in range(3):
+        launch()
+    torch.cuda.synchronize()
+
+    samples_ms = []
+    for _ in range(10):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        launch()
+        stop.record()
+        stop.synchronize()
+        samples_ms.append(start.elapsed_time(stop))
+
+    flops = attention_flops(segments, num_qo_heads, head_dim, head_dim)
+    assert flops == 28_653_368_031_232
+    median_ms = statistics.median(samples_ms)
+    tflops = flops / 1e9 / median_ms
+    print(
+        f"[h3] segments={segments} heads={num_qo_heads} dim={head_dim} "
+        f"flops={flops / 1e12:.6f} TFLOP"
+    )
+    print(
+        f"[h3:4wave] median={median_ms:.3f} ms min={min(samples_ms):.3f} ms "
+        f"max={max(samples_ms):.3f} ms tflops={tflops:.3f}"
+    )
+    print("[h3:protocol] warmup=3 samples=10 timing=CUDA-event aggregation=statistics.median")
+    print("[h3:formula] FLOPs=sum(4 * S_i^2 * head_dim * heads); TFLOPS=FLOPs/(median_ms*1e9)")
+    assert torch.isfinite(output).all()
+    return median_ms, tflops
 
 
 def run_pa_prefill(model_config, batch_size, qo_len, kv_len, causal, num_iters=10):
@@ -242,6 +360,9 @@ def main():
         "bf16_ref": [(1, 40960, 40960, False)],
     }
     selected = os.environ.get("PA_CASE", "all")
+    if selected == "h3":
+        run_h3_benchmark()
+        return
     if selected == "all":
         selected_cases = [
             *cases["tails"],

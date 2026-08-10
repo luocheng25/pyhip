@@ -8,6 +8,7 @@ ping-pong，V从paged global直接进入fragment。stage0执行K global预取与
 """
 
 import os
+import statistics
 
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
@@ -35,6 +36,11 @@ if 1:
 # flyc.compile 返回预建 CallState 的 callable(每次调用 ~6us),避开完整 JitFunction.__call__
 # 路径(~140us:签名绑定 + 重建 cache-key + globals/runtime 检查),降低 host 侧开销。
 _FLY_COMPILED_CACHE = {}
+
+H3_SEGMENTS = (63225, 7)
+H3_HEADS = 14
+H3_HEAD_DIM = 128
+H3_SINGLE_SEQ_LEN = sum(H3_SEGMENTS)
 
 
 def fly_compiled(key, build_launch, args):
@@ -531,25 +537,63 @@ def torch_ref(Q, K, V):
     return output
 
 
+def torch_ref_sdpa(Q, K, V):
+    """使用 BF16 SDPA 计算长序列参考，避免物化 H*M*N 的 score 张量。"""
+    output = torch.nn.functional.scaled_dot_product_attention(
+        Q.unsqueeze(0),
+        K.unsqueeze(0),
+        V.unsqueeze(0),
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0 / (Q.shape[-1] ** 0.5),
+    )
+    return output.squeeze(0)
+
+
+def bench(fn, warmup=3, iters=10):
+    """与 H3 harness 相同的 CUDA-event median 计时。"""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        stop.record()
+        stop.synchronize()
+        samples.append(start.elapsed_time(stop))
+    return {
+        "median": statistics.median(samples),
+        "min": min(samples),
+        "max": max(samples),
+        "samples": samples,
+    }
+
+
 def main():
     torch.manual_seed(0)
     torch.set_default_device("cuda")
 
-    # 222T旋转反相MHA；H/MULT仅控制问题尺寸。
-    H = int(os.environ.get("H", "8"))
+    # 222T旋转反相MHA；当前 H3 kernel 仅支持单段 dense attention。
+    H = int(os.environ.get("H", str(H3_HEADS)))
+    D = int(os.environ.get("D", str(H3_HEAD_DIM)))
+    seq_len = int(os.environ.get("SEQ_LEN", str(H3_SINGLE_SEQ_LEN)))
     BM, BN = 128, 32
-    mult = int(os.environ.get("MULT", "16"))
-    M, N, D = BM * mult, BM * mult, 128
+    M, N = seq_len, seq_len
 
-    Q = torch.randn(H, M, D, dtype=torch.bfloat16)
-    K = torch.randn(H, N, D, dtype=torch.bfloat16)
-    V = torch.randn(H, N, D, dtype=torch.bfloat16)
+    generator = torch.Generator(device="cuda").manual_seed(1101)
+    Q = torch.randn(H, M, D, dtype=torch.bfloat16, generator=generator)
+    K = torch.randn(H, N, D, dtype=torch.bfloat16, generator=generator)
+    V = torch.randn(H, N, D, dtype=torch.bfloat16, generator=generator)
     # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
     V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
 
     stream = torch.cuda.current_stream()
     o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
+    print(f"[h3] source segments={H3_SEGMENTS}; using closest supported single sequence S={seq_len}")
     print(f"[cfg] H={H} M={M} N={N} D={D} pipeline=stage_antiphase priority=2")
     kernel = fly_compiled(
         (M, N, D, BM, BN, H),
@@ -559,51 +603,27 @@ def main():
     torch.cuda.synchronize()
 
     # ---- 精度 ----
-    o_ref = torch_ref(Q, K, V)
+    if seq_len == H3_SINGLE_SEQ_LEN:
+        o_ref = torch_ref_sdpa(Q, K, V)
+    else:
+        o_ref = torch_ref(Q, K, V)
     diff = (o_fly.float() - o_ref.float()).abs()
     rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
     print(
         f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}"
     )
 
-    # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
-    from pyhip import cudaPerf
-
+    # ---- 性能:H3 同款 3 warmup + 10 CUDA-event samples + median ----
     flops = H * 4 * M * N * D  # 每 head gemm1+gemm2 各 2*M*N*D
     mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2
 
-    BUF_COPY = 10
-    Qs = [torch.randn(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
-    o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-
-    run_count = 50
-
-    def perf(fn, name):
-        for _ in range(10):  # warmup
-            fn(0)
-        torch.cuda.synchronize()
-        tfs, uss = [], []
-        i = 0
-        for _ in range(run_count):
-            with cudaPerf(flops, mem_bytes, name=name, verbose=0) as p:
-                fn(i)
-            i = (i + 1) % BUF_COPY
-            tfs.append(p.tflops())
-            uss.append(p.dt() * 1e6)
-        tfs.sort()
-        uss.sort()
-        return uss[run_count // 2], tfs[run_count // 2]
-
-    def launch(index):
-        kernel(Qs[index], Ks[index], V_shufs[index], o_flys[index], stream)
-
-    microseconds, tflops = perf(launch, "attn_stage_antiphase")
+    timing = bench(lambda: kernel(Q, K, V_shuf, o_fly, stream))
+    median_ms = timing["median"]
+    tflops = flops / (median_ms / 1e3) / 1e12
     print(
-        f"[perf] fly: {microseconds:8.1f} us  {tflops:7.1f} TFLOPS  "
-        f"({mem_bytes / microseconds / 1e3:.0f} GB/s)"
+        f"[perf] fly: median={median_ms:.3f} ms "
+        f"min={timing['min']:.3f} ms max={timing['max']:.3f} ms "
+        f"{tflops:.3f} TFLOPS ({mem_bytes / median_ms / 1e6:.0f} GB/s)"
     )
 
 
