@@ -41,6 +41,8 @@ Q tensor 并不相同。下面的五实现总表便于观察量级和功率行�
 - 吞吐接近 `319-324T` 的三个实现都出现约 1 秒功率循环；较慢的 Triton/MI308 没有检测到稳定循环。
 - FP8 没有消除 DPM/PPT 周期。由于 FP8 kernel 单次约 89-90 ms，一个周期包含约 11 个 dispatch；
   此前 BF16 单次约 158-160 ms，同一时间周期表现为 6-7 个 dispatch。
+- CU0 的 Advanced Thread Trace（ATT）进一步确认：三个循环实现只有 `43.9-53.7 stall cycles/MFMA`，
+  而不循环的 MI308/Triton 为 `76.7/116.3`；差异来自动态流水线紧实度，不是第二 resident slot 空闲。
 
 ## 正确性
 
@@ -124,6 +126,61 @@ MI300 burst 起点为 `0,11,22,33,44,55,66`，6 个完整间隔全部为 11 disp
 达到 88C，但没有循环的 MI308 也达到 80C；本机 AMDSMI 的 PPT/PROCHOT/thermal accumulated counter
 仍返回 `N/A`，因此只能确认频率、功耗、吞吐同步变化，不能给出硬件 violation 次数。
 
+## ATT 指令级确认
+
+为检验“稳定高频实现是否只是静态 occupancy 较低”以及“循环实现是否具有更紧实的动态流水线”，
+对五项 FP8 kernel 各采集一次 `gfx942` CU0 Advanced Thread Trace。AITER/Triton 覆盖 SIMD0-3、slot0-1；
+FlyDSL 的四 SIMD 原始 trace 超出 decoder 可处理范围，因此使用 512 MiB buffer 重采 SIMD0、slot0-1。
+分析器要求每个 wave 的 `num_stitched == num_insts`；下表所用 1736 个 wave 全部通过，失败的四 SIMD
+FlyDSL trace 不参与结果。
+
+`Stall/MFMA` 与 `Idle/MFMA` 是 decoder 指令统计的累计 cycle 除以 FP8 MFMA hit 数；`issue density`
+是每 SIMD 的 decoded dynamic instructions / wave-active cycles，再取 SIMD 中值。FlyDSL 只采一个 SIMD，
+所以绝对 wave 数和 wave 时长不能与四 SIMD trace 横比；表中的每 MFMA 归一值、单 SIMD issue density
+和同一 SIMD 的 slot overlap 才是比较口径。
+
+| 实现 | 遥测分类 | ATT 范围 / 完整 wave | Inst/MFMA | Stall/MFMA | Idle/MFMA | Stall+Idle/MFMA | issue density | 双 slot overlap |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Triton | 不循环 | SIMD0-3 / 348 | 18.718 | 116.319 | 6.063 | 122.382 | 0.088910 | 99.915% |
+| ASM MI308 | 不循环 | SIMD0-3 / 712 | 8.499 | 76.734 | 1.954 | 78.689 | 0.067022 | 99.921% |
+| ASM MI300 | 约 1 s 循环 | SIMD0-3 / 672 | 9.453 | **43.892** | 2.326 | **46.217** | **0.096445** | 99.941% |
+| FlyDSL 8-wave | 约 1 s 循环 | SIMD0 / 2 | 9.559 | 53.383 | 11.224 | 64.608 | 0.088721 | 100.000% |
+| FlyDSL 4-wave | 约 1 s 循环 | SIMD0 / 2 | 9.808 | 53.680 | 10.810 | 64.490 | 0.090402 | 100.000% |
+
+循环组的 `Stall/MFMA` 完整落在 `43.9-53.7`，稳定组则为 `76.7-116.3`。相对稳定的 MI308，
+MI300/8-wave/4-wave 分别低 `42.8%/30.4%/30.0%`；五项的双 slot overlap 均约 100%，因此可以
+排除“采样 CU 没有第二 resident slot”这一简单静态驻留解释。Triton 的 raw issue density 虽接近 FlyDSL，
+但每 MFMA 需要 `18.718` 条动态指令，约为其余实现的两倍，并承担最高的归一 stall，不能把 raw issue
+density 单独解释为有效计算密度。
+
+MI300/MI308 是最强的受控对照：两者使用同一 AITER symbol、相同 kernel resources、launch geometry、
+输入、scale 与输出口径，只替换 code object。MI300 相对 MI308 的 ATT 变化如下：
+
+| 指标 | ASM MI308 | ASM MI300 | MI300 变化 |
+|---|---:|---:|---:|
+| 总 Stall/MFMA | 76.734 | 43.892 | **-42.8%** |
+| Stall+Idle/MFMA | 78.689 | 46.217 | **-41.3%** |
+| issue density | 0.067022 | 0.096445 | **+43.9%** |
+| median wave duration | 4,002,288 cycles | 3,093,882 cycles | **-22.7%** |
+| MFMA stall/MFMA | 23.036 | 2.318 | -89.9% |
+| VALU stall/MFMA | 13.594 | 2.124 | -84.4% |
+| EXP stall/MFMA | 2.414 | 0.309 | -87.2% |
+| waitcnt stall/MFMA | 6.587 | 4.101 | -37.7% |
+
+MI300 的 barrier stall 从 `18.045` 增至 `23.129/MFMA`、SALU/branch stall 从 `2.828` 增至
+`5.519/MFMA`，但被 MFMA/VALU/EXP 与 memory-wait 的大幅下降覆盖，故总 stall 仍低 42.8%。这不是
+“所有 stall 都变少”的笼统结论，而是 code-object 调度改变了 stall 构成并显著压缩了总执行空隙。
+
+Triton 的 `116.319 stall/MFMA` 主要来自 `waitcnt 42.646`（36.7%）、`VALU 30.987`（26.6%）和
+`MFMA 23.931`（20.6%），三类合计 83.9%；最大单项是 `s_waitcnt vmcnt(0)`。这与其 162.7 ms 延迟、
+522 W 平均功耗和没有稳定 DPM 周期相符：波前持续驻留，但大量 cycle 在等待或执行额外标量/向量工作，
+单位有效 MFMA 的持续功率密度低于 MI300/FlyDSL。
+
+因此，ATT 确认的是**执行机制**：MI300/FlyDSL 用更少的归一 stall、更密集的有效 issue 将相同 H3 工作
+压入约 90 ms，持续功率升入 PPT/DPM 控制区；Triton/MI308 虽保持较高 SCLK，却因等待和额外指令较多，
+没有进入同一周期区。约 1 秒的控制周期、SCLK 与功耗同步变化仍由 10 ms 遥测证明；ATT 本身不读取
+PPT violation，也不能替代缺失的 AMDSMI accumulated counter，因此不把它表述为直接观测到硬件阈值。
+
 ## FP8 与历史 BF16 Auto 基线
 
 | FP8 实现 | FP8 平均 | 历史 BF16 实现 | BF16 平均 | 变化 |
@@ -168,21 +225,138 @@ hash 与备份 MI308 hash，退出 trap 无条件恢复。最终活动文件已�
 - 所有正式 JSON 为 schema v2，每项恰好 70 条、index `0..69`、全部 `sensor_count>0`；
 - AMDSMI throttle counters 为 `N/A`，报告不伪造 PPT/thermal violation 次数。
 
-## 复现与产物
+## 复现
 
-FlyDSL per-token Q 组：
+### 前提
+
+- 从仓库根目录运行，使用报告“环境与完整性”中的ROCm/Torch/AITER环境。默认AITER解释器为
+  `/opt/venv/bin/python3`，默认物理GPU为4，可用`GPU=<index>`覆盖。
+- AITER安装目录必须同时包含MI308/MI300 FP8 group code object，且SHA256与“支持路径与二进制身份”
+  一节一致。wrapper会在修改活动路径前验证源文件和备份。
+- profiler会要求目标GPU在CUDA初始化前busy为0、无其他KFD进程、初始显存不超过1 GiB且DPM为
+  `auto`。
+- FlyDSL paged组需要0.3.0。与BF16报告共用同一隔离环境：
 
 ```bash
-bash tests/flydsl/run_h3_fp8_auto.sh
+/opt/venv/bin/python3 -m venv --system-site-packages \
+  artifacts/h3-five-kernel/venv-flydsl030
+artifacts/h3-five-kernel/venv-flydsl030/bin/python -m pip install flydsl==0.3.0
+artifacts/h3-five-kernel/venv-flydsl030/bin/python -m pip install -e .
 ```
 
-AITER per-tensor Q/K/V 组：
+### 相关代码
+
+| 文件 | 职责 |
+|---|---|
+| [run_h3_fp8_report.sh](run_h3_fp8_report.sh) | 串联FlyDSL组、AITER组并生成统一manifest |
+| [run_h3_fp8_auto.sh](run_h3_fp8_auto.sh) | FlyDSL 8/4-wave正确性、性能和BF16历史对比 |
+| [run_h3_aiter_fp8_auto.sh](run_h3_aiter_fp8_auto.sh) | Triton/ASM正确性、性能和MI300 `.co`安全切换 |
+| [h3_profile_common.sh](h3_profile_common.sh) | 在任何CUDA初始化前执行GPU空闲/DPM预检 |
+| [h3_paged_inputs.py](h3_paged_inputs.py) | 两组共享H3输入、量化、反量化reference和比较指标 |
+| [h3_aiter_fp8.py](h3_aiter_fp8.py) | 显式descale的AITER Triton/ASM FP8 launcher |
+| [check_h3_fp8_paged.py](check_h3_fp8_paged.py) | FlyDSL组whole/main/tail正确性 |
+| [check_h3_aiter_fp8.py](check_h3_aiter_fp8.py) | AITER组whole/main/tail正确性 |
+| [profile_h3_attention_throttle.py](profile_h3_attention_throttle.py) | 五项逐dispatch性能和遥测采集 |
+| [analyze_h3_attention_throttle.py](analyze_h3_attention_throttle.py) | DPM周期和完整周期分析 |
+| [run_h3_fp8_att.sh](run_h3_fp8_att.sh) | 五项ATT采集、完整性检查和摘要生成 |
+| [run_h3_fp8_att_target.py](run_h3_fp8_att_target.py) | 每次rocprof进程只发射一个目标dispatch |
+| [analyze_h3_fp8_att.py](analyze_h3_fp8_att.py) | wave完整性、stall/MFMA、issue density和slot overlap |
+
+### 正式性能与正确性
+
+一条命令复现两组正确性、三轮`3 warmup + 70 dispatch`性能采集、离线分析、BF16历史对比和校验和：
 
 ```bash
-bash tests/flydsl/run_h3_aiter_fp8_auto.sh
+bash tests/flydsl/run_h3_fp8_report.sh
 ```
 
-主要产物：
+[run_h3_fp8_report.sh](run_h3_fp8_report.sh)依次调用：
+
+1. [run_h3_fp8_auto.sh](run_h3_fp8_auto.sh)：共享Q per-token、K/V per-tensor输入，检查FlyDSL
+   8-wave/4-wave正确性并采集两项性能。
+2. [run_h3_aiter_fp8_auto.sh](run_h3_aiter_fp8_auto.sh)：共享Q/K/V per-tensor输入，运行
+   [check_h3_aiter_fp8.py](check_h3_aiter_fp8.py)和Triton/ASM MI308采集；随后临时切换MI300 `.co`，
+   重跑正确性与ASM MI300采集，最后恢复MI308。
+3. 对三份profile运行[analyze_h3_attention_throttle.py](analyze_h3_attention_throttle.py)，并用
+   [analyze_h3_fp8_auto.py](analyze_h3_fp8_auto.py)生成FP8/BF16历史量级对比。
+
+MI300替换由shell `trap`保护。运行后验证活动文件已恢复：
+
+```bash
+sha256sum \
+  /sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
+# 预期：5a9cfe058a455734e8ac46e740f250631b0396eb785df8e5ab2b8df2ceacbe2e
+```
+
+### 快速smoke
+
+以下命令跳过reference并把每项减为1次dispatch，只验证入口、`.co`恢复、schema和分析链：
+
+```bash
+GPU=4 \
+H3_SKIP_CORRECTNESS=1 \
+ATTN_PROFILE_WARMUP=0 \
+ATTN_PROFILE_ITERS=1 \
+ATTN_FP8_OUTPUT_DIR=/tmp/h3-fp8-auto-smoke \
+bash tests/flydsl/run_h3_fp8_report.sh
+```
+
+### ATT指令级复现
+
+先按[GPU profiling说明](../../docs/profile-gpu.md)安装ROCprof trace decoder 0.1.6。不要提交decoder
+安装包、解压目录或原始ATT；五条trace需要数GiB临时空间。若decoder已安装到`/opt/rocm/lib`：
+
+```bash
+GPU=4 \
+ROCPROF_ATT_LIBRARY_PATH=/opt/rocm/lib \
+H3_ATT_TRACE_ROOT=/tmp/h3-fp8-att-repro \
+bash tests/flydsl/run_h3_fp8_att.sh
+```
+
+若decoder位于其他目录，将`ROCPROF_ATT_LIBRARY_PATH`设为包含
+`librocprof-trace-decoder.so`的目录。wrapper采集Triton、ASM MI308、ASM MI300和两项FlyDSL：
+
+- AITER/Triton：CU0、SIMD0-3、slot0-1、约2 GiB ATT buffer；
+- FlyDSL：CU0、SIMD0、slot0-1、512 MiB buffer；
+- 每条capture log不得出现`Stitch Incomplete`、`Wave incomplete`、cutoff或parser mismatch；
+- [analyze_h3_fp8_att.py](analyze_h3_fp8_att.py)还会要求每个wave满足
+  `num_stitched == num_insts`，只把约48 KiB的摘要写入`artifacts/h3-fp8-att/`。
+
+### 结果验收
+
+```bash
+cd artifacts/h3-fp8-auto
+sha256sum -c SHA256SUMS
+cd ../h3-fp8-att
+sha256sum -c SHA256SUMS
+cd ../..
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+expected = {
+    "profile-auto-fp8.json": ["8wave_varlen_fp8", "4wave_varlen_fp8"],
+    "profile-auto-aiter-mi308-fp8.json": ["triton_fp8", "asm_mi308_fp8"],
+    "profile-auto-aiter-mi300-fp8.json": ["asm_mi300_fp8"],
+}
+for name, implementations in expected.items():
+    data = json.loads((Path("artifacts/h3-fp8-auto") / name).read_text())
+    assert data["schema_version"] == 2
+    assert data["warmup"] == 3 and data["iters"] == 70
+    assert [result["name"] for result in data["results"]] == implementations
+    for result in data["results"]:
+        assert [row["index"] for row in result["dispatches"]] == list(range(70))
+        assert all(row["elapsed_ms"] > 0 and row["sensor_count"] > 0
+                   for row in result["dispatches"])
+print("H3 FP8 profiles validated")
+PY
+```
+
+复现的是同一实现、量化口径、输入、采样和分析协议；auto-DPM初始相位、温度和软件版本会造成小幅
+变化，不应要求新JSON与归档文件逐字节相同。
+
+## 产物
 
 - FlyDSL：[profile-auto-fp8.json](../../artifacts/h3-fp8-auto/profile-auto-fp8.json)，
   [analysis-auto-fp8.json](../../artifacts/h3-fp8-auto/analysis-auto-fp8.json)，
@@ -197,4 +371,8 @@ bash tests/flydsl/run_h3_aiter_fp8_auto.sh
   [aiter-fp8-probe-mi308.log](../../artifacts/h3-fp8-auto/aiter-fp8-probe-mi308.log)，
   [aiter-fp8-probe-mi300.log](../../artifacts/h3-fp8-auto/aiter-fp8-probe-mi300.log)
 - 历史 BF16 对比：[fp8-vs-bf16.json](../../artifacts/h3-fp8-auto/fp8-vs-bf16.json)
+- ATT 指令级摘要：[analysis.json](../../artifacts/h3-fp8-att/analysis.json)，
+  [analysis.log](../../artifacts/h3-fp8-att/analysis.log)，
+  [SHA256SUMS](../../artifacts/h3-fp8-att/SHA256SUMS)；单 dispatch 入口与分析器分别为
+  [run_h3_fp8_att_target.py](run_h3_fp8_att_target.py) 和 [analyze_h3_fp8_att.py](analyze_h3_fp8_att.py)
 - 全部校验和：[SHA256SUMS](../../artifacts/h3-fp8-auto/SHA256SUMS)

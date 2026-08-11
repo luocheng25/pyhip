@@ -4,23 +4,31 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
+source tests/flydsl/h3_profile_common.sh
 
 gpu=${GPU:-4}
 python=${FLYDSL_PYTHON:-artifacts/h3-five-kernel/venv-flydsl030/bin/python}
 output_dir=${ATTN_FP8_OUTPUT_DIR:-$root/artifacts/h3-fp8-auto}
+warmup=${ATTN_PROFILE_WARMUP:-3}
+iters=${ATTN_PROFILE_ITERS:-70}
 
 mkdir -p "$output_dir"
 
-HIP_VISIBLE_DEVICES="$gpu" \
-PYTHONPYCACHEPREFIX="$output_dir/pycache-correctness" \
-FLYDSL_RUNTIME_ENABLE_CACHE=0 \
-"$python" -B tests/flydsl/check_h3_fp8_paged.py \
-    2>&1 | tee "$output_dir/correctness-fp8.log"
+[[ -x "$python" ]]
+h3_require_idle_gpu "$gpu" "$python"
+
+if [[ ${H3_SKIP_CORRECTNESS:-0} != 1 ]]; then
+    HIP_VISIBLE_DEVICES="$gpu" \
+    PYTHONPYCACHEPREFIX="$output_dir/pycache-correctness" \
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+    "$python" -B tests/flydsl/check_h3_fp8_paged.py \
+        2>&1 | tee "$output_dir/correctness-fp8.log"
+fi
 
 HIP_VISIBLE_DEVICES="$gpu" \
 ATTN_PROFILE_IMPLS=8wave_varlen_fp8,4wave_varlen_fp8 \
-ATTN_PROFILE_WARMUP=3 \
-ATTN_PROFILE_ITERS=70 \
+ATTN_PROFILE_WARMUP="$warmup" \
+ATTN_PROFILE_ITERS="$iters" \
 ATTN_PROFILE_OUTPUT="$output_dir/profile-auto-fp8.json" \
 ATTN_PROFILE_SENSOR_INTERVAL_MS=10 \
 PYTHONPYCACHEPREFIX="$output_dir/pycache-formal" \

@@ -1,0 +1,6 @@
+triton_fp8: waves=348 complete=True MFMA=11002368 stall/MFMA=116.319 idle/MFMA=6.063 issue_density=0.088910 slot_overlap=99.915%
+asm_mi308_fp8: waves=712 complete=True MFMA=12393728 stall/MFMA=76.734 idle/MFMA=1.954 issue_density=0.067022 slot_overlap=99.921%
+asm_mi300_fp8: waves=672 complete=True MFMA=12646400 stall/MFMA=43.892 idle/MFMA=2.326 issue_density=0.096445 slot_overlap=99.941%
+flydsl_8wave_fp8: waves=2 complete=True MFMA=2718976 stall/MFMA=53.383 idle/MFMA=11.224 issue_density=0.088721 slot_overlap=100.000%
+flydsl_4wave_fp8: waves=2 complete=True MFMA=2750592 stall/MFMA=53.680 idle/MFMA=10.810 issue_density=0.090402 slot_overlap=100.000%
+analysis_output=artifacts/h3-fp8-att/analysis.json

@@ -201,10 +201,113 @@ CUDA event 在 ROCm PyTorch 中用于记录 GPU stream 上两个事件之间的�
 打印不计入 `elapsed_ms`。本报告的 TFLOPS 是算法 FLOPs 除以 event 时间，不代表 GPU 所有真实执行指令数，
 也不包含编译、输入构造或 host 调度开销。
 
-## 原始产物
+## 复现
 
-所有正式 JSON 均通过以下验收：schema v2、固定实现顺序、每项 70 条、index `0..69`、event 时间和 TFLOPS
-均为正、每条 `sensor_count>0`。原始顺序完整保留：
+### 前提
+
+- 从仓库根目录运行，ROCm/Torch/AITER环境与“硬件与软件”一节一致；默认AITER解释器为
+  `/opt/venv/bin/python3`。
+- AITER安装目录必须同时包含MI308和MI300的BF16 RTNA group code object，且SHA256与“正确性与
+  二进制身份”一节一致。wrapper在运行前校验两者，任何不匹配都会停止。
+- 默认使用物理GPU 4；可用`GPU=<index>`覆盖。profiler会在CUDA初始化前要求目标卡busy为0、无其他
+  KFD进程、初始显存占用不超过1 GiB且DPM为`auto`。
+- FlyDSL kernel需要0.3.0。不要提交虚拟环境，可在容器现有Torch环境上创建：
+
+```bash
+/opt/venv/bin/python3 -m venv --system-site-packages \
+  artifacts/h3-five-kernel/venv-flydsl030
+artifacts/h3-five-kernel/venv-flydsl030/bin/python -m pip install flydsl==0.3.0
+artifacts/h3-five-kernel/venv-flydsl030/bin/python -m pip install -e .
+```
+
+### 相关代码
+
+| 文件 | 职责 |
+|---|---|
+| [run_h3_five_kernel_auto.sh](run_h3_five_kernel_auto.sh) | 三轮采集、MI300 `.co`切换/恢复、离线分析与manifest |
+| [h3_profile_common.sh](h3_profile_common.sh) | 在任何CUDA初始化前检查GPU进程、busy、显存和DPM |
+| [profile_h3_attention_throttle.py](profile_h3_attention_throttle.py) | 构造五种实现并记录70条逐dispatch event和10 ms遥测 |
+| [analyze_h3_attention_throttle.py](analyze_h3_attention_throttle.py) | 原序列均值、峰谷、相关性、burst和完整周期分析 |
+| [h3_attn_kernel_test.py](pa_4wave/h3_attn_kernel_test.py) | Triton/ASM真实H3 pack正确性和7-token tail检查 |
+| [test_attn_8wave_32x32_lkgv.py](test_attn_8wave_32x32_lkgv.py) | FlyDSL 8-wave dense入口 |
+| [test_pa_prefill.py](pa_4wave/test_pa_prefill.py) | FlyDSL 4-wave真实paged-varlen入口 |
+
+### 正式运行
+
+一条命令复现AITER正确性、三轮性能采集、离线分析和校验和：
+
+```bash
+bash tests/flydsl/run_h3_five_kernel_auto.sh
+```
+
+[run_h3_five_kernel_auto.sh](run_h3_five_kernel_auto.sh)按以下顺序执行：
+
+1. 用MI308 `.co`执行真实`(63225,7)` pack的AITER正确性，以及Triton和ASM MI308的
+   `3 warmup + 70 dispatch`采集。
+2. 在独立进程前把MI300 `.co`临时放入MI308活动路径，重新执行正确性和70次ASM MI300采集。
+3. 恢复MI308 `.co`并验证hash，然后用FlyDSL 0.3.0环境采集`8wave_32x32,4wave_varlen`。
+4. 对三份profile运行[analyze_h3_attention_throttle.py](analyze_h3_attention_throttle.py)，生成
+   `analysis-auto-*.json/.log`和`SHA256SUMS`。
+
+MI300替换由shell `trap`保护；正常退出或中途失败都会尝试恢复MI308原件。仍应在运行后检查：
+
+```bash
+sha256sum \
+  /sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_bf16_rtna_group.co
+# 预期：3687c5610a454572e4a615ec58f05e707fdf3995e4dc932cf2219ad2fa0052ff
+```
+
+### 快速smoke
+
+smoke只验证三种进程、`.co`切换/恢复、JSON schema和分析链，不复现70次平均值：
+
+```bash
+GPU=4 \
+H3_SKIP_CORRECTNESS=1 \
+ATTN_PROFILE_WARMUP=0 \
+ATTN_PROFILE_ITERS=1 \
+ATTN_PROFILE_OUTPUT_DIR=/tmp/h3-five-kernel-smoke \
+bash tests/flydsl/run_h3_five_kernel_auto.sh
+```
+
+### 结果验收
+
+正式JSON应为schema v2、固定实现顺序、每项70条、index `0..69`、event时间和TFLOPS均为正，且每条
+`sensor_count>0`。检查产物和活动二进制：
+
+```bash
+cd artifacts/h3-five-kernel
+sha256sum -c SHA256SUMS
+cd ../..
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+expected = {
+    "profile-auto-aiter-mi308.json": ["triton", "asm_mi308"],
+    "profile-auto-aiter-mi300.json": ["asm_mi300"],
+    "profile-auto-flydsl.json": ["8wave_32x32", "4wave_varlen"],
+}
+for name, implementations in expected.items():
+    data = json.loads((Path("artifacts/h3-five-kernel") / name).read_text())
+    assert data["schema_version"] == 2
+    assert data["warmup"] == 3 and data["iters"] == 70
+    assert [result["name"] for result in data["results"]] == implementations
+    for result in data["results"]:
+        assert [row["index"] for row in result["dispatches"]] == list(range(70))
+        assert all(row["elapsed_ms"] > 0 and row["sensor_count"] > 0
+                   for row in result["dispatches"])
+print("H3 five-kernel profiles validated")
+PY
+```
+
+复现的是同一实现、输入、采样和分析协议；auto-DPM初始相位、温度和软件版本会使性能值发生小幅变化，
+不应要求新JSON与归档文件逐字节相同。
+
+## 产物
+
+原始顺序完整保留：
 
 - AITER Triton + ASM MI308：
   [profile-auto-aiter-mi308.json](../../artifacts/h3-five-kernel/profile-auto-aiter-mi308.json)，
