@@ -16,12 +16,14 @@ ATTN_FP8_OUTPUT_DIR="$output_dir" bash tests/flydsl/run_h3_aiter_fp8_auto.sh
     files=(
         profile-auto-fp8.json profile-auto-fp8.log
         analysis-auto-fp8.json analysis-auto-fp8.log
-        fp8-vs-bf16.json fp8-vs-bf16.log
         profile-auto-aiter-mi308-fp8.json profile-auto-aiter-mi308-fp8.log
         analysis-auto-aiter-mi308-fp8.json analysis-auto-aiter-mi308-fp8.log
         profile-auto-aiter-mi300-fp8.json profile-auto-aiter-mi300-fp8.log
         analysis-auto-aiter-mi300-fp8.json analysis-auto-aiter-mi300-fp8.log
     )
+    if [[ -f fp8-vs-bf16.json && -f fp8-vs-bf16.log ]]; then
+        files+=(fp8-vs-bf16.json fp8-vs-bf16.log)
+    fi
     for correctness in \
         correctness-fp8.log \
         aiter-fp8-probe-mi308.log \

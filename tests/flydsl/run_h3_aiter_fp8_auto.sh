@@ -8,11 +8,13 @@ source tests/flydsl/h3_profile_common.sh
 
 gpu=${GPU:-4}
 python=${AITER_PYTHON:-/opt/venv/bin/python3}
+aiter_root=${AITER_ROOT:-/sgl-workspace/aiter}
 output_dir=${ATTN_FP8_OUTPUT_DIR:-$root/artifacts/h3-fp8-auto}
 warmup=${ATTN_PROFILE_WARMUP:-3}
 iters=${ATTN_PROFILE_ITERS:-70}
-active=/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
-mi300=/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_fp8_group.co
+sensor_interval_ms=${ATTN_PROFILE_SENSOR_INTERVAL_MS:-10}
+active=$aiter_root/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
+mi300=$aiter_root/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_fp8_group.co
 backup="$output_dir/fwd_hd128_fp8_group.mi308.original.co"
 mi308_sha=5a9cfe058a455734e8ac46e740f250631b0396eb785df8e5ab2b8df2ceacbe2e
 mi300_sha=5e5b4b6891c600a0051ca0ebb3c14f415be7db8f3aa9607a18f057e244d65575
@@ -50,7 +52,7 @@ ATTN_PROFILE_IMPLS=triton_fp8,asm_mi308_fp8 \
 ATTN_PROFILE_WARMUP="$warmup" \
 ATTN_PROFILE_ITERS="$iters" \
 ATTN_PROFILE_OUTPUT="$output_dir/profile-auto-aiter-mi308-fp8.json" \
-ATTN_PROFILE_SENSOR_INTERVAL_MS=10 \
+ATTN_PROFILE_SENSOR_INTERVAL_MS="$sensor_interval_ms" \
 PYTHONPYCACHEPREFIX="$output_dir/pycache-formal-aiter-mi308-fp8" \
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 "$python" -B tests/flydsl/profile_h3_attention_throttle.py \
@@ -73,7 +75,7 @@ ATTN_PROFILE_MI308_FP8_REFERENCE="$backup" \
 ATTN_PROFILE_WARMUP="$warmup" \
 ATTN_PROFILE_ITERS="$iters" \
 ATTN_PROFILE_OUTPUT="$output_dir/profile-auto-aiter-mi300-fp8.json" \
-ATTN_PROFILE_SENSOR_INTERVAL_MS=10 \
+ATTN_PROFILE_SENSOR_INTERVAL_MS="$sensor_interval_ms" \
 PYTHONPYCACHEPREFIX="$output_dir/pycache-formal-aiter-mi300-fp8" \
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 "$python" -B tests/flydsl/profile_h3_attention_throttle.py \

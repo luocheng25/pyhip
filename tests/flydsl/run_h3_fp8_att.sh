@@ -9,12 +9,13 @@ source tests/flydsl/h3_profile_common.sh
 gpu=${GPU:-4}
 aiter_python=${AITER_PYTHON:-/opt/venv/bin/python3}
 flydsl_python=${FLYDSL_PYTHON:-artifacts/h3-five-kernel/venv-flydsl030/bin/python}
+aiter_root=${AITER_ROOT:-/sgl-workspace/aiter}
 decoder_dir=${ROCPROF_ATT_LIBRARY_PATH:-/opt/rocm/lib}
 trace_root=${H3_ATT_TRACE_ROOT:-/tmp/h3-fp8-att-repro}
 output_dir=${H3_ATT_OUTPUT_DIR:-$root/artifacts/h3-fp8-att}
 
-active=/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
-mi300=/sgl-workspace/aiter/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_fp8_group.co
+active=$aiter_root/hsa/gfx942/fmha_v3_fwd/MI308/fwd_hd128_fp8_group.co
+mi300=$aiter_root/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_fp8_group.co
 backup="$trace_root/fwd_hd128_fp8_group.mi308.original.co"
 mi308_sha=5a9cfe058a455734e8ac46e740f250631b0396eb785df8e5ab2b8df2ceacbe2e
 mi300_sha=5e5b4b6891c600a0051ca0ebb3c14f415be7db8f3aa9607a18f057e244d65575

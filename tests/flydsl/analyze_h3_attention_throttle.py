@@ -52,6 +52,17 @@ def arithmetic_mean(values):
     return sum(values) / len(values) if values else None
 
 
+def percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def complete_cycles(rows, starts, wall_starts):
     cycles = []
     for cycle_index, (begin, end) in enumerate(zip(starts, starts[1:])):
@@ -87,6 +98,10 @@ def analyze_result(result, high_fraction):
 
     tflops = [row["h3_tflops"] for row in rows]
     sclk = [row["sclk_mean_mhz"] for row in rows]
+    sclk_min = [row["sclk_min_mhz"] for row in rows]
+    sclk_max = [row["sclk_max_mhz"] for row in rows]
+    steady_rows = rows[2:] if len(rows) > 2 else rows
+    steady_sclk = [row["sclk_mean_mhz"] for row in steady_rows]
     power = [row["power_mean_w"] for row in rows]
     minimum = min(tflops)
     maximum = max(tflops)
@@ -121,6 +136,26 @@ def analyze_result(result, high_fraction):
         "mean_elapsed_ms": arithmetic_mean([row["elapsed_ms"] for row in rows]),
         "mean_h3_tflops": arithmetic_mean(tflops),
         "mean_sclk_mhz": arithmetic_mean(sclk),
+        "observed_sclk_min_mhz": min(sclk_min),
+        "observed_sclk_max_mhz": max(sclk_max),
+        "dispatch_mean_sclk_min_mhz": min(sclk),
+        "dispatch_mean_sclk_p05_mhz": percentile(sclk, 0.05),
+        "dispatch_mean_sclk_median_mhz": percentile(sclk, 0.50),
+        "dispatch_mean_sclk_p95_mhz": percentile(sclk, 0.95),
+        "dispatch_mean_sclk_max_mhz": max(sclk),
+        "sensor_sample_count": sum(row["sensor_count"] for row in rows),
+        "sensor_count_per_dispatch_min": min(row["sensor_count"] for row in rows),
+        "sensor_count_per_dispatch_max": max(row["sensor_count"] for row in rows),
+        "steady_state_start_index": 2 if len(rows) > 2 else 0,
+        "steady_observed_sclk_min_mhz": min(
+            row["sclk_min_mhz"] for row in steady_rows
+        ),
+        "steady_observed_sclk_max_mhz": max(
+            row["sclk_max_mhz"] for row in steady_rows
+        ),
+        "steady_dispatch_mean_sclk_p05_mhz": percentile(steady_sclk, 0.05),
+        "steady_dispatch_mean_sclk_median_mhz": percentile(steady_sclk, 0.50),
+        "steady_dispatch_mean_sclk_p95_mhz": percentile(steady_sclk, 0.95),
         "mean_power_w": arithmetic_mean(power),
         "peak": {
             "index": peak_index,
@@ -185,6 +220,24 @@ def print_analysis(analyses):
             + (f"{sclk_correlation:.4f}" if sclk_correlation is not None else "unavailable")
             + " corr_tflops_power="
             + (f"{power_correlation:.4f}" if power_correlation is not None else "unavailable")
+        )
+        print(
+            f"sclk_observed_range={analysis['observed_sclk_min_mhz']:.0f}-"
+            f"{analysis['observed_sclk_max_mhz']:.0f}MHz "
+            f"dispatch_mean_range={analysis['dispatch_mean_sclk_min_mhz']:.1f}-"
+            f"{analysis['dispatch_mean_sclk_max_mhz']:.1f}MHz "
+            f"p05/median/p95={analysis['dispatch_mean_sclk_p05_mhz']:.1f}/"
+            f"{analysis['dispatch_mean_sclk_median_mhz']:.1f}/"
+            f"{analysis['dispatch_mean_sclk_p95_mhz']:.1f}MHz "
+            f"sensor_samples={analysis['sensor_sample_count']}"
+        )
+        print(
+            f"steady_sclk_index={analysis['steady_state_start_index']} "
+            f"observed_range={analysis['steady_observed_sclk_min_mhz']:.0f}-"
+            f"{analysis['steady_observed_sclk_max_mhz']:.0f}MHz "
+            f"p05/median/p95={analysis['steady_dispatch_mean_sclk_p05_mhz']:.1f}/"
+            f"{analysis['steady_dispatch_mean_sclk_median_mhz']:.1f}/"
+            f"{analysis['steady_dispatch_mean_sclk_p95_mhz']:.1f}MHz"
         )
         print(
             f"high_threshold={analysis['high_threshold_tflops']:.3f}T "
