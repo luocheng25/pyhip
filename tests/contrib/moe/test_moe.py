@@ -397,6 +397,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
+            down_physical_n128 = os.getenv("MOE_DOWN_PHYSICAL_N128", "0") == "1"
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
                 amax = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -554,10 +555,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                    down_tile_n = (
+                        int(os.getenv("MOE_DOWN_PHYSICAL_TILE_N", "256"))
+                        if down_physical_n128
+                        else TILE_N
+                    )
+                    if down_physical_n128:
+                        assert down_tile_n in (128, 192, 256)
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
-                        ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'down'), ('alg', down_alg), ('E', E),
-                        ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type)
+                        ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
+                        ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
+                        ('down_physical_n128', down_physical_n128)
                     )
                     if down_alg == "prefill_1x4":
                         #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)
@@ -616,7 +625,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         _moe_invert_sorted_ids(TOPK)(
                             sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], B
                         )
-                        _moe_sorted_sum(TOPK, N2)(loc_ids, gemm2_out, cur_out, B)
+                        _moe_sorted_sum(
+                            TOPK,
+                            N2,
+                            down_physical_n128,
+                            down_tile_n if down_physical_n128 else None,
+                        )(loc_ids, gemm2_out, cur_out, B)
 
                         """
                         gemm2_out_r = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
@@ -1087,7 +1101,7 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
 
 if __name__ == '__main__':
     TILE_M = 64
-    TILE_N = 128
+    TILE_N = 256
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1024*2
     TP = 8
@@ -1112,7 +1126,7 @@ if __name__ == '__main__':
 
     tile_mn = {
         "TILE_M":64,
-        "TILE_N":128,}
+        "TILE_N":256,}
     hy3_args = {
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":192*8,
@@ -1149,19 +1163,28 @@ if __name__ == '__main__':
         "run_count":10,
         "quant_type":'ptpc'
     }    
+    h3_args = {
+        "HIDDEN_SIZE":6144,
+        "INTER_SIZE":384*8,
+        "TP":8,
+        "E":128,
+        "TOPK":4,
+        "run_count":10,
+        "quant_type":'ptpc'
+    }
     model_args = hy3_args
-    model_args = qwen35_35B_args
+    model_args = h3_args
     batch = [8192, 8192*2, 8192*4, 8192*8, 8192*16]
     batch = [8192*8]
     prec = [get_fp8type()]
     #prec = [torch.bfloat16]
 
-    for b in [1, 4, 8192, 8192*2, 8192*4, 8192*8, 8192*16]:
+    for b in [8192*4]: #[1, 4, 8192, 8192*2, 8192*4, 8192*8, 8192*16]:
         batch = [b]
         print(f"================== {b}")
         #with torchPerf(30):
         torch.cuda.empty_cache() 
-        entry_common('aiter', batch, prec, **tile_mn, **model_args)
+        #entry_common('aiter', batch, prec, **tile_mn, **model_args)
         torch.cuda.empty_cache() 
         entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
 
