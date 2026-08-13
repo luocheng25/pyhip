@@ -398,6 +398,21 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
             down_physical_n128 = os.getenv("MOE_DOWN_PHYSICAL_N128", "0") == "1"
+            down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
+            down_output_padding_bytes = (
+                int(down_padding_env) if down_padding_env is not None else None
+            )
+            down_row_group_env = os.getenv("MOE_DOWN_OUTPUT_ROW_GROUP")
+            down_output_row_group = (
+                int(down_row_group_env) if down_row_group_env is not None else None
+            )
+            if down_output_padding_bytes is not None:
+                assert down_physical_n128
+                assert down_output_padding_bytes in (0, 32, 64, 128)
+            if down_output_row_group is not None:
+                assert down_physical_n128
+                assert down_output_padding_bytes is None
+                assert down_output_row_group in (1, 2, 4, 8, 16)
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
                 amax = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -541,7 +556,16 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     if USE_ATOMIC_WRITE:
                         gemm2_out = cur_out
                     else:
-                        gemm2_out = torch.empty([sorted_expert_ids.shape[0]*TILE_M, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                        gemm2_row_size = N2 + (
+                            down_output_padding_bytes // hidden_states.element_size()
+                            if down_output_padding_bytes is not None
+                            else 0
+                        )
+                        gemm2_out = torch.empty(
+                            [sorted_expert_ids.shape[0] * TILE_M, gemm2_row_size],
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
 
                     if weight_dtype == 'fp8' and use_prefill:
                         if compile_act_quant_type == 'ptpc':
@@ -566,7 +590,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
-                        ('down_physical_n128', down_physical_n128)
+                        ('down_physical_n128', down_physical_n128),
+                        ('down_output_padding_bytes', down_output_padding_bytes),
+                        ('down_output_row_group', down_output_row_group)
                     )
                     if down_alg == "prefill_1x4":
                         #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)
@@ -630,6 +656,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                             N2,
                             down_physical_n128,
                             down_tile_n if down_physical_n128 else None,
+                            down_output_padding_bytes,
+                            down_output_row_group,
                         )(loc_ids, gemm2_out, cur_out, B)
 
                         """

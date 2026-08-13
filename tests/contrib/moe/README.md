@@ -595,3 +595,186 @@ sorted_sum降低约5.5%；down没有代码改动，实测中位数仍优于1.582
 - load cache modifier：SC0与默认等价，SC1绕L2退化约1.7%，NT与默认等价；保留默认缓存。
 - 反向连续读后BF16 atomic scatter：仓库已有gfx942测试表明`global_atomic_pk_add_bf16`带宽约为
     普通写出的1/4，预计只会把随机读瓶颈换成更慢的原子写，未引入。
+
+#### 原逻辑layout + N方向padding实验
+
+后续将commit `a6a1632`称为`base`：它使用BN256整wave连续物理写出，down基线为
+1.5821 ms / 390.9 TFLOPS。实验通过`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`恢复
+`sorted_sum`原先要求的row-major逻辑layout，并在每个sorted row的N方向尾部增加padding；环境变量
+未设置时仍运行`base`。
+
+原逻辑layout中，down中间结果的第一维是sorting后的row，第二维是逻辑channel。每行的N个BF16
+连续存放，`sorted_sum`使用`loc_ids[token, topk]`选择4行，并在相同channel位置求和：
+
+```text
+                         N / channel方向（地址递增）
+                c=0                                      c=N-1
+sorted row 0   [ x x x x x x x x | ... | x x x x x x x x ][ padding ]
+sorted row 1   [ x x x x x x x x | ... | x x x x x x x x ][ padding ]
+sorted row 2   [ x x x x x x x x | ... | x x x x x x x x ][ padding ]
+                   ^ 一个sorted_sum lane读取8个BF16 = 16B ^
+
+row_stride_bytes = N * sizeof(BF16) + padding_bytes
+address(row, col) = base + row * row_stride_bytes + col * sizeof(BF16)
+
+output[token, col:col+8]
+    = sum(A[loc_ids[token, k], col:col+8], k=0..TOPK-1)
+```
+
+BN256 down的一条wave store在这个layout中的地址分布如下。`lane 0..15`写16个不同row的同一段N，
+`lane 16/32/48`回到相同16个row并分别前进16/32/48个channel；因此一条wave指令不是连续1024B，
+而是跨16行散布的64个16B transaction：
+
+```text
+lane       sorted row                 channel range（每lane 8 BF16）
+0..15      token_repeat*16 + lane     c +  0 .. c +  7
+16..31     token_repeat*16 + lane-16  c + 16 .. c + 23
+32..47     token_repeat*16 + lane-32  c + 32 .. c + 39
+48..63     token_repeat*16 + lane-48  c + 48 .. c + 55
+
+下一条channel_piece store补齐每行的c+8..15、c+24..31、c+40..47、c+56..63。
+```
+
+H3的`N=6144`，无padding时row stride恰好为`12288B = 3 * 4096B = 192 * 64B`，相邻row
+在4KB页内和64B cache-line编号上完全同相。若down退化主要来自cache set冲突，增加一个或两个
+64B cache line应打散相邻row映射；32B则用于区分“任意错相”与“完整cache-line错相”。
+
+在空闲card3上按`base -> 0 -> 32 -> 64 -> 128`和反向顺序各运行一轮；每轮剔除前两次warmup，
+再合并两轮共18个稳态样本取中位数。五档完整H3均保持`diff=0.00105974`：
+
+| 版本 | padding | row stride | stride mod 4KB | Down | TFLOPS | sorted_sum | 合计 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `base`整wave连续物理layout | - | - | - | **1.5603 ms** | **396.4** | 1.1811 ms | 2.7414 ms |
+| 原逻辑layout | 0B | 12288B | 0B | 1.9644 ms | 314.8 | **0.5661 ms** | 2.5305 ms |
+| 原逻辑layout | 32B | 12320B | 32B | 1.9202 ms | 322.1 | 0.6124 ms | 2.5326 ms |
+| 原逻辑layout | 64B | 12352B | 64B | 1.8619 ms | 332.2 | 0.5993 ms | 2.4612 ms |
+| 原逻辑layout | **128B** | **12416B** | **128B** | **1.8266 ms** | **338.6** | **0.5766 ms** | **2.4032 ms** |
+
+结果有两个层次：
+
+- 对down单kernel，`base`整wave连续1024B写出仍最快；128B padded逻辑layout比`base`慢17.1%。
+- 在原逻辑layout内部，padding收益随32/64/128B单调增加。128B相对0B让down降低7.0%；同时
+    避免物理layout的昂贵逆映射，使`down + sorted_sum`比`base`降低12.3%，是本轮端到端最佳。
+
+0B与128B的第5次稳态down ATT分别为：
+
+- `/tmp/moe_pad_att_0/ui_output_agent_61597_dispatch_2596`
+- `/tmp/moe_pad_att_128/ui_output_agent_5719_dispatch_2596`
+
+两者ISA静态指令数、动态mix、资源和occupancy完全一致：192条MFMA、44条buffer load、16条
+buffer store，`108 VGPR + 132 AGPR`、112 SGPR、25,600B LDS、2 waves/SIMD。只有地址stride
+不同，因此可以直接比较stall：
+
+| ATT指标 | 0B | 128B | 变化 |
+|---|---:|---:|---:|
+| total cycles | 89.38M | 84.77M | -5.2% |
+| total stall | 69.47M | 64.66M | -6.9% |
+| VMEM store stall | 15.34M | 12.25M | **-20.1%** |
+| VMEM load stall | 18.61M | 15.46M | **-16.9%** |
+| VMEM wait stall | 2.32M | 2.35M | +1.3% |
+| MFMA stall | 29.23M | 30.61M | +4.7% |
+
+PMC进一步排除了“padding减少写事务”的解释。第5次稳态dispatch中：
+
+| PMC | 0B | 128B | 变化 |
+|---|---:|---:|---:|
+| `TCC_WRITE_sum` | 50,331,648 | 50,331,648 | 0 |
+| `TCP_TCC_WRITE_REQ_sum` | 50,331,648 | 50,331,648 | 0 |
+| `TCC_EA0_WRREQ_DRAM_sum` | 25,179,646 | 25,170,164 | -0.04% |
+
+steady-state的`TCC_EA0_WRREQ_STALL_sum`和`TCC_TOO_MANY_EA_WRREQS_STALL_sum`均为0，所以不是
+DRAM credit耗尽或pending写请求达到硬上限。综合来看，128B padding没有减少软件请求、L2写请求
+或HBM写事务，却让同样的store请求完成得更快，并连带降低后续weight load stall。**这支持原始
+`3 * 4KB`行stride造成cache set/TCC地址映射同相、局部排队或bank/channel争用的假设。** 当前
+rocprof SDK将非sum TCC counter仍聚合为单值，尚不能直接展示16个TCC实例的负载倾斜。
+
+#### 兼顾down与sorted_sum：tile-major AoSoA
+
+![R2 tile-major AoSoA布局示意图](r2_tile_major_aosoa.png)
+
+图片只画一个wave（W0，负责N0..63），并将过程拆成三个独立区域：
+
+1. **逻辑值到线程。** 每个格子正好表示8个BF16，即一个128-bit/16B atom；格内`Txx/Sy`
+    分别表示负责该atom的wave thread和动态store slot。主网格只展开`t0`的16行，`t1/t2/t3`
+    使用相同64个thread，store slot依次变为`S2/S3`、`S4/S5`、`S6/S7`。
+2. **Down写入物理内存。** 分开画出S0和S1两条wave store；每个R2双行组分别形成一个连续
+    128B段，8个双行组合计为`8 x 128B = 1024B`。
+3. **sorted_sum读取。** 以source row 0为例，蓝框分别标出两个连续64B读取组；灰色格属于配对
+    row 1，读取row 0时跳过。箭头显示8个物理atom如何交给sum lane 0..7并恢复逻辑N顺序。
+
+完全连续物理layout按`[N block, wave, store index, physical lane]`排列，down每条wave store覆盖
+连续1024B，但同一逻辑row的数据被wave和store index拆散。row-major layout则反过来：每行完全
+连续，但一条down wave store跨16行散布。两者不是只能二选一，可以按小组row构造AoSoA：
+
+```text
+tile-major顺序：
+    [N256 block]
+        [16-row token repeat]
+            [R-row group]
+                [wave 0..3，每wave负责N64]
+                    [channel piece 0..1，每piece为8 channel]
+                        [R rows]
+                            [lane group 0..3]
+```
+
+令`R in {1,2,4,8,16}`，每个元素仍是8个BF16/16B atom。物理atom编号为：
+
+```text
+row_block   = row_in_16 // R
+row_in_blk  = row_in_16 % R
+
+physical_lane = ((row_block * 4 + wave_id) * (2 * R * 4)
+                                 + channel_piece * (R * 4)
+                                 + row_in_blk * 4
+                                 + lane_group)
+
+physical_chunk = block_n * (64 * 256 / 8)
+                             + token_repeat * (16 * 256 / 8)
+                             + physical_lane
+```
+
+这样一条down wave store仍然具有大粒度连续段，而同一逻辑row在一个N256 tile内的四个N64 wave
+共512B也被聚在同一局部区域：
+
+| R | down每条wave store | sorted_sum行局部性 |
+|---:|---:|---:|
+| 16 | 1段 x 1024B | 16行AoSoA；同row跨wave距离较大 |
+| 8 | 2段 x 512B | 8行AoSoA |
+| 4 | 4段 x 256B | 4行AoSoA |
+| **2** | **8段 x 128B** | **2行AoSoA；同row N256共512B局部聚集** |
+| 1 | 16段 x 64B | 单行N256连续512B，但down连续段最小 |
+
+通过`MOE_DOWN_OUTPUT_ROW_GROUP=1/2/4/8/16`选择；环境变量未设置时严格保持`base`原地址公式。
+五档地址在一个`64x256` tile上均穷举验证为完整双射，并通过down写出到sorted_sum恢复的GPU
+正确性测试。第一次五档正反sweep结果：
+
+| R | Down | sorted_sum | 合计 |
+|---:|---:|---:|---:|
+| 16 | 1.5690 ms | 1.2120 ms | 2.7811 ms |
+| 8 | **1.5626 ms** | 1.1979 ms | 2.7605 ms |
+| 4 | 1.5850 ms | 0.8912 ms | 2.4763 ms |
+| **2** | 1.6037 ms | **0.7104 ms** | **2.3142 ms** |
+| 1 | 1.9048 ms | 0.5628 ms | 2.4677 ms |
+
+随后恢复“环境变量未设置=原base”约束，在完全空闲card3上对`base / R2 / 128B padded row-major`
+按正反顺序公平复测，合并18个稳态样本：
+
+| 版本 | Down | sorted_sum | 合计 | 相对base合计 |
+|---|---:|---:|---:|---:|
+| `base`整wave连续 | **1.5675 ms** | 1.1823 ms | 2.7498 ms | - |
+| **tile-major R2** | **1.5953 ms** | **0.7116 ms** | **2.3069 ms** | **-16.1%** |
+| 128B padded row-major | 1.8126 ms | **0.5757 ms** | 2.3883 ms | -13.1% |
+
+R2相对base只牺牲1.8%的down，却让sorted_sum降低39.8%；端到端比base快16.1%，也比此前最佳
+128B padded row-major快3.4%。这就是当前“兼得”方案：不增加中间结果字节数，不增加额外kernel，
+只改变tile内物理地址排列。
+
+R2 ATT：
+
+- down：`/tmp/moe_r2_att/ui_output_agent_38743_dispatch_2596`
+- sorted_sum：`/tmp/moe_r2_att/ui_output_agent_38743_dispatch_2599`
+
+资源与base保持同档：down为`108 VGPR + 132 AGPR`、25,600B LDS、2 waves/SIMD；sorted_sum为
+52 VGPR + 4 accum VGPR、8 waves/SIMD。R2 down ATT中VMEM store stall为5.88M、VMEM load为
+8.45M；虽然不如base的整wave1024B极限，但仍远优于row-major。sorted_sum仍由VMEM load主导，
+但tile-major行局部性将真实H3时间压到约0.71 ms。

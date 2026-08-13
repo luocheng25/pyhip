@@ -75,6 +75,8 @@ def compile_gemm(
     activation="silu",
     swiglu_limit=None,
     down_physical_n128=False,
+    down_output_padding_bytes=None,
+    down_output_row_group=None,
 ):
 
     TILE_K = 64
@@ -118,6 +120,21 @@ def compile_gemm(
         assert K % 128 == 0
         assert weight_dtype == "fp8"
         assert weight_quant_type == "ptpc"
+    if down_output_padding_bytes is not None:
+        assert down_physical_n128 and BLOCK_TILE_SIZE_N == 256
+        assert down_output_padding_bytes in (0, 32, 64, 128)
+    if down_output_row_group is not None:
+        assert down_physical_n128 and BLOCK_TILE_SIZE_N == 256
+        assert down_output_padding_bytes is None
+        assert down_output_row_group in (1, 2, 4, 8, 16)
+    output_row_group = (
+        down_output_row_group if down_output_row_group is not None else 16
+    )
+    output_row_stride = N + (
+        down_output_padding_bytes // (fx.BFloat16.width // 8)
+        if down_output_padding_bytes is not None
+        else 0
+    )
     # Supported native-fp8 prefill (weight, act) combos: weight ptpc requires act ptpc;
     # weight per_tensor allows act ptpc or per_tensor.
     if weight_dtype == "fp8" and alg == "prefill_1x4":
@@ -2042,15 +2059,15 @@ def compile_gemm(
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
-                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
-                (BLOCK_TILE_SIZE_M, N),
+                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * output_row_stride),
+                (BLOCK_TILE_SIZE_M, output_row_stride),
             )
             physical_store_rsrc = None
             if const_expr(down_physical_n128):
                 physical_store_rsrc = fx.buffer_ops.create_buffer_resource(
                     arg_p_output,
                     max_size=False,
-                    num_records_bytes=BLOCK_TILE_SIZE_M * N * 2,
+                    num_records_bytes=BLOCK_TILE_SIZE_M * output_row_stride * 2,
                 )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
@@ -2564,21 +2581,42 @@ def compile_gemm(
                         packed = channels_lo.shuffle(
                             channels_hi, list(range(8))
                         ).bitcast(fx.Int32)
-                        if const_expr(BLOCK_N == 256):
-                            # Interleave the four 16-lane groups so one wave
-                            # instruction writes 64 consecutive 16-byte chunks.
-                            physical_lane = fx.Int64(lane_id % 16) * 4 + fx.Int64(
-                                lane_group
-                            )
-                            physical_chunk = (
-                                (
-                                    (fx.Int64(block_n) * 4 + fx.Int64(wave_id))
-                                    * physical_store_count
-                                    + store_index
+                        if const_expr(
+                            BLOCK_N == 256 and down_output_padding_bytes is None
+                        ):
+                            if const_expr(down_output_row_group is None):
+                                physical_lane = fx.Int64(lane_id % 16) * 4 + fx.Int64(
+                                    lane_group
                                 )
-                                * 64
-                                + physical_lane
-                            )
+                                physical_chunk = (
+                                    (
+                                        (fx.Int64(block_n) * 4 + fx.Int64(wave_id))
+                                        * physical_store_count
+                                        + store_index
+                                    )
+                                    * 64
+                                    + physical_lane
+                                )
+                            else:
+                                # Tile-major AoSoA: group R rows, then place
+                                # four N64 waves and two 8-channel pieces inside
+                                # each group. R trades producer coalescing for
+                                # consumer row locality without extra bytes.
+                                row_in_tile = fx.Int64(lane_id % 16)
+                                row_block = row_in_tile // output_row_group
+                                row_in_block = row_in_tile % output_row_group
+                                physical_lane = (
+                                    (row_block * 4 + fx.Int64(wave_id))
+                                    * (2 * output_row_group * 4)
+                                    + channel_piece * (output_row_group * 4)
+                                    + row_in_block * 4
+                                    + fx.Int64(lane_group)
+                                )
+                                physical_chunk = (
+                                    fx.Int64(block_n) * (BLOCK_M * BLOCK_N // 8)
+                                    + token_repeat * (16 * BLOCK_N // 8)
+                                    + physical_lane
+                                )
                             byte_offset = (physical_chunk * 16).to(fx.Int32)
                         else:
                             physical_col = (
@@ -2587,9 +2625,13 @@ def compile_gemm(
                                 + fx.Int64(lane_group) * LANE_N
                                 + channel_piece * 8
                             )
-                            byte_offset = ((row * N + physical_col) * 2).to(fx.Int32)
+                            byte_offset = (
+                                (row * output_row_stride + physical_col) * 2
+                            ).to(fx.Int32)
                     if const_expr(BLOCK_N == 192):
-                        byte_offset = ((row * N + physical_col) * 2).to(fx.Int32)
+                        byte_offset = (
+                            (row * output_row_stride + physical_col) * 2
+                        ).to(fx.Int32)
                     fx.buffer_ops.buffer_store(
                         packed,
                         physical_store_rsrc,
@@ -3054,10 +3096,31 @@ def _ptr(t):
 
 
 @functools.cache
-def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
+def sorted_sum(
+    TOPK,
+    N,
+    physical_n128=False,
+    physical_tile_n=None,
+    row_padding_bytes=None,
+    physical_row_group=None,
+):
     if physical_n128:
         assert physical_tile_n in (128, 192, 256)
+    if row_padding_bytes is not None:
+        assert physical_n128 and physical_tile_n == 256
+        assert row_padding_bytes in (0, 32, 64, 128)
+    if physical_row_group is not None:
+        assert physical_n128 and physical_tile_n == 256
+        assert row_padding_bytes is None
+        assert physical_row_group in (1, 2, 4, 8, 16)
     num_threads = 64
+    input_row_group = physical_row_group if physical_row_group is not None else 16
+    source_row_stride = N + (
+        row_padding_bytes // 2 if row_padding_bytes is not None else 0
+    )
+    wave_contiguous_input = (
+        physical_n128 and physical_tile_n == 256 and row_padding_bytes is None
+    )
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def sorted_sum_kernel(loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer):
@@ -3075,7 +3138,7 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
         output_dtype = B.dtype
         B = fx.make_view(B + fx.Int64(batch) * (N), fx.make_layout(N, 1))
         physical_store_rsrc = None
-        if fx.const_expr(physical_n128):
+        if fx.const_expr(physical_n128 and row_padding_bytes is None):
             physical_store_rsrc = fx.buffer_ops.create_buffer_resource(
                 B,
                 max_size=False,
@@ -3088,10 +3151,11 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
         )
 
         token_ptrs = [
-            (A + fx.Int64(token_locs[topk]) * N) for topk in fx.range_constexpr(TOPK)
+            (A + fx.Int64(token_locs[topk]) * source_row_stride)
+            for topk in fx.range_constexpr(TOPK)
         ]
         physical_input_rsrc = None
-        if fx.const_expr(physical_n128 and physical_tile_n == 256):
+        if fx.const_expr(wave_contiguous_input):
             physical_input = fx.make_view(A, fx.make_layout(N, 1))
             physical_input_rsrc = fx.buffer_ops.create_buffer_resource(
                 physical_input,
@@ -3099,7 +3163,7 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
             )
 
         def load_atom(topk_id, off):
-            if fx.const_expr(physical_n128 and physical_tile_n == 256):
+            if fx.const_expr(wave_contiguous_input):
                 token_loc = fx.Int64(token_locs[topk_id])
                 block_row = token_loc % 64
                 column = fx.Int64(off)
@@ -3108,16 +3172,34 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
                 wave_id = column_in_block // 64
                 lane_group = (column_in_block % 64) // 16
                 channel_piece = (column_in_block % 16) // 8
-                store_index = (block_row // 16) * 2 + channel_piece
-                # Inverse of the wave-contiguous BN256 store mapping.
-                physical_lane = (block_row % 16) * 4 + lane_group
-                physical_offset = (
-                    (token_loc // 64) * (64 * N)
-                    + block_n * (64 * 256)
-                    + wave_id * (8 * 64 * 8)
-                    + store_index * (64 * 8)
-                    + physical_lane * 8
-                )
+                token_repeat = block_row // 16
+                row_in_tile = block_row % 16
+                if fx.const_expr(physical_row_group is None):
+                    store_index = token_repeat * 2 + channel_piece
+                    physical_lane = row_in_tile * 4 + lane_group
+                    physical_offset = (
+                        (token_loc // 64) * (64 * N)
+                        + block_n * (64 * 256)
+                        + wave_id * (8 * 64 * 8)
+                        + store_index * (64 * 8)
+                        + physical_lane * 8
+                    )
+                else:
+                    # Inverse of the tile-major AoSoA down-store mapping.
+                    row_block = row_in_tile // input_row_group
+                    row_in_block = row_in_tile % input_row_group
+                    physical_lane = (
+                        (row_block * 4 + wave_id) * (2 * input_row_group * 4)
+                        + channel_piece * (input_row_group * 4)
+                        + row_in_block * 4
+                        + lane_group
+                    )
+                    physical_offset = (
+                        (token_loc // 64) * (64 * N)
+                        + block_n * (64 * 256)
+                        + token_repeat * (16 * 256)
+                        + physical_lane * 8
+                    )
                 return fx.Vector(
                     fx.buffer_ops.buffer_load(
                         physical_input_rsrc,
@@ -3138,7 +3220,7 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
             return [load_atom(topk, off) for topk in fx.range_constexpr(TOPK)]
 
         def atom_column(atom_index, col):
-            if fx.const_expr(physical_n128 and physical_tile_n == 256):
+            if fx.const_expr(wave_contiguous_input):
                 lane_in_octet = lane_id % 8
                 physical_atom = (
                     (lane_id // 8) * 8
@@ -3149,18 +3231,18 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
             return col[0].to_py_value()
 
         def reduce_store(dst, store_column, frag):
-            if fx.const_expr(physical_n128 and physical_tile_n == 256):
+            if fx.const_expr(wave_contiguous_input):
                 vec_sum = frag[0].to(fx.Float32)
             else:
                 vec_sum = frag[0].load().to(fx.Float32)
             for m in fx.range_constexpr(1, TOPK):
-                if fx.const_expr(physical_n128 and physical_tile_n == 256):
+                if fx.const_expr(wave_contiguous_input):
                     vec = frag[m].to(fx.Float32)
                 else:
                     vec = frag[m].load().to(fx.Float32)
                 vec_sum += vec
 
-            if fx.const_expr(physical_n128):
+            if fx.const_expr(physical_n128 and row_padding_bytes is None):
                 vec_sum = vec_sum.to(output_dtype)
                 byte_offset = fx.Int32(store_column) * (output_dtype.width // 8)
                 fx.buffer_ops.buffer_store(
@@ -3175,7 +3257,7 @@ def sorted_sum(TOPK, N, physical_n128=False, physical_tile_n=None):
                 out_frag.store(vec_sum)
                 fx.copy(copy_atom_b, out_frag, dst)
 
-        if fx.const_expr(physical_n128 and physical_tile_n == 256):
+        if fx.const_expr(wave_contiguous_input):
             atom_count = N // (64 * (copy_bits // output_dtype.width))
             prefetch_depth = 2
             grouped_atom_count = atom_count // prefetch_depth * prefetch_depth
