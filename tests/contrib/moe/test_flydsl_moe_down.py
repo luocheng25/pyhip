@@ -193,25 +193,26 @@ def test_down_prefill_1x4_fp8_ptpc(hidden_size):
 
 
 @pytest.mark.parametrize(
-    "tile_n,hidden_size,padding_bytes,row_group",
+    "tile_n,hidden_size,padding_bytes,row_group,cshuffle_output",
     [
-        (128, 512, None, None),
-        (128, 1024, None, None),
-        (192, 1536, None, None),
-        (256, 512, None, None),
-        (256, 512, 0, None),
-        (256, 512, 32, None),
-        (256, 512, 64, None),
-        (256, 512, 128, None),
-        (256, 512, None, 1),
-        (256, 512, None, 2),
-        (256, 512, None, 4),
-        (256, 512, None, 8),
-        (256, 512, None, 16),
+        (128, 512, None, None, False),
+        (128, 1024, None, None, False),
+        (192, 1536, None, None, False),
+        (256, 512, None, None, False),
+        (256, 512, 0, None, False),
+        (256, 512, 32, None, False),
+        (256, 512, 64, None, False),
+        (256, 512, 128, None, False),
+        (256, 512, 128, None, True),
+        (256, 512, None, 1, False),
+        (256, 512, None, 2, False),
+        (256, 512, None, 4, False),
+        (256, 512, None, 8, False),
+        (256, 512, None, 16, False),
     ],
 )
 def test_down_prefill_physical_sorted_sum(
-    tile_n, hidden_size, padding_bytes, row_group
+    tile_n, hidden_size, padding_bytes, row_group, cshuffle_output
 ):
     torch.manual_seed(11)
     batch_size = 64
@@ -274,6 +275,7 @@ def test_down_prefill_physical_sorted_sum(
         down_physical_n128=True,
         down_output_padding_bytes=padding_bytes,
         down_output_row_group=row_group,
+        down_cshuffle_output=cshuffle_output,
     )
     launch(
         _ptr(activation_fp8),

@@ -53,7 +53,23 @@ gfx950的256个CU分布在8个XCD上，每个XCD具有独立的L2-cache, 通过�
 
 固定测试配置：gfx942（MI308X），FP8 PTPC，`B=32768`，`H=6144`，本地
 `I=384`（TP=8），`E=128`，`TOPK=4`，`BM=64`，`BN=256`。gateup和down都走
-`prefill_1x4`。以下TFLOPS按未padding的有效token计算；sorting后实际执行行数多6.25%。
+`prefill_1x4`。以下TFLOPS按有效token计算。sorting为2176个WG分配输出空间，但平衡路由下只有
+2048个WG进入计算，尾部128个WG由设备端valid边界提前退出，因此MFMA工作量没有6.25%的padding膨胀。
+
+> **后续实验应保留的正向结论**
+>
+> - **旧`e6fe8e9` N64代码的唯一稳定正收益是128B行padding：** 正反padding sweep从
+>   `1.8257 + 0.5613 = 2.3870 ms`降到`1.7368 + 0.5661 = 2.3030 ms`，合计降低3.52%。
+>   R2、scale经LDS、store均匀分布、完全顺序写出和`setprio`反相均无端到端正收益，实验代码
+>   已移除，数据继续保留在本文后半部分。
+> - **N256端到端最佳是4KB wave-private XOR CShuffle + 128B padding：** A LDS仍为
+>   `Swizzle(3,4,3)`时，同机正反
+>   trace为`1.6553 + 0.5753 = 2.2306 ms`，优于既有R2的
+>   `1.5911 + 0.7047 = 2.2959 ms`，端到端降低2.84%。LDS为29,696B，资源为
+>   `100 VGPR + 132 AGPR`，继续保持2 wave/SIMD。随后A LDS固化为`Swizzle(3,4,4)`；
+>   空闲32轮同进程ABBA中down稳定降低2.55%。再将下一N块scale load放到8条weight load之前，
+>   scale提交从`vmcnt(0)`放宽到`vmcnt(8)`，down再降低1.51%。最终同窗口为
+>   **1.516768 ms / 407.8 TFLOPS**，达到gateup 421.2 TFLOPS的96.82%。
 
 ### 基线（2026-08-11）
 
@@ -778,3 +794,561 @@ R2 ATT：
 52 VGPR + 4 accum VGPR、8 waves/SIMD。R2 down ATT中VMEM store stall为5.88M、VMEM load为
 8.45M；虽然不如base的整wave1024B极限，但仍远优于row-major。sorted_sum仍由VMEM load主导，
 但tile-major行局部性将真实H3时间压到约0.71 ms。
+
+#### BN256 4KB wave-private XOR CShuffle
+
+在恢复当前N256代码后，增加`MOE_DOWN_CSHUFFLE_OUTPUT=1`实验路径。该路径要求同时设置
+`MOE_DOWN_PHYSICAL_N128=1`和`MOE_DOWN_PHYSICAL_TILE_N=256`；启用后默认自动使用最佳的128B
+row-major padding：
+
+```bash
+MOE_DOWN_PHYSICAL_N128=1 \
+MOE_DOWN_PHYSICAL_TILE_N=256 \
+MOE_DOWN_CSHUFFLE_OUTPUT=1
+```
+
+如需复现实验，仍可用`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`显式覆盖默认值。
+
+完整`M64 x N256` CShuffle需要32KB，若再加24KB A tile会破坏LDS预算。因此每个wave只分配
+一个`M8 x N64`、1024B的私有scratch，4个wave合计4KB；8个M8 slice依次复用该scratch：
+
+```text
+A LDS                 64 x 384 x FP8       = 24,576B
+weight-scale LDS      256 x FP32           =  1,024B
+CShuffle scratch      4 x 8 x 64 x BF16    =  4,096B
+                                                -------
+总LDS/WG                                      29,696B
+```
+
+gfx942每CU有64KB LDS，因此仍可驻留2个WG。一个WG有4个wave且每个wave落到不同SIMD，资源
+`100 VGPR + 132 AGPR`也不低于原R2的occupancy，最终继续保持2 wave/SIMD。
+
+每个wave负责连续N64。对一个M8 slice，scratch逻辑布局为
+`[wave_id][row_in_8][physical_atom][8 x BF16]`。producer中只有拥有当前8行的32个lane活跃，
+每lane写两个16B atom：
+
+```text
+logical_atom  = lane_group * 2 + channel_piece
+physical_atom = logical_atom XOR row_in_8
+lds_atom      = wave_id * 64 + row_in_8 * 8 + physical_atom
+```
+
+gfx942有32个4B bank，一个16B atom横跨4个bank。线性映射在固定`channel_piece`时只有4个起始
+bank、每个bank承受8个lane；XOR后覆盖8个起始bank、每个4个lane，达到32个活跃lane写128-bit
+数据的理论下限。consumer使用同一XOR逆映射，64个lane各读一个16B atom；每个起始bank承受
+8个lane，也达到64-lane读取的理论下限。随后每lane按以下地址执行row-major 128-bit global
+store：
+
+```text
+row = slice_id * 8 + lane_id // 8
+col = block_n * 256 + wave_id * 64 + (lane_id % 8) * 8
+```
+
+##### LDS bank conflict硬件计数器验证
+
+使用rocprofv3在gfx942上采集`SQ_LDS_BANK_CONFLICT`、`SQ_LDS_IDX_ACTIVE`、`SQ_INSTS_LDS`、
+`SQ_LDS_ADDR_CONFLICT`和`SQ_LDS_UNALIGNED_STALL`。每个方案执行11个完整H3 down dispatch，剔除
+前两个warmup后取9个稳态dispatch中位数；R2和CShuffle按正反顺序各采集一次，两轮原始计数完全
+一致，完整H3均保持`diff=0.00105974`：
+
+| 方案 | `SQ_LDS_BANK_CONFLICT` | `SQ_LDS_IDX_ACTIVE` | `SQ_INSTS_LDS` | address conflict | unaligned stall |
+|---|---:|---:|---:|---:|---:|
+| base / pad128 direct / R2 | 38,141,952 | 84,475,904 | 5,791,744 | 0 | 0 |
+| 自动128B XOR CShuffle | 38,141,952 | 122,224,640 | 10,510,336 | 0 | 0 |
+| **CShuffle - R2** | **0** | **+37,748,736** | **+4,718,592** | **0** | **0** |
+
+新增LDS指令数恰好为：
+
+```text
+2048个有效WG x 4 waves x 24个N256块 x (16条ds_write_b128 + 8条ds_read_b128)
+    = 4,718,592条LDS指令
+```
+
+因此计数器差分覆盖了完整CShuffle路径，并非漏采部分dispatch；新增IDX-active与新增LDS指令之比
+为8.0，而新增bank-conflict停顿周期严格为0。即：**XOR CShuffle本身的硬件实测bank conflict
+增量为0。**
+
+需要区分“新增CShuffle”和“整个down kernel”：整个kernel的`SQ_LDS_BANK_CONFLICT`原始计数
+不是0。结合最终ISA和完整H3动态指令数，可以把非零部分精确闭合到A LDS路径。H3有2048个
+有效WG，每个WG 4 waves；
+每wave在A prologue执行6条`ds_write2_b64`，随后24个N256块各执行24条A `ds_read_b128`：
+
+```text
+A LDS动态指令
+    = 2048 WG x 4 waves x (6 write + 24 N blocks x 24 read)
+    = 4,767,744
+
+A LDS触发的SQ_LDS_BANK_CONFLICT计数周期
+    = 4,767,744 x 8 cycles/instruction
+    = 38,141,952
+```
+
+按当前K384 specialization中每条A LDS指令对应8个计数周期，进一步做计数会计拆分：
+
+| A LDS路径 | 动态指令数 | `SQ_LDS_BANK_CONFLICT`周期 | 占非零计数 |
+|---|---:|---:|---:|
+| prologue的6条`ds_write2_b64` | 49,152 | 393,216 | 1.03% |
+| 24个N256块内的A `ds_read_b128` | 4,718,592 | 37,748,736 | **98.97%** |
+| **合计** | **4,767,744** | **38,141,952** | **100%** |
+
+该结果与PMC的非零计数逐项相等。scale LDS每个N块包含1条write和4条read：
+
+```text
+2048 WG x 4 waves x 25 scale blocks x 5 LDS instructions = 1,024,000
+```
+
+base/R2的总LDS指令也恰好为`4,767,744 + 1,024,000 = 5,791,744`，因此scale LDS的冲突
+贡献为0。加上CShuffle的4,718,592条无冲突指令后，又精确得到10,510,336条总LDS指令。
+所以整个kernel的非零原始计数全部由A LDS指令触发；在当前K384 specialization中，每条A LDS
+指令对应8个`SQ_LDS_BANK_CONFLICT`计数周期，scale和CShuffle对应的增量均为0。rocprof官方
+派生指标也符合这一计数来源解释：
+
+| 方案 | `LdsBankConflict`（conflicts/access） | `LDSBankConflict`（GPU时间占比） | `LdsUtil` |
+|---|---:|---:|---:|
+| R2 | 0.823196605 | 17.331081% | 38.384473% |
+| 自动128B XOR CShuffle | 0.453624318 | 15.665657% | 50.200086% |
+
+CShuffle增加大量不提高原始冲突计数的LDS访问，因此整kernel的派生冲突率和冲突时间占比下降，
+而不是降到0。若后续目标是降低整个kernel的该项计数或确认真实可优化冲突，需要继续分析A LDS
+布局；当前scale和XOR CShuffle无需再为bank conflict修改。
+
+静态地址枚举进一步区分了A写和A读：
+
+- **A cooperative写。** `all_copy_atoms`让每个wave的64 lanes写64个不同16B atom；经过
+    `Swizzle(3,4,3)`后，16B起始bank为`0,4,...,28`八组、每组8 lanes，展开4个dword后32个
+    bank各承受8次访问，负载完全均匀。总数据1024B在gfx942的128B/cycle LDS上理论就需要8周期，
+    因此表中的393,216周期是服务下限，不是可通过换bank映射消除的写冲突。
+- **A MMA读。** 最终ISA的每条A `ds_read_b128`地址只使用`lane_id[5:4]`构造，wave内只有4个
+    不同16B地址/broadcast组；相比CShuffle读的64个唯一地址均匀覆盖32 bank，A读的bank并行度
+    明显更低。若非零计数中存在可优化的真实冲突，集中在占98.97%的A读路径。
+
+这里的“来自A LDS”是**计数来源归因**，不能直接等价成38,141,952周期全部可通过swizzle消除。
+为区分固定waterfall/broadcast服务与真实同bank冲突，新增独立程序
+`prove_lds_bank_conflict.py`。三种模式都在循环内只生成一条`ds_read_b128`，资源同为8 VGPR、
+16KB LDS和8 wave/SIMD，并在每次读取后立即`lgkmcnt(0)`：
+
+| 独立模式 | 地址分布 | `s_memtime` cycles/read | 相对均匀模式 |
+|---|---|---:|---:|
+| `balanced_unique` | 64个连续16B地址 | 100.008789 | - |
+| `broadcast_4` | 由`lane[5:4]`选择4个地址，模拟A读 | 100.008789 | 0.00% |
+| `same_bank_stride128` | 64个不同地址、128B stride，故意落到相同4 banks | 152.008789 | +52.00% |
+
+因此A-like四地址broadcast并不是严重bank conflict；故意制造的真冲突才表现出清晰的额外串行。
+`SQ_LDS_BANK_CONFLICT`对当前宽向量A访问还包含固定服务/waterfall语义，不能单独作为优化判据。
+
+在生产规模上进一步扫描A LDS swizzle。无swizzle逐bit正确但慢13.56%；`(3,3,3)`数值错误；
+`(3,4,3)`到`(2,4,3)`性能中性；`(3,4,4)`逐bit正确且稳定更快。GPU完全空闲时做32轮
+`old(3,4,3) -> new(3,4,4) -> new -> old`同进程ABBA：
+
+| A LDS布局 | Down中位数 | Q1--Q3 |
+|---|---:|---:|
+| `Swizzle(3,4,3)` | 1.543086 ms | 1.541816--1.544806 ms |
+| **`Swizzle(3,4,4)`** | **1.503666 ms** | **1.502206--1.506037 ms** |
+
+配对`new/old=0.974474`，Q1--Q3为`0.973333--0.975757`，即稳定降低2.55%；最终输出逐bit一致。
+两版均为192条MFMA、44条buffer load、8条store、40条LDS read、24条LDS write和29,696B LDS，
+资源档位不变；新布局只改变A地址bit映射并少一条地址指令。当前physical BN256默认固化
+`Swizzle(3,4,4)`，其他tile继续使用原布局。保留该改动的依据是空闲ABBA性能和正确性，不是原始
+bank-conflict计数下降。
+
+##### Down理论上限、ATT与PMC（最终版本）
+
+独立程序`prove_fp8_mfma_roof.py`在同一空闲窗口重测
+`v_mfma_f32_16x16x32_fp8_fp8`：1/2/4/8/16条独立accumulator链分别为
+48.008789、28.004395、22.003174、19.001587、17.500793 cycles/MFMA，16链有效频率为
+1.78827GHz。SQ PMC同时给出精确的16.000 busy cycles/MFMA，前者包含单wave循环/发射开销，
+后者是MFMA管线占用。按80 CU、4 SIMD/CU：
+
+| Roof | 有效TFLOPS | 最终407.8T效率 | 含义 |
+|---|---:|---:|---|
+| 架构dense MFMA | 585.98 | 69.59% | 16 cycles/MFMA，不含搬运和后处理 |
+| 微基准dense MFMA | 535.73 | 76.11% | 17.500793 cycles/MFMA |
+| 架构MFMA + 串行后处理 | 484.95 | 84.08% | 192 MFMA，加64 MUL、64 FMA和32 PERM；均按名义4-cycle issue |
+| 微基准MFMA + 串行后处理 | 450.02 | 90.61% | 保守的当前codegen参照，不是硬件绝对上限 |
+| 全部6.09375GiB均走HBM | 500.97 | 81.39% | 极保守假设；PMC证明实际HBM字节远少于该值 |
+
+最终同窗口24轮`gateup -> down -> down -> gateup`为gateup 2.937016ms / 421.2T、down
+1.516768ms / 407.8T，down/gateup为96.82%。完整随机H3保持`diff=0.00105974`；资源为
+`100 VGPR + 132 AGPR`、29,696B LDS和2 wave/SIMD。
+
+最终ATT为`/tmp/moe_down_only_att_final/ui_output_agent_30780_dispatch_18`：
+
+| Stall类别 | Stall | 占比 |
+|---|---:|---:|
+| MFMA/FMA | 28.73M | 51.1% |
+| LDS/SMEM wait | 10.65M | 19.0% |
+| VMEM wait | 4.74M | 8.4% |
+| VMEM load | 4.28M | 7.6% |
+| LDS指令 | 3.26M | 5.8% |
+| VMEM store | 2.99M | 5.3% |
+
+最后一条MFMA之后仍有14.70M stall：8.17M为CShuffle LDS wait、2.66M为store、1.89M为LDS
+指令、1.10M为后处理VALU。每个M8 slice都存在必要的`LDS write -> wait -> LDS read -> wait ->
+global store`依赖；同wave后面已无MFMA可遮盖，只能依赖另一驻留wave。此前双槽CShuffle仅把
+`lgkmcnt(0)`从23减到18，却将LDS从29,696B推到32,768B、next-free VGPR从198推到228，完整
+N6144还不正确；将slice分散到K阶段则资源升到`116+132`并退化，均已撤销。
+
+最终PMC：L2 hit为64.77%；HBM读0.639GB、写1.611GB，总带宽1.483TB/s，仅为5.3TB/s峰值的
+27.99%。因此当前down不是HBM带宽受限。`SQ_LDS_BANK_CONFLICT=38,141,952`仍与旧A布局完全
+相同，而A `Swizzle(3,4,4)`已稳定快2.55%，再次证明该raw counter不能单独代表可优化冲突。
+8704个launch wave中只有8192个执行MFMA，恰好对应2048个有效WG、每wave 4608条MFMA；尾部
+128个WG正确地在valid边界退出。
+
+仍可优化与当前不可达原因：
+
+- **已解决：** A LDS `Swizzle(3,4,4)`；scale load前置；XOR CShuffle新增bank-conflict为0；
+    A-like broadcast不是严重真实冲突。
+- **可能继续优化：** 首批weight load的operand-ready/VMEM队列和resident-wave相位，但HBM只有
+    28%峰值，目标应是增加隐藏距离而不是追带宽；任何改法必须保持2 wave/SIMD。
+- **当前布局下不可消除：** 16-cycle MFMA管线占用、最后一批weight依赖，以及CShuffle每slice
+    的写读硬依赖。普通VALU虽有MFMA co-issue容量，但accumulator退休和严格scheduler均未让后处理
+    进入最后64条MFMA，且显著增加VGPR。达到585.98T需要不存在的完美交织；达到或超过同窗口
+    gateup仍差3.18%，需要同时降低MFMA operand-ready和CShuffle尾部，不能靠单个PMC计数实现。
+
+##### Scale load前置
+
+原K2阶段先发下一N块的8条weight load，最后才发scale load；提交scale到LDS时因此生成
+`s_waitcnt vmcnt(0)`。最终实现先发scale load，以`sched_barrier(0)`固定编译器顺序，再发8条
+weight load，机器码将提交放宽为`vmcnt(8)`。该barrier不生成机器指令，静态指令数、228个
+VGPR-form寄存器、29,696B LDS和occupancy均不变。
+
+空闲GPU4同进程24轮ABBA，baseline与候选逐bit一致：
+
+| 版本 | Down中位数 | Q1--Q3 | 配对ratio |
+|---|---:|---:|---:|
+| 原scale-last | 1.544149 ms | 1.543088--1.545039 ms | - |
+| **scale-first** | **1.520589 ms** | **1.519539--1.521828 ms** | **0.984869（-1.51%）** |
+
+ATT中精确`vmcnt(0)` stall从1.994M降到0.379M（-81.0%），纯VMEM-wait从4.998M降到
+3.789M（-24.2%），总stall从58.76M降到56.20M（-4.35%）。该顺序已固化，实验参数已删除。
+
+scratch按wave完全分区，所以CShuffle不需要额外workgroup同步。最初保守实现每个M8 slice使用
+一次`s_barrier`，完整H3为`1.7361 + 0.5668 = 2.3029 ms`。将其替换为
+`s_waitcnt lgkmcnt(0) + sched_barrier(0)`后，小回归和完整H3都保持正确；`sched_barrier`只固定编译器
+调度边界，不产生机器指令。最终ISA中CShuffle每wave、每N256块包含16条
+`ds_write_b128`、8条`ds_read_b128`和8条`buffer_store_dwordx4`，输出阶段没有新增
+`s_barrier`；kernel中仅保留原A tile初始化的两条barrier。
+
+空闲card3上每个配置使用独立进程，关闭JIT cache，按正反顺序运行；每轮剔除前两次warmup，
+合并18个稳态rocprof kernel trace样本：
+
+| N256输出方案 | Down | 有效TFLOPS | sorted_sum | 合计 | LDS/WG | VGPR+AGPR |
+|---|---:|---:|---:|---:|---:|---:|
+| 128B padded direct | 1.801648 ms | 343.3 | **0.563943 ms** | 2.365591 ms | 25,600B | 108+132 |
+| 既有R2 | **1.591147 ms** | **388.7** | 0.704703 ms | 2.295850 ms | 25,600B | 108+132 |
+| CShuffle + `s_barrier` | 1.736088 ms | 356.2 | 0.566823 ms | 2.302910 ms | 29,696B | 100+132 |
+| **wave-private XOR CShuffle** | **1.655287 ms** | **373.6** | **0.575343 ms** | **2.230630 ms** | **29,696B** | **100+132** |
+
+最终CShuffle相对R2让down增加4.03%，但row-major consumer让sorted_sum降低18.36%，端到端降低
+2.84%；相对历史R2结果`2.3069 ms`降低3.31%。完整H3保持`diff=0.00105974`。
+
+启用CShuffle后改为自动选择128B padding，再次在空闲card3进行两轮复验。每轮均采用独立进程、
+关闭JIT cache、正反顺序运行并剔除前两次warmup；合并36个稳态样本：
+
+| 方案 | Down中位数 | Down Q1--Q3 | sorted_sum中位数 | sorted_sum Q1--Q3 | 合计 |
+|---|---:|---:|---:|---:|---:|
+| R2 | 1.603607 ms | 1.592247--1.617667 ms | 0.694983 ms | 0.687683--0.710073 ms | 2.298590 ms |
+| **自动128B XOR CShuffle** | **1.651227 ms** | **1.645507--1.662657 ms** | **0.568483 ms** | **0.560733--0.575423 ms** | **2.219710 ms** |
+
+自动padding CShuffle相对R2的down慢2.97%，但sorted_sum快18.20%，端到端快3.43%。8次完整H3
+进程均保持`diff=0.00105974`；资源仍为29,696B LDS、`100 VGPR + 132 AGPR`和2 wave/SIMD。
+
+##### 自动padding四路重新测试（2026-08-13，A LDS为`Swizzle(3,4,3)`）
+
+为同时校验测试环境和历史数据，在8张卡均空闲时重新测试当前base、显式128B direct、R2和
+自动128B CShuffle。固定使用card3，每个配置独立进程、关闭JIT cache，按
+`base -> pad128 -> R2 -> CShuffle`及完全反序各运行一轮；每个进程剔除前两次warmup，合并
+18个稳态样本。8个完整H3进程均保持`diff=0.00105974`：
+
+| 当前方案 | Down中位数 | 有效TFLOPS | Down Q1--Q3 | sorted_sum中位数 | sorted_sum Q1--Q3 | 合计 |
+|---|---:|---:|---:|---:|---:|---:|
+| base整wave连续 | **1.567087 ms** | **394.7** | 1.546417--1.585467 ms | 1.176345 ms | 1.171915--1.180905 ms | 2.743431 ms |
+| 128B padded direct | 1.821187 ms | 339.6 | 1.800218--1.841017 ms | **0.563583 ms** | 0.562862--0.564273 ms | 2.384769 ms |
+| R2 | 1.605447 ms | 385.2 | 1.588417--1.612517 ms | 0.687283 ms | 0.686513--0.689773 ms | 2.292730 ms |
+| **自动128B XOR CShuffle** | **1.660807 ms** | **372.4** | **1.655237--1.667617 ms** | **0.566002 ms** | **0.565393--0.567142 ms** | **2.226809 ms** |
+
+同一测试窗口内，CShuffle相对base的down慢5.98%，但端到端快18.83%；相对pad128 direct的
+down快8.81%、端到端快6.62%；相对R2的down慢3.45%，但sorted_sum快17.65%，端到端快2.88%。
+
+本轮结果与对应历史公平测试的漂移如下。负数表示本轮更快：
+
+| 对比项 | 本轮合计 | 历史合计 | Down变化 | sorted_sum变化 | 合计变化 |
+|---|---:|---:|---:|---:|---:|
+| base vs 历史base | 2.743432 ms | 2.749800 ms | -0.03% | -0.50% | -0.23% |
+| pad128 direct vs 历史pad128 | 2.384770 ms | 2.388300 ms | +0.47% | -2.10% | -0.15% |
+| R2 vs 历史R2 | 2.292730 ms | 2.306900 ms | +0.64% | -3.42% | -0.61% |
+| CShuffle vs 首次CShuffle | 2.226809 ms | 2.230630 ms | +0.33% | -1.62% | -0.17% |
+| CShuffle vs 上次自动padding 36样本 | 2.226809 ms | 2.219710 ms | +0.58% | -0.44% | +0.32% |
+| CShuffle vs 旧`e6fe8e9` pad128最佳 | 2.226809 ms | 2.302900 ms | -4.38% | -0.02% | -3.30% |
+
+base、pad128和R2相对历史合计漂移均不超过0.61%，CShuffle相对前两次结果也在0.32%以内，说明
+本轮环境与历史可比，且CShuffle端到端优势可重复。该快照中最快down仍是整wave连续base，最快
+`down + sorted_sum`则是自动128B XOR CShuffle。具体而言，当时CShuffle down的1.660807 ms仍比
+历史最快down 1.5603 ms慢6.44%，其372.4 TFLOPS也比历史gateup 452.5 TFLOPS低17.70%；但当前
+合计2.226809 ms比历史R2 2.3069 ms快3.47%，比旧`e6fe8e9` pad128最佳2.3029 ms快3.30%。
+
+##### BN256 CShuffle完全顺序写出实验
+
+实验将CShuffle读回后的global store改成完全顺序物理布局。对每个64-row WG，物理顺序为
+`[N256 block][M8 row slice][wave N64][lane 0..63]`；每lane仍写一个16B atom：
+
+```text
+physical_atom = (((block_n * 8 + row_chunk) * 4 + wave_id) * 64 + lane_id)
+byte_offset   = physical_atom * 16
+```
+
+因此每条wave store覆盖连续1024B。sorted_sum按以下公式恢复逻辑row/channel：
+
+```text
+row_chunk    = (token_loc % 64) // 8
+row_in_8     = token_loc % 8
+block_n      = column // 256
+wave_id      = (column % 256) // 64
+output_atom  = (column % 64) // 8
+physical_lane = row_in_8 * 8 + output_atom
+
+physical_atom = (((block_n * 8 + row_chunk) * 4 + wave_id) * 64
+                 + physical_lane)
+```
+
+穷举一个H3 WG的49,152个16B atom验证为完整双射；每个wave地址严格为64个连续16B chunk。
+双N块GPU回归和完整H3均正确，最终输出与当前CShuffle逐bit一致（`max_diff=0`，生产H3
+`diff=0.00105974`）。最终down ISA仍为8条`buffer_store_dwordx4`、16条CShuffle
+`ds_write_b128`和8条CShuffle `ds_read_b128`；LDS保持29,696B，但编译器地址live range使
+架构VGPR升到226，rocprof运行资源仍处于同一2-wave/SIMD档位。
+
+首次跨进程trace期间8张GPU均被外部任务占满，数据未采纳。随后等待card3真正空闲，使用单进程、
+同一输入、同一stream的24轮ABBA交错测试，每种kernel各48个样本，顺序为
+`CShuffle -> sequential -> sequential -> CShuffle`：
+
+| 项目 | 当前CShuffle中位数 | 完全顺序中位数 | 配对sequential/CShuffle | 配对Q1--Q3 |
+|---|---:|---:|---:|---:|
+| Down | 1.543247 ms | **1.523307 ms** | 0.987363（-1.26%） | 0.986477--0.987882 |
+| sorted_sum | **0.571203 ms** | 0.779044 ms | 1.361851（+36.19%） | 1.358570--1.366031 |
+| **Down + sorted_sum组合事件** | **2.108050 ms** | **2.316932 ms** | **1.098785（+9.88%）** | **1.095390--1.101125** |
+
+完全顺序写出稳定改善down 1.26%，但sorted_sum退化36.19%，端到端退化9.88%。原因是producer
+获得连续1024B wave store，但同一逻辑row的N64数据被分散到不同
+`row_chunk/wave`区域，consumer失去row-major连续读取。实验代码和
+`MOE_DOWN_CSHUFFLE_SEQUENTIAL`开关已移除，仅保留结论。
+
+还尝试将上一N块的8个M8 slice按`3/3/2`分散到当前块的3个K128阶段。该版本虽正确，但资源升到
+`116 VGPR + 132 AGPR`，down退化到1.776187 ms，合计2.349549 ms；说明额外live range和阶段
+干扰超过store重叠收益，代码已撤销，当前保留每个N块postprocess后的集中CShuffle。
+
+#### `e6fe8e9`旧N64 CShuffle独立复测
+
+![当前旧e6 down写出与sorted_sum读入](e6_down_sorted_sum_io.png)
+
+图中每个细格表示8个BF16，即一个128-bit/16B atom，并按当前代码的实际线程映射绘制：
+
+- **Down写出：** 256-thread WG中，`row0=tid//8`、`atom=tid%8`；每thread分别写
+    `row0`和`row0+32`的一个atom。每8个相邻thread在一条逻辑row内形成连续128B段，
+    但一条wave store同时跨8条row，整体是`8 x 128B`分散段。
+- **物理row：** H3每条row有6144个BF16（12288B）。推荐的128B padding使row stride变为
+    6208个BF16（12416B）；padding位于row尾部，不属于任何逻辑channel，sorted_sum不会读取。
+    未设置padding时只移除图中的灰色尾部，thread/atom映射完全不变。
+- **sorted_sum读入：** 64个thread在每个round中各读取一个16B atom，所以每个`loc[k]`
+    source row形成连续1024B读取；TOPK=4的四个向量转换到FP32后逐元素求和，再转回BF16。
+    N=6144共需12个round，每个round覆盖512个channel。
+
+为区分layout收益与后续N256计算流水优化，工作树中的`moe_gemm_splitk.py`和`test_moe.py`
+先直接复制为commit `e6fe8e9348595aefb96bcf76b1370d313676ad44`的文件内容（未执行revert、
+未移动HEAD），再只移植以下两项：
+
+- row-major输出增加0/32/64/128B可选行padding；
+- 保留旧N64 CShuffle和LDS读回，仅将每thread最后两个8-BF16 store手工映射到R2
+    tile-major AoSoA，sorted_sum使用对应逆映射。
+
+旧实现与后续N256版本的关键区别是：**旧base本身就是row-major输出**。它的sorted_sum已经按
+连续行读取，因此R2不再修复consumer端，只会将原本连续的行拆成AoSoA。固定H3配置不变，在
+空闲card3按正反顺序运行，每个版本合并18个稳态kernel trace样本；三种布局均保持
+`diff=0.00105974`：
+
+| `e6fe8e9`旧代码布局 | Down | 有效TFLOPS | sorted_sum | 合计 |
+|---|---:|---:|---:|---:|
+| 原始row-major base | 1.8180 ms | 340.2 | **0.5605 ms** | 2.3785 ms |
+| **128B padded row-major** | **1.7401 ms** | **355.4** | 0.5668 ms | **2.3068 ms** |
+| R2 tile-major AoSoA | 1.7496 ms | 353.5 | 0.7451 ms | 2.4947 ms |
+
+相对旧base，R2让down降低3.8%，说明128B连续写段仍改善producer；但sorted_sum增加32.9%，
+最终合计反而增加4.9%。128B padding让down降低4.3%，合计降低3.0%，是旧代码上的最佳方案。
+资源也反映了两种改法的差异：base/padding down均为`60 VGPR + 132 AGPR`，R2手工地址映射为
+`72 VGPR + 128 AGPR`；base/padding sorted_sum为`44 VGPR + 4 accum VGPR`，R2为
+`52 VGPR + 4 accum VGPR`。
+
+padding正反sweep进一步确认128B最优：
+
+| padding | row stride | Down | 有效TFLOPS | sorted_sum | 合计 |
+|---:|---:|---:|---:|---:|---:|
+| 0B | 12288B | 1.8257 ms | 338.8 | **0.5613 ms** | 2.3870 ms |
+| 32B | 12320B | 1.7607 ms | 351.3 | 0.6056 ms | 2.3663 ms |
+| 64B | 12352B | 1.7564 ms | 352.1 | 0.5923 ms | 2.3487 ms |
+| **128B** | **12416B** | **1.7368 ms** | **356.1** | 0.5661 ms | **2.3030 ms** |
+
+因此，**padding收益不依赖后续N256流水优化，R2收益则依赖producer基线已经采用整wave连续物理
+layout**。在`e6fe8e9`这种原生row-major CShuffle基线上应选128B padding，不应选R2。
+
+#### `e6fe8e9`旧N64 down完全顺序写出实验
+
+为把producer写事务做到极致，实验将每个`M64 x N64` tile的512个16B atom按
+`[N64 tile][repeat 0/1][thread 0..255]`顺序写入。对N64 tile `n`、CShuffle输出repeat `r`
+和线程`tid`：
+
+```text
+physical_chunk = (2*n + r) * 256 + tid
+byte_offset = physical_chunk * 16
+```
+
+因此每个repeat的256-thread store覆盖连续4096B，每个wave覆盖连续1024B；两次repeat合计
+连续8192B。最终ISA仍为192条MFMA、34条128-bit VMEM load、8条128-bit global store和32条
+128-bit LDS read，静态指令数不变；down资源从`60 VGPR + 132 AGPR`降到
+`56 VGPR + 128 AGPR`。
+
+sorted_sum同步使用逆映射。对排序后逻辑row `loc`和逻辑column `col`：
+
+```text
+block_row = loc % 64
+repeat = block_row // 32
+row0 = block_row % 32
+atom = (col % 64) // 8
+
+physical_chunk = (loc // 64) * (64*N/8)
+               + ((col // 64) * 2 + repeat) * 256
+               + row0 * 8 + atom
+```
+
+小回归和完整生产H3均保持`diff=0.00105974`。空闲card3按
+`pad128 -> sequential -> sequential -> pad128`正反顺序运行，每个版本合并18个稳态kernel
+trace样本：
+
+| 布局 | Down | 有效TFLOPS | sorted_sum | 合计 | 相对pad128合计 |
+|---|---:|---:|---:|---:|---:|
+| 128B padded row-major | 1.731907 ms | 356.9 | **0.578623 ms** | **2.310530 ms** | - |
+| 完全顺序写出 | **1.719666 ms** | **359.6** | 0.765843 ms | 2.485510 ms | **+7.57%** |
+
+完全顺序写出仅让down降低0.70%，却让sorted_sum增加32.35%。原因是producer获得连续4KB/1KB
+写段后，同一逻辑row的N64片段被拆散到不同repeat/thread区域，consumer失去pad128的整行连续
+读取。相对历史数据：
+
+- 历史最快down为整wave连续N256 base的`1.5603 ms`，完全顺序旧N64仍慢10.22%；
+- 历史端到端R2最佳为`1.5953 + 0.7116 = 2.3069 ms`，完全顺序慢7.74%；
+- 旧e6 padding sweep最佳为`1.7368 + 0.5661 = 2.3029 ms`，完全顺序慢7.93%。
+
+同进程H3三方ABBA（pad128/R2/sequential共享输入、排序元数据、stream和外部负载窗口）也得到
+相同排序：完全顺序down最快，但合计仍落后pad128约7.75%，落后R2约0.92%。因此完全顺序布局
+只优化producer，不能形成端到端收益；实验代码和`MOE_DOWN_OUTPUT_SEQUENTIAL`开关已移除。
+
+#### `e6fe8e9`旧N64 down主循环与128-bit指令预算
+
+当前H3 specialization的tile为：
+
+| 层级 | tile | 说明 |
+|---|---:|---|
+| workgroup输出 | `M64 x N64` | 256 threads，4 waves |
+| 每wave输出 | `M16 x N64` | 4个wave沿M分割 |
+| reduction | `K384 = 6 x K64` | 每个K64执行8条FP8 MFMA |
+| 每wave计算 | `48 MFMA / N64 tile` | `6 x 8` |
+| CShuffle | 两槽`M64 x N64 x BF16` | 当前tile写LDS，下一tile计算时读回并写global |
+| LDS总量 | 24,576B | A为`M64 x K384 x FP8`；与16KB CShuffle union复用 |
+
+以下伪代码描述稳态主循环。`store_repeat0/1`分别是每thread负责的`row=tid//8`和`row+32`
+两个16B输出向量；严格16/32实验曾将它们移动到第2/4个K64计算之后：
+
+```python
+# prologue：一次性加载并复用整个A tile
+A_global_to_LDS(M64 x K384)                 # 每wave 6 x load128 + 6 x LDS-write128
+barrier()
+A_frag = LDS_to_register(A)                 # 每wave 24 x LDS-read128
+
+# 先计算N tile 0并写入CShuffle槽0
+C0 = gemm_N64_K384(A_frag, W0)
+postprocess(C0, scale0, routing_weight)
+C0_to_LDS(slot=0)
+barrier()
+
+for n in range(0, N64_tiles - 2, 2):
+    # ping半迭代：写出C[n]，同时计算C[n+1]
+    out = LDS_to_register(slot=0)            # 2 x LDS-read128 / wave
+    W_next = global_to_register(W[n+2])      # 6 x VMEM-load128 / wave
+    scale_next = global_to_register(S[n+2])  # 1 x VMEM-load128 / wave
+
+    acc = 0
+    for k64 in range(6):
+        acc = 8_MFMA(acc, W[n+1, k64], A_frag[k64])
+        if distributed and k64 == 1:
+            global_store128(out.repeat0)     # 最终ISA：MFMA 16之后
+        if distributed and k64 == 3:
+            global_store128(out.repeat1)     # 最终ISA：MFMA 32之后
+    postprocess(acc, scale[n+1], routing_weight)
+    C_to_LDS(acc, slot=1)                    # 2 x LDS-write128等价指令 / wave
+    barrier()
+
+    # pong半迭代对n+1/n+2执行相同流程，slot 0/1互换
+```
+
+按最终ISA统计，每个稳态`M64 x N64 x K384` tile的128-bit向量指令如下。这里的“每wave”是
+一条vector ISA由一个wave执行一次；“每WG”乘以4。初始化阶段的A读取单列，不重复计入每个N tile：
+
+| 指令 | 每wave / N64 tile | 每WG / N64 tile | 来源 |
+|---|---:|---:|---|
+| FP8 MFMA | 48 | 192 | 6个K64，每个8条 |
+| VMEM load128 | 7 | 28 | 6条weight + 1条PTPC weight scale |
+| LDS read128 | 2 | 8 | 读取上一N tile的两个CShuffle输出向量 |
+| VMEM store128 | 2 | 8 | 写`row0`与`row0+32` |
+| LDS write128等价 | 2 | 8 | 当前N tile写入CShuffle；ISA为两条`ds_write2st64_b64` |
+
+一次性A prologue每wave另有`6 x VMEM-load128 + 6 x LDS-write128 + 24 x LDS-read128`；routing
+weight、sorted id和per-token activation scale的32-bit访问不计入上表。
+
+##### weight scale先入LDS实验
+
+PTPC weight scale对同一个N64 tile在4个M-wave间完全相同。实验在A/C union的C分支中加入
+`2 x 64 x f32 = 512B`双槽scale LDS，不增加24KB总LDS；仅wave0的前16 lanes从global读取64个
+scale，然后所有4个wave从LDS构造各自的scale fragment。完整H3保持`diff=0.00105974`。
+
+| 每N64 tile / WG | 原global直读 | scale经LDS |
+|---|---:|---:|
+| scale VMEM-load128 wave指令 | 4（每wave 1） | 1（仅wave0） |
+| scale LDS-write128 wave指令 | 0 | 1 |
+| scale LDS-read128 wave指令 | 0 | 4（每wave 1） |
+| 总128-bit搬运指令 | 4 | 6 |
+
+scale VMEM读取确实降低75%，但总搬运从4条增到6条，并增加LDS依赖链和寄存器：资源从
+`60 VGPR + 132 AGPR`变为`68 VGPR + 132 AGPR`。首次空闲card3正反配对18个稳态样本中，
+pad128 down从`1.7342 ms`退化到`2.3622 ms`（+36.21%）。随后在全机有外部负载时改用更严格的
+单进程同stream ABBA：三种kernel共享相同H3输入、排序元数据和1.61GiB输出buffer，每种交错
+发射24次；base为`1.6060 ms`（Q1--Q3 `1.6036--1.6090`），scale-LDS为`2.3487 ms`
+（`2.3416--2.3697`），再次确认退化46.25%。因此scale-LDS代码和环境开关均已移除。
+
+##### 写出均匀分布实验
+
+基线最终ISA的两条store位于第6/12条MFMA之后。仅使用`sched_group`提示尝试16/32分布时，
+两个半迭代的调度不一致且down退化7.81%。最终改为源级持有上一tile的两个16B向量，在第2/4个
+K64计算后写出，并用`sched_barrier(0)`固定边界；两个半迭代的最终ISA均为MFMA 16/32。
+MFMA、VMEM/LDS读写条数、barrier数和24KB LDS均保持不变，资源变为`72 VGPR + 128 AGPR`。
+
+该候选通过完整H3正确性（`diff=0.00105974`）。一次较早、稳定但store位置为29/32的源级版本
+从`1.7329`改善到`1.7229 ms`（-0.58%）；严格16/32版本的跨进程正反结果受外部任务切入污染。
+最终使用上述单进程同stream ABBA复测：base为`1.6060 ms`，严格16/32为`1.6095 ms`
+（Q1--Q3 `1.6059--1.6119`），即退化0.22%，属于性能中性且资源更高。该实验代码和环境开关
+已移除，pad128继续使用原始MFMA 6/12附近写出。
+
+#### `e6fe8e9`旧N64 CShuffle的`setprio`反相实验
+
+旧N64循环的单个basic block同时混合上一块LDS读取/global store、下一块weight load、当前块
+MFMA和LDS写入，不具备后续N256实现中纯净的“读写stage / MFMA stage”边界。基于硬件驻留
+wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
+
+1. **读写slot偏置，计算统一prio3。** 每个N64半迭代开始将slot0/slot1设为`1/0`，block末
+    恢复为prio3。正反配对各合并18个稳态样本：原始row-major down为
+    `1.8601 -> 1.8587 ms`（-0.08%，噪声）；pad128为`1.7368 -> 1.7906 ms`
+    （+3.10%）。资源由`60 VGPR + 132 AGPR`变为`64 VGPR + 128 AGPR`。
+2. **严格阶段反相。** 读写阶段slot0/slot1=`1/0`，计算阶段反转为`2/3`，并用
+    `sched_barrier(0)`固定最终ISA边界。原始row-major down为`1.8461 -> 2.2967 ms`
+    （+24.41%）；pad128为`1.7291 -> 2.1883 ms`（+26.56%）。资源升至
+    `68 VGPR + 132 AGPR`。
+
+严格反相把原本由`sched_group`在同一basic block内交织的VMEM/MFMA/LDS强制切开，既增加SALU
+控制和VGPR，也破坏旧流水的指令重叠；固定slot0/slot1=`1/0`整个kernel则会长期饿死slot1，完整
+运行同样明显退化。因此本轮未保留任何`setprio`代码或环境开关，旧e6仍以128B padding为最佳。

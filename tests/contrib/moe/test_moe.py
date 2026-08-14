@@ -398,9 +398,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
             down_physical_n128 = os.getenv("MOE_DOWN_PHYSICAL_N128", "0") == "1"
+            down_cshuffle_output = (
+                os.getenv("MOE_DOWN_CSHUFFLE_OUTPUT", "0") == "1"
+            )
             down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
             down_output_padding_bytes = (
-                int(down_padding_env) if down_padding_env is not None else None
+                int(down_padding_env)
+                if down_padding_env is not None
+                else (128 if down_cshuffle_output else None)
             )
             down_row_group_env = os.getenv("MOE_DOWN_OUTPUT_ROW_GROUP")
             down_output_row_group = (
@@ -413,6 +418,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 assert down_physical_n128
                 assert down_output_padding_bytes is None
                 assert down_output_row_group in (1, 2, 4, 8, 16)
+            if down_cshuffle_output:
+                assert down_physical_n128
+                assert down_output_padding_bytes in (0, 32, 64, 128)
+                assert down_output_row_group is None
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
                 amax = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -592,7 +601,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
                         ('down_physical_n128', down_physical_n128),
                         ('down_output_padding_bytes', down_output_padding_bytes),
-                        ('down_output_row_group', down_output_row_group)
+                        ('down_output_row_group', down_output_row_group),
+                        ('down_cshuffle_output', down_cshuffle_output),
                     )
                     if down_alg == "prefill_1x4":
                         #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)

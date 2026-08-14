@@ -6,7 +6,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import llvm, scf, vector
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
@@ -77,6 +77,7 @@ def compile_gemm(
     down_physical_n128=False,
     down_output_padding_bytes=None,
     down_output_row_group=None,
+    down_cshuffle_output=False,
 ):
 
     TILE_K = 64
@@ -127,6 +128,10 @@ def compile_gemm(
         assert down_physical_n128 and BLOCK_TILE_SIZE_N == 256
         assert down_output_padding_bytes is None
         assert down_output_row_group in (1, 2, 4, 8, 16)
+    if down_cshuffle_output:
+        assert down_physical_n128 and BLOCK_TILE_SIZE_N == 256
+        assert down_output_padding_bytes in (0, 32, 64, 128)
+        assert down_output_row_group is None
     output_row_group = (
         down_output_row_group if down_output_row_group is not None else 16
     )
@@ -2180,6 +2185,13 @@ def compile_gemm(
             # mask,base,shift, swizzle always in unit of 128b,
             swz_base = ((128 // weight_dtype.width) - 1).bit_length()
             swz = fx.SwizzleType.get(3, swz_base, 3)
+            a_swz = fx.SwizzleType.get(
+                3,
+                swz_base,
+                4
+                if down_physical_n128 and BLOCK_TILE_SIZE_N == 256
+                else 3,
+            )
 
             act_dtype = weight_dtype  # fp8 / bf16
 
@@ -2198,8 +2210,19 @@ def compile_gemm(
                 scale_lds = scale_storage.peek().view(
                     fx.make_layout(BLOCK_N, 1)
                 )
+            cshuffle_lds = None
+            if const_expr(down_cshuffle_output):
+                cshuffle_storage = shared_allocator.allocate(
+                    fx.Array[fx.BFloat16, 4 * 8 * 64, 16]
+                )
+                cshuffle_lds = cshuffle_storage.peek().view(
+                    fx.make_layout(4 * 8 * 64, 1)
+                )
             ldsA0 = lds.A.peek().view(
-                fx.make_composed_layout(fx.static(swz), fxh.torch_layout(BLOCK_M, K))
+                fx.make_composed_layout(
+                    fx.static(a_swz),
+                    fxh.torch_layout(BLOCK_M, K),
+                )
             )
             layoutC = fx.make_composed_layout(
                 fx.static(swz),
@@ -2641,6 +2664,96 @@ def compile_gemm(
                         offset_is_bytes=True,
                     )
 
+            cshuffle_copy_atom = None
+            if const_expr(down_cshuffle_output):
+                cshuffle_copy_atom = flyobj.get_universal_copy_atom(
+                    fx.BFloat16, 128
+                )
+
+            def store_cshuffle_n256(output, block_n, cshuffle_lds_arg):
+                lane_id = fx.Int32(fx.thread_idx.x % 64)
+                wave_id = fx.Int32(fx.thread_idx.x // 64)
+                lane_group = lane_id // 16
+                lane_row = lane_id % 16
+                wave_lds_base = wave_id * (8 * 64)
+
+                for row_chunk in range_constexpr(8):
+                    token_repeat = row_chunk // 2
+                    row_half = row_chunk % 2
+                    producer = scf.IfOp(_raw(lane_row // 8 == row_half))
+                    with ir.InsertionPoint(producer.then_block):
+                        row_in_8 = lane_row % 8
+                        for channel_piece in range_constexpr(2):
+                            channels_lo = Vec(
+                                output[
+                                    None,
+                                    2 * channel_piece,
+                                    token_repeat,
+                                ].load()
+                            )
+                            channels_hi = Vec(
+                                output[
+                                    None,
+                                    2 * channel_piece + 1,
+                                    token_repeat,
+                                ].load()
+                            )
+                            packed_bf16 = channels_lo.shuffle(
+                                channels_hi, list(range(8))
+                            )
+                            logical_atom = lane_group * 2 + channel_piece
+                            # Spread each M8 row across all eight 128-bit atom
+                            # positions, reaching the 4-way bank lower bound.
+                            physical_atom = logical_atom ^ row_in_8
+                            lds_offset = (
+                                wave_lds_base
+                                + (row_in_8 * 8 + physical_atom) * 8
+                            )
+                            lds_dst = fx.make_view(
+                                fx.get_iter(cshuffle_lds_arg) + lds_offset,
+                                fx.make_layout(8, 1),
+                            )
+                            lds_frag = fx.make_fragment_like(lds_dst)
+                            lds_frag.store(packed_bf16)
+                            fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
+                        scf.YieldOp([])
+
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    fx.rocdl.sched_barrier(0)
+                    output_row = row_chunk * 8 + lane_id // 8
+                    output_atom = lane_id % 8
+                    physical_atom = output_atom ^ (lane_id // 8)
+                    lds_offset = (
+                        wave_lds_base
+                        + ((lane_id // 8) * 8 + physical_atom) * 8
+                    )
+                    lds_src = fx.make_view(
+                        fx.get_iter(cshuffle_lds_arg) + lds_offset,
+                        fx.make_layout(8, 1),
+                    )
+                    out_frag = fx.make_fragment_like(lds_src)
+                    fx.copy(cshuffle_copy_atom, lds_src, out_frag)
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    output_column = (
+                        fx.Int64(block_n) * BLOCK_N
+                        + fx.Int64(wave_id) * WAVE_N
+                        + fx.Int64(output_atom) * 8
+                    )
+                    byte_offset = (
+                        (
+                            fx.Int64(output_row) * output_row_stride
+                            + output_column
+                        )
+                        * 2
+                    ).to(fx.Int32)
+                    fx.buffer_ops.buffer_store(
+                        Vec(out_frag.load()).bitcast(fx.Int32),
+                        physical_store_rsrc,
+                        byte_offset,
+                        cache_modifier=_PHYSICAL_N128_STORE_CACHE_MODIFIER,
+                        offset_is_bytes=True,
+                    )
+
             cp_atom_out_128b = None
             thrv_out = None
             fragOut = None
@@ -2785,28 +2898,30 @@ def compile_gemm(
                             )
                         else:
                             next_block_n = block_n + 1
+                            next_scale_vec = issue_scale_block_global(
+                                next_block_n
+                            )
+                            fx.rocdl.sched_barrier(0)
                             flyobj.load_tiled_mma_fragA(
                                 mm,
                                 weight,
                                 [None, None, next_block_n, 0],
                                 frag_weight_slots[next_slot],
                             )
-                            next_scale_vec = issue_scale_block_global(
-                                next_block_n
+                        if not fx.const_expr(down_cshuffle_output):
+                            stores_per_stage = physical_store_count // nBK
+                            extra_store_stages = physical_store_count % nBK
+                            stage_store_count = stores_per_stage + (
+                                extra_store_stages if k_core + 1 == nBK else 0
                             )
-                        stores_per_stage = physical_store_count // nBK
-                        extra_store_stages = physical_store_count % nBK
-                        stage_store_count = stores_per_stage + (
-                            extra_store_stages if k_core + 1 == nBK else 0
-                        )
-                        stage_store_begin = k_core * stores_per_stage
-                        store_physical_n128(
-                            fragC_bf16,
-                            block_n - 1,
-                            store_begin=stage_store_begin,
-                            store_count=stage_store_count,
-                            mask=has_previous_output,
-                        )
+                            stage_store_begin = k_core * stores_per_stage
+                            store_physical_n128(
+                                fragC_bf16,
+                                block_n - 1,
+                                store_begin=stage_store_begin,
+                                store_count=stage_store_count,
+                                mask=has_previous_output,
+                            )
                         enter_compute_stage()
                         fx.gemm(
                             mm,
@@ -2825,13 +2940,19 @@ def compile_gemm(
                         fc.store(fc.load() * fpc.load())
                     postprocess_to_bf16(fragC[0], fragC_bf16)
 
+                    if fx.const_expr(down_cshuffle_output):
+                        store_cshuffle_n256(
+                            fragC_bf16, block_n, cshuffle_lds
+                        )
+
                     results = yield [
                         frag_weight_slots[nBK % 2].load(),
                         next_frag_pc_scale.load(),
                         fragC_bf16.load(),
                     ]
                 fragC_bf16.store(results[2])
-                store_physical_n128(fragC_bf16, nBN - 1)
+                if not fx.const_expr(down_cshuffle_output):
+                    store_physical_n128(fragC_bf16, nBN - 1)
                 fx.rocdl.sched_barrier(0)
                 if const_expr(_PHYSICAL_N128_USE_SETPRIO):
                     fx.rocdl.s_setprio(0)
