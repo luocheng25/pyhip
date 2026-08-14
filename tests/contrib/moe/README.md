@@ -1391,7 +1391,7 @@ expert，实测前128个激活通道relative-L2为0.486，尾64个通道为1.0�
 
 核心kernel现在明确要求`N % BN == 0`；host在`384/256`时自动选择BN128。修复后gateup相对量化
 参考的整体relative-L2降到0.00166，前128和尾64分别为0.00166与0.00166。完整生产harness的
-`calc_diff=0.00021646`，低于0.02阈值。
+当时`calc_diff=0.00021646`，低于0.02阈值；scale融合后的当前值见后文。
 
 ### K512的LDS occupancy回退
 
@@ -1414,12 +1414,17 @@ legacy更快：
 Xiaomi K256和H3 K384使用128B padding；Hy3 K192使用0B padding。
 
 核心kernel支持`K % 64 == 0`和per-tensor scale。Hy3 K192按3个K64 stage执行，per-tensor不分配
-1KB PTPC scale LDS，总LDS为20,480B；最终ISA为next-free VGPR 150、accum offset 152，rocprof
-运行资源为`24 VGPR + 128 AGPR`、0 spill。最初沿用H3的128B
+1KB PTPC scale LDS，总LDS为20,480B。scale融合前的最终ISA为next-free VGPR 150、accum offset
+152，rocprof运行资源为`24 VGPR + 128 AGPR`；scale融合和异构stage组合后分别为144/144和
+`16 VGPR + 128 AGPR`。两者均可驻留3 waves/SIMD且0 spill。最初沿用H3的128B
 padding时，physical down虽更快，但producer之后的sorted-sum回退45.7%；padding消融确认0B可
 消除该回退并获得`down+sorted_sum`净收益。详细数据见后文“Down数据复核”。
 
 ### Hy3 K192实际与理论性能差距
+
+本节原始K192/K384墙钟、ATT、PMC及后续K扫描均采于per-tensor scale融合前的`b9c2750`基线，
+保留用于解释固定尾部和K长度缩放。当前scale融合结果单列在后文“两项候选实测”，不能把融合后的
+绝对时延与这些历史stall份额直接混算。
 
 为区分shape固定成本和K方向计算成本，固定`B=32768`、`N=4096`、`TOPK=9`、`E=193`、
 `BM64/BN256`、per-tensor、physical CShuffle和0B padding，只把K从192改成384。两者复用同一
@@ -1467,8 +1472,9 @@ MFMA动态执行数正好翻倍，但总ATT stall只从85.75M增到95.31M。统�
 block后，总stall仅从5775增到6419 cycles（+11.1%），而MFMA从96翻倍到192；其中非MFMA stall
 反而由约4301降到3996 cycles/block。固定输出路径因此在K192中占比更大。
 
-静态ISA也直接闭合该结论：K192/K384分别有96/192条MFMA、19/38条`buffer_load_dwordx4`和
-20/32条`ds_read_b128`；但两者都固定包含68条`v_mul_f32`（其中64条为输出scale）、64条
+融合前的静态ISA也直接闭合该结论：K192/K384分别有96/192条MFMA、19/38条
+`buffer_load_dwordx4`和20/32条`ds_read_b128`；但两者都固定包含68条`v_mul_f32`（其中64条为
+输出scale）、64条
 `v_fmaak_f32`、32条`v_perm_b32`、16条CShuffle `ds_write_b128`、8条global store、2条barrier和
 12条`setprio`。最后一条静态MFMA之后的stall为41.07M/37.34M，占各自总stall的47.89%/39.18%。
 
@@ -1495,20 +1501,57 @@ stall/exec分别为K192的59.3/78.8/66.7 cycles和K384的92.3/93.8/83.9 cycles�
 支付整套输出后处理、CShuffle、store和三次stage边界；固定成本和首条MFMA气泡无法被充分摊薄。**
 它不是MFMA吞吐、HBM带宽或occupancy问题。
 
-两个探针进一步排除了简单修复：将K192 LDS占用强制到2 WG/CU使down稳定回退13.4%，说明第三
+两个早期探针进一步排除了简单修复：将K192 LDS占用强制到2 WG/CU使down稳定回退13.4%，说明第三
 驻留wave有帮助；关闭`setprio`的ABBA有明显顺序双簇，正反几何对称估计仅约-1.3%，远小于理论
-缺口，未保留。更有针对性的后续方向是：
+缺口，未保留。
 
-1. 将K192从`3 x K64`改为异构`K128 + K64`两stage，少付一次stage切换，并给首批load更长的
-     MFMA遮盖窗口。
-2. 针对Hy3 per-tensor，将weight scale提前并入已存在的activation-scale/routing-weight组合，
-     尝试从MFMA尾部移除64条逐输出`v_mul_f32`；当前静态68条MUL中64条来自这一路径。
-3. 若继续流水化CShuffle，必须用额外计算覆盖约0.30ms剩余固定成本；单纯牺牲第三wave换寄存器
-     已被2-WG实验否证。
+#### K192两项候选实测
+
+按建议继续测试两个方向，均使用K192真实shape、1800MHz和同进程ABBA；实验候选放在临时
+worktree；最终只把有稳定组合收益的scale融合和异构stage化简实现合入主分支。
+
+**异构K128 + K64两stage：单独无收益，和scale融合组合后保留。** 第一版把前两个K64 core合并到
+一个compute窗口并同时保留
+两个activation fragment，尾部K64使用第二个窗口；输出与baseline逐bit一致，资源从
+`24 VGPR + 128 AGPR`增至`28 + 132`，但仍保持3 waves/SIMD、0 spill。正反顺序几何对称的
+`candidate/baseline`时延ratio为1.03049，即回退3.05%。第二版复用activation fragment，并把
+core1 load放到core0/1两组MFMA之间以恢复load/compute重叠；输出仍逐bit一致，但ratio仍为1.00544，
+回退0.54%。但scale融合移除尾部MUL后，第二版相对scale-only连续三轮ratio几何值为
+0.98422/0.98445/0.98477，合并72个ratio中位0.98467，即再降低1.53%。因此最终用两个编译期条件
+省略K192 core0后的read/write切换和core1前的compute切换，得到`K128 + K64`两stage；其他K、
+PTPC weight路径和原循环不变。
+
+**per-tensor scale融合：保留。** 对双per-tensor路径，先计算一次`activation_scale * weight_scale`
+标量并乘入routing-weight fragment，绕过逐row activation-scale gather；对PTPC activation +
+per-tensor weight路径，将expert weight标量并入原有activation-scale/routing-weight fragment。
+两种路径随后都跳过MFMA尾部的64条逐输出scale MUL。
+
+最终用纯净`b9c2750`作为baseline，非单位activation/weight/routing scale、共同gateup、10套buffer，
+独立运行三轮24轮ABBA，每路合并144个绝对样本和72个同轮ratio：
+
+| K192 variant | 中位时延 | Q1--Q3 | 有效TFLOPS |
+|---|---:|---:|---:|
+| `b9c2750` | 1.833768 ms | 1.807838--1.838829 ms | 252.95T |
+| scale融合 + 异构stage | **1.760709 ms** | 1.756938--1.795639 ms | **263.45T** |
+
+三轮ratio中位数为0.96837/0.96596/0.96550，合并中位0.96677（IQR 0.96097--0.98450），即down
+配对时延降低3.32%；绝对中位数对应时延降低3.98%、吞吐提高4.15%。乘法结合顺序改变使12.14亿个
+BF16输出中8192个不同，最大绝对差0.5，
+`rel_l2=1.41e-5`。随机数据参考矩阵覆盖K192/K384和per-tensor/PTPC activation，四项rel-L2均为
+0.401%--0.405%，低于既有3%阈值；完整`test_flydsl_moe_down.py` 11项通过。原生Hy3完整入口也通过，
+`calc_diff=0.00038600`。
+
+最终K192 ISA从628降至555条：`v_mul_f32`从68降至5，global load从8降至7，buffer load从20降至
+19，`setprio`从12降至9，wait从49降至45；96条MFMA、64条rounding FMA、32条PERM、8条store和
+20KB LDS均不变。next-free VGPR / accum offset从150/152降至144/144，rocprof combined VGPR从
+152降至144，但两者都保持3 waves/SIMD。因此收益来自移除尾部scale工作和一次stage边界，不是
+occupancy台阶。
+
+若继续流水化CShuffle，仍需覆盖剩余固定成本；单纯牺牲第三wave换寄存器已被2-WG实验否证。
 
 #### K继续扩展：K192--K1024
 
-继续沿用上述1800MHz、共同gateup、10-buffer和正反对称轮换协议，将K扩展到
+以下扫描采于scale融合前。继续沿用上述1800MHz、共同gateup、10-buffer和正反对称轮换协议，将K扩展到
 `192/384/512/576/640/704/768/896/960`。每个K有48个样本，其他shape、sorting结果、physical
 N256 CShuffle和0B padding均不变；全1输入下，各K输出与`K / 192 * K192输出`逐bit一致。
 physical路径在`K % 128 == 0`时使用`BLOCK_K=128`，否则使用`BLOCK_K=64`。
@@ -1579,19 +1622,20 @@ block重复读取，而每个N block都执行CShuffle。若要继续超过K960�
 
 | 模型 | padding效率 | 架构dense roof | 16链dense roof | 后处理0%遮盖参照 |
 |---|---:|---:|---:|---:|
-| Hy3 | 99.4819% | 582.94T | 532.95T | 385.94T |
+| Hy3 | 99.4819% | 582.94T | 532.95T | 433.80T |
 | Qwen3.5-397B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Qwen3.5-35B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Xiaomi | 96.9697% | 568.22T | 519.49T | 404.06T |
 | H3 | 100% | 585.98T | 535.73T | 450.02T |
 
-“后处理0%遮盖参照”沿用前文64 MUL、64 FMA、32 PERM全部暴露的操作计数，只适用于physical
-N256 codegen，不能套到legacy N64。它不是roof，也没有计入2个resident waves的实际遮盖；表中
-只保留它作为不同K长度下的统一敏感性点。参数化脚本`analyze_down_theoretical_roof.py`通过
-`--path physical_n256|legacy`区分路径，并用`--postprocess-overlap`扫描遮盖假设。
+“后处理0%遮盖参照”只适用于physical N256 codegen，不能套到legacy N64。PTPC和融合前基线使用
+64 MUL、64 FMA、32 PERM；当前Hy3 per-tensor已移除64条尾部MUL，因此表中用0 MUL、64 FMA、
+32 PERM，即384名义cycles。它不是roof，也没有计入resident waves的实际遮盖，只作为敏感性点。
+参数化脚本通过`--path physical_n256|legacy`区分路径；当前Hy3还需传`--postprocess-mul 0`，并可用
+`--postprocess-overlap`扫描遮盖假设。
 
 最终五个shape的生产正确性均通过：Hy3/Qwen3.5-397B/Qwen3.5-35B/Xiaomi/H3的`calc_diff`
-分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。下表保留此前同口径的
+分别为0.00038600、0.00020764、0.00020577、0.00019977、0.00020164。下表保留此前同口径的
 隔离单kernel峰值窗口，用于看roof距离；它不是后文10-buffer生产上下文的端到端时延，不能与
 `sorted_sum`绝对时延直接相加。Hy3 0B修复仅按生产上下文复测，不与这组历史峰值混列。
 
@@ -1699,7 +1743,7 @@ PMC进一步排除了“128B增加cache miss或DRAM流量”的解释。三个�
 miss和DRAM请求数，性能差来自这些请求的服务并行度/延迟，而非请求数量。当前sum counter仍不能
 进一步区分具体的TCC channel、HBM bank或地址hash机制，因此不作更具体硬件归因。
 
-修复后Hy3自动走physical N256/K64 + 0B padding，生产正确性保持`calc_diff=0.00021646`；固定
+0B padding修复时Hy3自动走physical N256/K64，融合前生产正确性为`calc_diff=0.00021646`；固定
 1800MHz的10-buffer完整调用为5.4853 ms / 253.71T，相对严格隔离的e6 5.6457 ms / 246.49T降低
 2.84%。Qwen两型的完整调用变化来自gateup tile选择及其他辅助kernel，不是down代码收益；
 Xiaomi/H3则同时包含gateup BN256和physical down收益。旧版与当前版均通过各自harness的正确性

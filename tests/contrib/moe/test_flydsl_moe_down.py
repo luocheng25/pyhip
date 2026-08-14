@@ -241,10 +241,13 @@ def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
     assert _relative_l2(logical_output, expected) < 3e-2
 
 
-def test_down_prefill_physical_per_tensor_k192_cshuffle():
+@pytest.mark.parametrize("intermediate_size", [192, 384])
+@pytest.mark.parametrize("act_quant_type", ["per_tensor", "ptpc"])
+def test_down_prefill_physical_per_tensor_cshuffle(
+    intermediate_size, act_quant_type
+):
     torch.manual_seed(17)
     batch_size = 64
-    intermediate_size = 192
     hidden_size = 512
     fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = torch.finfo(fp8_dtype).max
@@ -252,7 +255,10 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
     activation = 0.1 * torch.randn(
         batch_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
-    activation_scale = activation.float().abs().amax() / fp8_max
+    if act_quant_type == "per_tensor":
+        activation_scale = activation.float().abs().amax().reshape(1) / fp8_max
+    else:
+        activation_scale = activation.float().abs().amax(dim=1, keepdim=True) / fp8_max
     activation_fp8 = (
         (activation.float() / activation_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
     )
@@ -287,7 +293,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
         K=intermediate_size,
         weight_dtype="fp8",
         weight_quant_type="per_tensor",
-        act_quant_type="per_tensor",
+        act_quant_type=act_quant_type,
         TOPK=1,
         BLOCK_TILE_SIZE_M=64,
         BLOCK_TILE_SIZE_N=256,
@@ -307,7 +313,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
         _ptr(sorted_expert_ids),
         _ptr(num_valid_ids),
         _ptr(weight_scale),
-        _ptr(activation_scale.reshape(1)),
+        _ptr(activation_scale),
         batch_size,
         1,
         torch.cuda.current_stream(),

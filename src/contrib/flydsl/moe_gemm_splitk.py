@@ -2219,6 +2219,7 @@ def compile_gemm(
 
             nBN = fxh.div_up(N, BLOCK_N)
             nBK = fxh.div_up(K, BLOCK_K)
+            merge_k192_first_two_cores = K == 192 and weight_quant_type == "per_tensor"
 
             mm = flyobj.create_thr_mma(weight_dtype, (4, 1, 1))
 
@@ -2246,6 +2247,7 @@ def compile_gemm(
             fx.gpu.barrier()  # make sure all threads finished using ldsA (since it's reused by ldsC)
 
             arg_w_scale = None
+            per_tensor_w_scale = None
             scale_global_rsrc = None
             scale_lds_logical = None
             if const_expr(weight_quant_type == "per_tensor"):
@@ -2253,6 +2255,11 @@ def compile_gemm(
                     fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 1), (0, 0))
                 )
                 arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                if const_expr(down_physical_n128):
+                    per_tensor_w_scale = fx.make_view(
+                        fxh._as_ptr(p_w_scale) + expert_id,
+                        fx.make_layout(1, 1),
+                    )[0]
             if const_expr(weight_quant_type == "ptpc"):
                 if const_expr(down_physical_n128):
                     scale_global = fx.make_view(
@@ -2337,16 +2344,23 @@ def compile_gemm(
                 )
 
             arg_a_scale = None
+            per_tensor_a_scale = None
             if const_expr(act_quant_type == "per_tensor"):
-                arg_a_scale = fx.make_view(
-                    fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
-                    fx.make_layout((M, TOPK), (0, 0)),
-                )
-                arg_a_scale = fx.rocdl.make_buffer_tensor(
-                    arg_a_scale,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(1) * (arg_a_scale.dtype.width // 8),
-                )
+                if const_expr(down_physical_n128 and weight_quant_type == "per_tensor"):
+                    per_tensor_a_scale = fx.make_view(
+                        fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
+                        fx.make_layout(1, 1),
+                    )[0]
+                else:
+                    arg_a_scale = fx.make_view(
+                        fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
+                        fx.make_layout((M, TOPK), (0, 0)),
+                    )
+                    arg_a_scale = fx.rocdl.make_buffer_tensor(
+                        arg_a_scale,
+                        max_size=False,
+                        num_records_bytes=fx.Int64(1) * (arg_a_scale.dtype.width // 8),
+                    )
             if const_expr(act_quant_type == "ptpc"):
                 arg_a_scale = fx.make_view(
                     fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
@@ -2369,7 +2383,10 @@ def compile_gemm(
                 mm, sorted_weights, copy_atom_bits=32
             )
 
-            if fx.const_expr(arg_a_scale is not None):
+            if const_expr(per_tensor_a_scale is not None):
+                combined_scale = per_tensor_a_scale * per_tensor_w_scale
+                frag_sorted_weight.store(frag_sorted_weight.load() * combined_scale)
+            elif fx.const_expr(arg_a_scale is not None):
                 """load & combine per-token scales with per-token weights, and store into lds.C"""
                 cp_atom = flyobj.get_buffer_copy_atom(p_a_scale.dtype, 32)
                 coord_tensor = fx.make_view(
@@ -2397,7 +2414,12 @@ def compile_gemm(
                 for frag_pt, frag_sw in fxh.all_elements(
                     frag_pt_scales, frag_sorted_weight
                 ):
-                    frag_pt.store(frag_pt.load() * frag_sw.load())
+                    combined_scale = frag_pt.load() * frag_sw.load()
+                    if const_expr(
+                        down_physical_n128 and weight_quant_type == "per_tensor"
+                    ):
+                        combined_scale = combined_scale * per_tensor_w_scale
+                    frag_pt.store(combined_scale)
 
                 frag_sorted_weight = frag_pt_scales
 
@@ -2729,7 +2751,8 @@ def compile_gemm(
                                 [None, None, next_block_n, 0],
                                 frag_weight_slots[next_slot],
                             )
-                        enter_compute_stage()
+                        if const_expr(not (merge_k192_first_two_cores and k_core == 1)):
+                            enter_compute_stage()
                         fx.gemm(
                             mm,
                             fragC[0],
@@ -2737,7 +2760,8 @@ def compile_gemm(
                             frag_act,
                             fragC[0],
                         )
-                        enter_read_write_stage()
+                        if const_expr(not (merge_k192_first_two_cores and k_core == 0)):
+                            enter_read_write_stage()
                         if const_expr(
                             k_core + 1 == nBK and weight_quant_type == "ptpc"
                         ):
@@ -2745,8 +2769,9 @@ def compile_gemm(
                                 next_scale_vec, next_frag_pc_scale
                             )
 
-                    for fc, fpc in fxh.all_elements(fragC[0], frag_pc_scale):
-                        fc.store(fc.load() * fpc.load())
+                    if const_expr(weight_quant_type != "per_tensor"):
+                        for fc, fpc in fxh.all_elements(fragC[0], frag_pc_scale):
+                            fc.store(fc.load() * fpc.load())
                     postprocess_to_bf16(fragC[0], fragC_bf16)
 
                     store_cshuffle_n256(
