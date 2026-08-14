@@ -1418,6 +1418,93 @@ Xiaomi K256和H3 K384使用128B padding；Hy3 K192使用0B padding。
 padding时，physical down虽更快，但producer之后的sorted-sum回退45.7%；padding消融确认0B可
 消除该回退并获得`down+sorted_sum`净收益。详细数据见后文“Down数据复核”。
 
+### Hy3 K192实际与理论性能差距
+
+为区分shape固定成本和K方向计算成本，固定`B=32768`、`N=4096`、`TOPK=9`、`E=193`、
+`BM64/BN256`、per-tensor、physical CShuffle和0B padding，只把K从192改成384。两者复用同一
+sorting结果；每个计时样本前运行相同Hy3 gateup形成生产功耗上下文，10套输入/权重buffer轮换，
+GPU4固定1800MHz，24轮ABBA、每个K共48个样本。全1输入下K384输出与`2 * K192`逐bit一致。
+
+另用当前原生`entry_common('fly_splitk_2s')`跑10-buffer完整调用并记录11个kernel dispatch，剔除
+首个warmup后，Hy3 K192 down稳定中位为`1.811528 ms / 256.06T`，与下表同shape ABBA的
+`1.834509 ms / 252.85T`接近。后续理论差距按原生生产值回答；K192/K384缩放关系按下表的同协议
+ABBA回答。
+
+| K | 每N256 wave MFMA | 中位时延 | Q1--Q3 | 有效TFLOPS | 16链dense效率 | 后处理0%遮盖参照 | 实际/该参照 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 192 | 96 | 1.834509 ms | 1.808108--1.838909 ms | **252.85T** | 47.44% | 385.94T | 65.52% |
+| 384 | 192 | 3.039535 ms | 3.037565--3.045285 ms | **305.22T** | 57.27% | 447.68T | 68.18% |
+
+K翻倍但配对时延只增加1.6688倍（Q1--Q3为1.6528--1.6811），因此K384吞吐比K192高20.71%。
+按16链MFMA微基准，两个shape的padding后dense roof均为532.95T；对应纯MFMA理论时延为
+0.870351/1.740702 ms。再把每N256 wave固定的64 MUL、64 FMA、32 PERM按0%遮盖加入，理论时延
+变为1.201898/2.072249 ms。原生K192实测相对dense多0.941177 ms，相对0%遮盖参照仍多
+0.609629 ms；K384 ABBA则分别多1.298833/0.967285 ms。固定后处理只解释了部分差距，其余来自
+MFMA operand-ready、LDS/CShuffle和stage边界等待。
+
+仅用K192/K384两点拟合`t(K)=a*K+b`，得到`a=0.006276 ms/K`、`b=0.629483 ms`。该截距约占
+K192时延34.31%、K384时延20.71%；名义后处理640 cycles对应0.331547 ms，约占截距52.67%，
+余下约0.298 ms是CShuffle、同步、地址和流水切换等K无关成本。两点拟合只用于量级分解，不作为
+独立roof。
+
+#### K192/K384 ATT对比
+
+在相同1800MHz下分别采第6次稳态down dispatch；ATT时延为1.802689/3.038972 ms，与ABBA结果
+一致。K192资源为`24 VGPR + 128 AGPR`、20,480B LDS，可驻留3 waves/SIMD；K384为
+`64 VGPR + 128 AGPR`、28,672B LDS，可驻留2 waves/SIMD。K192 occupancy更高但效率更低，
+因此缺口不是驻留wave不足。
+
+| ATT stall类别 | K192占总stall | K384占总stall | K192 stall/MFMA | K384 stall/MFMA |
+|---|---:|---:|---:|---:|
+| MFMA | 25.52% | 37.76% | 15.35 | 12.62 |
+| VALU | 34.09% | 33.63% | 20.51 | 11.25 |
+| LDS wait + LDS指令 | 25.40% | 20.68% | 15.28 | 6.91 |
+| VMEM load/store/wait | 12.66% | 6.00% | 7.61 | 2.01 |
+| barrier + SALU | 2.34% | 1.92% | 1.41 | 0.64 |
+
+MFMA动态执行数正好翻倍，但总ATT stall只从85.75M增到95.31M。统一到每个有效wave、每个N256
+block后，总stall仅从5775增到6419 cycles（+11.1%），而MFMA从96翻倍到192；其中非MFMA stall
+反而由约4301降到3996 cycles/block。固定输出路径因此在K192中占比更大。
+
+静态ISA也直接闭合该结论：K192/K384分别有96/192条MFMA、19/38条`buffer_load_dwordx4`和
+20/32条`ds_read_b128`；但两者都固定包含68条`v_mul_f32`（其中64条为输出scale）、64条
+`v_fmaak_f32`、32条`v_perm_b32`、16条CShuffle `ds_write_b128`、8条global store、2条barrier和
+12条`setprio`。最后一条静态MFMA之后的stall为41.07M/37.34M，占各自总stall的47.89%/39.18%。
+
+两者都分3个K core，但K192每个stage1只有32条MFMA，K384有64条。三个core首条MFMA的
+stall/exec分别为K192的59.3/78.8/66.7 cycles和K384的92.3/93.8/83.9 cycles；K384首条绝对
+等待更高，却能摊到两倍MFMA上。组内MFMA中位stall/exec则由K192约13.1--14.0降到K384约11.7，
+说明K192的短计算窗口更难遮盖operand-ready和阶段切换。
+
+#### PMC排除项
+
+- `SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA`在K192/K384中均精确为16.0，说明MFMA硬件管线
+    吞吐正常；ATT中额外MFMA stall来自依赖或操作数未就绪，而不是MFMA执行单元变慢。
+- L2 hit rate为61.9%/67.6%。实际HBM读约0.418/0.775GB，写均为2.429GB，总带宽约
+    1.582/1.054TB/s，只占5.3TB/s峰值29.8%/19.9%；两者都不是HBM带宽受限。固定2.429GB输出写
+    在K192总流量中的占比更高，但ATT中VMEM store只占2.98% stall。
+- 每条LDS指令的`SQ_LDS_BANK_CONFLICT`为2.69/4.03，K384原始冲突率更高却性能更好；该counter
+    不能解释K192回退。K192更高的LDS stall/MFMA主要来自固定CShuffle写读依赖被更少MFMA摊薄。
+- 动态PMC按launch wave统计：K从192翻倍到384时，MFMA正好翻倍，但VALU仅增加36.6%、VMEM
+    增加60.1%、LDS增加33.7%，`SQ_WAVE_CYCLES`只增加15.9%，再次证明大量指令是K无关固定成本。
+
+#### 结论与下一步
+
+关键原因是：**K192使用3个K64 core，每个stage只有32条MFMA，却与K384的3个K128 core一样
+支付整套输出后处理、CShuffle、store和三次stage边界；固定成本和首条MFMA气泡无法被充分摊薄。**
+它不是MFMA吞吐、HBM带宽或occupancy问题。
+
+两个探针进一步排除了简单修复：将K192 LDS占用强制到2 WG/CU使down稳定回退13.4%，说明第三
+驻留wave有帮助；关闭`setprio`的ABBA有明显顺序双簇，正反几何对称估计仅约-1.3%，远小于理论
+缺口，未保留。更有针对性的后续方向是：
+
+1. 将K192从`3 x K64`改为异构`K128 + K64`两stage，少付一次stage切换，并给首批load更长的
+     MFMA遮盖窗口。
+2. 针对Hy3 per-tensor，将weight scale提前并入已存在的activation-scale/routing-weight组合，
+     尝试从MFMA尾部移除64条逐输出`v_mul_f32`；当前静态68条MUL中64条来自这一路径。
+3. 若继续流水化CShuffle，必须用额外计算覆盖约0.30ms剩余固定成本；单纯牺牲第三wave换寄存器
+     已被2-WG实验否证。
+
 ### 理论roof口径
 
 按gfx942 80CU、4 SIMD/CU、实测有效频率1.78827GHz，架构16-cycle dense roof为585.98T，
@@ -1513,7 +1600,8 @@ physical会同时改变down producer和sorted-sum consumer，必须合计。最�
 1800MHz性能确定性模式下执行；每个样本前运行共同gateup形成生产功耗上下文，10套输入/权重buffer
 轮换，24轮ABBA正反顺序。独立运行两次后合并48个同轮ratio样本；两种布局的最终reduced输出逐bit
 一致。表中绝对时延是两轮全部样本中位数，变化率是同轮`physical/legacy` ratio中位数，因此两列
-绝对中位数之比可能与配对变化率略有差别。
+绝对中位数之比可能与配对变化率略有差别。该表保留的是早期variant配对窗口的绝对样本，用于
+解释相对选路；当前原生Hy3 down绝对值以本节前述`1.811528 ms / 256.06T`为准。
 
 | 模型 | legacy down | physical down | down变化（IQR） | legacy sum | physical sum | sum变化（IQR） | legacy down+sum | physical down+sum | 合计变化（IQR） | 自动选择 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
