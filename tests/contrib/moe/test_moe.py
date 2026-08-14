@@ -184,7 +184,7 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
     )
     auto_physical = (
         wei_is_fp8(weight_type)
-        and quant_type in ('ptpc', 'per_tensor')
+        and quant_type == 'ptpc'
         and block_m == 64
         and n % 256 == 0
         and k % 64 == 0
@@ -252,7 +252,7 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
 @pytest.mark.parametrize(
     ("quant_type", "n", "k", "expected"),
     [
-        ("per_tensor", 4096, 192, (True, True)),
+        ("per_tensor", 4096, 192, (False, False)),
         ("ptpc", 4096, 512, (False, False)),
         ("ptpc", 2048, 512, (False, False)),
         ("ptpc", 6144, 256, (True, True)),
@@ -272,6 +272,18 @@ def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
         )
         == expected
     )
+
+
+def test_select_fly_down_layout_explicit_physical(monkeypatch):
+    monkeypatch.setenv("MOE_DOWN_PHYSICAL_N128", "1")
+    monkeypatch.setenv("MOE_DOWN_CSHUFFLE_OUTPUT", "1")
+    assert _select_fly_down_layout(
+        torch.float8_e4m3fnuz,
+        "per_tensor",
+        block_m=64,
+        n=4096,
+        k=192,
+    ) == (True, True)
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == 'ptpc':

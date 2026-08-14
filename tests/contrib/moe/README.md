@@ -1355,12 +1355,13 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 
 ## B=32768多shape自动选择（2026-08-14）
 
-H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile和down的实际LDS占用
-自动选路；显式`MOE_DOWN_PHYSICAL_N128=0/1`与`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`仍可覆盖自动值。
+H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile、量化模式、down的实际
+LDS占用和`down+sorted_sum`端到端收益自动选路；显式`MOE_DOWN_PHYSICAL_N128=0/1`与
+`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`仍可覆盖自动值。
 
 | 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
 |---|---:|---:|---:|---|---|---|
-| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle（K64） |
+| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | legacy N64 |
 | Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
 | Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle |
@@ -1394,22 +1395,13 @@ legacy更快：
 | Qwen3.5-397B | 390.68T | 315.36T | 4.2448 ms | 5.1822 ms |
 | Qwen3.5-35B | 370.12T | 277.38T | 1.7377 ms | 2.2139 ms |
 
-因此自动策略只在LDS不超过32KB时启用physical+CShuffle，而不是仅检查K对齐。Xiaomi K256
-保留physical路径；其消融中CShuffle合计3.5300ms，优于legacy 4.1458ms。
+因此自动策略仅对LDS不超过32KB且已有端到端收益的PTPC shape启用physical+CShuffle，而不是
+只检查K对齐。Xiaomi K256和H3 K384保留physical路径。
 
-physical N256随后推广到`K % 64 == 0`和per-tensor scale。Hy3 K192按3个K64 stage执行，且
-per-tensor不分配1KB PTPC scale LDS，总LDS为20,480B。同一空闲card1上，新路径与强制legacy
-都通过生产正确性，`calc_diff`同为0.00021646：
-
-| Hy3路径 | down | 有效TFLOPS | sorted_sum | down+sum |
-|---|---:|---:|---:|---:|
-| 强制legacy | 1.641827 ms | 282.52T | 0.788843 ms | 2.430670 ms |
-| **K64 physical N256+CShuffle** | **1.403926 ms** | **330.40T** | 0.870344 ms | **2.274270 ms** |
-
-physical使down降低14.49%、TFLOPS提高16.95%；虽然sorted_sum增加，down+sum仍降低6.44%，完整
-gateup+down+sum降低2.91%。K192 code object为20,480B LDS、160 VGPR、0 spill，LDS和VGPR均
-允许3 WG/CU（每SIMD 3 waves）；作为对照，H3 K384 specialization仍为29,696B LDS、
-next-free VGPR 236、0 spill，保持原2 WG/CU资源档位。
+核心kernel仍支持`K % 64 == 0`和per-tensor scale，便于显式实验。Hy3 K192按3个K64 stage
+执行，per-tensor不分配1KB PTPC scale LDS，总LDS为20,480B；code object使用160 VGPR、0
+spill。两轮生产式10-buffer复测表明它虽能加速down，却显著拖慢physical布局的consumer，最终
+`down+sorted_sum`回退，因此不进入自动策略。详细数据见后文“Down数据复核”。
 
 ### 理论roof口径
 
@@ -1419,7 +1411,7 @@ next-free VGPR 236、0 spill，保持原2 WG/CU资源档位。
 
 | 模型 | padding效率 | 架构dense roof | 16链dense roof | physical串行后处理参照 |
 |---|---:|---:|---:|---:|
-| Hy3 | 99.4819% | 582.94T | 532.95T | 385.94T |
+| Hy3 | 99.4819% | 582.94T | 532.95T | 不适用（默认legacy；显式实验为385.94T） |
 | Qwen3.5-397B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Qwen3.5-35B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Xiaomi | 96.9697% | 568.22T | 519.49T | 404.06T |
@@ -1431,16 +1423,96 @@ next-free VGPR 236、0 spill，保持原2 WG/CU资源档位。
 `--path physical_n256|legacy`区分这两种口径。
 
 最终五个shape的生产正确性均通过：Hy3/Qwen3.5-397B/Qwen3.5-35B/Xiaomi/H3的`calc_diff`
-分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。最终空闲窗口阶段实测：
+分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。下表是隔离单kernel的
+峰值窗口，用于看roof距离；它不是后文10-buffer生产上下文的端到端时延，不能与`sorted_sum`
+绝对时延直接相加：
 
 | 模型 | gateup | down | down/gateup | 16链dense效率 | physical实用参照效率 |
 |---|---:|---:|---:|---:|---:|
-| Hy3 | 399.97T | 330.40T | 82.61% | 61.99% | 85.61% |
+| Hy3 | 399.97T | 282.52T（legacy） | 70.64% | 53.01% | 不适用（legacy） |
 | Qwen3.5-397B | 474.16T | 399.44T | 84.24% | 74.56% | 不适用（legacy） |
 | Qwen3.5-35B | 442.62T | 393.71T | 88.95% | 73.49% | 不适用（legacy） |
 | Xiaomi | 468.73T | 326.99T | 69.76% | 62.94% | 80.93% |
 | H3 | 421.16T | 407.76T | 96.82% | 76.11% | 90.61% |
 
-Hy3和Xiaomi相对dense roof看似差距较大，但physical路径包含固定640-cycle串行后处理参照；相对
-该参照分别达到85.61%和80.93%。Qwen两型的主要问题是K512 physical occupancy，回退legacy后
-恢复到约399/394T。GPU被外部任务占满或测试中途切入时的样本均未进入上表。
+Xiaomi相对dense roof看似差距较大，但physical路径包含固定640-cycle串行后处理参照；相对该
+参照达到80.93%。Qwen两型的主要问题是K512 physical occupancy，回退legacy后恢复到约399/394T；
+Hy3因consumer回退也使用legacy。GPU被外部任务占满或测试中途切入时的样本均未进入上表。
+
+### 与`e6fe8e9`修改前完整调用对比
+
+基线来自detached worktree中的commit
+`e6fe8e9348595aefb96bcf76b1370d313676ad44`。为避免editable安装把“旧版”重新指向当前源码，
+每次运行都对`test_moe.__file__`和`moe_gemm_splitk.__file__`做绝对路径断言：e6必须来自
+`/tmp/pyhip-e6-baseline`，当前版必须来自主工作树。旧版使用原生`BM64/BN128`和legacy N64，
+当前版使用`BM64/TILE_N=256`及最终自动选路。两版在同一gfx942 GPU、1800MHz性能确定性模式、
+`B=32768`下运行各自原生`entry_common('fly_splitk_2s')`；10套buffer轮换，剔除首轮后取其余
+9轮完整`run()`时延均值。测试后均执行`--resetperfdeterminism`并恢复auto。
+
+完整调用包括sorting、激活量化、gateup、down、sorted-sum及相关索引kernel；有效TFLOPS仍只按
+gateup和down的有效GEMM FLOP计算，因此低于前表的单kernel TFLOPS。它用于确认最终路径，不用于
+单独归因down；down的因果数据见后文同进程布局消融。
+
+| 模型 | `e6fe8e9`路径 | 当前路径 | e6完整调用 | 当前完整调用 | 时延变化 | e6有效TFLOPS | 当前有效TFLOPS | TFLOPS变化 |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| Hy3 | gate BN128 + legacy N64 | gate BN128 + legacy N64 | 5.6457 ms | 5.6323 ms | -0.24% | 246.49T | 247.07T | +0.24% |
+| Qwen3.5-397B | gate BN128 + legacy N64 | gate BN256 + legacy N64 | 12.8120 ms | 11.9771 ms | **-6.52%** | 321.91T | 344.26T | **+6.94%** |
+| Qwen3.5-35B | gate BN128 + legacy N64 | gate BN256 + legacy N64 | 5.1311 ms | 4.9894 ms | **-2.76%** | 321.43T | 330.56T | **+2.84%** |
+| Xiaomi | gate BN128 + legacy N64 | gate BN256 + physical N256/K128 | 9.8038 ms | 8.5322 ms | **-12.97%** | 252.35T | 289.96T | **+14.90%** |
+| H3 | gate BN128 + legacy N64 | gate BN256 + physical N256/K128 | 6.1790 ms | 5.7129 ms | **-7.54%** | 300.29T | 324.78T | **+8.16%** |
+
+#### Gateup数据复核
+
+e6与当前版本的gateup主体并没有代码变化：对`_make_1x4_tiled_mma`、`gemm_1x4`、
+`_apply_1x4_fp8_dequant`、`_gateup_pair_bf16`、`_make_gateup_weight_view`和
+`moe_2stage_gateup_prefill_1x4`做AST归一化比较，六个函数全部相同。进一步在严格模块路径断言下
+固定Qwen3.5-35B为BN128分别编译e6和当前代码；去掉源码路径注释和汇编元数据后，617条指令的
+SHA均为`7e628b6f...a7a48e64`，资源也同为16,384B LDS、118 VGPR、96 SGPR。
+
+此前跨进程stage表中14%--25%的“gateup版本提升”混入了两项非代码因素：旧commit自带测试入口
+默认`TILE_N=128`，当前入口默认`TILE_N=256`；长时间大shape采样还会在gfx942上触发明显DPM
+双峰。为拆开两者，在同一进程、同一输入、同一stream中交错运行`e6 BN128 -> 当前BN128 ->
+当前BN256`，三路输出逐bit一致：
+
+| 模型 | 当前BN128 / e6 BN128 | 当前BN256 / 当前BN128 | 当前BN256 / e6 BN128 | 结论 |
+|---|---:|---:|---:|---|
+| Qwen3.5-397B | 0.9986（-0.14%） | 0.9738（-2.62%） | 0.9633（-3.67%） | 版本中性，BN256小幅收益 |
+| Qwen3.5-35B | 0.9993（-0.07%） | 1.0185（+1.85%） | 1.0012（+0.12%） | 版本中性，tile差异接近噪声 |
+| Xiaomi | 0.9926（-0.74%） | 0.8703（-12.97%） | 0.8592（-14.08%） | 大部分收益来自BN256 |
+| H3 | 0.9785（-2.15%） | 0.9881（-1.19%） | 0.9677（-3.23%） | 版本差异仍在运行波动范围 |
+
+Hy3的gate总宽度为384，BN256不是完整tile，因此e6和当前都应使用BN128；当前正确性断言只是禁止
+错误配置，不构成性能优化。综上，不能把前述跨进程gateup差值归因于gateup代码优化；可归因的
+变化只有入口tile选择，且收益高度依赖shape。
+
+#### Down数据复核
+
+先确认“版本变化”本身。五个shape均在严格e6/current模块路径断言下编译相同legacy N64配置；
+去掉源码路径注释和汇编元数据后，down与legacy sorted-sum的指令数、逐条指令流SHA和资源占用
+分别完全一致。原始`.s`文件SHA不同只来自两个内嵌`s_nop`调试注释中的源码绝对路径。因此：
+
+- Qwen两型和最终Hy3都使用legacy路径，其down/sorted-sum在代码层面性能中性；跨进程的绝对
+    时延差不能归因于down代码变化。
+- H3/Xiaomi的收益来自当前自动选择physical N256+CShuffle，而不是legacy实现被改快。
+
+physical会同时改变down producer和sorted-sum consumer，必须合计。最终消融在同一当前进程、
+1800MHz性能确定性模式下执行；每个样本前运行共同gateup形成生产功耗上下文，10套输入/权重buffer
+轮换，24轮ABBA正反顺序。独立运行两次后合并48个同轮ratio样本；两种布局的最终reduced输出逐bit
+一致。表中绝对时延是两轮全部样本中位数，变化率是同轮`physical/legacy` ratio中位数，因此两列
+绝对中位数之比可能与配对变化率略有差别。
+
+| 模型 | legacy down | physical down | down变化（IQR） | legacy sum | physical sum | sum变化（IQR） | legacy down+sum | physical down+sum | 合计变化（IQR） | 自动选择 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Hy3 | 2.206548 ms / 210.22T | 2.004367 ms / 231.42T | **-9.80%**（-14.49%~-9.31%） | 0.867163 ms | 1.263385 ms | **+45.70%**（+45.13%~+45.95%） | 3.072651 ms | 3.267252 ms | **+5.96%**（+2.85%~+6.28%） | **legacy** |
+| Xiaomi | 3.989694 ms / 206.69T | 3.660633 ms / 225.27T | **-9.00%**（-16.63%~-8.45%） | 1.289245 ms | 1.071803 ms | **-16.96%**（-17.08%~-14.36%） | 5.278059 ms | 4.725256 ms | **-11.04%**（-13.41%~-10.72%） | **physical** |
+| H3 | 2.794370 ms / 221.33T | 2.571089 ms / 240.55T | **-8.16%**（-12.94%~-7.98%） | 0.605582 ms | 0.603342 ms | -0.84%（-1.16%~-0.16%） | 3.401532 ms | 3.175012 ms | **-6.68%**（-6.75%~-6.58%） | **physical** |
+
+Hy3是本轮复核的关键反例：K64 physical producer确实快约9.8%，但其physical布局令
+sorted-sum慢约45.7%，两轮`down+sum`分别回退5.86%和6.00%，合并后为+5.96%。因此默认自动
+策略回退legacy；`MOE_DOWN_PHYSICAL_N128=1`仍可显式启用K64 physical做实验。Xiaomi与H3的
+端到端收益分别为11.04%和6.68%，继续自动使用physical。
+
+严格隔离的完整调用与该决策一致：Hy3回退legacy后相对e6仅-0.24%，属于性能中性；Qwen两型的
+完整调用变化来自gateup tile选择及其他辅助kernel，不是down代码收益；Xiaomi/H3则同时包含
+gateup BN256和physical down收益。旧版与当前版均通过各自harness的正确性阈值，但两个版本的
+参考实现对FP8激活量化的建模不同，因此`calc_diff`绝对值不作横向比较。
