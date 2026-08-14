@@ -200,19 +200,11 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
         auto_physical if physical_setting == "auto" else physical_setting == "1"
     )
 
-    cshuffle_setting = os.getenv("MOE_DOWN_CSHUFFLE_OUTPUT", "auto").lower()
-    assert cshuffle_setting in ("0", "1", "auto")
-    down_cshuffle_output = (
-        down_physical_n128
-        if cshuffle_setting == "auto"
-        else cshuffle_setting == "1"
-    )
-    assert not down_cshuffle_output or down_physical_n128
-    return down_physical_n128, down_cshuffle_output
+    return down_physical_n128
 
 
-def _select_fly_down_padding_bytes(quant_type, n, k, down_cshuffle_output):
-    if not down_cshuffle_output:
+def _select_fly_down_padding_bytes(quant_type, n, k, down_physical_n128):
+    if not down_physical_n128:
         return None
     if quant_type == 'per_tensor' and n == 4096 and k == 192:
         return 0
@@ -263,17 +255,16 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
 @pytest.mark.parametrize(
     ("quant_type", "n", "k", "expected"),
     [
-        ("per_tensor", 4096, 192, (True, True)),
-        ("per_tensor", 4096, 256, (False, False)),
-        ("ptpc", 4096, 512, (False, False)),
-        ("ptpc", 2048, 512, (False, False)),
-        ("ptpc", 6144, 256, (True, True)),
-        ("ptpc", 6144, 384, (True, True)),
+        ("per_tensor", 4096, 192, True),
+        ("per_tensor", 4096, 256, False),
+        ("ptpc", 4096, 512, False),
+        ("ptpc", 2048, 512, False),
+        ("ptpc", 6144, 256, True),
+        ("ptpc", 6144, 384, True),
     ],
 )
 def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
     monkeypatch.delenv("MOE_DOWN_PHYSICAL_N128", raising=False)
-    monkeypatch.delenv("MOE_DOWN_CSHUFFLE_OUTPUT", raising=False)
     assert (
         _select_fly_down_layout(
             torch.float8_e4m3fnuz,
@@ -288,18 +279,17 @@ def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
 
 def test_select_fly_down_layout_explicit_physical(monkeypatch):
     monkeypatch.setenv("MOE_DOWN_PHYSICAL_N128", "1")
-    monkeypatch.setenv("MOE_DOWN_CSHUFFLE_OUTPUT", "1")
     assert _select_fly_down_layout(
         torch.float8_e4m3fnuz,
         "per_tensor",
         block_m=64,
         n=4096,
         k=192,
-    ) == (True, True)
+    ) is True
 
 
 @pytest.mark.parametrize(
-    ("quant_type", "n", "k", "cshuffle", "expected"),
+    ("quant_type", "n", "k", "physical", "expected"),
     [
         ("per_tensor", 4096, 192, True, 0),
         ("ptpc", 6144, 256, True, 128),
@@ -307,8 +297,8 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
         ("per_tensor", 4096, 192, False, None),
     ],
 )
-def test_select_fly_down_padding_bytes(quant_type, n, k, cshuffle, expected):
-    assert _select_fly_down_padding_bytes(quant_type, n, k, cshuffle) == expected
+def test_select_fly_down_padding_bytes(quant_type, n, k, physical, expected):
+    assert _select_fly_down_padding_bytes(quant_type, n, k, physical) == expected
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == 'ptpc':
@@ -589,7 +579,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            down_physical_n128, down_cshuffle_output = _select_fly_down_layout(
+            down_physical_n128 = _select_fly_down_layout(
                 weight_type,
                 quant_type,
                 TILE_M,
@@ -604,24 +594,15 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     quant_type,
                     N2,
                     K2,
-                    down_cshuffle_output,
+                    down_physical_n128,
                 )
-            )
-            down_row_group_env = os.getenv("MOE_DOWN_OUTPUT_ROW_GROUP")
-            down_output_row_group = (
-                int(down_row_group_env) if down_row_group_env is not None else None
             )
             if down_output_padding_bytes is not None:
                 assert down_physical_n128
                 assert down_output_padding_bytes in (0, 32, 64, 128)
-            if down_output_row_group is not None:
-                assert down_physical_n128
-                assert down_output_padding_bytes is None
-                assert down_output_row_group in (1, 2, 4, 8, 16)
-            if down_cshuffle_output:
+            if down_physical_n128:
                 assert down_physical_n128
                 assert down_output_padding_bytes in (0, 32, 64, 128)
-                assert down_output_row_group is None
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
                 amax = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -787,21 +768,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
-                    down_tile_n = (
-                        int(os.getenv("MOE_DOWN_PHYSICAL_TILE_N", "256"))
-                        if down_physical_n128
-                        else TILE_N
-                    )
-                    if down_physical_n128:
-                        assert down_tile_n in (128, 192, 256)
+                    down_tile_n = 256 if down_physical_n128 else TILE_N
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
                         ('down_physical_n128', down_physical_n128),
                         ('down_output_padding_bytes', down_output_padding_bytes),
-                        ('down_output_row_group', down_output_row_group),
-                        ('down_cshuffle_output', down_cshuffle_output),
                     )
                     if down_alg == "prefill_1x4":
                         #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)
@@ -863,10 +836,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         _moe_sorted_sum(
                             TOPK,
                             N2,
-                            down_physical_n128,
-                            down_tile_n if down_physical_n128 else None,
                             down_output_padding_bytes,
-                            down_output_row_group,
                         )(loc_ids, gemm2_out, cur_out, B)
 
                         """

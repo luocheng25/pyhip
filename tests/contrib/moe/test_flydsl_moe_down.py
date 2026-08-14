@@ -46,74 +46,6 @@ def test_absmax_reuse_clears_output():
         assert amax.item() == value
 
 
-def _pack_bn256_physical(logical_rows):
-    row_count, hidden_size = logical_rows.shape
-    assert row_count % 64 == 0
-    assert hidden_size % 256 == 0
-
-    token_loc = torch.arange(row_count, dtype=torch.int64, device=logical_rows.device)[
-        :, None
-    ]
-    column = torch.arange(
-        0, hidden_size, 8, dtype=torch.int64, device=logical_rows.device
-    )[None, :]
-    block_row = token_loc % 64
-    column_in_block = column % 256
-    wave_id = column_in_block // 64
-    lane_group = (column_in_block % 64) // 16
-    channel_piece = (column_in_block % 16) // 8
-    store_index = (block_row // 16) * 2 + channel_piece
-    physical_lane = (block_row % 16) * 4 + lane_group
-    physical_offset = (
-        (token_loc // 64) * (64 * hidden_size)
-        + (column // 256) * (64 * 256)
-        + wave_id * (8 * 64 * 8)
-        + store_index * (64 * 8)
-        + physical_lane * 8
-    )
-
-    element_index = physical_offset[..., None] + torch.arange(
-        8, dtype=torch.int64, device=logical_rows.device
-    )
-    physical_rows = torch.empty_like(logical_rows)
-    physical_rows.view(-1)[element_index.reshape(-1)] = logical_rows.reshape(-1)
-    return physical_rows
-
-
-def _pack_bn256_tile_major(logical_rows, row_group):
-    row_count, hidden_size = logical_rows.shape
-    assert row_count % 64 == 0
-    assert hidden_size % 256 == 0
-    assert row_group in (1, 2, 4, 8, 16)
-
-    token_loc = torch.arange(row_count, dtype=torch.int64, device=logical_rows.device)[:, None]
-    column = torch.arange(0, hidden_size, 8, dtype=torch.int64, device=logical_rows.device)[None, :]
-    block_row = token_loc % 64
-    row_in_tile = block_row % 16
-    column_in_block = column % 256
-    lane_group = (column_in_block % 64) // 16
-    channel_piece = (column_in_block % 16) // 8
-    physical_lane = (
-        ((row_in_tile // row_group) * 4 + column_in_block // 64)
-        * (2 * row_group * 4)
-        + channel_piece * (row_group * 4)
-        + (row_in_tile % row_group) * 4
-        + lane_group
-    )
-    physical_offset = (
-        (token_loc // 64) * (64 * hidden_size)
-        + (column // 256) * (64 * 256)
-        + (block_row // 16) * (16 * 256)
-        + physical_lane * 8
-    )
-    element_index = physical_offset[..., None] + torch.arange(
-        8, dtype=torch.int64, device=logical_rows.device
-    )
-    physical_rows = torch.empty_like(logical_rows)
-    physical_rows.view(-1)[element_index.reshape(-1)] = logical_rows.reshape(-1)
-    return physical_rows
-
-
 @pytest.mark.parametrize("hidden_size", [128, 384])
 def test_down_prefill_1x4_fp8_ptpc(hidden_size):
     torch.manual_seed(7)
@@ -207,31 +139,15 @@ def test_down_prefill_1x4_fp8_ptpc(hidden_size):
 
 
 @pytest.mark.parametrize(
-    "tile_n,hidden_size,padding_bytes,row_group,cshuffle_output",
-    [
-        (128, 512, None, None, False),
-        (128, 1024, None, None, False),
-        (192, 1536, None, None, False),
-        (256, 512, None, None, False),
-        (256, 512, 0, None, False),
-        (256, 512, 32, None, False),
-        (256, 512, 64, None, False),
-        (256, 512, 128, None, False),
-        (256, 512, 128, None, True),
-        (256, 512, None, 1, False),
-        (256, 512, None, 2, False),
-        (256, 512, None, 4, False),
-        (256, 512, None, 8, False),
-        (256, 512, None, 16, False),
-    ],
+    "padding_bytes",
+    [0, 32, 64, 128],
 )
-def test_down_prefill_physical_sorted_sum(
-    tile_n, hidden_size, padding_bytes, row_group, cshuffle_output
-):
+def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
     torch.manual_seed(11)
     batch_size = 64
     block_m = 64
     intermediate_size = 384
+    hidden_size = 512
     topk = 1
     fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = torch.finfo(fp8_dtype).max
@@ -281,15 +197,13 @@ def test_down_prefill_physical_sorted_sum(
         act_quant_type="ptpc",
         TOPK=topk,
         BLOCK_TILE_SIZE_M=block_m,
-        BLOCK_TILE_SIZE_N=tile_n,
+        BLOCK_TILE_SIZE_N=256,
         stage="down",
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
         down_physical_n128=True,
         down_output_padding_bytes=padding_bytes,
-        down_output_row_group=row_group,
-        down_cshuffle_output=cshuffle_output,
     )
     launch(
         _ptr(activation_fp8),
@@ -312,7 +226,7 @@ def test_down_prefill_physical_sorted_sum(
     loc_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda").view(
         batch_size, topk
     )
-    sorted_sum(topk, hidden_size, True, tile_n, padding_bytes, row_group)(
+    sorted_sum(topk, hidden_size, padding_bytes)(
         loc_ids, physical_output, logical_output, batch_size
     )
     torch.cuda.synchronize()
@@ -340,9 +254,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
     )
     activation_scale = activation.float().abs().amax() / fp8_max
     activation_fp8 = (
-        (activation.float() / activation_scale)
-        .clamp(-fp8_max, fp8_max)
-        .to(fp8_dtype)
+        (activation.float() / activation_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
     )
     weight = 0.1 * torch.randn(
         1, hidden_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
@@ -364,7 +276,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
         [batch_size, batch_size], dtype=torch.int32, device="cuda"
     )
     physical_output = torch.full(
-        (batch_size, hidden_size + 64),
+        (batch_size, hidden_size),
         torch.nan,
         dtype=torch.bfloat16,
         device="cuda",
@@ -384,8 +296,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
         E=1,
         USE_ATOMIC_WRITE=False,
         down_physical_n128=True,
-        down_output_padding_bytes=128,
-        down_cshuffle_output=True,
+        down_output_padding_bytes=0,
     )
     launch(
         _ptr(activation_fp8),
@@ -408,9 +319,7 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
     loc_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda").view(
         batch_size, 1
     )
-    sorted_sum(1, hidden_size, True, 256, 128)(
-        loc_ids, physical_output, logical_output, batch_size
-    )
+    sorted_sum(1, hidden_size, 0)(loc_ids, physical_output, logical_output, batch_size)
     torch.cuda.synchronize()
 
     expected = (activation_fp8.float() * activation_scale) @ (
@@ -419,58 +328,3 @@ def test_down_prefill_physical_per_tensor_k192_cshuffle():
     expected = (expected * routing_weight[:, None]).to(torch.bfloat16)
     assert torch.isfinite(logical_output).all()
     assert _relative_l2(logical_output, expected) < 3e-2
-
-
-def test_sorted_sum_bn256_topk4_prefetch():
-    torch.manual_seed(19)
-    batch_size = 64
-    topk = 4
-    hidden_size = 1024
-    logical_rows = torch.randn(
-        batch_size * topk,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    physical_rows = _pack_bn256_physical(logical_rows)
-    loc_ids = torch.randperm(batch_size * topk, dtype=torch.int32, device="cuda").view(
-        batch_size, topk
-    )
-    output = torch.empty(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
-
-    sorted_sum(topk, hidden_size, True, 256)(loc_ids, physical_rows, output, batch_size)
-    torch.cuda.synchronize()
-
-    expected = logical_rows[loc_ids.long()].float().sum(dim=1).to(torch.bfloat16)
-    assert torch.isfinite(output).all()
-    assert _relative_l2(output, expected) < 1e-3
-
-
-@pytest.mark.parametrize("row_group", [1, 2, 4, 8, 16])
-def test_sorted_sum_bn256_tile_major_row_group(row_group):
-    torch.manual_seed(23)
-    batch_size = 64
-    topk = 4
-    hidden_size = 1024
-    logical_rows = torch.randn(
-        batch_size * topk,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    physical_rows = _pack_bn256_tile_major(logical_rows, row_group)
-    loc_ids = torch.randperm(
-        batch_size * topk, dtype=torch.int32, device="cuda"
-    ).view(batch_size, topk)
-    output = torch.empty(
-        batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
-    )
-
-    sorted_sum(topk, hidden_size, True, 256, None, row_group)(
-        loc_ids, physical_rows, output, batch_size
-    )
-    torch.cuda.synchronize()
-
-    expected = logical_rows[loc_ids.long()].float().sum(dim=1).to(torch.bfloat16)
-    assert torch.isfinite(output).all()
-    assert _relative_l2(output, expected) < 1e-3

@@ -388,8 +388,8 @@ v7到v8的ATT中，scale helper stall从11.24M降至2.23M，VMEM-wait总量从11
 
 #### Tile N 128/192/256比较
 
-physical down现支持`BLOCK_TILE_SIZE_N`为128/192/256，H3默认通过
-`MOE_DOWN_PHYSICAL_TILE_N=256`选择BN256。BN128仍使用4个wave沿N：每wave负责32 channel，
+本节记录已删除的tile sweep。实验阶段physical down曾支持`BLOCK_TILE_SIZE_N`为128/192/256；
+最终只保留BN256。BN128使用4个wave沿N：每wave负责32 channel，
 每lane最终得到8个连续BF16，因此每token只需一条128-bit store；三个K128 stage的4条store
 自动分成2/1/1。BN128与BN256总MFMA、weight字节数和输出字节数相同，仅改变N外循环粒度。
 
@@ -410,7 +410,7 @@ physical down现支持`BLOCK_TILE_SIZE_N`为128/192/256，H3默认通过
 BN128相对BN256慢8.9%。BN192在4-wave分布下每wave48 channel、3个MFMA-M repeat；每lane最终
 有3组连续4 BF16，使用每token三条64-bit `buffer_store_dwordx2`，三个K128 stage各分4条。
 N1536端到端正确，资源为ISA VGPR202、单N块144条MFMA和12条64-bit store，但两轮均比BN256
-慢约30%。因此默认恢复BN256；BN128/192保留为环境开关和正确性覆盖。
+慢约30%。因此最终删除BN128/192实现、环境开关和专用正确性覆盖，仅保留BN256。
 
 #### Gateup/down pipeline、no-pk与scalar FMA
 
@@ -562,7 +562,7 @@ load stall。当前down已从VMEM主导转为MFMA主导。
 174.72M / 93.0%，其中VMEM load 121.08M / 69.3%、VMEM wait 35.91M / 20.6%、VMEM store
 14.29M / 8.2%。地址及其他算术只有1.6%，因此重点是load合并和MLP，而不是继续削减整数运算。
 
-最终保留三项改动：
+该实验版本曾保留三项改动：
 
 1. 将BN256源A包装成单个buffer resource，最终ISA使用`buffer_load_dwordx4`。
 2. 重排8-lane内的逻辑column分工：
@@ -585,17 +585,20 @@ load stall。当前down已从VMEM主导转为MFMA主导。
 | 版本 | sorted_sum | Down | Down资源 | 结果 |
 |---|---:|---:|---:|---|
 | 连续布局原始逆映射 | 1.2471 ms | 1.5821 ms | 108+132 | 基线 |
-| lane重排 + buffer load + 运行时双atom预取 | **1.1779 ms** | **1.5645 ms** | 108+132 | 保留 |
+| lane重排 + buffer load + 运行时双atom预取 | **1.1779 ms** | **1.5645 ms** | 108+132 | 实验最佳 |
 
 sorted_sum降低约5.5%；down没有代码改动，实测中位数仍优于1.5821 ms门槛。两者合计从
 2.8292 ms降到约2.7424 ms，但仍高于原逻辑写出布局的2.5173 ms。
 
-最终sorted_sum ATT为
+该实验版本的sorted_sum ATT为
 `/tmp/moe_h3_sorted_sum_runtime_pair_att/ui_output_agent_26152_dispatch_2599`：56个arch VGPR、
 64个SGPR、8 waves/SIMD。每轮动态body为8条`buffer_load_dwordx4`和2条
 `buffer_store_dwordx4`；总stall 150.02M / 92.3%，VMEM load 121.22M / 80.8%、VMEM wait
 12.85M / 8.6%、VMEM store 13.27M / 8.8%。双预取显著压低wait，但剩余瓶颈是物理布局下单逻辑行
 最多只有4 lane组成连续64B读取，而不是occupancy或地址算术。
+
+后续最终路径统一为wave-private CShuffle写row-major输出，consumer不再需要物理逆映射；因此
+本节的buffer-resource逆映射、lane重排、双atom预取及专用测试现均已删除，仅保留实验数据。
 
 已否证方案：
 
@@ -760,9 +763,9 @@ physical_chunk = block_n * (64 * 256 / 8)
 | **2** | **8段 x 128B** | **2行AoSoA；同row N256共512B局部聚集** |
 | 1 | 16段 x 64B | 单行N256连续512B，但down连续段最小 |
 
-通过`MOE_DOWN_OUTPUT_ROW_GROUP=1/2/4/8/16`选择；环境变量未设置时严格保持`base`原地址公式。
-五档地址在一个`64x256` tile上均穷举验证为完整双射，并通过down写出到sorted_sum恢复的GPU
-正确性测试。第一次五档正反sweep结果：
+该历史实验曾通过`MOE_DOWN_OUTPUT_ROW_GROUP=1/2/4/8/16`选择。五档地址在一个`64x256`
+tile上均穷举验证为完整双射，并通过down写出到sorted_sum恢复的GPU正确性测试。第一次五档
+正反sweep结果：
 
 | R | Down | sorted_sum | 合计 |
 |---:|---:|---:|---:|
@@ -782,8 +785,8 @@ physical_chunk = block_n * (64 * 256 / 8)
 | 128B padded row-major | 1.8126 ms | **0.5757 ms** | 2.3883 ms | -13.1% |
 
 R2相对base只牺牲1.8%的down，却让sorted_sum降低39.8%；端到端比base快16.1%，也比此前最佳
-128B padded row-major快3.4%。这就是当前“兼得”方案：不增加中间结果字节数，不增加额外kernel，
-只改变tile内物理地址排列。
+128B padded row-major快3.4%。后续wave-private CShuffle + row-major padding取得更好结果后，
+tile-major实现、逆映射、环境开关和专用测试均已删除，本节只保留实验数据。
 
 R2 ATT：
 
@@ -797,14 +800,13 @@ R2 ATT：
 
 #### BN256 4KB wave-private XOR CShuffle
 
-在恢复当前N256代码后，增加`MOE_DOWN_CSHUFFLE_OUTPUT=1`实验路径。该路径要求同时设置
-`MOE_DOWN_PHYSICAL_N128=1`和`MOE_DOWN_PHYSICAL_TILE_N=256`；启用后默认自动使用最佳的128B
-row-major padding：
+在恢复N256代码后，实验路径加入4KB wave-private XOR CShuffle。验证完成后它已成为physical
+N256的唯一输出路径：启用`MOE_DOWN_PHYSICAL_N128=1`即固定使用BN256+CShuffle；row padding
+由shape策略选择，也可显式覆盖：
 
 ```bash
 MOE_DOWN_PHYSICAL_N128=1 \
-MOE_DOWN_PHYSICAL_TILE_N=256 \
-MOE_DOWN_CSHUFFLE_OUTPUT=1
+MOE_DOWN_OUTPUT_PADDING_BYTES=128
 ```
 
 如需复现实验，仍可用`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`显式覆盖默认值。
@@ -1370,8 +1372,7 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 
 H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile、量化模式、down的实际
 LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；显式
-`MOE_DOWN_PHYSICAL_N128=0/1`、`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`和
-`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
+`MOE_DOWN_PHYSICAL_N128=0/1`和`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
 
 | 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
 |---|---:|---:|---:|---|---|---|
