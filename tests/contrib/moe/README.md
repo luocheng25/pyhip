@@ -801,11 +801,11 @@ R2 ATT：
 #### BN256 4KB wave-private XOR CShuffle
 
 在恢复N256代码后，实验路径加入4KB wave-private XOR CShuffle。验证完成后它已成为physical
-N256的唯一输出路径：启用`MOE_DOWN_PHYSICAL_N128=1`即固定使用BN256+CShuffle；row padding
+N256的唯一输出路径：启用`MOE_DOWN_PHYSICAL_N256=1`即固定使用BN256+CShuffle；row padding
 由shape策略选择，也可显式覆盖：
 
 ```bash
-MOE_DOWN_PHYSICAL_N128=1 \
+MOE_DOWN_PHYSICAL_N256=1 \
 MOE_DOWN_OUTPUT_PADDING_BYTES=128
 ```
 
@@ -1372,7 +1372,7 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 
 H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile、量化模式、down的实际
 LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；显式
-`MOE_DOWN_PHYSICAL_N128=0/1`和`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
+`MOE_DOWN_PHYSICAL_N256=0/1`和`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
 
 | 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
 |---|---:|---:|---:|---|---|---|

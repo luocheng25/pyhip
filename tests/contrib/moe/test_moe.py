@@ -194,17 +194,17 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
         and physical_lds_bytes <= 32 * 1024
     )
 
-    physical_setting = os.getenv("MOE_DOWN_PHYSICAL_N128", "auto").lower()
+    physical_setting = os.getenv("MOE_DOWN_PHYSICAL_N256", "auto").lower()
     assert physical_setting in ("0", "1", "auto")
-    down_physical_n128 = (
+    down_physical_n256 = (
         auto_physical if physical_setting == "auto" else physical_setting == "1"
     )
 
-    return down_physical_n128
+    return down_physical_n256
 
 
-def _select_fly_down_padding_bytes(quant_type, n, k, down_physical_n128):
-    if not down_physical_n128:
+def _select_fly_down_padding_bytes(quant_type, n, k, down_physical_n256):
+    if not down_physical_n256:
         return None
     if quant_type == 'per_tensor' and n == 4096 and k == 192:
         return 0
@@ -264,7 +264,7 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
     ],
 )
 def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
-    monkeypatch.delenv("MOE_DOWN_PHYSICAL_N128", raising=False)
+    monkeypatch.delenv("MOE_DOWN_PHYSICAL_N256", raising=False)
     assert (
         _select_fly_down_layout(
             torch.float8_e4m3fnuz,
@@ -278,7 +278,7 @@ def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
 
 
 def test_select_fly_down_layout_explicit_physical(monkeypatch):
-    monkeypatch.setenv("MOE_DOWN_PHYSICAL_N128", "1")
+    monkeypatch.setenv("MOE_DOWN_PHYSICAL_N256", "1")
     assert _select_fly_down_layout(
         torch.float8_e4m3fnuz,
         "per_tensor",
@@ -579,7 +579,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            down_physical_n128 = _select_fly_down_layout(
+            down_physical_n256 = _select_fly_down_layout(
                 weight_type,
                 quant_type,
                 TILE_M,
@@ -594,14 +594,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     quant_type,
                     N2,
                     K2,
-                    down_physical_n128,
+                    down_physical_n256,
                 )
             )
             if down_output_padding_bytes is not None:
-                assert down_physical_n128
+                assert down_physical_n256
                 assert down_output_padding_bytes in (0, 32, 64, 128)
-            if down_physical_n128:
-                assert down_physical_n128
+            if down_physical_n256:
+                assert down_physical_n256
                 assert down_output_padding_bytes in (0, 32, 64, 128)
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
@@ -768,12 +768,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
-                    down_tile_n = 256 if down_physical_n128 else TILE_N
+                    down_tile_n = 256 if down_physical_n256 else TILE_N
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
-                        ('down_physical_n128', down_physical_n128),
+                        ('down_physical_n256', down_physical_n256),
                         ('down_output_padding_bytes', down_output_padding_bytes),
                     )
                     if down_alg == "prefill_1x4":

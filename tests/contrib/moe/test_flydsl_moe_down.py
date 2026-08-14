@@ -202,7 +202,7 @@ def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n128=True,
+        down_physical_n256=True,
         down_output_padding_bytes=padding_bytes,
     )
     launch(
@@ -301,7 +301,7 @@ def test_down_prefill_physical_per_tensor_cshuffle(
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n128=True,
+        down_physical_n256=True,
         down_output_padding_bytes=0,
     )
     launch(

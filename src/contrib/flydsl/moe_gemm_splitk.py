@@ -15,8 +15,8 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import helpers as fxh
 
-_PHYSICAL_N128_STORE_CACHE_MODIFIER = 0
-_PHYSICAL_N128_USE_SETPRIO = True
+_PHYSICAL_N256_STORE_CACHE_MODIFIER = 0
+_PHYSICAL_N256_USE_SETPRIO = True
 
 
 def _read_hw_wave_slot():
@@ -74,7 +74,7 @@ def compile_gemm(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
-    down_physical_n128=False,
+    down_physical_n256=False,
     down_output_padding_bytes=None,
 ):
 
@@ -112,7 +112,7 @@ def compile_gemm(
     ], "activation must be either 'silu' or 'swiglu'"
     if activation == "swiglu":
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
-    if down_physical_n128:
+    if down_physical_n256:
         assert stage == "down" and alg == "prefill_1x4"
         assert BLOCK_TILE_SIZE_N == 256
         assert N % BLOCK_TILE_SIZE_N == 0
@@ -2059,7 +2059,7 @@ def compile_gemm(
                 (BLOCK_TILE_SIZE_M, output_row_stride),
             )
             physical_store_rsrc = None
-            if const_expr(down_physical_n128):
+            if const_expr(down_physical_n256):
                 physical_store_rsrc = fx.buffer_ops.create_buffer_resource(
                     arg_p_output,
                     max_size=False,
@@ -2081,7 +2081,7 @@ def compile_gemm(
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
-            if const_expr(down_physical_n128):
+            if const_expr(down_physical_n256):
                 arg_p_weight = fx.make_view(
                     fxh._as_ptr(p_weight, weight_dtype)
                     + fx.Int64(expert_id * N * K),
@@ -2119,10 +2119,10 @@ def compile_gemm(
             fx.rocdl.make_buffer_tensor(arg_p_sorted_ids, max_size=False)
 
             BLOCK_M = BLOCK_TILE_SIZE_M
-            BLOCK_N = 256 if down_physical_n128 else 64
+            BLOCK_N = 256 if down_physical_n256 else 64
             BLOCK_K = (
                 128
-                if down_physical_n128 and K % 128 == 0
+                if down_physical_n256 and K % 128 == 0
                 else 64 // (weight_dtype.width // 8)
             )
             WAVE_N = BLOCK_N // 4
@@ -2134,7 +2134,7 @@ def compile_gemm(
             a_swz = fx.SwizzleType.get(
                 3,
                 swz_base,
-                4 if down_physical_n128 else 3,
+                4 if down_physical_n256 else 3,
             )
 
             act_dtype = weight_dtype  # fp8 / bf16
@@ -2148,7 +2148,7 @@ def compile_gemm(
             lds = shared_allocator.allocate(SharedStorage)
             scale_lds = None
             if const_expr(
-                down_physical_n128 and weight_quant_type == "ptpc"
+                down_physical_n256 and weight_quant_type == "ptpc"
             ):
                 scale_storage = shared_allocator.allocate(
                     fx.Array[fx.Float32, BLOCK_N, 16]
@@ -2157,7 +2157,7 @@ def compile_gemm(
                     fx.make_layout(BLOCK_N, 1)
                 )
             cshuffle_lds = None
-            if const_expr(down_physical_n128):
+            if const_expr(down_physical_n256):
                 cshuffle_storage = shared_allocator.allocate(
                     fx.Array[fx.BFloat16, 4 * 8 * 64, 16]
                 )
@@ -2230,10 +2230,10 @@ def compile_gemm(
             fragC = [
                 mm.make_fragment_C(c_fake_tensor),
             ]
-            if not down_physical_n128:
+            if not down_physical_n256:
                 fragC.append(mm.make_fragment_C(c_fake_tensor))
             fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
-            if const_expr(down_physical_n128):
+            if const_expr(down_physical_n256):
                 frag_act = flyobj.load_tiled_mma_fragB(
                     mm,
                     ldsA,
@@ -2255,13 +2255,13 @@ def compile_gemm(
                     fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 1), (0, 0))
                 )
                 arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
-                if const_expr(down_physical_n128):
+                if const_expr(down_physical_n256):
                     per_tensor_w_scale = fx.make_view(
                         fxh._as_ptr(p_w_scale) + expert_id,
                         fx.make_layout(1, 1),
                     )[0]
             if const_expr(weight_quant_type == "ptpc"):
-                if const_expr(down_physical_n128):
+                if const_expr(down_physical_n256):
                     scale_global = fx.make_view(
                         fxh._as_ptr(p_w_scale) + expert_id * N,
                         fx.make_layout(N, 1),
@@ -2294,7 +2294,7 @@ def compile_gemm(
                 arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
 
             scale_lds_copy_atom = None
-            if const_expr(down_physical_n128):
+            if const_expr(down_physical_n256):
                 scale_lds_copy_atom = flyobj.get_universal_copy_atom(
                     fx.Float32, 128
                 )
@@ -2346,7 +2346,7 @@ def compile_gemm(
             arg_a_scale = None
             per_tensor_a_scale = None
             if const_expr(act_quant_type == "per_tensor"):
-                if const_expr(down_physical_n128 and weight_quant_type == "per_tensor"):
+                if const_expr(down_physical_n256 and weight_quant_type == "per_tensor"):
                     per_tensor_a_scale = fx.make_view(
                         fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
                         fx.make_layout(1, 1),
@@ -2416,7 +2416,7 @@ def compile_gemm(
                 ):
                     combined_scale = frag_pt.load() * frag_sw.load()
                     if const_expr(
-                        down_physical_n128 and weight_quant_type == "per_tensor"
+                        down_physical_n256 and weight_quant_type == "per_tensor"
                     ):
                         combined_scale = combined_scale * per_tensor_w_scale
                     frag_pt.store(combined_scale)
@@ -2463,7 +2463,7 @@ def compile_gemm(
             copy_atom_ = None
             fragC_bf16r = None
             thrv_ldsCt = None
-            if not down_physical_n128:
+            if not down_physical_n256:
                 tcopyLDS, cp_ldsc = flyobj.get_tiled_copy_coalesced_mn(
                     ldsC[None, None, 0], copy_atom_bits=128, num_threads=256
                 )
@@ -2483,7 +2483,7 @@ def compile_gemm(
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             def postprocess_to_bf16(fragC, dst):
-                if const_expr(down_physical_n128):
+                if const_expr(down_physical_n256):
                     round_bit = as_ir_value(fx.Uint32(0x8000)).bitcast(
                         fx.Float32.ir_type
                     )
@@ -2583,14 +2583,14 @@ def compile_gemm(
                         Vec(out_frag.load()).bitcast(fx.Int32),
                         physical_store_rsrc,
                         byte_offset,
-                        cache_modifier=_PHYSICAL_N128_STORE_CACHE_MODIFIER,
+                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
                         offset_is_bytes=True,
                     )
 
             cp_atom_out_128b = None
             thrv_out = None
             fragOut = None
-            if not down_physical_n128:
+            if not down_physical_n256:
                 arg_p_output = fx.flat_divide(
                     arg_p_output, (BLOCK_M, BLOCK_N)
                 )
@@ -2627,13 +2627,13 @@ def compile_gemm(
                 //     MASK = 0x0000 0100: ALL DS read instructions may be scheduled accoss SCHED_BARRIER.
                 //     MASK = 0x0000 0200: ALL DS write instructions may be scheduled across SCHED_BARRIER.
                 """
-                n_factor = 2 if down_physical_n128 else BLOCK_N // 64
+                n_factor = 2 if down_physical_n256 else BLOCK_N // 64
                 num_mfma_inst = n_factor * (BLOCK_M // 16) * (
                     K // (16 if weight_dtype.width == 16 else 32)
                 )
                 num_stores = (
                     BLOCK_M // 16
-                    if down_physical_n128
+                    if down_physical_n256
                     else BLOCK_M // (256 // (BLOCK_N // 8))
                 )
                 num_loads = n_factor * K // (
@@ -2661,25 +2661,25 @@ def compile_gemm(
 
             hw_wave_slot = (
                 _read_hw_wave_slot()
-                if const_expr(down_physical_n128)
+                if const_expr(down_physical_n256)
                 else None
             )
 
             def enter_read_write_stage():
-                if const_expr(down_physical_n128):
+                if const_expr(down_physical_n256):
                     fx.rocdl.sched_barrier(0)
-                    if const_expr(_PHYSICAL_N128_USE_SETPRIO):
+                    if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         _set_hw_slot_priority(hw_wave_slot, 1, 0)
                     fx.rocdl.sched_barrier(0)
 
             def enter_compute_stage():
-                if const_expr(down_physical_n128):
+                if const_expr(down_physical_n256):
                     fx.rocdl.sched_barrier(0)
-                    if const_expr(_PHYSICAL_N128_USE_SETPRIO):
+                    if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         fx.rocdl.s_setprio(3)
                     fx.rocdl.sched_barrier(0)
 
-            if fx.const_expr(down_physical_n128):
+            if fx.const_expr(down_physical_n256):
                 # Prologue: stage0 prepares N block 0 / K core 0.
                 enter_read_write_stage()
                 frag_weight = flyobj.load_tiled_mma_fragA(
@@ -2785,7 +2785,7 @@ def compile_gemm(
                     ]
                 fragC_bf16.store(results[2])
                 fx.rocdl.sched_barrier(0)
-                if const_expr(_PHYSICAL_N128_USE_SETPRIO):
+                if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                     fx.rocdl.s_setprio(0)
                 fx.rocdl.sched_barrier(0)
             else:
@@ -2999,7 +2999,7 @@ def compile_gemm(
         else:
             value_attrs = (
                 {"passthrough": [["target-features", "-packed-fp32-ops"]]}
-                if const_expr(down_physical_n128)
+                if const_expr(down_physical_n256)
                 else None
             )
             moe_2stage_down_prefill_1x4(
