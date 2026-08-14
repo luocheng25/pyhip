@@ -959,13 +959,26 @@ bank-conflict计数下降。
 1.78827GHz。SQ PMC同时给出精确的16.000 busy cycles/MFMA，前者包含单wave循环/发射开销，
 后者是MFMA管线占用。按80 CU、4 SIMD/CU：
 
-| Roof | 有效TFLOPS | 最终407.8T效率 | 含义 |
+| 参照 | 有效TFLOPS | 最终407.8T/参照 | 含义 |
 |---|---:|---:|---|
 | 架构dense MFMA | 585.98 | 69.59% | 16 cycles/MFMA，不含搬运和后处理 |
 | 微基准dense MFMA | 535.73 | 76.11% | 17.500793 cycles/MFMA |
-| 架构MFMA + 串行后处理 | 484.95 | 84.08% | 192 MFMA，加64 MUL、64 FMA和32 PERM；均按名义4-cycle issue |
-| 微基准MFMA + 串行后处理 | 450.02 | 90.61% | 保守的当前codegen参照，不是硬件绝对上限 |
+| 架构MFMA + 后处理0%遮盖 | 484.95 | 84.08% | 192 MFMA，加64 MUL、64 FMA和32 PERM；均按名义4-cycle issue |
+| 微基准MFMA + 后处理0%遮盖 | 450.02 | 90.61% | 单wave操作计数敏感性点，不是roof或硬件上限 |
 | 全部6.09375GiB均走HBM | 500.97 | 81.39% | 极保守假设；PMC证明实际HBM字节远少于该值 |
+
+后处理计数来自最终physical N256 ISA：每wave的64个FP32结果各需一次routing-weight MUL和一次
+带BF16 rounding bias的FMA，两个BF16打包为一条PERM，因此为64 MUL、64 FMA和32 PERM，名义
+串行成本为640 cycles。450.02T把这640 cycles全部加在`192 * 17.500793`个MFMA cycles之后，
+即明确假设同wave和其他驻留wave都提供0%遮盖。它只回答“若后处理完全暴露，操作计数对应多少
+吞吐”，不能作为physical路径的真实roof。
+
+实际有2个resident waves/SIMD，但“2 waves”不等于固定50%遮盖：两wave的stage相位、`setprio`、
+VMEM/LDS等待和最后一个N块drain都会改变可重叠比例。按微基准MFMA口径，后处理遮盖
+0/25/50/75/100%时的敏感性参照分别为450.02/468.77/489.15/511.38/535.73T。最终ATT也显示
+最后一条MFMA之后仍有14.70M stall，其中8.17M为CShuffle LDS wait、2.66M为store，证明尾部并未
+被完全遮盖；但ATT不能据此反推出一个跨所有wave固定的遮盖率。脚本现在用
+`--postprocess-overlap`显式指定假设，默认0仅为保持原数值。
 
 最终同窗口24轮`gateup -> down -> down -> gateup`为gateup 2.937016ms / 421.2T、down
 1.516768ms / 407.8T，down/gateup为96.82%。完整随机H3保持`diff=0.00105974`；资源为
@@ -1356,12 +1369,13 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 ## B=32768多shape自动选择（2026-08-14）
 
 H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile、量化模式、down的实际
-LDS占用和`down+sorted_sum`端到端收益自动选路；显式`MOE_DOWN_PHYSICAL_N128=0/1`与
-`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`仍可覆盖自动值。
+LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；显式
+`MOE_DOWN_PHYSICAL_N128=0/1`、`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`和
+`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
 
 | 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
 |---|---:|---:|---:|---|---|---|
-| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | legacy N64 |
+| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding（K64） |
 | Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
 | Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle |
@@ -1395,13 +1409,13 @@ legacy更快：
 | Qwen3.5-397B | 390.68T | 315.36T | 4.2448 ms | 5.1822 ms |
 | Qwen3.5-35B | 370.12T | 277.38T | 1.7377 ms | 2.2139 ms |
 
-因此自动策略仅对LDS不超过32KB且已有端到端收益的PTPC shape启用physical+CShuffle，而不是
-只检查K对齐。Xiaomi K256和H3 K384保留physical路径。
+因此自动策略只在LDS不超过32KB且已有端到端收益时启用physical+CShuffle，而不是只检查K对齐。
+Xiaomi K256和H3 K384使用128B padding；Hy3 K192使用0B padding。
 
-核心kernel仍支持`K % 64 == 0`和per-tensor scale，便于显式实验。Hy3 K192按3个K64 stage
-执行，per-tensor不分配1KB PTPC scale LDS，总LDS为20,480B；code object使用160 VGPR、0
-spill。两轮生产式10-buffer复测表明它虽能加速down，却显著拖慢physical布局的consumer，最终
-`down+sorted_sum`回退，因此不进入自动策略。详细数据见后文“Down数据复核”。
+核心kernel支持`K % 64 == 0`和per-tensor scale。Hy3 K192按3个K64 stage执行，per-tensor不分配
+1KB PTPC scale LDS，总LDS为20,480B；code object使用160 VGPR、0 spill。最初沿用H3的128B
+padding时，physical down虽更快，但producer之后的sorted-sum回退45.7%；padding消融确认0B可
+消除该回退并获得`down+sorted_sum`净收益。详细数据见后文“Down数据复核”。
 
 ### 理论roof口径
 
@@ -1409,35 +1423,34 @@ spill。两轮生产式10-buffer复测表明它虽能加速down，却显著拖�
 16链`17.500793 cycles/MFMA`微基准roof为535.73T。先乘均衡路由的BM64 padding效率，得到所有
 路径都可比较的有效dense roof：
 
-| 模型 | padding效率 | 架构dense roof | 16链dense roof | physical串行后处理参照 |
+| 模型 | padding效率 | 架构dense roof | 16链dense roof | 后处理0%遮盖参照 |
 |---|---:|---:|---:|---:|
-| Hy3 | 99.4819% | 582.94T | 532.95T | 不适用（默认legacy；显式实验为385.94T） |
+| Hy3 | 99.4819% | 582.94T | 532.95T | 385.94T |
 | Qwen3.5-397B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Qwen3.5-35B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Xiaomi | 96.9697% | 568.22T | 519.49T | 404.06T |
 | H3 | 100% | 585.98T | 535.73T | 450.02T |
 
-“physical串行后处理参照”按每个N256 wave的64 MUL、64 FMA、32 PERM各4-cycle串行计算，只适用
-于physical N256 codegen；不能套到legacy N64。它也不是硬件上限，因为实际VMEM/LDS与后处理可被
-另一驻留wave部分遮盖。参数化脚本`analyze_down_theoretical_roof.py`通过
-`--path physical_n256|legacy`区分这两种口径。
+“后处理0%遮盖参照”沿用前文64 MUL、64 FMA、32 PERM全部暴露的操作计数，只适用于physical
+N256 codegen，不能套到legacy N64。它不是roof，也没有计入2个resident waves的实际遮盖；表中
+只保留它作为不同K长度下的统一敏感性点。参数化脚本`analyze_down_theoretical_roof.py`通过
+`--path physical_n256|legacy`区分路径，并用`--postprocess-overlap`扫描遮盖假设。
 
 最终五个shape的生产正确性均通过：Hy3/Qwen3.5-397B/Qwen3.5-35B/Xiaomi/H3的`calc_diff`
-分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。下表是隔离单kernel的
-峰值窗口，用于看roof距离；它不是后文10-buffer生产上下文的端到端时延，不能与`sorted_sum`
-绝对时延直接相加：
+分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。下表保留此前同口径的
+隔离单kernel峰值窗口，用于看roof距离；它不是后文10-buffer生产上下文的端到端时延，不能与
+`sorted_sum`绝对时延直接相加。Hy3 0B修复仅按生产上下文复测，不与这组历史峰值混列。
 
-| 模型 | gateup | down | down/gateup | 16链dense效率 | physical实用参照效率 |
+| 模型 | gateup | down | down/gateup | 16链dense效率 | down/0%遮盖参照 |
 |---|---:|---:|---:|---:|---:|
-| Hy3 | 399.97T | 282.52T（legacy） | 70.64% | 53.01% | 不适用（legacy） |
 | Qwen3.5-397B | 474.16T | 399.44T | 84.24% | 74.56% | 不适用（legacy） |
 | Qwen3.5-35B | 442.62T | 393.71T | 88.95% | 73.49% | 不适用（legacy） |
 | Xiaomi | 468.73T | 326.99T | 69.76% | 62.94% | 80.93% |
 | H3 | 421.16T | 407.76T | 96.82% | 76.11% | 90.61% |
 
-Xiaomi相对dense roof看似差距较大，但physical路径包含固定640-cycle串行后处理参照；相对该
-参照达到80.93%。Qwen两型的主要问题是K512 physical occupancy，回退legacy后恢复到约399/394T；
-Hy3因consumer回退也使用legacy。GPU被外部任务占满或测试中途切入时的样本均未进入上表。
+最后一列只是相对0%遮盖操作参照的比值，不应称为效率或roof距离。Qwen两型的主要问题是K512
+physical occupancy，继续使用legacy；Hy3使用physical 0B，数据见后文配对表。GPU被外部任务
+占满或测试中途切入时的样本均未进入上表。
 
 ### 与`e6fe8e9`修改前完整调用对比
 
@@ -1455,7 +1468,7 @@ gateup和down的有效GEMM FLOP计算，因此低于前表的单kernel TFLOPS。
 
 | 模型 | `e6fe8e9`路径 | 当前路径 | e6完整调用 | 当前完整调用 | 时延变化 | e6有效TFLOPS | 当前有效TFLOPS | TFLOPS变化 |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| Hy3 | gate BN128 + legacy N64 | gate BN128 + legacy N64 | 5.6457 ms | 5.6323 ms | -0.24% | 246.49T | 247.07T | +0.24% |
+| Hy3 | gate BN128 + legacy N64 | gate BN128 + physical N256/K64，0B padding | 5.6457 ms | 5.4853 ms | **-2.84%** | 246.49T | 253.71T | **+2.93%** |
 | Qwen3.5-397B | gate BN128 + legacy N64 | gate BN256 + legacy N64 | 12.8120 ms | 11.9771 ms | **-6.52%** | 321.91T | 344.26T | **+6.94%** |
 | Qwen3.5-35B | gate BN128 + legacy N64 | gate BN256 + legacy N64 | 5.1311 ms | 4.9894 ms | **-2.76%** | 321.43T | 330.56T | **+2.84%** |
 | Xiaomi | gate BN128 + legacy N64 | gate BN256 + physical N256/K128 | 9.8038 ms | 8.5322 ms | **-12.97%** | 252.35T | 289.96T | **+14.90%** |
@@ -1491,8 +1504,8 @@ Hy3的gate总宽度为384，BN256不是完整tile，因此e6和当前都应使�
 去掉源码路径注释和汇编元数据后，down与legacy sorted-sum的指令数、逐条指令流SHA和资源占用
 分别完全一致。原始`.s`文件SHA不同只来自两个内嵌`s_nop`调试注释中的源码绝对路径。因此：
 
-- Qwen两型和最终Hy3都使用legacy路径，其down/sorted-sum在代码层面性能中性；跨进程的绝对
-    时延差不能归因于down代码变化。
+- Qwen两型使用legacy路径，其down/sorted-sum在代码层面性能中性；跨进程的绝对时延差不能
+    归因于down代码变化。
 - H3/Xiaomi的收益来自当前自动选择physical N256+CShuffle，而不是legacy实现被改快。
 
 physical会同时改变down producer和sorted-sum consumer，必须合计。最终消融在同一当前进程、
@@ -1503,16 +1516,36 @@ physical会同时改变down producer和sorted-sum consumer，必须合计。最�
 
 | 模型 | legacy down | physical down | down变化（IQR） | legacy sum | physical sum | sum变化（IQR） | legacy down+sum | physical down+sum | 合计变化（IQR） | 自动选择 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Hy3 | 2.206548 ms / 210.22T | 2.004367 ms / 231.42T | **-9.80%**（-14.49%~-9.31%） | 0.867163 ms | 1.263385 ms | **+45.70%**（+45.13%~+45.95%） | 3.072651 ms | 3.267252 ms | **+5.96%**（+2.85%~+6.28%） | **legacy** |
+| Hy3，0B padding | 2.201731 ms / 210.68T | 2.036950 ms / 227.72T | **-7.61%**（-9.05%~-6.69%） | 0.870943 ms | 0.867363 ms | -0.22%（-0.43%~+0.10%） | 3.081979 ms | 2.919034 ms | **-5.41%**（-5.79%~-4.88%） | **physical** |
 | Xiaomi | 3.989694 ms / 206.69T | 3.660633 ms / 225.27T | **-9.00%**（-16.63%~-8.45%） | 1.289245 ms | 1.071803 ms | **-16.96%**（-17.08%~-14.36%） | 5.278059 ms | 4.725256 ms | **-11.04%**（-13.41%~-10.72%） | **physical** |
 | H3 | 2.794370 ms / 221.33T | 2.571089 ms / 240.55T | **-8.16%**（-12.94%~-7.98%） | 0.605582 ms | 0.603342 ms | -0.84%（-1.16%~-0.16%） | 3.401532 ms | 3.175012 ms | **-6.68%**（-6.75%~-6.58%） | **physical** |
 
-Hy3是本轮复核的关键反例：K64 physical producer确实快约9.8%，但其physical布局令
-sorted-sum慢约45.7%，两轮`down+sum`分别回退5.86%和6.00%，合并后为+5.96%。因此默认自动
-策略回退legacy；`MOE_DOWN_PHYSICAL_N128=1`仍可显式启用K64 physical做实验。Xiaomi与H3的
-端到端收益分别为11.04%和6.68%，继续自动使用physical。
+Hy3最初复用了H3的128B padding，得到down -9.80%、sorted-sum +45.70%、合计+5.96%的回退。
+固定其他代码只扫row padding后，0/32/64/128B的`down+sum`变化分别为-5.41%/+13.74%/+12.68%/
++5.86%，所以自动策略对Hy3选择0B，对H3/Xiaomi保持128B。
 
-严格隔离的完整调用与该决策一致：Hy3回退legacy后相对e6仅-0.24%，属于性能中性；Qwen两型的
-完整调用变化来自gateup tile选择及其他辅助kernel，不是down代码收益；Xiaomi/H3则同时包含
-gateup BN256和physical down收益。旧版与当前版均通过各自harness的正确性阈值，但两个版本的
-参考实现对FP8激活量化的建模不同，因此`calc_diff`绝对值不作横向比较。
+0B结果独立复测两次，`down+sum`分别为-5.36%和-5.44%；上表合并两轮48个同轮ratio样本。
+
+这是读侧跨row gather的地址映射问题，不是“不连续写”：0B和128B的down都通过同一wave-private
+CShuffle写row-major 128-bit atom，sorted-sum也都在每个选中source row内连续读取128-bit atom，
+并连续写最终输出。TOPK=9本来就要跨9个不同sorted row gather；padding只把这些row的基址stride
+从8192B改为8320B。legacy和physical 0B的sorted-sum最终ISA逐字相同（1590行、62 VGPR、
+32 SGPR）；128B版指令更少、SGPR更低，因此不是地址算术开销。
+
+两个独立consumer实验进一步定位了stride与gather分布的交互：预填source、不执行down、使用顺序
+`loc_ids`时，128B/0B ratio为0.9879；换成真实Hy3 sorting产生的`loc_ids`后，ratio变为1.1475
+（+14.75%）。执行对应down后，第一次和第二次读取的ratio分别为1.1345和1.1572；10-buffer生产
+上下文中差距可放大到约45.7%。因此128B不是普遍慢，而是8320B row stride与真实TOPK=9跨row
+gather组合不佳。
+
+PMC进一步排除了“128B增加cache miss或DRAM流量”的解释。三个稳态dispatch中，0B与128B的
+`TCC_HIT_sum/TCC_MISS_sum`均约为2.117M/21.009M，L2 hit rate同为9.154%；
+`TCC_EA0_RDREQ_DRAM_sum`也同为约18.924M，差异小于0.01%。所以两种stride产生几乎相同的L2
+miss和DRAM请求数，性能差来自这些请求的服务并行度/延迟，而非请求数量。当前sum counter仍不能
+进一步区分具体的TCC channel、HBM bank或地址hash机制，因此不作更具体硬件归因。
+
+修复后Hy3自动走physical N256/K64 + 0B padding，生产正确性保持`calc_diff=0.00021646`；固定
+1800MHz的10-buffer完整调用为5.4853 ms / 253.71T，相对严格隔离的e6 5.6457 ms / 246.49T降低
+2.84%。Qwen两型的完整调用变化来自gateup tile选择及其他辅助kernel，不是down代码收益；
+Xiaomi/H3则同时包含gateup BN256和physical down收益。旧版与当前版均通过各自harness的正确性
+阈值，但两个版本的参考实现对FP8激活量化的建模不同，因此`calc_diff`绝对值不作横向比较。

@@ -184,7 +184,10 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
     )
     auto_physical = (
         wei_is_fp8(weight_type)
-        and quant_type == 'ptpc'
+        and (
+            quant_type == 'ptpc'
+            or (quant_type == 'per_tensor' and n == 4096 and k == 192)
+        )
         and block_m == 64
         and n % 256 == 0
         and k % 64 == 0
@@ -206,6 +209,14 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
     )
     assert not down_cshuffle_output or down_physical_n128
     return down_physical_n128, down_cshuffle_output
+
+
+def _select_fly_down_padding_bytes(quant_type, n, k, down_cshuffle_output):
+    if not down_cshuffle_output:
+        return None
+    if quant_type == 'per_tensor' and n == 4096 and k == 192:
+        return 0
+    return 128
 
 
 def _select_fly_gateup_layout(use_prefill, n, requested_tile_n):
@@ -252,7 +263,8 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
 @pytest.mark.parametrize(
     ("quant_type", "n", "k", "expected"),
     [
-        ("per_tensor", 4096, 192, (False, False)),
+        ("per_tensor", 4096, 192, (True, True)),
+        ("per_tensor", 4096, 256, (False, False)),
         ("ptpc", 4096, 512, (False, False)),
         ("ptpc", 2048, 512, (False, False)),
         ("ptpc", 6144, 256, (True, True)),
@@ -284,6 +296,19 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
         n=4096,
         k=192,
     ) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("quant_type", "n", "k", "cshuffle", "expected"),
+    [
+        ("per_tensor", 4096, 192, True, 0),
+        ("ptpc", 6144, 256, True, 128),
+        ("ptpc", 6144, 384, True, 128),
+        ("per_tensor", 4096, 192, False, None),
+    ],
+)
+def test_select_fly_down_padding_bytes(quant_type, n, k, cshuffle, expected):
+    assert _select_fly_down_padding_bytes(quant_type, n, k, cshuffle) == expected
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == 'ptpc':
@@ -575,7 +600,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             down_output_padding_bytes = (
                 int(down_padding_env)
                 if down_padding_env is not None
-                else (128 if down_cshuffle_output else None)
+                else _select_fly_down_padding_bytes(
+                    quant_type,
+                    N2,
+                    K2,
+                    down_cshuffle_output,
+                )
             )
             down_row_group_env = os.getenv("MOE_DOWN_OUTPUT_ROW_GROUP")
             down_output_row_group = (

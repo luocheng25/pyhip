@@ -133,7 +133,7 @@ def main():
         "--path",
         choices=("physical_n256", "legacy"),
         default="physical_n256",
-        help="only physical_n256 reports the serialized CShuffle postprocess roof",
+        help="only physical_n256 reports the postprocess overlap sensitivity reference",
     )
     parser.add_argument(
         "--postprocess-mul", type=int, default=POSTPROCESS_MUL_PER_N256_WAVE
@@ -147,6 +147,15 @@ def main():
     parser.add_argument("--mul-cycles", type=float, default=4.0)
     parser.add_argument("--fma-cycles", type=float, default=4.0)
     parser.add_argument("--perm-cycles", type=float, default=4.0)
+    parser.add_argument(
+        "--postprocess-overlap",
+        type=float,
+        default=0.0,
+        help=(
+            "fraction of postprocess cycles hidden by other work; 0 reproduces "
+            "the single-wave zero-overlap reference and is not inferred from occupancy"
+        ),
+    )
     parser.add_argument("--hbm-peak-tbps", type=float, default=5.3)
     parser.add_argument("--kernel", default="moe_2stage_down_prefill_1x4_0")
     parser.add_argument("--dispatch-id", default="latest")
@@ -155,6 +164,8 @@ def main():
     parser.add_argument("--l2-csv", nargs="+")
     parser.add_argument("--hbm-csv", nargs="+")
     args = parser.parse_args()
+    if not 0.0 <= args.postprocess_overlap <= 1.0:
+        raise ValueError("postprocess overlap must be in [0, 1]")
 
     useful_rows = args.batch * args.topk
     executed_rows = args.executed_rows or useful_rows
@@ -184,25 +195,36 @@ def main():
     measured_mfma_roof = (
         MFMA_FLOPS / args.mfma_cycles * SIMDS * args.effective_ghz * 1e9 / 1e12
     )
-    serialized_postprocess_cycles = (
+    nominal_postprocess_cycles = (
         args.postprocess_mul * args.mul_cycles
         + args.postprocess_fma * args.fma_cycles
         + args.postprocess_perm * args.perm_cycles
     )
+    exposed_postprocess_cycles = nominal_postprocess_cycles * (
+        1.0 - args.postprocess_overlap
+    )
     architecture_mfma_cycles = mfma_per_wave * ARCH_MFMA_CYCLES
     measured_mfma_cycles = mfma_per_wave * args.mfma_cycles
-    architecture_schedule_efficiency = architecture_mfma_cycles / (
-        architecture_mfma_cycles + serialized_postprocess_cycles
+    architecture_operation_reference_factor = architecture_mfma_cycles / (
+        architecture_mfma_cycles + exposed_postprocess_cycles
     )
-    measured_schedule_efficiency = measured_mfma_cycles / (
-        measured_mfma_cycles + serialized_postprocess_cycles
+    measured_operation_reference_factor = measured_mfma_cycles / (
+        measured_mfma_cycles + exposed_postprocess_cycles
     )
-    architecture_schedule_roof = architecture_roof * architecture_schedule_efficiency
-    measured_schedule_roof = measured_mfma_roof * measured_schedule_efficiency
+    architecture_operation_reference = (
+        architecture_roof * architecture_operation_reference_factor
+    )
+    measured_operation_reference = (
+        measured_mfma_roof * measured_operation_reference_factor
+    )
     useful_architecture_roof = architecture_roof * padding_efficiency
     useful_measured_roof = measured_mfma_roof * padding_efficiency
-    useful_architecture_schedule_roof = architecture_schedule_roof * padding_efficiency
-    useful_measured_schedule_roof = measured_schedule_roof * padding_efficiency
+    useful_architecture_operation_reference = (
+        architecture_operation_reference * padding_efficiency
+    )
+    useful_measured_operation_reference = (
+        measured_operation_reference * padding_efficiency
+    )
     useful_tflops = useful_flops / (args.kernel_ms * 1e9)
     arithmetic_intensity = useful_flops / naive_bytes
     all_hbm_roof = arithmetic_intensity * args.hbm_peak_tbps
@@ -213,7 +235,9 @@ def main():
     print(f"mfma_per_wave={mfma_per_wave}")
     print(f"useful_tflops={useful_tflops:.3f}")
     if args.path == "physical_n256":
-        print(f"serialized_postprocess_cycles={serialized_postprocess_cycles:.3f}")
+        print(f"nominal_postprocess_cycles={nominal_postprocess_cycles:.3f}")
+        print(f"postprocess_overlap={args.postprocess_overlap:.4%}")
+        print(f"exposed_postprocess_cycles={exposed_postprocess_cycles:.3f}")
     print(f"architecture_mfma_roof_tflops={architecture_roof:.3f}")
     print(f"useful_architecture_mfma_roof_tflops={useful_architecture_roof:.3f}")
     print(
@@ -223,21 +247,29 @@ def main():
     print(f"useful_measured_mfma_roof_tflops={useful_measured_roof:.3f}")
     print(f"measured_mfma_efficiency={useful_tflops / useful_measured_roof:.4%}")
     if args.path == "physical_n256":
-        print(f"architecture_schedule_roof_tflops={architecture_schedule_roof:.3f}")
         print(
-            "useful_architecture_schedule_roof_tflops="
-            f"{useful_architecture_schedule_roof:.3f}"
+            "architecture_operation_reference_tflops="
+            f"{architecture_operation_reference:.3f}"
         )
         print(
-            "architecture_schedule_efficiency="
-            f"{useful_tflops / useful_architecture_schedule_roof:.4%}"
-        )
-        print(f"measured_schedule_roof_tflops={measured_schedule_roof:.3f}")
-        print(
-            f"useful_measured_schedule_roof_tflops={useful_measured_schedule_roof:.3f}"
+            "useful_architecture_operation_reference_tflops="
+            f"{useful_architecture_operation_reference:.3f}"
         )
         print(
-            f"measured_schedule_efficiency={useful_tflops / useful_measured_schedule_roof:.4%}"
+            "actual_over_architecture_operation_reference="
+            f"{useful_tflops / useful_architecture_operation_reference:.4%}"
+        )
+        print(
+            "measured_mfma_operation_reference_tflops="
+            f"{measured_operation_reference:.3f}"
+        )
+        print(
+            "useful_measured_mfma_operation_reference_tflops="
+            f"{useful_measured_operation_reference:.3f}"
+        )
+        print(
+            "actual_over_measured_mfma_operation_reference="
+            f"{useful_tflops / useful_measured_operation_reference:.4%}"
         )
     print(f"naive_arithmetic_intensity_flop_per_byte={arithmetic_intensity:.3f}")
     print(f"all_hbm_traffic_roof_tflops={all_hbm_roof:.3f}")
