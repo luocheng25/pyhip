@@ -1414,7 +1414,8 @@ legacy更快：
 Xiaomi K256和H3 K384使用128B padding；Hy3 K192使用0B padding。
 
 核心kernel支持`K % 64 == 0`和per-tensor scale。Hy3 K192按3个K64 stage执行，per-tensor不分配
-1KB PTPC scale LDS，总LDS为20,480B；code object使用160 VGPR、0 spill。最初沿用H3的128B
+1KB PTPC scale LDS，总LDS为20,480B；最终ISA为next-free VGPR 150、accum offset 152，rocprof
+运行资源为`24 VGPR + 128 AGPR`、0 spill。最初沿用H3的128B
 padding时，physical down虽更快，但producer之后的sorted-sum回退45.7%；padding消融确认0B可
 消除该回退并获得`down+sorted_sum`净收益。详细数据见后文“Down数据复核”。
 
