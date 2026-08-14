@@ -83,7 +83,35 @@ def _gateup_activation_ref(gate, up, activation, swiglu_limit=None):
 
 
 # https://github.com/huggingface/transformers/blob/1fed6166c00b800330fcda8494f78cbcad8e4e3b/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L235-L263
-def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids, activation='silu', swiglu_limit=None):
+def _quantize_dequantize_ref(value, quant_type, quant_dtype):
+    if quant_type == 'ptpc':
+        quantized, scale = aiter.get_torch_quant(aiter.QuantType.per_Token)(
+            value.reshape(-1, value.shape[-1]), quant_dtype=quant_dtype
+        )
+        return (
+            quantized.float() * scale.float()
+        ).reshape_as(value).to(value.dtype)
+    if quant_type == 'per_tensor':
+        fmax = torch.finfo(quant_dtype).max
+        scale = value.float().abs().amax() / fmax
+        quantized = (
+            (value.float() / scale).clamp(-fmax, fmax).to(quant_dtype)
+        )
+        return (quantized.float() * scale).to(value.dtype)
+    return value
+
+
+def get_torch_ref(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    activation='silu',
+    swiglu_limit=None,
+    activation_quant_type=None,
+    activation_quant_dtype=None,
+):
     batch_size, hidden_dim = hidden_states.shape
     E, N1, K1 = w1.shape
     INTER_SIZE = N1 // 2
@@ -95,30 +123,155 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids, activation='silu
     # this will be used to easily index which expert is going to be sollicitated
     expert_mask = torch.nn.functional.one_hot(topk_ids.to(dtype=torch.long), num_classes=E).permute(2, 1, 0)
 
+    intermediate_states = None
+    if activation_quant_type is not None:
+        intermediate_states = torch.empty(
+            (batch_size, topk_ids.shape[1], INTER_SIZE),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(E):
-        def expert_forward(n, x):
+        def gateup_forward(n, x):
             gate_proj = w1[n, 0 : INTER_SIZE].t()
             up_proj = w1[n, INTER_SIZE :,].t()
-            down_proj = w2[n].t()
             return _gateup_activation_ref(
                 x @ gate_proj, x @ up_proj, activation, swiglu_limit
-            ) @ down_proj
+            )
         idx, top_x = torch.where(expert_mask[expert_idx])
 
-        # Index the correct hidden states and compute the expert hidden state for
-        # the current expert. We need to make sure to multiply the output hidden
-        # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
         current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-        current_hidden_states = expert_forward(expert_idx, current_state) * topk_weight[top_x, idx, None]
+        gateup_output = gateup_forward(expert_idx, current_state)
+        if intermediate_states is not None:
+            intermediate_states[top_x, idx] = gateup_output.to(hidden_states.dtype)
+            continue
 
-        # However `index_add_` only support torch tensors for indexing so we'll use
-        # the `top_x` tensor here.
+        current_hidden_states = (
+            gateup_output @ w2[expert_idx].t()
+        ) * topk_weight[top_x, idx, None]
+
         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+    if intermediate_states is None:
+        return final_hidden_states
+
+    intermediate_states = _quantize_dequantize_ref(
+        intermediate_states, activation_quant_type, activation_quant_dtype
+    )
+    for expert_idx in range(E):
+        idx, top_x = torch.where(expert_mask[expert_idx])
+        current_hidden_states = (
+            intermediate_states[top_x, idx].float() @ w2[expert_idx].float().t()
+        ) * topk_weight[top_x, idx, None]
+        final_hidden_states.index_add_(
+            0, top_x, current_hidden_states.to(hidden_states.dtype)
+        )
     return final_hidden_states
 
 def wei_is_fp8(weight_type):
     return weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz
+
+
+def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
+    a_lds_bytes = block_m * k
+    double_buffered_c_lds_bytes = 2 * block_m * 64 * 2
+    scale_lds_bytes = 256 * 4 if quant_type == 'ptpc' else 0
+    physical_lds_bytes = (
+        max(a_lds_bytes, double_buffered_c_lds_bytes)
+        + scale_lds_bytes
+        + 4 * 8 * 64 * 2
+    )
+    auto_physical = (
+        wei_is_fp8(weight_type)
+        and quant_type in ('ptpc', 'per_tensor')
+        and block_m == 64
+        and n % 256 == 0
+        and k % 64 == 0
+        and physical_lds_bytes <= 32 * 1024
+    )
+
+    physical_setting = os.getenv("MOE_DOWN_PHYSICAL_N128", "auto").lower()
+    assert physical_setting in ("0", "1", "auto")
+    down_physical_n128 = (
+        auto_physical if physical_setting == "auto" else physical_setting == "1"
+    )
+
+    cshuffle_setting = os.getenv("MOE_DOWN_CSHUFFLE_OUTPUT", "auto").lower()
+    assert cshuffle_setting in ("0", "1", "auto")
+    down_cshuffle_output = (
+        down_physical_n128
+        if cshuffle_setting == "auto"
+        else cshuffle_setting == "1"
+    )
+    assert not down_cshuffle_output or down_physical_n128
+    return down_physical_n128, down_cshuffle_output
+
+
+def _select_fly_gateup_layout(use_prefill, n, requested_tile_n):
+    if not use_prefill:
+        return "splitk", requested_tile_n
+    if requested_tile_n in (128, 256) and n % requested_tile_n == 0:
+        return "prefill_1x4", requested_tile_n
+    if n % 128 == 0:
+        return "prefill_1x4", 128
+    return "splitk", requested_tile_n
+
+
+@pytest.mark.parametrize(
+    ("n", "requested_tile_n", "expected"),
+    [
+        (384, 256, ("prefill_1x4", 128)),
+        (1024, 256, ("prefill_1x4", 256)),
+        (512, 256, ("prefill_1x4", 256)),
+    ],
+)
+def test_select_fly_gateup_layout(n, requested_tile_n, expected):
+    assert _select_fly_gateup_layout(True, n, requested_tile_n) == expected
+
+
+def test_gateup_prefill_rejects_incomplete_n_tile():
+    from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm
+
+    with pytest.raises(AssertionError, match="requires a complete N tile"):
+        compile_gemm(
+            N=384,
+            K=4096,
+            weight_dtype="fp8",
+            weight_quant_type="per_tensor",
+            act_quant_type="per_tensor",
+            TOPK=9,
+            BLOCK_TILE_SIZE_M=64,
+            BLOCK_TILE_SIZE_N=256,
+            stage="gateup",
+            alg="prefill_1x4",
+            E=193,
+        )
+
+
+@pytest.mark.parametrize(
+    ("quant_type", "n", "k", "expected"),
+    [
+        ("per_tensor", 4096, 192, (True, True)),
+        ("ptpc", 4096, 512, (False, False)),
+        ("ptpc", 2048, 512, (False, False)),
+        ("ptpc", 6144, 256, (True, True)),
+        ("ptpc", 6144, 384, (True, True)),
+    ],
+)
+def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
+    monkeypatch.delenv("MOE_DOWN_PHYSICAL_N128", raising=False)
+    monkeypatch.delenv("MOE_DOWN_CSHUFFLE_OUTPUT", raising=False)
+    assert (
+        _select_fly_down_layout(
+            torch.float8_e4m3fnuz,
+            quant_type,
+            block_m=64,
+            n=n,
+            k=k,
+        )
+        == expected
+    )
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == 'ptpc':
@@ -261,7 +414,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     else:
         assert 0, f'not support weight type "{weight_type}"'
 
-    topk_weight = torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32)
+    topk_weight = torch.softmax(
+        torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32), dim=-1
+    )
     topk_ids = torch.ones([BUF_COPY, B, TOPK], dtype=torch.int32)
     # make a B*TOPK seq, which contains 0...E-1 0...E-1
     rep_e = div_up(B * TOPK, E)
@@ -397,9 +552,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            down_physical_n128 = os.getenv("MOE_DOWN_PHYSICAL_N128", "0") == "1"
-            down_cshuffle_output = (
-                os.getenv("MOE_DOWN_CSHUFFLE_OUTPUT", "0") == "1"
+            down_physical_n128, down_cshuffle_output = _select_fly_down_layout(
+                weight_type,
+                quant_type,
+                TILE_M,
+                N2,
+                K2,
             )
             down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
             down_output_padding_bytes = (
@@ -509,13 +667,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 # sorting tile (TILE_M, shared with the down stage) is >=32 and a 32-multiple;
                 # 'splitk' otherwise.
                 use_prefill = B > 32 and TILE_M >= 32 and TILE_M % 32 == 0
-                if use_prefill:
-                    gateup_alg = 'prefill_1x4'
-                else:
-                    gateup_alg = 'splitk'
+                gateup_alg, gateup_tile_n = _select_fly_gateup_layout(
+                    use_prefill, N1, TILE_N
+                )
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tile_n), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
                 if activation == 'swiglu':
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
@@ -878,7 +1035,42 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         else:
             w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
             w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0], activation=activation, swiglu_limit=swiglu_limit)
+        reference_hidden = hidden_states[0]
+        if wei_is_fp8(weight_type):
+            if quant_type == 'ptpc':
+                reference_hidden_q, reference_hidden_scale = aiter.get_torch_quant(
+                    aiter.QuantType.per_Token
+                )(reference_hidden, quant_dtype=weight_type)
+                reference_hidden = (
+                    reference_hidden_q.float() * reference_hidden_scale.float()
+                ).to(hidden_states.dtype)
+            elif quant_type == 'per_tensor':
+                fmax = torch.finfo(weight_type).max
+                reference_hidden_scale = reference_hidden.float().abs().amax() / fmax
+                reference_hidden_q = (
+                    (reference_hidden.float() / reference_hidden_scale)
+                    .clamp(-fmax, fmax)
+                    .to(weight_type)
+                )
+                reference_hidden = (
+                    reference_hidden_q.float() * reference_hidden_scale
+                ).to(hidden_states.dtype)
+
+        ref_out = get_torch_ref(
+            hidden_states=reference_hidden,
+            w1=w1_ref,
+            w2=w2_ref,
+            topk_weight=topk_weight[0],
+            topk_ids=topk_ids[0],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            activation_quant_type=(
+                quant_type
+                if kernel_type == 'fly_splitk_2s' and wei_is_fp8(weight_type)
+                else None
+            ),
+            activation_quant_dtype=weight_type,
+        )
         # aiter_out = _run_aiter(hidden_states=hidden_states[0], w1=w1[0], w2=w2[0], topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0], quant_type=quant_type)
         #print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, ref_out)=} ")

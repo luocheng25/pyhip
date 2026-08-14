@@ -8,7 +8,11 @@ from aiter.ops.shuffle import shuffle_weight
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm, sorted_sum
+from pyhip.contrib.flydsl.moe_gemm_splitk import (
+    compile_gemm,
+    flydsl_absmax,
+    sorted_sum,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a ROCm GPU"
@@ -30,6 +34,16 @@ def _relative_l2(actual, expected):
     error = (actual.float() - expected.float()).square().sum().sqrt()
     reference = expected.float().square().sum().sqrt()
     return (error / reference).item()
+
+
+def test_absmax_reuse_clears_output():
+    amax = torch.empty(1, dtype=torch.float32, device="cuda")
+    launch = flydsl_absmax()
+    for value in (16.0, 0.125):
+        source = torch.full((4096,), value, dtype=torch.bfloat16, device="cuda")
+        launch(source, amax)
+        torch.cuda.synchronize()
+        assert amax.item() == value
 
 
 def _pack_bn256_physical(logical_rows):
@@ -309,6 +323,100 @@ def test_down_prefill_physical_sorted_sum(
     expected = (expected * routing_weight[:, None]).to(torch.bfloat16)
 
     assert torch.isfinite(physical_output[:, :hidden_size]).all()
+    assert torch.isfinite(logical_output).all()
+    assert _relative_l2(logical_output, expected) < 3e-2
+
+
+def test_down_prefill_physical_per_tensor_k192_cshuffle():
+    torch.manual_seed(17)
+    batch_size = 64
+    intermediate_size = 192
+    hidden_size = 512
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    activation = 0.1 * torch.randn(
+        batch_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    activation_scale = activation.float().abs().amax() / fp8_max
+    activation_fp8 = (
+        (activation.float() / activation_scale)
+        .clamp(-fp8_max, fp8_max)
+        .to(fp8_dtype)
+    )
+    weight = 0.1 * torch.randn(
+        1, hidden_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    weight_scale = weight.float().abs().amax(dim=(1, 2)) / fp8_max
+    weight_fp8 = (
+        (weight.float() / weight_scale[:, None, None])
+        .clamp(-fp8_max, fp8_max)
+        .to(fp8_dtype)
+    )
+    shuffled_weight = shuffle_weight(weight_fp8, layout=(16, 16))
+
+    routing_weight = torch.linspace(
+        0.25, 1.0, batch_size, dtype=torch.float32, device="cuda"
+    )
+    sorted_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+    sorted_expert_ids = torch.zeros(1, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.tensor(
+        [batch_size, batch_size], dtype=torch.int32, device="cuda"
+    )
+    physical_output = torch.full(
+        (batch_size, hidden_size + 64),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    launch = compile_gemm(
+        N=hidden_size,
+        K=intermediate_size,
+        weight_dtype="fp8",
+        weight_quant_type="per_tensor",
+        act_quant_type="per_tensor",
+        TOPK=1,
+        BLOCK_TILE_SIZE_M=64,
+        BLOCK_TILE_SIZE_N=256,
+        stage="down",
+        alg="prefill_1x4",
+        E=1,
+        USE_ATOMIC_WRITE=False,
+        down_physical_n128=True,
+        down_output_padding_bytes=128,
+        down_cshuffle_output=True,
+    )
+    launch(
+        _ptr(activation_fp8),
+        _ptr(shuffled_weight),
+        _ptr(physical_output),
+        _ptr(sorted_ids),
+        _ptr(routing_weight),
+        _ptr(sorted_expert_ids),
+        _ptr(num_valid_ids),
+        _ptr(weight_scale),
+        _ptr(activation_scale.reshape(1)),
+        batch_size,
+        1,
+        torch.cuda.current_stream(),
+    )
+
+    logical_output = torch.empty(
+        batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    loc_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda").view(
+        batch_size, 1
+    )
+    sorted_sum(1, hidden_size, True, 256, 128)(
+        loc_ids, physical_output, logical_output, batch_size
+    )
+    torch.cuda.synchronize()
+
+    expected = (activation_fp8.float() * activation_scale) @ (
+        weight_fp8[0].float() * weight_scale[0]
+    ).T
+    expected = (expected * routing_weight[:, None]).to(torch.bfloat16)
     assert torch.isfinite(logical_output).all()
     assert _relative_l2(logical_output, expected) < 3e-2
 

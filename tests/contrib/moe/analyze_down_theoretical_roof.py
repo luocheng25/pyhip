@@ -6,12 +6,8 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-
-USEFUL_FLOPS = 2 * 32768 * 4 * 384 * 6144
 MFMA_FLOPS = 2 * 16 * 16 * 32
 SIMDS = 80 * 4
-NAIVE_BYTES = 6_543_114_240
-MFMA_PER_N256_WAVE = 192
 POSTPROCESS_MUL_PER_N256_WAVE = 64
 POSTPROCESS_FMA_PER_N256_WAVE = 64
 POSTPROCESS_PERM_PER_N256_WAVE = 32
@@ -38,7 +34,9 @@ def read_counter_csv(paths, kernel, dispatch_id):
             row for row in matching_rows if int(row["Dispatch_Id"]) == selected_dispatch
         ]
         if not selected_rows:
-            raise ValueError(f"dispatch {selected_dispatch} did not match {kernel!r} in {path}")
+            raise ValueError(
+                f"dispatch {selected_dispatch} did not match {kernel!r} in {path}"
+            )
         first_row = selected_rows[0]
         duration_ms = (
             int(first_row["End_Timestamp"]) - int(first_row["Start_Timestamp"])
@@ -122,7 +120,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kernel-ms", type=float, required=True)
     parser.add_argument("--effective-ghz", type=float, required=True)
-    parser.add_argument("--mfma-cycles", type=float, default=17.613525)
+    parser.add_argument("--batch", type=int, default=32768)
+    parser.add_argument("--topk", type=int, default=4)
+    parser.add_argument("--n", type=int, default=6144)
+    parser.add_argument("--k", type=int, default=384)
+    parser.add_argument("--block-m", type=int, default=64)
+    parser.add_argument("--executed-rows", type=int)
+    parser.add_argument("--mfma-per-wave", type=int)
+    parser.add_argument("--mfma-per-block", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--mfma-cycles", type=float, default=17.500793)
+    parser.add_argument(
+        "--path",
+        choices=("physical_n256", "legacy"),
+        default="physical_n256",
+        help="only physical_n256 reports the serialized CShuffle postprocess roof",
+    )
     parser.add_argument(
         "--postprocess-mul", type=int, default=POSTPROCESS_MUL_PER_N256_WAVE
     )
@@ -144,6 +156,28 @@ def main():
     parser.add_argument("--hbm-csv", nargs="+")
     args = parser.parse_args()
 
+    useful_rows = args.batch * args.topk
+    executed_rows = args.executed_rows or useful_rows
+    if executed_rows < useful_rows or executed_rows % args.block_m:
+        raise ValueError("executed rows must cover useful rows and be block-m aligned")
+    useful_flops = 2 * useful_rows * args.k * args.n
+    padding_efficiency = useful_rows / executed_rows
+    workgroups = executed_rows // args.block_m
+    naive_bytes = (
+        workgroups * args.n * args.k
+        + executed_rows * args.n * 2
+        + executed_rows * args.k
+        + workgroups * args.n * 4
+    )
+    if args.mfma_per_wave is not None and args.mfma_per_block is not None:
+        raise ValueError("use only one of --mfma-per-wave and --mfma-per-block")
+    default_mfma_per_wave = (16 if args.path == "physical_n256" else 4) * (
+        args.k // 32
+    )
+    mfma_per_wave = (
+        args.mfma_per_wave or args.mfma_per_block or default_mfma_per_wave
+    )
+
     architecture_roof = (
         MFMA_FLOPS / ARCH_MFMA_CYCLES * SIMDS * args.effective_ghz * 1e9 / 1e12
     )
@@ -155,8 +189,8 @@ def main():
         + args.postprocess_fma * args.fma_cycles
         + args.postprocess_perm * args.perm_cycles
     )
-    architecture_mfma_cycles = MFMA_PER_N256_WAVE * ARCH_MFMA_CYCLES
-    measured_mfma_cycles = MFMA_PER_N256_WAVE * args.mfma_cycles
+    architecture_mfma_cycles = mfma_per_wave * ARCH_MFMA_CYCLES
+    measured_mfma_cycles = mfma_per_wave * args.mfma_cycles
     architecture_schedule_efficiency = architecture_mfma_cycles / (
         architecture_mfma_cycles + serialized_postprocess_cycles
     )
@@ -165,32 +199,55 @@ def main():
     )
     architecture_schedule_roof = architecture_roof * architecture_schedule_efficiency
     measured_schedule_roof = measured_mfma_roof * measured_schedule_efficiency
-    useful_tflops = USEFUL_FLOPS / (args.kernel_ms * 1e9)
-    arithmetic_intensity = USEFUL_FLOPS / NAIVE_BYTES
+    useful_architecture_roof = architecture_roof * padding_efficiency
+    useful_measured_roof = measured_mfma_roof * padding_efficiency
+    useful_architecture_schedule_roof = architecture_schedule_roof * padding_efficiency
+    useful_measured_schedule_roof = measured_schedule_roof * padding_efficiency
+    useful_tflops = useful_flops / (args.kernel_ms * 1e9)
+    arithmetic_intensity = useful_flops / naive_bytes
     all_hbm_roof = arithmetic_intensity * args.hbm_peak_tbps
+    print(f"useful_rows={useful_rows}")
+    print(f"executed_rows={executed_rows}")
+    print(f"padding_efficiency={padding_efficiency:.4%}")
+    print(f"path={args.path}")
+    print(f"mfma_per_wave={mfma_per_wave}")
     print(f"useful_tflops={useful_tflops:.3f}")
-    print(f"serialized_postprocess_cycles={serialized_postprocess_cycles:.3f}")
+    if args.path == "physical_n256":
+        print(f"serialized_postprocess_cycles={serialized_postprocess_cycles:.3f}")
     print(f"architecture_mfma_roof_tflops={architecture_roof:.3f}")
-    print(f"architecture_mfma_efficiency={useful_tflops / architecture_roof:.4%}")
+    print(f"useful_architecture_mfma_roof_tflops={useful_architecture_roof:.3f}")
+    print(
+        f"architecture_mfma_efficiency={useful_tflops / useful_architecture_roof:.4%}"
+    )
     print(f"measured_mfma_roof_tflops={measured_mfma_roof:.3f}")
-    print(f"measured_mfma_efficiency={useful_tflops / measured_mfma_roof:.4%}")
-    print(f"architecture_schedule_roof_tflops={architecture_schedule_roof:.3f}")
-    print(f"architecture_schedule_efficiency={useful_tflops / architecture_schedule_roof:.4%}")
-    print(f"measured_schedule_roof_tflops={measured_schedule_roof:.3f}")
-    print(f"measured_schedule_efficiency={useful_tflops / measured_schedule_roof:.4%}")
+    print(f"useful_measured_mfma_roof_tflops={useful_measured_roof:.3f}")
+    print(f"measured_mfma_efficiency={useful_tflops / useful_measured_roof:.4%}")
+    if args.path == "physical_n256":
+        print(f"architecture_schedule_roof_tflops={architecture_schedule_roof:.3f}")
+        print(
+            "useful_architecture_schedule_roof_tflops="
+            f"{useful_architecture_schedule_roof:.3f}"
+        )
+        print(
+            "architecture_schedule_efficiency="
+            f"{useful_tflops / useful_architecture_schedule_roof:.4%}"
+        )
+        print(f"measured_schedule_roof_tflops={measured_schedule_roof:.3f}")
+        print(
+            f"useful_measured_schedule_roof_tflops={useful_measured_schedule_roof:.3f}"
+        )
+        print(
+            f"measured_schedule_efficiency={useful_tflops / useful_measured_schedule_roof:.4%}"
+        )
     print(f"naive_arithmetic_intensity_flop_per_byte={arithmetic_intensity:.3f}")
     print(f"all_hbm_traffic_roof_tflops={all_hbm_roof:.3f}")
-    print(f"naive_l2_side_tbps={NAIVE_BYTES / (args.kernel_ms * 1e-3) / 1e12:.3f}")
+    print(f"naive_l2_side_tbps={naive_bytes / (args.kernel_ms * 1e-3) / 1e12:.3f}")
 
     if args.att_code_json:
         att = read_att(Path(args.att_code_json))
         print(
             "ATT",
-            {
-                key: value
-                for key, value in att.items()
-                if not key.endswith("_by_class")
-            },
+            {key: value for key, value in att.items() if not key.endswith("_by_class")},
         )
         if att["mfma_exec"]:
             print(
@@ -198,8 +255,7 @@ def main():
                 f"{att['mfma_cycles'] / att['mfma_exec']:.6f}"
             )
             print(
-                "att_mfma_stall_per_exec="
-                f"{att['mfma_stall'] / att['mfma_exec']:.6f}"
+                "att_mfma_stall_per_exec=" f"{att['mfma_stall'] / att['mfma_exec']:.6f}"
             )
         for instruction_class, stall in sorted(
             att["stall_by_class"].items(), key=lambda item: item[1], reverse=True
@@ -267,8 +323,12 @@ def main():
 
                 read_bytes_min = read_32b_max * 32 + (read_requests - read_32b_max) * 64
                 read_bytes_max = read_32b_min * 32 + (read_requests - read_32b_min) * 64
-                write_bytes_min = write_64b_min * 64 + (write_requests - write_64b_min) * 32
-                write_bytes_max = write_64b_max * 64 + (write_requests - write_64b_max) * 32
+                write_bytes_min = (
+                    write_64b_min * 64 + (write_requests - write_64b_min) * 32
+                )
+                write_bytes_max = (
+                    write_64b_max * 64 + (write_requests - write_64b_max) * 32
+                )
                 hbm_bytes_min = read_bytes_min + write_bytes_min
                 hbm_bytes_max = read_bytes_max + write_bytes_max
                 seconds = args.kernel_ms * 1e-3
@@ -282,7 +342,9 @@ def main():
                     "estimated_hbm_write_gb_range="
                     f"{write_bytes_min / 1e9:.3f}..{write_bytes_max / 1e9:.3f}"
                 )
-                print(f"estimated_hbm_tbps_range={hbm_tbps_min:.3f}..{hbm_tbps_max:.3f}")
+                print(
+                    f"estimated_hbm_tbps_range={hbm_tbps_min:.3f}..{hbm_tbps_max:.3f}"
+                )
                 print(
                     "estimated_hbm_peak_fraction_range="
                     f"{hbm_tbps_min / args.hbm_peak_tbps:.4%}.."
@@ -290,8 +352,8 @@ def main():
                 )
                 print(
                     "measured_hbm_arithmetic_intensity_range="
-                    f"{USEFUL_FLOPS / hbm_bytes_max:.3f}.."
-                    f"{USEFUL_FLOPS / hbm_bytes_min:.3f}"
+                    f"{useful_flops / hbm_bytes_max:.3f}.."
+                    f"{useful_flops / hbm_bytes_min:.3f}"
                 )
 
 

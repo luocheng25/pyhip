@@ -1352,3 +1352,95 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 严格反相把原本由`sched_group`在同一basic block内交织的VMEM/MFMA/LDS强制切开，既增加SALU
 控制和VGPR，也破坏旧流水的指令重叠；固定slot0/slot1=`1/0`整个kernel则会长期饿死slot1，完整
 运行同样明显退化。因此本轮未保留任何`setprio`代码或环境开关，旧e6仍以128B padding为最佳。
+
+## B=32768多shape自动选择（2026-08-14）
+
+H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile和down的实际LDS占用
+自动选路；显式`MOE_DOWN_PHYSICAL_N128=0/1`与`MOE_DOWN_CSHUFFLE_OUTPUT=0/1`仍可覆盖自动值。
+
+| 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
+|---|---:|---:|---:|---|---|---|
+| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle（K64） |
+| Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
+| Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
+| Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle |
+| H3 | 384 | 6144 | 4 | PTPC | prefill BN256 | physical N256 + CShuffle |
+
+### Hy3不完整gateup tile
+
+Hy3 gateup总宽度为`N=2*I=384`。旧host直接沿用`BN=256`并启动两个N block，但
+`_make_gateup_weight_view()`的静态layout只完整描述`N/BN`个tile；第二个不完整tile因此越过当前
+expert，实测前128个激活通道relative-L2为0.486，尾64个通道为1.0。所有expert使用相同权重时
+错误会被掩盖，这也是单expert/同权重诊断曾经通过的原因。
+
+核心kernel现在明确要求`N % BN == 0`；host在`384/256`时自动选择BN128。修复后gateup相对量化
+参考的整体relative-L2降到0.00166，前128和尾64分别为0.00166与0.00166。完整生产harness的
+`calc_diff=0.00021646`，低于0.02阈值。
+
+### K512的LDS occupancy回退
+
+physical N256的LDS按实际分配计算为：
+
+```text
+max(A: BM*K*FP8, C: 2*BM*64*BF16) + scale: 256*FP32 + CShuffle: 4*8*64*BF16
+```
+
+BM64时，PTPC K384为29,696B、PTPC K256为21,504B，均不超过32KB，因此每个64KB CU可驻留
+两个WG；PTPC K512为37,888B，只能驻留一个WG。Qwen两个K512 shape的逐bit布局消融也确认
+legacy更快：
+
+| 模型 | legacy down | physical CShuffle down | legacy合计 | physical CShuffle合计 |
+|---|---:|---:|---:|---:|
+| Qwen3.5-397B | 390.68T | 315.36T | 4.2448 ms | 5.1822 ms |
+| Qwen3.5-35B | 370.12T | 277.38T | 1.7377 ms | 2.2139 ms |
+
+因此自动策略只在LDS不超过32KB时启用physical+CShuffle，而不是仅检查K对齐。Xiaomi K256
+保留physical路径；其消融中CShuffle合计3.5300ms，优于legacy 4.1458ms。
+
+physical N256随后推广到`K % 64 == 0`和per-tensor scale。Hy3 K192按3个K64 stage执行，且
+per-tensor不分配1KB PTPC scale LDS，总LDS为20,480B。同一空闲card1上，新路径与强制legacy
+都通过生产正确性，`calc_diff`同为0.00021646：
+
+| Hy3路径 | down | 有效TFLOPS | sorted_sum | down+sum |
+|---|---:|---:|---:|---:|
+| 强制legacy | 1.641827 ms | 282.52T | 0.788843 ms | 2.430670 ms |
+| **K64 physical N256+CShuffle** | **1.403926 ms** | **330.40T** | 0.870344 ms | **2.274270 ms** |
+
+physical使down降低14.49%、TFLOPS提高16.95%；虽然sorted_sum增加，down+sum仍降低6.44%，完整
+gateup+down+sum降低2.91%。K192 code object为20,480B LDS、160 VGPR、0 spill，LDS和VGPR均
+允许3 WG/CU（每SIMD 3 waves）；作为对照，H3 K384 specialization仍为29,696B LDS、
+next-free VGPR 236、0 spill，保持原2 WG/CU资源档位。
+
+### 理论roof口径
+
+按gfx942 80CU、4 SIMD/CU、实测有效频率1.78827GHz，架构16-cycle dense roof为585.98T，
+16链`17.500793 cycles/MFMA`微基准roof为535.73T。先乘均衡路由的BM64 padding效率，得到所有
+路径都可比较的有效dense roof：
+
+| 模型 | padding效率 | 架构dense roof | 16链dense roof | physical串行后处理参照 |
+|---|---:|---:|---:|---:|
+| Hy3 | 99.4819% | 582.94T | 532.95T | 385.94T |
+| Qwen3.5-397B | 100% | 585.98T | 535.73T | 不适用（legacy） |
+| Qwen3.5-35B | 100% | 585.98T | 535.73T | 不适用（legacy） |
+| Xiaomi | 96.9697% | 568.22T | 519.49T | 404.06T |
+| H3 | 100% | 585.98T | 535.73T | 450.02T |
+
+“physical串行后处理参照”按每个N256 wave的64 MUL、64 FMA、32 PERM各4-cycle串行计算，只适用
+于physical N256 codegen；不能套到legacy N64。它也不是硬件上限，因为实际VMEM/LDS与后处理可被
+另一驻留wave部分遮盖。参数化脚本`analyze_down_theoretical_roof.py`通过
+`--path physical_n256|legacy`区分这两种口径。
+
+最终五个shape的生产正确性均通过：Hy3/Qwen3.5-397B/Qwen3.5-35B/Xiaomi/H3的`calc_diff`
+分别为0.00021646、0.00020764、0.00020577、0.00019977、0.00020164。最终空闲窗口阶段实测：
+
+| 模型 | gateup | down | down/gateup | 16链dense效率 | physical实用参照效率 |
+|---|---:|---:|---:|---:|---:|
+| Hy3 | 399.97T | 330.40T | 82.61% | 61.99% | 85.61% |
+| Qwen3.5-397B | 474.16T | 399.44T | 84.24% | 74.56% | 不适用（legacy） |
+| Qwen3.5-35B | 442.62T | 393.71T | 88.95% | 73.49% | 不适用（legacy） |
+| Xiaomi | 468.73T | 326.99T | 69.76% | 62.94% | 80.93% |
+| H3 | 421.16T | 407.76T | 96.82% | 76.11% | 90.61% |
+
+Hy3和Xiaomi相对dense roof看似差距较大，但physical路径包含固定640-cycle串行后处理参照；相对
+该参照分别达到85.61%和80.93%。Qwen两型的主要问题是K512 physical occupancy，回退legacy后
+恢复到约399/394T。GPU被外部任务占满或测试中途切入时的样本均未进入上表。

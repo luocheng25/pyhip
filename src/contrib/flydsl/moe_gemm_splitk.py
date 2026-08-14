@@ -118,9 +118,9 @@ def compile_gemm(
         assert stage == "down" and alg == "prefill_1x4"
         assert BLOCK_TILE_SIZE_N in (128, 192, 256)
         assert N % BLOCK_TILE_SIZE_N == 0
-        assert K % 128 == 0
+        assert K % 64 == 0
         assert weight_dtype == "fp8"
-        assert weight_quant_type == "ptpc"
+        assert weight_quant_type in ("ptpc", "per_tensor")
     if down_output_padding_bytes is not None:
         assert down_physical_n128 and BLOCK_TILE_SIZE_N == 256
         assert down_output_padding_bytes in (0, 32, 64, 128)
@@ -188,6 +188,10 @@ def compile_gemm(
         assert 128 <= BLOCK_TILE_SIZE_N <= 256 and BLOCK_TILE_SIZE_N % 128 == 0, (
             "For prefill_1x4 alg, BLOCK_TILE_SIZE_N must be in [128, 256] and a multiple of 128 "
             "(each wave owns contiguous_n//4 = BN//8 output channels, a multiple of 16)"
+        )
+        assert N % BLOCK_TILE_SIZE_N == 0, (
+            f"gateup prefill_1x4 requires a complete N tile, got N={N}, "
+            f"BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N}"
         )
         # fp8 issues 128-bit g2r loads (16 fp8/thread) -> widen K-tile to 128; bf16 keeps 64.
         # tile_k override (default 64 for bf16 / 128 for fp8) enables the BK sweep; the per-ki
@@ -2177,7 +2181,11 @@ def compile_gemm(
 
             BLOCK_M = BLOCK_TILE_SIZE_M
             BLOCK_N = BLOCK_TILE_SIZE_N if down_physical_n128 else 64
-            BLOCK_K = 128 if down_physical_n128 else 64 // (weight_dtype.width // 8)
+            BLOCK_K = (
+                128
+                if down_physical_n128 and K % 128 == 0
+                else 64 // (weight_dtype.width // 8)
+            )
             WAVE_N = BLOCK_N // 4
             LANE_N = WAVE_N // 4
             C_BLOCK_N = 64
@@ -2203,7 +2211,9 @@ def compile_gemm(
             shared_allocator = fx.SharedAllocator()
             lds = shared_allocator.allocate(SharedStorage)
             scale_lds = None
-            if const_expr(down_physical_n128):
+            if const_expr(
+                down_physical_n128 and weight_quant_type == "ptpc"
+            ):
                 scale_storage = shared_allocator.allocate(
                     fx.Array[fx.Float32, BLOCK_N, 16]
                 )
@@ -2852,12 +2862,22 @@ def compile_gemm(
                 frag_weight = flyobj.load_tiled_mma_fragA(
                     mm, weight, [None, None, 0, 0]
                 )
-                frag_pc_scale = load_scale_block_via_lds(0)
+                if const_expr(weight_quant_type == "ptpc"):
+                    frag_pc_scale = load_scale_block_via_lds(0)
+                else:
+                    frag_pc_scale = flyobj.load_tiled_mma_fragC(
+                        mm,
+                        arg_w_scale,
+                        [None, None, 0, 0],
+                        copy_atom_bits=32,
+                    )
                 frag_weight_slots = [
                     frag_weight,
                     fx.make_fragment_like(frag_weight),
                 ]
                 next_frag_pc_scale = fx.make_fragment_like(frag_pc_scale)
+                if const_expr(weight_quant_type == "per_tensor"):
+                    next_frag_pc_scale.store(frag_pc_scale.load())
                 fragC_bf16.fill(0)
 
                 for block_n, state in range(
@@ -2877,7 +2897,7 @@ def compile_gemm(
                     has_previous_output = block_n > 0
                     next_scale_vec = None
 
-                    # Each unrolled iteration is one 64x64x128 core per wave.
+                    # Each unrolled iteration is one 64x64xBLOCK_K core per wave.
                     # Stage0 handles reads, prefetches, stores, and postprocess;
                     # stage1 contains only the current K core's MFMA instructions.
                     for k_core in range_constexpr(nBK):
@@ -2898,10 +2918,11 @@ def compile_gemm(
                             )
                         else:
                             next_block_n = block_n + 1
-                            next_scale_vec = issue_scale_block_global(
-                                next_block_n
-                            )
-                            fx.rocdl.sched_barrier(0)
+                            if const_expr(weight_quant_type == "ptpc"):
+                                next_scale_vec = issue_scale_block_global(
+                                    next_block_n
+                                )
+                                fx.rocdl.sched_barrier(0)
                             flyobj.load_tiled_mma_fragA(
                                 mm,
                                 weight,
@@ -2931,7 +2952,9 @@ def compile_gemm(
                             fragC[0],
                         )
                         enter_read_write_stage()
-                        if const_expr(k_core + 1 == nBK):
+                        if const_expr(
+                            k_core + 1 == nBK and weight_quant_type == "ptpc"
+                        ):
                             commit_scale_block_lds(
                                 next_scale_vec, next_frag_pc_scale
                             )
@@ -3573,6 +3596,7 @@ def flydsl_absmax():
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
         stream = torch.cuda.current_stream()
+        Amax.zero_()
         wg_count = (
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
