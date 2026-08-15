@@ -1614,6 +1614,98 @@ K896，但wave cycles/MFMA却高22.5%，所以回退来自K64 stage的调度/ope
 block重复读取，而每个N block都执行CShuffle。若要继续超过K960，需要减少/移除独立CShuffle
 空间，或不再把完整K的A常驻LDS；仅扩大K无法通过gfx942资源检查。
 
+### per-tensor K128用`sched_group`替代`setprio`
+
+本轮继续固定`B=32768/N=4096/TOPK=9/E=193/K=384`、BM64/BN256、per-tensor、0B padding，
+每个计时样本前运行共同Hy3 gateup，轮换10套输入/权重buffer，并在GPU4固定1800MHz。control与
+candidate在同一Python进程中按`C-X-X-C`/`X-C-C-X`交替；两路输出逐bit一致。
+
+原路径用slot相关`setprio`把读写和64条MFMA强制分相。新路径让8条A LDS read、8条下一core的
+weight VMEM load和64条当前core MFMA保留在同一basic block，并用完整配额的
+`sched_group_barrier`指定顺序。三个邻域的最终ISA与结果如下；v1/v2各24轮，v3为12轮筛选：
+
+| 版本 | 每core内8条VMEM位置 | 同轮control | candidate | candidate/control | 有效TFLOPS |
+|---|---|---:|---:|---:|---:|
+| v1 | MFMA `0,8,...,56`前 | 2.993772 ms | 2.887851 ms | 0.966340（-3.37%） | 321.25T |
+| **v2** | **MFMA `0,4,...,28`前** | **2.993518 ms** | **2.874578 ms** | **0.960801（-3.92%）** | **322.73T** |
+| v3 | MFMA `0,3,...,21`前 | 3.000558 ms | 2.898877 ms | 0.966001（-3.40%） | 320.02T |
+
+v1把最后一条load拖到第56条MFMA附近，下一core前隐藏距离不足；ATT的VMEM-wait/MFMA相对
+control增加15.6%。v2将8条load集中在前半core，最后一条后仍有约32条MFMA，VMEM-wait/MFMA
+回落到相对control仅+1.0%。v3进一步压到前21条MFMA后，VMEM请求过密并回退。因此保留
+`DSRD8 -> 8 x (VMEM1 -> MFMA4) -> MFMA32`。
+
+v2 ATT为`/tmp/hy3_k384_sched_v2_att/ui_output_agent_33556_dispatch_19`，control为
+`/tmp/hy3_k384_current_att/ui_output_agent_8446_dispatch_19`。v2 trace出现context save/restore和
+`Stitch Incomplete`警告，因此只按动态MFMA数归一作方向判断：MFMA stall/MFMA降低7.2%，
+LDS-wait降低5.5%，VMEM-wait基本持平（+1.0%），总stall/MFMA降低1.2%。无抢占警告的v1也得到
+MFMA stall/MFMA降低6.7%、LDS-wait降低5.5%和总stall/MFMA降低0.8%，方向一致。
+
+原始wave时间线进一步排除了“去掉`setprio`后反相更强”这个解释。16个SIMD中，两resident slot
+恰好只有一个处于MFMA的双活时间中位占比为control 58.01%、v1 58.27%，基本不变；至少一个slot
+处于MFMA反而从60.05%降到58.86%。但单wave中位时长从140,912降到137,172 cycles。因此收益来自
+单wave内部VMEM/MFMA交织和operand-ready改善，不是更高的双wave反相比例。
+
+最终ISA保持192条MFMA、38条buffer load、32条DS read、8条store；`setprio`从12降到0，机器
+指令从793降到765。资源保持next-free VGPR 190、accum offset 192、28,672B LDS、0 scratch和
+2 waves/SIMD。
+
+该调度目前只对`physical N256 + per-tensor + BLOCK_K=128`启用。fresh compile-only逐条比较确认：
+
+- 优化后的K384机器码与上述322.73T v2逐条一致。
+- Hy3原生K192仍保留异构K128+K64两stage及9条`setprio`，558条机器指令逐条不变。
+- H3 K384 PTPC、Xiaomi K256 PTPC和legacy N64分别保持935/750/771条机器指令逐条不变。
+
+PTPC若也全局去掉`setprio`，H3资源从228降到220 combined VGPR，但Xiaomi从212升到224；在没有
+空闲GPU完成两个生产shape ABBA前不扩大作用域。
+
+### Hy3 K384三wave specialization
+
+在上述322.73T K128 scheduler基础上，继续只优化Hy3生产shape：`B=32768/N=4096/K=384`、
+`TOPK=9/E=193`、BM64/BN256、activation/weight均为per-tensor、0B padding。最终将K core改为
+K64，并把activation布局改为：K0--K3常驻16KB LDS，K4/K5依次借用4KB CShuffle scratch读入
+持久fragment；进入N循环后scratch只用于原CShuffle。总LDS从28,672B降到20,480B，LLVM附加
+`rocdl.waves_per_eu=3`后为168 VGPR、0 scratch/0 spill，达到3 waves/SIMD。
+
+K0--K3每core使用`DSRD4 -> VMEM4 -> MFMA32`；K4同样先集中发4条下一weight load；K5预取
+下一N块K0，消费距离跨过后处理/CShuffle，因此使用`4 x (VMEM1 -> MFMA1) -> MFMA28`。最终
+CShuffle还删除了每个M8 slice在DS write后的首个`lgkmcnt(0)`：gfx942同wave LDS操作按序发射，
+只保留DS read结果使用前的`lgkmcnt(0)`。随机FP8输入在N512/N4096各重复20次，当前版与冻结的
+修改前版本完整有效输出始终逐bit一致。
+
+最终24轮、10-buffer、共同gateup上下文ABBA结果：
+
+| 版本 | 中位时延 | 有效TFLOPS | candidate/control |
+|---|---:|---:|---:|
+| 修改前K128 | 2.962432 ms | 313.16T | - |
+| **K64三wave** | **2.675950 ms** | **346.69T** | **0.901313** |
+
+即同窗口延迟降低9.87%，吞吐提升10.95%。按本节此前2.874578ms/322.73T基线用配对ratio归一，
+对应2.590894ms/358.07T，超过吞吐+10%的355.00T目标。测试期间GPU util约1%，但外部进程仍占
+77%--81% VRAM，因此正式结论以同进程配对ratio为主，不把该窗口绝对值与空闲窗口混用。
+
+2026-08-15在同一GPU4、650W、1800MHz performance determinism下复测两种PTL。`VECTOR,F8`
+全程保持单一稳态：control为2.222207ms/417.47T，K64三wave为2.131987ms/435.14T；24轮配对
+ratio中位数为0.959404（时延-4.06%，吞吐+4.23%），IQR为0.957809--0.961188，完整输出逐bit
+一致。`F16,BF16`则在第8--10轮从2.13ms快态切换到3.14ms慢态，两个版本同步降档，因此其混合
+总中位数不代表单一kernel稳态。后续性能tune以更稳定的`VECTOR,F8`作为参考PTL。
+
+这里的配对ratio先在每轮内计算
+`mean(candidate_1, candidate_2) / mean(control_1, control_2)`，再取所有轮次的中位数；它不是
+两路全部样本中位数之比。正反ABBA顺序用于抵消执行顺序和短时频率漂移，但仍需结合ratio IQR和
+逐轮原始值识别整机状态切换。
+
+最终ISA为684条机器指令：192 MFMA、34条buffer load、8条buffer store、32条DS read、22条
+DS write、64条wait、4条`s_barrier`、0条`setprio`；20,480B LDS、168 VGPR、0 spill。主分支
+机器指令与正式计时候选逐条一致。fresh compile-only还确认K192、H3 PTPC、Xiaomi PTPC和legacy
+N64的558/935/750/771条机器指令逐条不变；11项MoE down GPU回归全部通过。
+
+已否证方案：K64单独切换但仍28KB LDS慢3.54%；BM32虽为16KB/92 VGPR却慢30.5%；K96被布局
+扩成256 MFMA且238 VGPR；K128尾fragment产生54次spill；三尾fragment产生27次spill；全activation
+直读产生57次spill；每N块重填K4虽为158 VGPR却没有收益；row-major direct store慢23%；packed
+FP32 FMA生成32条目标指令但带57--70次spill；分段后处理/CShuffle逐bit正确但退化。当前保留的
+收益来自同时跨越LDS/VGPR两个3-wave门槛和K64差异化调度，而不是单独减少某类指令。
+
 ### 理论roof口径
 
 按gfx942 80CU、4 SIMD/CU、实测有效频率1.78827GHz，架构16-cycle dense roof为585.98T，
@@ -1622,7 +1714,7 @@ block重复读取，而每个N block都执行CShuffle。若要继续超过K960�
 
 | 模型 | padding效率 | 架构dense roof | 16链dense roof | 后处理0%遮盖参照 |
 |---|---:|---:|---:|---:|
-| Hy3 | 99.4819% | 582.94T | 532.95T | 433.80T |
+| Hy3 | 99.4819% | 582.94T | 532.95T | 478.29T |
 | Qwen3.5-397B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Qwen3.5-35B | 100% | 585.98T | 535.73T | 不适用（legacy） |
 | Xiaomi | 96.9697% | 568.22T | 519.49T | 404.06T |
@@ -1630,7 +1722,8 @@ block重复读取，而每个N block都执行CShuffle。若要继续超过K960�
 
 “后处理0%遮盖参照”只适用于physical N256 codegen，不能套到legacy N64。PTPC和融合前基线使用
 64 MUL、64 FMA、32 PERM；当前Hy3 per-tensor已移除64条尾部MUL，因此表中用0 MUL、64 FMA、
-32 PERM，即384名义cycles。它不是roof，也没有计入resident waves的实际遮盖，只作为敏感性点。
+32 PERM，即384名义cycles。最终Hy3 ISA中每个wave执行192条MFMA；旧的433.80T取值误用了
+96 MFMA/wave。它不是roof，也没有计入resident waves的实际遮盖，只作为敏感性点。
 参数化脚本通过`--path physical_n256|legacy`区分路径；当前Hy3还需传`--postprocess-mul 0`，并可用
 `--postprocess-overlap`扫描遮盖假设。
 

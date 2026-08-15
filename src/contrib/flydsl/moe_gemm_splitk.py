@@ -89,6 +89,17 @@ def compile_gemm(
     # where a single quant_type drove both).
     if act_quant_type is None:
         act_quant_type = weight_quant_type
+    enable_hy3_k384_3wave = (
+        down_physical_n256
+        and weight_quant_type == "per_tensor"
+        and act_quant_type == "per_tensor"
+        and BLOCK_TILE_SIZE_M == 64
+        and N == 4096
+        and K == 384
+        and TOPK == 9
+        and E == 193
+        and down_output_padding_bytes == 0
+    )
     assert (
         BLOCK_TILE_SIZE_M <= 256
     ), "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
@@ -2120,11 +2131,17 @@ def compile_gemm(
 
             BLOCK_M = BLOCK_TILE_SIZE_M
             BLOCK_N = 256 if down_physical_n256 else 64
+            use_physical_k384_3wave = enable_hy3_k384_3wave
             BLOCK_K = (
-                128
-                if down_physical_n256 and K % 128 == 0
-                else 64 // (weight_dtype.width // 8)
+                64
+                if use_physical_k384_3wave
+                else (
+                    128
+                    if down_physical_n256 and K % 128 == 0
+                    else 64 // (weight_dtype.width // 8)
+                )
             )
+            A_LDS_K = 4 * BLOCK_K if use_physical_k384_3wave else K
             WAVE_N = BLOCK_N // 4
             C_BLOCK_N = 64
 
@@ -2141,7 +2158,7 @@ def compile_gemm(
 
             @fx.union
             class SharedStorage:
-                A: fx.Array[act_dtype, BLOCK_M * K]
+                A: fx.Array[act_dtype, BLOCK_M * A_LDS_K]
                 C: fx.Array[fx.BFloat16, 2 * BLOCK_M * C_BLOCK_N]
 
             shared_allocator = fx.SharedAllocator()
@@ -2157,6 +2174,7 @@ def compile_gemm(
                     fx.make_layout(BLOCK_N, 1)
                 )
             cshuffle_lds = None
+            streaming_ldsA = None
             if const_expr(down_physical_n256):
                 cshuffle_storage = shared_allocator.allocate(
                     fx.Array[fx.BFloat16, 4 * 8 * 64, 16]
@@ -2164,10 +2182,18 @@ def compile_gemm(
                 cshuffle_lds = cshuffle_storage.peek().view(
                     fx.make_layout(4 * 8 * 64, 1)
                 )
+                if const_expr(use_physical_k384_3wave):
+                    streaming_ldsA = fx.make_view(
+                        fx.recast_iter(act_dtype, fx.get_iter(cshuffle_lds)),
+                        fx.make_composed_layout(
+                            fx.static(a_swz),
+                            fxh.torch_layout(BLOCK_M, BLOCK_K),
+                        ),
+                    )
             ldsA0 = lds.A.peek().view(
                 fx.make_composed_layout(
                     fx.static(a_swz),
-                    fxh.torch_layout(BLOCK_M, K),
+                    fxh.torch_layout(BLOCK_M, A_LDS_K),
                 )
             )
             layoutC = fx.make_composed_layout(
@@ -2211,11 +2237,55 @@ def compile_gemm(
                     arg_p_input, (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]), 128
                 )
                 fx.copy(cp_atom, atom_A, dst)
-            fx.gpu.barrier()
+            if const_expr(not use_physical_k384_3wave):
+                fx.gpu.barrier()
+
+            def stage_streaming_act(k_offset):
+                if const_expr(use_physical_k384_3wave):
+                    fx.rocdl.sched_barrier(0)
+                    cp_streaming_ldsA = flatten_A(streaming_ldsA)
+                    cp_streaming_rows = flatten_A(
+                        fxh.make_1d_coord_tensor(
+                            streaming_ldsA,
+                            0,
+                            fx.get_iter(arg_p_sorted_ids),
+                        )
+                    )
+                    cp_streaming_cols = flatten_A(
+                        fxh.make_1d_coord_tensor(
+                            streaming_ldsA,
+                            1,
+                            fx.make_int_tuple(k_offset),
+                        )
+                    )
+                    for dst, row, col in fxh.all_copy_atoms(
+                        cp_streaming_ldsA,
+                        cp_streaming_rows,
+                        cp_streaming_cols,
+                        atom_bits=128,
+                        num_threads=256,
+                    ):
+                        sorted_id = row[0].bitcast(fx.Uint32)
+                        atom_A = fxh.atom_tensor(
+                            arg_p_input,
+                            (
+                                sorted_id & 0xFFFFFF,
+                                sorted_id >> 24,
+                                col[0],
+                            ),
+                            128,
+                        )
+                        fx.copy(cp_atom, atom_A, dst)
+                    fx.gpu.barrier()
 
             # (BLOCK_N, BLOCK_K, num_blocks_N, num_blocks_K)
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
             ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
+            streaming_ldsA_blocks = (
+                fx.flat_divide(streaming_ldsA, (BLOCK_M, BLOCK_K))
+                if const_expr(use_physical_k384_3wave)
+                else None
+            )
 
             nBN = fxh.div_up(N, BLOCK_N)
             nBK = fxh.div_up(K, BLOCK_K)
@@ -2233,6 +2303,8 @@ def compile_gemm(
             if not down_physical_n256:
                 fragC.append(mm.make_fragment_C(c_fake_tensor))
             fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
+            if const_expr(use_physical_k384_3wave):
+                stage_streaming_act(A_LDS_K)
             if const_expr(down_physical_n256):
                 frag_act = flyobj.load_tiled_mma_fragB(
                     mm,
@@ -2244,7 +2316,32 @@ def compile_gemm(
                 frag_act = flyobj.load_tiled_mma_fragB(
                     mm, ldsA, copy_atom_bits=128
                 )
-            fx.gpu.barrier()  # make sure all threads finished using ldsA (since it's reused by ldsC)
+            if const_expr(not use_physical_k384_3wave):
+                # make sure all threads finished using ldsA (since it's reused by ldsC)
+                fx.gpu.barrier()
+
+            tail_frag_act4 = None
+            tail_frag_act5 = None
+            if const_expr(use_physical_k384_3wave):
+                resident_k_cores = A_LDS_K // BLOCK_K
+                tail_frag_act4 = flyobj.load_tiled_mma_fragB(
+                    mm,
+                    streaming_ldsA_blocks,
+                    [None, None, 0, 0],
+                    copy_atom_bits=128,
+                )
+                fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                fx.gpu.barrier()
+                stage_streaming_act((resident_k_cores + 1) * BLOCK_K)
+                tail_frag_act5 = flyobj.load_tiled_mma_fragB(
+                    mm,
+                    streaming_ldsA_blocks,
+                    [None, None, 0, 0],
+                    copy_atom_bits=128,
+                )
+                fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                fx.rocdl.sched_barrier(0)
+                fx.gpu.barrier()
 
             arg_w_scale = None
             per_tensor_w_scale = None
@@ -2551,7 +2648,8 @@ def compile_gemm(
                             fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
                         scf.YieldOp([])
 
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    if const_expr(not use_physical_k384_3wave):
+                        fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                     fx.rocdl.sched_barrier(0)
                     output_row = row_chunk * 8 + lane_id // 8
                     output_atom = lane_id % 8
@@ -2661,19 +2759,54 @@ def compile_gemm(
 
             hw_wave_slot = (
                 _read_hw_wave_slot()
-                if const_expr(down_physical_n256)
+                if const_expr(
+                    down_physical_n256
+                    and not (
+                        weight_quant_type == "per_tensor"
+                        and (BLOCK_K == 128 or use_physical_k384_3wave)
+                    )
+                )
                 else None
             )
 
+            use_physical_k128_sched_group = (
+                down_physical_n256
+                and weight_quant_type == "per_tensor"
+                and BLOCK_K == 128
+            )
+            use_physical_sched_group = (
+                use_physical_k128_sched_group or use_physical_k384_3wave
+            )
+
+            def schedule_physical_k_core(k_core):
+                if const_expr(use_physical_k384_3wave):
+                    num_loads = BLOCK_K // 16
+                    if const_expr(k_core < A_LDS_K // BLOCK_K):
+                        fx.rocdl.sched_dsrd(num_loads)
+                    mfma_group = 1 if k_core + 1 == nBK else 0
+                    for _ in range_constexpr(num_loads):
+                        fx.rocdl.sched_vmem(1)
+                        if const_expr(mfma_group > 0):
+                            fx.rocdl.sched_mfma(mfma_group)
+                    fx.rocdl.sched_mfma(BLOCK_K // 2 - num_loads * mfma_group)
+                    fx.rocdl.sched_barrier(0)
+                elif const_expr(use_physical_k128_sched_group):
+                    fx.rocdl.sched_dsrd(8)
+                    for _ in range_constexpr(8):
+                        fx.rocdl.sched_vmem(1)
+                        fx.rocdl.sched_mfma(4)
+                    fx.rocdl.sched_mfma(32)
+                    fx.rocdl.sched_barrier(0)
+
             def enter_read_write_stage():
-                if const_expr(down_physical_n256):
+                if const_expr(down_physical_n256 and not use_physical_sched_group):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         _set_hw_slot_priority(hw_wave_slot, 1, 0)
                     fx.rocdl.sched_barrier(0)
 
             def enter_compute_stage():
-                if const_expr(down_physical_n256):
+                if const_expr(down_physical_n256 and not use_physical_sched_group):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         fx.rocdl.s_setprio(3)
@@ -2725,12 +2858,24 @@ def compile_gemm(
                     for k_core in range_constexpr(nBK):
                         current_slot = k_core % 2
                         next_slot = (k_core + 1) % 2
-                        flyobj.load_tiled_mma_fragB(
-                            mm,
-                            ldsA,
-                            [None, None, 0, k_core],
-                            frag_act,
-                        )
+                        if const_expr(
+                            use_physical_k384_3wave
+                            and k_core == A_LDS_K // BLOCK_K
+                        ):
+                            current_frag_act = tail_frag_act4
+                        elif const_expr(
+                            use_physical_k384_3wave
+                            and k_core == A_LDS_K // BLOCK_K + 1
+                        ):
+                            current_frag_act = tail_frag_act5
+                        else:
+                            flyobj.load_tiled_mma_fragB(
+                                mm,
+                                ldsA,
+                                [None, None, 0, k_core],
+                                frag_act,
+                            )
+                            current_frag_act = frag_act
                         if const_expr(k_core + 1 < nBK):
                             flyobj.load_tiled_mma_fragA(
                                 mm,
@@ -2757,9 +2902,10 @@ def compile_gemm(
                             mm,
                             fragC[0],
                             frag_weight_slots[current_slot],
-                            frag_act,
+                            current_frag_act,
                             fragC[0],
                         )
+                        schedule_physical_k_core(k_core)
                         if const_expr(not (merge_k192_first_two_cores and k_core == 0)):
                             enter_read_write_stage()
                         if const_expr(
@@ -2785,7 +2931,7 @@ def compile_gemm(
                     ]
                 fragC_bf16.store(results[2])
                 fx.rocdl.sched_barrier(0)
-                if const_expr(_PHYSICAL_N256_USE_SETPRIO):
+                if const_expr(_PHYSICAL_N256_USE_SETPRIO and not use_physical_sched_group):
                     fx.rocdl.s_setprio(0)
                 fx.rocdl.sched_barrier(0)
             else:
@@ -2998,7 +3144,14 @@ def compile_gemm(
             )
         else:
             value_attrs = (
-                {"passthrough": [["target-features", "-packed-fp32-ops"]]}
+                {
+                    "passthrough": [["target-features", "-packed-fp32-ops"]],
+                    "rocdl.waves_per_eu": (
+                        3
+                        if const_expr(enable_hy3_k384_3wave)
+                        else None
+                    ),
+                }
                 if const_expr(down_physical_n256)
                 else None
             )
