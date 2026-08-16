@@ -840,3 +840,33 @@ case均已完整撤回，kernel与测试逐字恢复到P7提交`755f72c`。实�
 因此，当前最优点仍是P7 row-major CShuffle。后续高层契约只有在避免`sorted_sum`现有row-major
 coalescing损失时才值得测试，例如减少或消除中间结果往返；单纯交换row locality与producer store
 coalescing的AoSoA家族不再是优先方向。
+
+### 直接BF16 atomic scatter
+
+为真正消除中间结果往返，又在P7 CShuffle读回后将每个8-BF16 atom按`sorted_id`直接原子累加到
+最终`[B,N]`输出。该探针保持P7计算、LDS CShuffle、分级read/wait和2-wave资源不变，只把每条
+16B普通store展开为4条`global_atomic_pk_add_bf16`；候选还必须在dispatch前清零最终输出。
+
+功能上该路径可行：`B=32/TOPK=2/N512/K384/E1`下显式让每个token接收两条route，连续10次清零、
+atomic down都与P7 row-major down加`sorted_sum`逐bit一致，证明token索引、TOPK累加和padding route
+屏蔽语义成立。真实Hy3编译资源仍为`68 VGPR + 132 AGPR / 112 SGPR / 32KB LDS / 0 scratch`，
+occupancy保持2 waves/SIMD。
+
+但kernel trace的6次Hy3 dispatch中，首轮8.501713ms，后5轮为
+`7.408829/7.436709/7.407269/7.413789/7.444070ms`；对应的输出清零kernel另需约
+`0.074--0.076ms`。仅atomic down本身就约为P7 `down + sorted_sum`短ABBA中位数2.777031ms的
+2.67倍，因此无需进入ABBA：瓶颈是gfx942 packed-BF16 atomic服务吞吐，而不是occupancy或中间
+buffer字节数。该结果与仓库早期“BF16 atomic带宽约为普通写出的1/4”结论方向一致，并把它实证
+延伸到了当前P7 producer。
+
+探针已完整撤回，kernel再次逐字恢复到`755f72c`并通过4个physical CShuffle GPU测试。原始凭据：
+
+- TOPK2正确性：`/tmp/check_p7_atomic_scatter.py`，SHA256
+  `4a29283dbb842b77ce54b9937c8a5253e2bdbbc68ae6403be710091105f6c1d5`；
+- Hy3资源驱动：`/tmp/profile_hy3_atomic_once.py`，SHA256
+  `91ada6d70575a04a6be15d6176524ead3a57995693e6e97799a98f77ff8cdf38`；
+- kernel trace CSV：`/tmp/moe_atomic_resource/out_kernel_trace.csv`，SHA256
+  `c7d54ec72475387b86764c4b2a7cd0d21cc5071f90d6401e640432599ebe2658`。
+
+所以“消除中间buffer”不能依赖当前BF16 global atomic；若继续压缩往返，必须使用普通store可高效
+服务的表示，或从算法上让单一owner写最终token，不能只把reduce搬进原子尾部。
