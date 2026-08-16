@@ -2551,7 +2551,7 @@ def compile_gemm(
                             fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
                         scf.YieldOp([])
 
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    # Same-wave DS ops are ordered; wait for the read result below.
                     fx.rocdl.sched_barrier(0)
                     output_row = row_chunk * 8 + lane_id // 8
                     output_atom = lane_id % 8

@@ -335,3 +335,87 @@ P0 fresh ATT仍使用单SE、CU2、全4 SIMD、N2--N13窗口；232/232 wave完�
 其中VMEM issue两wave同因从`9.8934%`降到`3.5875%`，说明收益确实来自恢复physical VMEM反相，
 不是偶然墙钟波动。P0已达到保守目标带下沿；下一步以P0为新基线，先尝试在不损失VMEM反相的前提下
 降低重新暴露的DS wait，再评估tail结构重写。
+
+### P1完成：删除CShuffle写侧冗余wait
+
+P0的每个M8 CShuffle slice原来是：
+
+`DS write -> lgkmcnt(0) -> DS read -> lgkmcnt(0) -> buffer store`
+
+gfx942会保持同一wave内DS操作的发射顺序，因此第一条write-side `lgkmcnt(0)`不是保证本wave
+write-before-read所必需的；真正必须保留的是第二条wait，它保证DS read结果在被buffer store消费前已经
+ready。P1只删除第一条wait，不改变CShuffle地址、bank映射、DS read或结果消费顺序。
+
+最终ISA逐行diff只有8条write-side `s_waitcnt lgkmcnt(0)`消失，对应8个M8 slice；其余指令顺序完全
+相同：
+
+| 项目 | P0 | P1 |
+|---|---:|---:|
+| MFMA | 192 | 192 |
+| buffer / global load | 38 / 10 | 38 / 10 |
+| DS read / write | 32 / 22 | 32 / 22 |
+| buffer store | 8 | 8 |
+| `lgkmcnt(0)` | 24 | 16 |
+| next-free VGPR / SGPR | 190 / 96 | 190 / 96 |
+| LDS / scratch | 28,672B / 0 | 28,672B / 0 |
+| 实际资源 | 64V + 128A，2 waves/SIMD | 64V + 128A，2 waves/SIMD |
+
+正确性分两层验证：正式ABBA的完整输出逐bit一致；另外在随机route、activation、weight和scale下，
+`N=512`与`N=4096`各连续执行20次，40次完整有效输出全部逐bit一致。这同时检查了异步LDS顺序在
+重复执行中没有非确定性结果。
+
+在与P0相同的GPU4、`VECTOR,F8`、1800MHz determinism、10-buffer共同gateup上下文中进行24轮正反
+ABBA，24/24轮候选均胜出：
+
+| 版本 | 中位时延 | 有效TFLOPS | 配对口径 |
+|---|---:|---:|---:|
+| P0 slot priority | 2.190950ms | 423.430T | - |
+| **P1去除write wait** | **2.163370ms** | **428.828T** | candidate/control中位`0.986942` |
+
+配对时延降低`1.306%`、等价吞吐提升`1.323%`，ratio IQR为`0.983107--0.987691`，不跨1。
+与P0的分阶段配对比例相乘，Control到P1的累计时延比例为`0.974019`，即约降低`2.598%`。
+
+P1 fresh ATT继续使用单SE、CU2、全4 SIMD、N2--N13窗口；P0/P1均为232/232条完整wave，资源均为
+`64V+128A/112S/28,672B/0 scratch`。按MFMA execution mass归一后的physical总时间从
+`3976.05 cycle/N`降到`3964.70 cycle/N`，减少`11.36 cycle/N`；MFMA union busy增加`0.221pp`。
+Single-wave总时间从`7483.49 cycle/N`降到`7325.00 cycle/N`，减少`158.49 cycle/N`（`2.118%`）。
+
+| Physical状态 | P1 - P0（百分点） | owner周期变化 |
+|---|---:|---:|
+| `vmem_issue_stall` | +1.285 | +66,502 |
+| `vmem_wait_stall` | +0.109 | +5,636 |
+| `ds_issue_stall` | +0.495 | +25,638 |
+| **`ds_wait_stall`** | **-2.052** | **-106,612** |
+| `structural_tail` | +0.126 | +6,354 |
+| residual | -0.185 | -9,594 |
+| **`MFMA union execution`** | **+0.221** | **+9,472** |
+
+两wave同为DS wait的见证量从`1.4230%`降到`0.5712%`，`DS wait + structural tail`联合状态从
+`4.4809%`降到`3.3231%`。节省的周期没有一比一转成MFMA：两wave同为VMEM issue从`3.5875%`回升到
+`4.5855%`，DS issue和tail也略有重新暴露。因此P1是成功的**DS wait优化**，不是P3 tail优化；下一步
+仍应从当前P1重新采样并处理新主项，不能继续按旧P0百分比线性估算收益。
+
+冻结产物：
+
+- 24轮ABBA：`/tmp/moe-p1-cshuffle-nowritewait-abba24.log`，SHA256
+  `4de553dce03a19f46d346ef218df3978b70f6c3b3ff21c75f8d4af2b67e52bc1`；
+- 随机正确性：`/tmp/moe-p1-cshuffle-nowritewait-random20.log`，SHA256
+  `1fb302710a4a9c0807ed8f1329c5edb6a1f6399023919f094f88ddf057d10326`；
+- 最终ISA：`/tmp/moe-p1-cshuffle-nowritewait-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，
+  SHA256 `0253d3e8ca489b06058ded09957ec2fae994b3c1dfb1b190c5d81da65d5d5bcd`；
+- P0/P1 exposure账本：`/tmp/CONTROL_K128_P1_STALL_EXPOSURE.json`，SHA256
+  `68a55e4169ea68f9d1aa2f2a0edc7d5956b698f8d4e8d0adc0f6d41c271e0895`。
+
+### 已否证的低风险单变量
+
+以下候选都已恢复，不应在没有新ATT证据时重复扫描。短筛均以P0为control并保持2 waves/SIMD：
+
+| 候选 | 4轮candidate/control中位 | 判定 |
+|---|---:|---|
+| 头部`DSRD8 -> DSRD4 + DSRD4` | `0.999463` | IQR跨1，未稳定降低DS wait |
+| read/write priority `1/0 -> 2/0` | `1.001519` | 退化 |
+| 取消compute阶段priority | `1.044018` | 明确退化约4.4% |
+| read/write slot priority反转为`0/1` | `0.997456` | IQR跨1，无稳定收益 |
+| compute priority `3 -> 2` | `1.003133` | 后三轮全部退化 |
+
+Priority实验说明P0的完整阶段切换必须保留；简单拆分DSRD也没有把single-wave变化转化为physical收益。
