@@ -2661,7 +2661,7 @@ def compile_gemm(
 
             hw_wave_slot = (
                 _read_hw_wave_slot()
-                if const_expr(down_physical_n256 and not (weight_quant_type == "per_tensor" and BLOCK_K == 128))
+                if const_expr(down_physical_n256)
                 else None
             )
 
@@ -2677,14 +2677,14 @@ def compile_gemm(
                     fx.rocdl.sched_barrier(0)
 
             def enter_read_write_stage():
-                if const_expr(down_physical_n256 and not use_physical_sched_group):
+                if const_expr(down_physical_n256):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         _set_hw_slot_priority(hw_wave_slot, 1, 0)
                     fx.rocdl.sched_barrier(0)
 
             def enter_compute_stage():
-                if const_expr(down_physical_n256 and not use_physical_sched_group):
+                if const_expr(down_physical_n256):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                         fx.rocdl.s_setprio(3)
@@ -2797,7 +2797,7 @@ def compile_gemm(
                     ]
                 fragC_bf16.store(results[2])
                 fx.rocdl.sched_barrier(0)
-                if const_expr(_PHYSICAL_N256_USE_SETPRIO and not use_physical_sched_group):
+                if const_expr(_PHYSICAL_N256_USE_SETPRIO):
                     fx.rocdl.s_setprio(0)
                 fx.rocdl.sched_barrier(0)
             else:

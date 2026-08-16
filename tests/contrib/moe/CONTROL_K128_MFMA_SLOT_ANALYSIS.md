@@ -771,7 +771,7 @@ upper-bound model  42153cd0257c697d1462079ee36f19a04ad4a4d21772e6164b711bf681adf
 24-round ABBA log  8e7c01a7f804409273c4362b66b7849cb448028fbb7c61ac90545fb89a76ad12
 stall analyzer      5824df28d4aa85d1e5b09a8f911641327fa72cca471b2360dc747e159c83a8da
 stall exposure JSON 687e5550efc99c5e1583c8612a3445a39cbacf92590fc190deb9d6f304e002a8
-stall exposure MD   1b5f10df251064989936702e6053e7e09fa788e99b5410bb50c7813e98b31580
+stall exposure MD   863bfbb0ba18e30e7c00c752d3328c2d859a0f2cde4dace21ed9c886dfd428fa
 ```
 
 图中的百分比使用steady N-loop；完整生命周期busy只用于模型与ATT墙钟闭合。任何后续候选都必须同时

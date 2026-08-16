@@ -289,3 +289,49 @@ Control的VMEM wait owner只有0.69%，两wave同时VMEM wait仅0.0019%；相比
   两wave同因和原因转移。
 5. **保留条件。** 只有正确性与资源通过、ABBA墙钟改善，并且physical账本能解释收益时才保留；
   “目标行下降但busy/墙钟不变”视为原因转移，不视为优化成功。
+
+## 优化进展
+
+### P0完成：K128恢复slot-aware priority
+
+P0保留Control的`DSRD8 -> 8 x (VMEM1 -> MFMA4) -> MFMA32` sched-group，只把K128原先绕开的
+hardware-slot priority边界接回：read/write stage按slot设为`1/0`，compute stage设为`3`，尾部恢复为`0`。
+
+最终ISA的工作量和资源与`0f0a14c`基线完全相同：
+
+| 项目 | Control | P0 |
+|---|---:|---:|
+| MFMA | 192 | 192 |
+| buffer load / store | 38 / 8 | 38 / 8 |
+| DS read / write | 32 / 22 | 32 / 22 |
+| `setprio` / `s_getreg` | 0 / 0 | 12 / 1 |
+| next-free VGPR / accum offset | 190 / 192 | 190 / 192 |
+| LDS / scratch | 28,672B / 0 | 28,672B / 0 |
+| 实际资源 | 64V + 128A，2 waves/SIMD | 64V + 128A，2 waves/SIMD |
+
+在GPU4、`VECTOR,F8`、1800MHz determinism、10-buffer共同gateup上下文中进行24轮正反ABBA；完整输出
+逐bit一致。结果为：
+
+| 版本 | 中位时延 | 有效TFLOPS | 配对口径 |
+|---|---:|---:|---:|
+| `0f0a14c` Control | 2.221609ms | 417.586T | - |
+| **P0 slot priority** | **2.192790ms** | **423.074T** | candidate/control中位`0.986906` |
+
+配对时延降低`1.309%`、等价吞吐提升`1.327%`，ratio IQR为`0.985008--0.988416`，不跨1。
+
+P0 fresh ATT仍使用单SE、CU2、全4 SIMD、N2--N13窗口；232/232 wave完整，资源为
+`64V+128A/28,672B/0 scratch`。与Control的physical变化为：
+
+| Physical状态 | P0 - Control（百分点） |
+|---|---:|
+| `vmem_issue_stall` | **-7.395** |
+| `vmem_wait_stall` | **-0.375** |
+| `ds_issue_stall` | -0.046 |
+| `ds_wait_stall` | +0.290 |
+| `structural_tail` | +0.863 |
+| residual | +1.175 |
+| **`MFMA union execution`** | **+5.487** |
+
+其中VMEM issue两wave同因从`9.8934%`降到`3.5875%`，说明收益确实来自恢复physical VMEM反相，
+不是偶然墙钟波动。P0已达到保守目标带下沿；下一步以P0为新基线，先尝试在不损失VMEM反相的前提下
+降低重新暴露的DS wait，再评估tail结构重写。
