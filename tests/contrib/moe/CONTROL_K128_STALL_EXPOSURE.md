@@ -492,5 +492,7 @@ DS wait，但没有消除新主项`structural_tail 7.51%`和`vmem_issue_stall 7.
 | 取消compute阶段priority | `1.044018` | 明确退化约4.4% |
 | read/write slot priority反转为`0/1` | `0.997456` | IQR跨1，无稳定收益 |
 | compute priority `3 -> 2` | `1.003133` | 后三轮全部退化 |
+| CShuffle双slice成组、8次wait降为4次 | `1.002490` | 后三轮两次约退化0.9%，DS/store突发抵消收益 |
+| CShuffle单read-ahead、read与前一store重叠 | `0.998282` | 最后两轮退化，IQR跨1 |
 
 Priority实验说明P0的完整阶段切换必须保留；简单拆分DSRD也没有把single-wave变化转化为physical收益。
