@@ -759,6 +759,11 @@ successful-issue slot模型的steady MFMA busy也从`82.515%`升到`83.568%`，�
 | output store `nt -> nt sc1` | `1.018043` | ISA仅多8个`sc1`，后三轮全部退化 |
 | output store `nt -> sc0 nt` | `0.999144` | IQR跨1，2/4轮退化，无稳定收益 |
 | slot1反向M8 store顺序 | `0.999893` | 8条`s_cselect`、combined 196 -> 204，IQR跨1 |
+| 下一N的K0/K1整fragment跨tail预取 | `1.009941` | combined 196 -> 192，但后三轮全部退化0.56%--2.15% |
+| 下一N的K1首个128-bit atom跨tail预取 | `1.031204` | combined 196 -> 192，但后三轮全部退化3.0%--5.0% |
+| K384前两个K128 core合并sched-group | - | combined 196 -> 252，静态资源门槛直接淘汰 |
+| next-pair写入隐藏当前pair的`read_1` | `0.992027` | 资源不变，但Q3为1.015869、后两轮均未胜出 |
+| read/write slot priority `1/0 -> 1/1` | `0.989288` | ISA仅改4条`setprio`，但Q3为1.015627、后两轮一胜一负 |
 | tail-only slot priority `1/0 -> 0/1` | `1.010352` | 资源/工作量不变，后三轮全部退化 |
 | VMEM/MFMA间隔`4 -> 5` | - | 后端生成与P3逐字相同的ISA，无有效旋钮 |
 | packed-local逐fragment后处理 | `1.021923` | 约256 combined档，后三轮全部退化2.0%--3.5% |
@@ -774,3 +779,16 @@ successful-issue slot模型的steady MFMA busy也从`82.515%`升到`83.568%`，�
 P7 LDS恰好32KB、权威combined资源为200，下一步不能再增加LDS，也不应重复双read成组、read-ahead、
 packed FMA、cache或priority扫描；必须针对新暴露的VMEM load/store联合状态提出不增加长期live state的
 方案。
+
+P7之后又按首条weight load约`49.5/81.7/103.2 cycles`的三个K128 core转相热点测试了更窄的VMEM
+方案。整K1跨tail预取复用现有两个weight slot，首atom版本只跨tail携带每lane 16B；两者均通过
+`N=512/4096`各20次完整输出逐bit比较，且combined资源都意外从196降到192，但分别稳定退化约1%和
+3%。这证明寄存器档下降不等于调度改善：前者把下一N的K0/K1共16条load集中到K2后，后者手工拆分
+copy改变了weight fragment寄存器映射和MFMA operand分配。K384双core合并则在不改工作量的情况下把
+combined直接推到252。三种方案都已完整恢复，不应再以“更早load”或“更低next-free VGPR”为由重复。
+
+pair级`next-write`和read/write等优先级都保持P7资源与工作量，并通过40次随机逐bit验证，但短ABBA的
+IQR均跨1。前者将第二条read等待换成DS-write/store相位波动，后者解除slot1节流后增加两resident wave
+同相竞争。至此，P7后的局部CShuffle wait、slot priority和weight预取邻域均已闭合；剩余
+`vmem_issue_stall 8.868%`是load/store共享队列和两wave联合状态，不是一个可由单条wait、cache位或
+首load移动线性回收的预算。
