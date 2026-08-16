@@ -2160,10 +2160,10 @@ def compile_gemm(
             cshuffle_lds = None
             if const_expr(down_physical_n256):
                 cshuffle_storage = shared_allocator.allocate(
-                    fx.Array[fx.BFloat16, 4 * 8 * 64, 16]
+                    fx.Array[fx.BFloat16, 4 * 16 * 64, 16]
                 )
                 cshuffle_lds = cshuffle_storage.peek().view(
-                    fx.make_layout(4 * 8 * 64, 1)
+                    fx.make_layout(4 * 16 * 64, 1)
                 )
             ldsA0 = lds.A.peek().view(
                 fx.make_composed_layout(
@@ -2509,88 +2509,82 @@ def compile_gemm(
                 wave_id = fx.Int32(fx.thread_idx.x // 64)
                 lane_group = lane_id // 16
                 lane_row = lane_id % 16
-                wave_lds_base = wave_id * (8 * 64)
+                wave_lds_base = wave_id * (16 * 64)
 
-                def write_row_chunk(row_chunk):
-                    token_repeat = row_chunk // 2
-                    row_half = row_chunk % 2
-                    producer = scf.IfOp(_raw(lane_row // 8 == row_half))
-                    with ir.InsertionPoint(producer.then_block):
-                        row_in_8 = lane_row % 8
-                        for channel_piece in range_constexpr(2):
-                            channels_lo = Vec(
-                                output[
-                                    None,
-                                    2 * channel_piece,
-                                    token_repeat,
-                                ].load()
-                            )
-                            channels_hi = Vec(
-                                output[
-                                    None,
-                                    2 * channel_piece + 1,
-                                    token_repeat,
-                                ].load()
-                            )
-                            packed_bf16 = channels_lo.shuffle(
-                                channels_hi, list(range(8))
-                            )
-                            logical_atom = lane_group * 2 + channel_piece
-                            # Spread each M8 row across all eight 128-bit atom
-                            # positions, reaching the 4-way bank lower bound.
-                            physical_atom = logical_atom ^ row_in_8
-                            lds_offset = (
-                                wave_lds_base
-                                + (row_in_8 * 8 + physical_atom) * 8
-                            )
-                            lds_dst = fx.make_view(
-                                fx.get_iter(cshuffle_lds_arg) + lds_offset,
-                                fx.make_layout(8, 1),
-                            )
-                            lds_frag = fx.make_fragment_like(lds_dst)
-                            lds_frag.store(packed_bf16)
-                            fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
-                        scf.YieldOp([])
-
-                write_row_chunk(0)
-                for row_chunk in range_constexpr(8):
-                    fx.rocdl.sched_barrier(0)
-                    output_row = row_chunk * 8 + lane_id // 8
-                    output_atom = lane_id % 8
-                    physical_atom = output_atom ^ (lane_id // 8)
-                    lds_offset = (
-                        wave_lds_base
-                        + ((lane_id // 8) * 8 + physical_atom) * 8
-                    )
-                    lds_src = fx.make_view(
-                        fx.get_iter(cshuffle_lds_arg) + lds_offset,
-                        fx.make_layout(8, 1),
-                    )
-                    out_frag = fx.make_fragment_like(lds_src)
-                    fx.copy(cshuffle_copy_atom, lds_src, out_frag)
-                    if const_expr(row_chunk + 1 < 8):
-                        # Hide the current read behind the next slice's independent writes.
-                        write_row_chunk(row_chunk + 1)
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    output_column = (
-                        fx.Int64(block_n) * BLOCK_N
-                        + fx.Int64(wave_id) * WAVE_N
-                        + fx.Int64(output_atom) * 8
-                    )
-                    byte_offset = (
-                        (
-                            fx.Int64(output_row) * output_row_stride
-                            + output_column
+                # All 64 lanes produce one M16 pair, halving the DS writes used
+                # by the previous two masked M8 producers.
+                def write_row_pair(row_pair):
+                    row_in_8 = lane_row % 8
+                    row_half = lane_row // 8
+                    for channel_piece in range_constexpr(2):
+                        channels_lo = Vec(
+                            output[
+                                None,
+                                2 * channel_piece,
+                                row_pair,
+                            ].load()
                         )
-                        * 2
-                    ).to(fx.Int32)
-                    fx.buffer_ops.buffer_store(
-                        Vec(out_frag.load()).bitcast(fx.Int32),
-                        physical_store_rsrc,
-                        byte_offset,
-                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
-                        offset_is_bytes=True,
-                    )
+                        channels_hi = Vec(
+                            output[
+                                None,
+                                2 * channel_piece + 1,
+                                row_pair,
+                            ].load()
+                        )
+                        packed_bf16 = channels_lo.shuffle(
+                            channels_hi, list(range(8))
+                        )
+                        logical_atom = lane_group * 2 + channel_piece
+                        physical_atom = logical_atom ^ row_in_8
+                        lds_offset = (
+                            wave_lds_base
+                            + ((row_half * 8 + row_in_8) * 8 + physical_atom) * 8
+                        )
+                        lds_dst = fx.make_view(
+                            fx.get_iter(cshuffle_lds_arg) + lds_offset,
+                            fx.make_layout(8, 1),
+                        )
+                        lds_frag = fx.make_fragment_like(lds_dst)
+                        lds_frag.store(packed_bf16)
+                        fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
+
+                for row_pair in range_constexpr(4):
+                    write_row_pair(row_pair)
+                    for row_half in range_constexpr(2):
+                        fx.rocdl.sched_barrier(0)
+                        output_row = (row_pair * 2 + row_half) * 8 + lane_id // 8
+                        output_atom = lane_id % 8
+                        physical_atom = output_atom ^ (lane_id // 8)
+                        lds_offset = (
+                            wave_lds_base
+                            + ((row_half * 8 + lane_id // 8) * 8 + physical_atom) * 8
+                        )
+                        lds_src = fx.make_view(
+                            fx.get_iter(cshuffle_lds_arg) + lds_offset,
+                            fx.make_layout(8, 1),
+                        )
+                        out_frag = fx.make_fragment_like(lds_src)
+                        fx.copy(cshuffle_copy_atom, lds_src, out_frag)
+                        fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                        output_column = (
+                            fx.Int64(block_n) * BLOCK_N
+                            + fx.Int64(wave_id) * WAVE_N
+                            + fx.Int64(output_atom) * 8
+                        )
+                        byte_offset = (
+                            (
+                                fx.Int64(output_row) * output_row_stride
+                                + output_column
+                            )
+                            * 2
+                        ).to(fx.Int32)
+                        fx.buffer_ops.buffer_store(
+                            Vec(out_frag.load()).bitcast(fx.Int32),
+                            physical_store_rsrc,
+                            byte_offset,
+                            cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                            offset_is_bytes=True,
+                        )
 
             cp_atom_out_128b = None
             thrv_out = None
