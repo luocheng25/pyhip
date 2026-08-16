@@ -953,5 +953,50 @@ physical CShuffle GPU回归通过。原始凭据：
   SHA256 `735ea03eeb58677348259e49cdcb5f9f23c325a547fbbf923877120b7aff015d`。
 
 所以当前per-32 INT8方案也被端到端关闭。它证明压缩后的consumer确有带宽收益，但若继续沿压缩表示
-推进，必须显著降低producer量化VALU成本，例如使用真正的packed转换指令；仅调整scale粒度或buffer
-排列不能弥补当前约0.68ms的producer增量。
+推进，必须显著降低producer量化VALU成本；仅调整buffer排列不能弥补当前约0.68ms的producer增量。
+
+#### Packed转换与per-8最终边界
+
+随后继续程序化检查了两个直接针对producer成本的后端方案。首先，gfx942的packed FP8 producer可用
+`v_cvt_pk_fp8_f32`，consumer可用`v_cvt_pk_f32_fp8`。但在10组随机P7 route输出上做纯数值上界时，
+同样per-32 BF16 scale的FP8压缩相对P7 reduced输出`rel_l2`中位数2.379983%、最大2.406758%，
+明显超过1%探针门槛；对应INT8中位数仅0.593014%。因此packed FP8在改kernel前即因精度淘汰。
+
+gfx942另有`v_cvt_pk_u8_f32(value, byte_index, old_dword)`。独立FlyDSL微型kernel覆盖
+`[-200,300]`、正负半整数和边界值：将signed量化值加128后，硬件结果再减128逐项等于Torch
+`round-even + clamp[-128,127]`。最终ISA每4值恰为4条`v_cvt_pk_u8_f32`，没有`v_rndne`、
+`v_cvt_i32_f32`或额外OR打包。于是producer改存`q+128`，consumer对每个dword异或
+`0x80808080`恢复signed字节。
+
+per-32 packed-U8保持53.125%行宽和原误差。producer ISA有64条融合转换、0条`v_div_*`，资源仍为
+190/192/96/32KB/0；4轮结果为：down 2.659770ms vs P7 2.094308ms，consumer 0.493702ms vs
+0.740683ms，组合3.242231ms vs 2.891750ms。组合配对中位数`1.134499`，IQR
+`1.115149--1.143382`，稳定退化13.45%。
+
+最后将scale粒度从32缩到8：每lane独立absmax，删除producer全部16条`ds_swizzle_b32`及对应等待；
+行宽变为`N+N/4`字节，即BF16的62.5%。consumer每16 channel仍只需一条32-bit scale-pair load。
+资源为next-free/accum `196/196`、SGPR 96、32KB LDS、0 scratch，保持2 waves/SIMD；相对P7误差还
+降至0.483092%。相同4轮协议得到：
+
+| 计时范围 | P7中位数 | per-8 packed-U8中位数 | INT8/P7配对中位数 | 配对IQR |
+|---|---:|---:|---:|---:|
+| down | 2.138028ms | 2.398449ms | 1.119063 | 1.095643--1.138278 |
+| consumer | 0.743083ms | 0.516562ms | 0.696434 | 0.684133--0.702942 |
+| `down + consumer` | 2.939870ms | 2.997111ms | 1.029974 | 1.015270--1.038939 |
+
+per-8已将组合退化压到约3.00%，但IQR仍完全高于1，未达到“组合事件IQR严格低于1”的保留门槛；
+因此也未进入24轮或fresh ATT。所有packed-U8/per-8代码和测试再次撤回，P7逐字恢复并通过4项GPU
+回归。至此，当前P7上的INT8 scale粒度、完整除法/rcp、标量/packed转换邻域均已闭合。新增凭据：
+
+- packed-U8微型kernel：`/tmp/probe_flydsl_cvt_pk_u8.py`，SHA256
+  `4d19b7ba9aeb02d6ad2c79feb08b0299687635f65a48fba40ea6808d63633503`；
+- 微型ISA：`/tmp/cvt-pk-u8-probe-dump/cvt_pk_u8_kernel_0/21_final_isa.s`，SHA256
+  `209768ca897a7a2ac36bf72c23362da1c434d1454ca94e844085222ce7077274`；
+- per-32 packed日志：`/tmp/moe-p7-int8-pku8-end-to-end-abba4.log`，SHA256
+  `c0ba887874ced6a4055fbe63ea46c40a8c2b660e2669363a5f28ba75662b6633`；
+- per-8实现diff：`/tmp/p7-int8-per8-pku8-experiment.diff`，SHA256
+  `705b98349f6d7e97840fd039a06d33e8b1c4afc88b777d4db78eb74e34da2248`；
+- per-8日志：`/tmp/moe-p7-int8-per8-end-to-end-abba4.log`，SHA256
+  `0c9d81536a0c47c3f1ab77bf65f60e08836ba5f84b2437db4754bc5b2bd4450a`；
+- per-8 ISA：`/tmp/moe-p8-int8-per8-producer-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，
+  SHA256 `ca33541ae6dd033a587e11854ffcdea33445cd599b6588c9122fffad5c4f960c`。
