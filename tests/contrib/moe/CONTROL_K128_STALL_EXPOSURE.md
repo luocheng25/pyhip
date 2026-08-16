@@ -481,6 +481,80 @@ DS wait，但没有消除新主项`structural_tail 7.51%`和`vmem_issue_stall 7.
 - P1/P2 exposure账本：`/tmp/CONTROL_K128_P2_STALL_EXPOSURE.json`，SHA256
   `39c92985d70fa3e4f864475f324cb83bb3d34dae09c6c35283bb932aa7684072`。
 
+### P3完成：gfx942 non-temporal输出store
+
+P2 fresh ATT的physical `vmem_issue_stall`为`7.22%`，两wave同因达`4.62%`；opcode细分又显示8条
+输出store累计`1.256M` stall，并会反压下一轮weight load。输出是一次写入、随后由同stream中的独立
+sorted_sum kernel读取，适合non-temporal写策略。
+
+LLVM `AMDGPURawPtrBufferStore`的aux定义在gfx942与旧架构不同：bit0/bit1/bit4分别是
+`sc0/nt/sc1`。P3把physical N256输出store的aux从`0`改为`2`。最终ISA逐行diff严格只有8条
+`buffer_store_dwordx4`增加`nt`后缀；指令数、顺序和资源完全不变：
+
+| 项目 | P2 | P3 |
+|---|---:|---:|
+| MFMA | 192 | 192 |
+| buffer / global load | 38 / 10 | 38 / 10 |
+| DS read / write | 32 / 22 | 32 / 22 |
+| buffer store | 8个default | 8个`nt` |
+| next-free VGPR / accum offset | 192 / 192 | 192 / 192 |
+| LDS / scratch | 28,672B / 0 | 28,672B / 0 |
+| 权威资源 | 64V + 128A，2 waves/SIMD | 64V + 128A，2 waves/SIMD |
+
+随机route、activation、weight和scale下，`N=512`与`N=4096`各连续执行20次，40次完整有效输出
+全部逐bit一致；正式ABBA的完整输出也逐bit一致。相同stream的kernel边界保证后续消费者看到已经完成
+的store，`nt`只改变缓存策略，不改变程序顺序或输出地址。
+
+在相同GPU4、`VECTOR,F8`、1800MHz determinism和10-buffer共同gateup上下文中，以提交`406906d`
+的P2源码快照为control进行24轮正反ABBA，24/24轮候选均胜出：
+
+| 版本 | 中位时延 | 有效TFLOPS | 配对口径 |
+|---|---:|---:|---:|
+| P2增加read隐藏距离 | 2.137749ms | 433.967T | - |
+| **P3 non-temporal store** | **2.110829ms** | **439.502T** | candidate/control中位`0.987811` |
+
+配对时延降低`1.219%`、等价吞吐提升`1.234%`，ratio IQR为`0.981261--0.990510`，不跨1。
+将P0--P3四步配对比例相乘，Control到P3的累计时延比例约为`0.954194`，即降低`4.581%`、
+等价吞吐提升`4.801%`。
+
+P3 fresh ATT继续使用单SE、CU2、全4 SIMD、N2--N13窗口；P2/P3均为232/232条完整wave，权威资源
+均为`64V+128A/112S/28,672B/0 scratch`。按MFMA execution mass归一后的physical总时间从
+`3929.22 cycle/N`降到`3825.60 cycle/N`，减少`103.62 cycle/N`（`2.637%`）；MFMA union busy从
+`78.183%`升到`80.301%`，增加`2.118pp`。Single-wave总时间从`7263.15 cycle/N`降到
+`7094.46 cycle/N`，减少`168.68 cycle/N`（`2.322%`）。
+
+| Physical状态 | P3 - P2（百分点） | owner周期变化 |
+|---|---:|---:|
+| **`vmem_issue_stall`** | **-1.608** | **-92,980** |
+| `vmem_wait_stall` | -0.128 | -7,264 |
+| `ds_issue_stall` | -0.146 | -13,132 |
+| `ds_wait_stall` | -0.064 | -8,152 |
+| `structural_tail` | -0.129 | -24,216 |
+| residual | -0.043 | -6,420 |
+| **`MFMA union execution`** | **+2.118** | - |
+
+两wave同为VMEM issue的见证量从`4.6191%`降到`3.5092%`。动态opcode细分进一步闭合了原因：
+
+| 动态类别 | P2 stall | P3 stall | stall / hit | 变化 |
+|---|---:|---:|---:|---:|
+| 8条输出store | 1.256M | 1.022M | 42.30 -> 34.41 cycles | -18.66% |
+| weight/global load | 1.672M | 1.406M | 17.66 -> 14.86 cycles | -15.88% |
+
+因此P3不仅降低了store自身发射阻塞，也释放了共享VMEM队列、降低后续weight load阻塞；physical
+VMEM owner、MFMA union busy和ABBA墙钟三者方向一致。P3后的首要剩余项变为
+`structural_tail 7.38%`和`vmem_issue_stall 5.62%`，而不是继续追逐已经降到`2.07%`的DS wait。
+
+冻结产物：
+
+- 24轮ABBA：`/tmp/moe-p3-store-nt-abba24.log`，SHA256
+  `60708478a5189ffef6120ff8fa824fd7befdbb2ee957f9f1416cf17e6ba625fb`；
+- 随机正确性：`/tmp/moe-p3-store-nt-random20.log`，SHA256
+  `1fb302710a4a9c0807ed8f1329c5edb6a1f6399023919f094f88ddf057d10326`；
+- 最终ISA：`/tmp/moe-p3-store-nt-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，SHA256
+  `416d8ee48b0537822a760420ef4025d51a9f40d2fa04d4a158a65d469865387a`；
+- P2/P3 exposure账本：`/tmp/CONTROL_K128_P3_STALL_EXPOSURE.json`，SHA256
+  `4e2de5c5ef4a86d79bdab85890b4a6856afd9c031b37f43ef758a019546f8e8e`。
+
 ### 已否证的低风险单变量
 
 以下候选都已恢复，不应在没有新ATT证据时重复扫描。短筛均以P0为control并保持2 waves/SIMD：

@@ -15,7 +15,8 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import helpers as fxh
 
-_PHYSICAL_N256_STORE_CACHE_MODIFIER = 0
+# gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
+_PHYSICAL_N256_STORE_CACHE_MODIFIER = 2
 _PHYSICAL_N256_USE_SETPRIO = True
 
 
