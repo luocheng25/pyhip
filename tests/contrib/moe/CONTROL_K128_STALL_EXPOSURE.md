@@ -902,3 +902,56 @@ P7探针按`sorted_id`将每个CShuffle 16B atom普通store到`(token*TOPK+topk,
 
 至此，无损改变中间结果所有权的两条直接路径都关闭：atomic受服务吞吐限制，route-major普通store
 受producer随机写限制。下一类候选应保留sorted-row地址局部性，只压缩中间表示或融合consumer工作。
+
+### Sorted-row INT8压缩
+
+沿“保留sorted-row地址局部性，只压缩中间表示”实现了一个有损探针。P7的计算、M16 row-pair
+CShuffle、分级read/wait和sorted-row ownership均不变；每个lane读回连续8个BF16，4个相邻lane通过
+两次`shuffle_xor`共享32-channel absmax。每32 channel保存一个BF16 scale，各lane保存8个INT8。
+单行使用分离平面：前`N`字节为INT8数据，后`N/16`字节为scale，因此行宽从BF16的`2N`降到
+`N+N/16`字节，即原来的53.125%。matching consumer仍按真实`loc_ids` gather，在FP32中执行
+`q * scale`和TOPK累加，最后写BF16。
+
+正确性先在随机sorted-row排列的`B32/TOPK2/N512/K384`上验证：GPU consumer逐bit等于Torch按
+packed契约解码后求和的结果。相对P7 reduced输出的`rel_l2`为0.609995%，P7相对FP32参考为
+0.373116%，INT8相对参考为0.675494%。真实Hy3的10套完整输出均有限，INT8相对P7的`rel_l2`为
+0.603679%，低于本轮1%的探针门槛，但这是有损契约，不可按P7的逐bit标准接收。
+
+资源没有跨档。最终producer ISA为next-free VGPR 190、accum offset 192、SGPR 96、32KB LDS、
+0 scratch，仍保持2 waves/SIMD；P7同参数为194/196/96/32KB/0。TOPK9 consumer为63 VGPR、
+22 SGPR、0 LDS、0 scratch。producer保持192条MFMA和38条buffer load，但静态buffer store从8条
+增到16条，并增加absmax、scale、舍入、INT8转换与打包。
+
+初版直接写`vmax/127`和`x/scale`，FlyDSL将向量除法展开为大量完整`v_div_*`序列。4轮受控ABBA
+中，down从2.087329ms退化到4.285018ms，consumer从0.741244ms改善到0.498362ms，组合事件从
+2.837271ms退化到4.851641ms；组合INT8/P7配对中位数`1.708408`，IQR
+`1.694768--1.729804`。
+
+随后按旧8-wave量化实现改为`scale=vmax*(1/127)`和硬件`v_rcp_f32(scale)`。最终ISA中的
+`v_div_*`从量化尾部完全消失，仅保留8条`v_rcp_f32`；随机TOPK2正确性和误差不变。相同协议复测：
+
+| 计时范围 | P7中位数 | INT8+rcp中位数 | INT8/P7配对中位数 | 配对IQR |
+|---|---:|---:|---:|---:|
+| down | 2.110629ms | 2.789332ms | 1.323455 | 1.273161--1.343097 |
+| consumer | 0.741483ms | 0.500202ms | 0.672049 | 0.661740--0.686474 |
+| `down + consumer` | 2.898133ms | 3.376055ms | 1.180187 | 1.158529--1.185833 |
+
+rcp优化将producer退化从约2.05倍压到1.32倍，证明完整除法是初版的主要缺陷；但consumer约33%的
+稳定收益仍不足以覆盖producer量化成本，组合事件稳定退化约18.02%。因此未进入24轮或fresh ATT，
+实验参数、packed store、`sorted_sum_i8`和测试均已撤回；kernel与测试逐字恢复`755f72c`，4项
+physical CShuffle GPU回归通过。原始凭据：
+
+- 实现diff：`/tmp/p7-int8-experiment.diff`，SHA256
+  `d259dab9448b7f074ece2995c36e9543f88811f9760fe225668fb2996fa613e9`；
+- 端到端驱动：`/tmp/compare_hy3_p7_int8_end_to_end.py`，SHA256
+  `763f0fce468b03790293e561bfbf15dc71e27bda30575bc6f8ecb2d3ee97c14b`；
+- 初版4轮日志：`/tmp/moe-p7-int8-end-to-end-abba4.log`，SHA256
+  `a9cd093656353111864060b2de71d987c5552ae57b509976b01edc65b7688e8c`；
+- rcp版4轮日志：`/tmp/moe-p7-int8-rcp-end-to-end-abba4.log`，SHA256
+  `bfcfb54a8ade5ae9ac2f1fe0e0b9b93843dc8c2611147fbcd8a93756c7c1472a`；
+- rcp版producer ISA：`/tmp/moe-p8-int8-rcp-producer-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，
+  SHA256 `735ea03eeb58677348259e49cdcb5f9f23c325a547fbbf923877120b7aff015d`。
+
+所以当前per-32 INT8方案也被端到端关闭。它证明压缩后的consumer确有带宽收益，但若继续沿压缩表示
+推进，必须显著降低producer量化VALU成本，例如使用真正的packed转换指令；仅调整scale粒度或buffer
+排列不能弥补当前约0.68ms的producer增量。
