@@ -503,7 +503,8 @@ LLVM `AMDGPURawPtrBufferStore`的aux定义在gfx942与旧架构不同：bit0/bit
 
 随机route、activation、weight和scale下，`N=512`与`N=4096`各连续执行20次，40次完整有效输出
 全部逐bit一致；正式ABBA的完整输出也逐bit一致。相同stream的kernel边界保证后续消费者看到已经完成
-的store，`nt`只改变缓存策略，不改变程序顺序或输出地址。
+的store，`nt`只改变缓存策略，不改变程序顺序或输出地址。最终运行完整
+`tests/contrib/moe/test_flydsl_moe_down.py`设备回归，结果为`11 passed`。
 
 在相同GPU4、`VECTOR,F8`、1800MHz determinism和10-buffer共同gateup上下文中，以提交`406906d`
 的P2源码快照为control进行24轮正反ABBA，24/24轮候选均胜出：
