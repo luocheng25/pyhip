@@ -573,8 +573,17 @@ VMEM owner、MFMA union busy和ABBA墙钟三者方向一致。P3后的首要剩�
 | 32条packed FMA替代64条scalar FMA | `1.013091` | 254/256 VGPR硬边界，后三轮全部退化 |
 | 16条packed + 32条scalar FMA | `1.016452` | 222/224 VGPR档，后三轮全部退化 |
 | 逐fragment FMA/BF16/CShuffle退休 | `1.015805` | 资源与工作量不变，但后三轮全部退化 |
+| output store `nt -> nt sc1` | `1.018043` | ISA仅多8个`sc1`，后三轮全部退化 |
+| tail-only slot priority `1/0 -> 0/1` | `1.010352` | 资源/工作量不变，后三轮全部退化 |
+| VMEM/MFMA间隔`4 -> 5` | - | 后端生成与P3逐字相同的ISA，无有效旋钮 |
 
 上述P4候选均通过`N=512/4096`各20次随机完整输出逐bit验证，并保持2 waves/SIMD，但都没有通过
 稳定性能门槛。Priority实验说明P0的完整阶段切换必须保留；简单拆分DSRD也没有把single-wave变化
 转化为physical收益。更重要的是，当前tail重写的第一约束已经不是“能否保持2-wave”，而是即使仍在
 2-wave档，combined寄存器从192升到220--256也会增加调度压力；不能只看occupancy整数值。
+
+因此P3是当前已验证的2-wave局部最优点：24轮吞吐为`439.502T`，相对分析Control的分阶段累计
+吞吐提升`4.801%`，fresh ATT的MFMA union busy为`80.301%`。剩余最大owner仍是
+`structural_tail 7.38%`，但继续推进前必须先找到不把combined寄存器推离192档的跨N状态表示；
+现有跨N fragment/LDS、packed FMA、逐fragment退休和tail priority方案都已用正确性、资源和ABBA
+程序化否证，不能按owner百分比继续线性外推。
