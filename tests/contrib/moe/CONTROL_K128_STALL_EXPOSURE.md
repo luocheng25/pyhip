@@ -799,3 +799,44 @@ IQR均跨1。前者将第二条read等待换成DS-write/store相位波动，后�
 pair顺序重排了后处理FMA与寄存器，不能把噪声内变化归因成TCC地址收益。至此pair顺序也被否证。
 当前可保留点仍是P7；若继续推进，应改变更高层的producer/consumer契约或使用新的后端调度能力，
 而不是继续枚举现有CShuffle顺序、wait阈值、priority或weight fragment生命周期。
+
+## P7上的R2 AoSoA producer/consumer契约否证
+
+沿“改变更高层producer/consumer契约”继续测试了P7 CShuffle后的`R=2` tile-major AoSoA布局。
+这不是历史`R=1/2/4/8/16`扫描的重复：历史扫描使用早期直接写出producer；本次保留P7的M16
+row-pair全lane LDS写入、分级双read和两级wait，仅将每个16B读回atom的VMEM地址改为R2，并给
+`sorted_sum`加入严格逆映射。物理buffer仍为`64xN` BF16、0B padding，没有增加中间结果字节数。
+
+R2映射先用程序枚举验证：在`64x512`上，producer和consumer的4096个16B atom地址逐项相等、
+无别名且稠密覆盖整个buffer。GPU聚焦测试覆盖64行和两个N256块，默认P7的0/32/64/128B padding
+以及R2均通过；随后在真实Hy3 shape上轮换10套buffer，最终`[32768,4096]` reduced输出全部逐bit
+等于P7。实现过程中还通过CPU按R2公式解码physical buffer，将producer和consumer分别隔离；最终
+matching consumer与CPU解码逐bit一致。
+
+性能使用GPU4、`VECTOR,F8`、1800MHz determinism、共同gateup、10-buffer轮换和正反ABBA。
+测试shape仍为B32768/TOPK9/N4096/K384/E193/BM64；分别计时down、`sorted_sum`和同一事件内的
+`down + sorted_sum`。4轮短ABBA结果为：
+
+| 计时范围 | P7中位数 | P7+R2中位数 | R2/P7配对中位数 | 配对IQR |
+|---|---:|---:|---:|---:|
+| down | 2.061889ms | 2.061089ms | 1.006482 | 0.906526--1.012705 |
+| `sorted_sum` | 0.713423ms | 1.671307ms | 2.319782 | 2.282043--2.351889 |
+| `down + sorted_sum` | 2.777031ms | 3.766636ms | 1.359892 | 1.357085--1.363994 |
+
+down单项没有稳定收益，IQR跨1；consumer则稳定退化约132%，使组合事件稳定退化约35.99%。原因是
+R2改善producer写地址的潜力不足以抵消按任意route gather时的consumer读取局部性损失。该结果也说明
+中间布局不能用producer-only数据验收：即使物理buffer大小不变、双射完全正确，consumer代价仍可
+主导端到端结果。
+
+R2在4轮门槛上已被大幅、稳定否证，因此未浪费资源继续24轮或fresh ATT；实验API、地址分支和测试
+case均已完整撤回，kernel与测试逐字恢复到P7提交`755f72c`。实验后GPU恢复为
+`F16,BF16 / auto / NUMA=1`。原始凭据：
+
+- 端到端驱动：`/tmp/compare_hy3_p7_r2_end_to_end.py`，SHA256
+  `4536dbdae727f307f21c48c8b80f6e2d6caa04b803df4937fc3e95b0d601bc55`；
+- 4轮日志：`/tmp/moe-p7-r2-end-to-end-abba4.log`，SHA256
+  `ddfcdf95080a86760e945cbacdb76bd0e5b79b6747ee75c1f4c1ce61898cd69f`。
+
+因此，当前最优点仍是P7 row-major CShuffle。后续高层契约只有在避免`sorted_sum`现有row-major
+coalescing损失时才值得测试，例如减少或消除中间结果往返；单纯交换row locality与producer store
+coalescing的AoSoA家族不再是优先方向。
