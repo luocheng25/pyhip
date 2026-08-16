@@ -2510,7 +2510,7 @@ def compile_gemm(
                 lane_row = lane_id % 16
                 wave_lds_base = wave_id * (8 * 64)
 
-                for row_chunk in range_constexpr(8):
+                def write_row_chunk(row_chunk):
                     token_repeat = row_chunk // 2
                     row_half = row_chunk % 2
                     producer = scf.IfOp(_raw(lane_row // 8 == row_half))
@@ -2551,7 +2551,8 @@ def compile_gemm(
                             fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
                         scf.YieldOp([])
 
-                    # Same-wave DS ops are ordered; wait for the read result below.
+                write_row_chunk(0)
+                for row_chunk in range_constexpr(8):
                     fx.rocdl.sched_barrier(0)
                     output_row = row_chunk * 8 + lane_id // 8
                     output_atom = lane_id % 8
@@ -2566,6 +2567,9 @@ def compile_gemm(
                     )
                     out_frag = fx.make_fragment_like(lds_src)
                     fx.copy(cshuffle_copy_atom, lds_src, out_frag)
+                    if const_expr(row_chunk + 1 < 8):
+                        # Hide the current read behind the next slice's independent writes.
+                        write_row_chunk(row_chunk + 1)
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                     output_column = (
                         fx.Int64(block_n) * BLOCK_N

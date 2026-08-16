@@ -406,6 +406,81 @@ Single-wave总时间从`7483.49 cycle/N`降到`7325.00 cycle/N`，减少`158.49 
 - P0/P1 exposure账本：`/tmp/CONTROL_K128_P1_STALL_EXPOSURE.json`，SHA256
   `68a55e4169ea68f9d1aa2f2a0edc7d5956b698f8d4e8d0adc0f6d41c271e0895`。
 
+### P2完成：用下一slice写入隐藏CShuffle读取等待
+
+P1剩余的CShuffle序列仍是逐slice串行：
+
+`write_i -> read_i -> lgkmcnt(0) -> store_i -> write_(i+1)`
+
+P2先写slice0；前7个slice在`read_i`之后立即完成下一slice的BF16 pack和两条独立DS write，再执行
+完整`lgkmcnt(0)`并store当前read结果。最后一个slice仍直接`read_7 -> lgkmcnt(0) -> store_7`：
+
+`read_i -> pack/write_(i+1) -> lgkmcnt(0) -> store_i`
+
+因此P2没有删除read-result wait，也没有依赖非零`lgkmcnt`阈值；它只增加DS read到完整wait之间的
+独立工作距离。最终ISA确认每个前7个slice的两条next-write都位于当前read和wait之间。MFMA、VMEM、
+DS和store工作量保持不变：
+
+| 项目 | P1 | P2 |
+|---|---:|---:|
+| MFMA | 192 | 192 |
+| buffer / global load | 38 / 10 | 38 / 10 |
+| DS read / write | 32 / 22 | 32 / 22 |
+| buffer store | 8 | 8 |
+| `lgkmcnt(0)` | 16 | 16 |
+| next-free VGPR / accum offset | 190 / 192 | 192 / 192 |
+| LDS / scratch | 28,672B / 0 | 28,672B / 0 |
+| 权威资源 | 64V + 128A，2 waves/SIMD | 64V + 128A，2 waves/SIMD |
+
+next-free VGPR增加2，但P1本来就按192档分配，P2没有跨资源档；ATT资源CSV仍为
+`64V+128A/112S/28,672B/0 scratch`。随机route、activation、weight和scale下，`N=512`与
+`N=4096`各连续执行20次，40次完整有效输出全部逐bit一致；正式ABBA的完整输出同样逐bit一致。
+
+在相同GPU4、`VECTOR,F8`、1800MHz determinism和10-buffer共同gateup上下文中，以提交`4e5b914`
+的P1源码快照为control进行24轮正反ABBA，24/24轮候选均胜出：
+
+| 版本 | 中位时延 | 有效TFLOPS | 配对口径 |
+|---|---:|---:|---:|
+| P1去除write wait | 2.158549ms | 429.785T | - |
+| **P2增加read隐藏距离** | **2.138729ms** | **433.768T** | candidate/control中位`0.991734` |
+
+配对时延降低`0.827%`、等价吞吐提升`0.833%`，ratio IQR为`0.984884--0.993821`，不跨1。
+将P0、P1、P2三步配对比例相乘，Control到P2的累计时延比例约为`0.965968`，即降低`3.403%`、
+等价吞吐提升`3.523%`。
+
+P2 fresh ATT继续使用单SE、CU2、全4 SIMD、N2--N13窗口；P1/P2均为232/232条完整wave。按MFMA
+execution mass归一后的physical总时间从`3964.70 cycle/N`降到`3929.22 cycle/N`，减少
+`35.48 cycle/N`（`0.895%`）；MFMA union busy从`77.484%`升到`78.183%`，增加`0.700pp`。
+Single-wave总时间从`7325.00 cycle/N`降到`7263.15 cycle/N`，减少`61.86 cycle/N`（`0.844%`）。
+
+| Physical状态 | P2 - P1（百分点） | owner周期变化 |
+|---|---:|---:|
+| `vmem_issue_stall` | +0.299 | -2,638 |
+| `vmem_wait_stall` | +0.104 | +4,090 |
+| `ds_issue_stall` | +0.150 | +1,274 |
+| **`ds_wait_stall`** | **-1.184** | **-66,796** |
+| `structural_tail` | -0.028 | -20,346 |
+| residual | -0.041 | -6,708 |
+| **`MFMA union execution`** | **+0.700** | - |
+
+两wave同为DS wait的见证量从`0.5712%`降到`0.1263%`，`DS wait + structural tail`联合状态从
+`3.3231%`降到`2.2886%`。`code.json`会把重复基本块的相同PC合并，不能用静态row数代表8个source
+slice；在可识别的CShuffle区域记录中，read-side wait stall从`1.704M`降到`0.916M`，每次动态命中的
+平均stall从`65.58`降到`41.14 cycles`。主归因仍以闭合的physical owner账本为准：P2继续降低了
+DS wait，但没有消除新主项`structural_tail 7.51%`和`vmem_issue_stall 7.22%`。
+
+冻结产物：
+
+- 24轮ABBA：`/tmp/moe-p2-cshuffle-readpipe-abba24.log`，SHA256
+  `8d9df432288975da1cc764c289e644d935a2a05e070f3d7956c29f4890513791`；
+- 随机正确性：`/tmp/moe-p2-cshuffle-readpipe-random20.log`，SHA256
+  `1fb302710a4a9c0807ed8f1329c5edb6a1f6399023919f094f88ddf057d10326`；
+- 当前源码对应最终ISA：
+  `/tmp/moe-p2-cshuffle-readpipe-final-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，SHA256
+  `433917dea86889d09afcf4badbb782ff17633213b099ddf2ff9b6bce6dfc7ae8`；
+- P1/P2 exposure账本：`/tmp/CONTROL_K128_P2_STALL_EXPOSURE.json`，SHA256
+  `39c92985d70fa3e4f864475f324cb83bb3d34dae09c6c35283bb932aa7684072`。
+
 ### 已否证的低风险单变量
 
 以下候选都已恢复，不应在没有新ATT证据时重复扫描。短筛均以P0为control并保持2 waves/SIMD：
