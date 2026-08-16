@@ -870,3 +870,35 @@ buffer字节数。该结果与仓库早期“BF16 atomic带宽约为普通写出
 
 所以“消除中间buffer”不能依赖当前BF16 global atomic；若继续压缩往返，必须使用普通store可高效
 服务的表示，或从算法上让单一owner写最终token，不能只把reduce搬进原子尾部。
+
+### Route-major普通scatter
+
+另一个无损高层契约是让P7用普通16B store直接写唯一的`[token,topk,N]`位置，再由consumer按
+identity loc连续读取TOPK行。历史`c72de65`之前曾采用这种语义，后来切换为当前sorted-row中间结果，
+但没有留下可与P7比较的墙钟数据，因此本轮先测consumer上界，再在P7 CShuffle上重建最小探针。
+
+保持当前`sorted_sum`代码不变，仅将真实sorting生成的随机`loc_ids`替换为identity loc，8轮正反
+ABBA得到：真实loc中位数0.757483ms，identity loc中位数0.730023ms，identity/actual配对中位数
+`0.957370`、IQR `0.922563--0.978044`。所以route-major consumer的乐观绝对收益只有约0.0275ms；
+它还未计入可删除的`invert_sorted_ids`，但该小kernel远不足以覆盖毫秒级producer退化。
+
+P7探针按`sorted_id`将每个CShuffle 16B atom普通store到`(token*TOPK+topk, channel)`，padding route
+用`topk<TOPK`屏蔽。随机sorted-row排列的`B32/TOPK2/N512/K384`连续10次最终输出逐bit等于P7。
+真实Hy3资源为`72 VGPR + 128 AGPR / 112 SGPR / 32KB LDS / 0 scratch`，仍保持2 waves/SIMD；
+但6次down为`3.018411/3.193772/2.949452/2.944171/2.948612/2.939732ms`。稳态producer单项
+已慢于P7 `down + sorted_sum`的2.777031ms，更不可能由约0.0275ms consumer收益回本，因此无需
+正式端到端ABBA。
+
+根因是expert-major workgroup中的64行被scatter到全局token/topk顺序，普通store失去P7按sorted row
+写出的局部性；避免了consumer gather，却把更大的代价转移给producer。探针已撤回并再次通过P7的
+4项GPU测试。原始凭据：
+
+- 随机route正确性：`/tmp/check_p7_route_major.py`，SHA256
+  `1fa13cdfae522409f1fd24a4013f87eb799acc3eb0ad38733feec0e7dbc956c9`；
+- producer trace：`/tmp/moe_route_major_resource/out_kernel_trace.csv`，SHA256
+  `07413a2b0f0aa9b9fec2dbed1756c1c2b20c1e2eaf8b18c31f401c69ba09f667`；
+- consumer上界日志：`/tmp/moe-p7-sorted-sum-identity-abba8.log`，SHA256
+  `a5811a2179b680103ccebdb56580eec04ee2f166d64fb7cab196a106b437967a`。
+
+至此，无损改变中间结果所有权的两条直接路径都关闭：atomic受服务吞吐限制，route-major普通store
+受producer随机写限制。下一类候选应保留sorted-row地址局部性，只压缩中间表示或融合consumer工作。
