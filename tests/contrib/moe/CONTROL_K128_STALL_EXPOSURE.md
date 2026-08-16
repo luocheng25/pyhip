@@ -764,6 +764,7 @@ successful-issue slot模型的steady MFMA busy也从`82.515%`升到`83.568%`，�
 | K384前两个K128 core合并sched-group | - | combined 196 -> 252，静态资源门槛直接淘汰 |
 | next-pair写入隐藏当前pair的`read_1` | `0.992027` | 资源不变，但Q3为1.015869、后两轮均未胜出 |
 | read/write slot priority `1/0 -> 1/1` | `0.989288` | ISA仅改4条`setprio`，但Q3为1.015627、后两轮一胜一负 |
+| M16 row-pair遍历顺序`0,1,2,3 -> 3,2,1,0` | `0.992165` | Q3为1.015624；后端同时重排后处理FMA，无法形成稳定地址顺序收益 |
 | tail-only slot priority `1/0 -> 0/1` | `1.010352` | 资源/工作量不变，后三轮全部退化 |
 | VMEM/MFMA间隔`4 -> 5` | - | 后端生成与P3逐字相同的ISA，无有效旋钮 |
 | packed-local逐fragment后处理 | `1.021923` | 约256 combined档，后三轮全部退化2.0%--3.5% |
@@ -792,3 +793,9 @@ IQR均跨1。前者将第二条read等待换成DS-write/store相位波动，后�
 同相竞争。至此，P7后的局部CShuffle wait、slot priority和weight预取邻域均已闭合；剩余
 `vmem_issue_stall 8.868%`是load/store共享队列和两wave联合状态，不是一个可由单条wait、cache位或
 首load移动线性回收的预算。
+
+最后按P7 fresh ATT逐pair拆分：正向第一个pair的`wait1/store0`为`67.6/84.1 cycles/N`，最后pair为
+`40.5/59.9 cycles/N`。反向遍历通过40次随机逐bit验证，资源和工作量不变，但4轮IQR跨1；LLVM还随
+pair顺序重排了后处理FMA与寄存器，不能把噪声内变化归因成TCC地址收益。至此pair顺序也被否证。
+当前可保留点仍是P7；若继续推进，应改变更高层的producer/consumer契约或使用新的后端调度能力，
+而不是继续枚举现有CShuffle顺序、wait阈值、priority或weight fragment生命周期。
