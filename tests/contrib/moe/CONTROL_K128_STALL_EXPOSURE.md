@@ -568,5 +568,13 @@ VMEM owner、MFMA union busy和ABBA墙钟三者方向一致。P3后的首要剩�
 | compute priority `3 -> 2` | `1.003133` | 后三轮全部退化 |
 | CShuffle双slice成组、8次wait降为4次 | `1.002490` | 后三轮两次约退化0.9%，DS/store突发抵消收益 |
 | CShuffle单read-ahead、read与前一store重叠 | `0.998282` | 最后两轮退化，IQR跨1 |
+| 跨N延迟1个M8 slice，携带BF16 fragment | `1.006517` | 218/220 VGPR档，后三轮全部退化 |
+| 跨N延迟1个M8 slice，仅携带LDS内容 | `0.997889` | 220/220 VGPR档，IQR跨1 |
+| 32条packed FMA替代64条scalar FMA | `1.013091` | 254/256 VGPR硬边界，后三轮全部退化 |
+| 16条packed + 32条scalar FMA | `1.016452` | 222/224 VGPR档，后三轮全部退化 |
+| 逐fragment FMA/BF16/CShuffle退休 | `1.015805` | 资源与工作量不变，但后三轮全部退化 |
 
-Priority实验说明P0的完整阶段切换必须保留；简单拆分DSRD也没有把single-wave变化转化为physical收益。
+上述P4候选均通过`N=512/4096`各20次随机完整输出逐bit验证，并保持2 waves/SIMD，但都没有通过
+稳定性能门槛。Priority实验说明P0的完整阶段切换必须保留；简单拆分DSRD也没有把single-wave变化
+转化为physical收益。更重要的是，当前tail重写的第一约束已经不是“能否保持2-wave”，而是即使仍在
+2-wave档，combined寄存器从192升到220--256也会增加调度压力；不能只看occupancy整数值。
