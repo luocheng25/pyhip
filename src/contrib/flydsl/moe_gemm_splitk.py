@@ -2550,8 +2550,10 @@ def compile_gemm(
 
                 for row_pair in range_constexpr(4):
                     write_row_pair(row_pair)
+                    out_frags = []
+                    byte_offsets = []
+                    fx.rocdl.sched_barrier(0)
                     for row_half in range_constexpr(2):
-                        fx.rocdl.sched_barrier(0)
                         output_row = (row_pair * 2 + row_half) * 8 + lane_id // 8
                         output_atom = lane_id % 8
                         physical_atom = output_atom ^ (lane_id // 8)
@@ -2565,7 +2567,7 @@ def compile_gemm(
                         )
                         out_frag = fx.make_fragment_like(lds_src)
                         fx.copy(cshuffle_copy_atom, lds_src, out_frag)
-                        fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                        out_frags.append(out_frag)
                         output_column = (
                             fx.Int64(block_n) * BLOCK_N
                             + fx.Int64(wave_id) * WAVE_N
@@ -2578,13 +2580,25 @@ def compile_gemm(
                             )
                             * 2
                         ).to(fx.Int32)
-                        fx.buffer_ops.buffer_store(
-                            Vec(out_frag.load()).bitcast(fx.Int32),
-                            physical_store_rsrc,
-                            byte_offset,
-                            cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
-                            offset_is_bytes=True,
-                        )
+                        byte_offsets.append(byte_offset)
+
+                    # Consume the older read first without forcing the newer read complete.
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
+                    fx.buffer_ops.buffer_store(
+                        Vec(out_frags[0].load()).bitcast(fx.Int32),
+                        physical_store_rsrc,
+                        byte_offsets[0],
+                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                        offset_is_bytes=True,
+                    )
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    fx.buffer_ops.buffer_store(
+                        Vec(out_frags[1].load()).bitcast(fx.Int32),
+                        physical_store_rsrc,
+                        byte_offsets[1],
+                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                        offset_is_bytes=True,
+                    )
 
             cp_atom_out_128b = None
             thrv_out = None

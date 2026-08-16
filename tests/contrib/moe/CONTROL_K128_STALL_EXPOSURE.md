@@ -670,6 +670,74 @@ tail窗口平均长度从`2316.14`降到`2152.80 cycles/N`，降低`7.05%`。其
 - P3/P6 successful-issue slot账本：`/tmp/moe-p3-p6-slots.json`，SHA256
   `507a1048538ecfdeb0993cd222feef5676b30217913795434817ef9b002254d3`。
 
+### P7完成：M16 pair双read分级消费
+
+P6每个M16 pair依次执行两个M8 half：
+
+`read_0 -> lgkmcnt(0) -> store_0 -> read_1 -> lgkmcnt(0) -> store_1`
+
+P7先连续发出两个独立`ds_read_b128`，再用`lgkmcnt(1)`只等待较老的`read_0`，store half0后用
+`lgkmcnt(0)`等待`read_1`并store half1：
+
+`read_0 -> read_1 -> lgkmcnt(1) -> store_0 -> lgkmcnt(0) -> store_1`
+
+这与已否证的双slice成组候选不同：旧候选在一次`lgkmcnt(0)`后连续发两条store，形成DS/store突发；
+P7保留两条store之间的分级wait，只提前第二条read。最终ISA确认4个M16 pair均形成上述顺序，且
+MFMA、DS read/write、VMEM load/store和总wait工作量不变：CShuffle的8个`lgkmcnt(0)`变为4个
+`lgkmcnt(1)`加4个`lgkmcnt(0)`。资源与P6逐项相同，仍为next-free VGPR 194、accum offset 196、
+`68V+132A/112S/32,768B LDS/0 scratch`和2 waves/SIMD。
+
+随机route、activation、weight和scale下，`N=512`与`N=4096`各连续20次，40次完整有效输出均与
+提交`7fb9107`的P6逐bit一致；正式ABBA完整输出同样逐bit一致。完整
+`tests/contrib/moe/test_flydsl_moe_down.py`设备回归结果为`11 passed`。
+
+在相同GPU4、`VECTOR,F8`、1800MHz determinism、10-buffer轮换和共同gateup上下文中，以P6为
+control进行24轮正反ABBA，20/24轮candidate/control小于1，ratio IQR严格低于1：
+
+| 版本 | 中位时延 | 有效TFLOPS | Q1--Q3 |
+|---|---:|---:|---:|
+| P6 M16 row-pair | 2.055387ms | 451.357T | 2.051447--2.063908ms |
+| **P7分级双read** | **2.036348ms** | **455.577T** | 2.032777--2.044037ms |
+
+配对ratio中位为`0.990328`，IQR为`0.984943--0.996017`：时延降低`0.967%`，等价吞吐提升
+`0.977%`。将P0--P6累计ratio与P7相乘，分析Control到P7的时延约降低`7.917%`，等价吞吐约提升
+`8.597%`。
+
+P7 fresh ATT使用与P6相同的单SE、CU2、全4 SIMD和N2--N13窗口；232条raw wave全部完整且每条
+包含3,072条MFMA，没有early-exit或部分wave。Single-wave总时间从`6989.75`降到
+`6774.67 cycles/N`，减少`3.077%`；exposure口径的physical MFMA union busy从`80.619%`升到
+`81.665%`，增加`1.045pp`。互斥owner变化为：
+
+| Physical owner | P6 | P7 | P7-P6 |
+|---|---:|---:|---:|
+| `ds_issue_stall` | 0.839% | 0.841% | +0.002pp |
+| **`ds_wait_stall`** | **3.061%** | **1.517%** | **-1.543pp** |
+| `structural_tail` | 4.954% | 4.609% | -0.345pp |
+| `vmem_issue_stall` | 8.115% | 8.868% | +0.754pp |
+| `vmem_wait_stall` | 0.466% | 0.400% | -0.066pp |
+| **MFMA union execution** | **80.619%** | **81.665%** | **+1.045pp** |
+
+successful-issue slot模型的steady MFMA busy也从`82.515%`升到`83.568%`，方向一致。tail窗口平均长度
+从`2152.80`降到`1965.11 cycles/N`，降低`8.72%`；其中8条read wait的stall从
+`514.10`降到`273.01 cycles/N`（-46.89%）。代价是8条NT store stall从`396.43`升到
+`424.66 cycles/N`，weight load从`103.52`升到`112.99 cycles/N`，但净tail和physical idle均下降。
+因此P7确实减少了read-result等待，而不是仅在single-wave内部重新归因。
+
+冻结产物：
+
+- 24轮ABBA：`/tmp/moe-p7-tiered-read-abba24.log`，SHA256
+  `236fb5c767efd362849a71f5939bc370c39ebe8c7c400b745a83126b5b3758c2`；
+- 随机正确性：`/tmp/moe-p7-tiered-read-random20.log`，SHA256
+  `1fb302710a4a9c0807ed8f1329c5edb6a1f6399023919f094f88ddf057d10326`；
+- 完整down设备回归：`/tmp/moe-p7-tiered-read-regression11.log`，SHA256
+  `caae0eb7c59762e4d395ccd4e499d2ec3beea44f74d747ca46095991eac9f4d8`；
+- 最终ISA：`/tmp/moe-p7-tiered-read-dump/moe_2stage_down_prefill_1x4_0/21_final_isa.s`，SHA256
+  `8badc10ab418378b7c890e575098c70d1a61c43ca3f4c7cbc90f770b85921fe9`；
+- P6/P7 exposure账本：`/tmp/moe-p6-p7-exposure.json`，SHA256
+  `bbc66af86ff928580303649c49a7df578d33a13fed03dc70b99e6675cad2db56`；
+- P6/P7 successful-issue slot账本：`/tmp/moe-p6-p7-slots.json`，SHA256
+  `50252d675ca17ca5908f976c48d981334fc8fb30e1143ae2bb204a310b333ef5`。
+
 ### 已否证的低风险单变量
 
 以下候选都已恢复，不应在没有新ATT证据时重复扫描。短筛均以P0为control并保持2 waves/SIMD：
@@ -690,6 +758,7 @@ tail窗口平均长度从`2316.14`降到`2152.80 cycles/N`，降低`7.05%`。其
 | 逐fragment FMA/BF16/CShuffle退休 | `1.015805` | 资源与工作量不变，但后三轮全部退化 |
 | output store `nt -> nt sc1` | `1.018043` | ISA仅多8个`sc1`，后三轮全部退化 |
 | output store `nt -> sc0 nt` | `0.999144` | IQR跨1，2/4轮退化，无稳定收益 |
+| slot1反向M8 store顺序 | `0.999893` | 8条`s_cselect`、combined 196 -> 204，IQR跨1 |
 | tail-only slot priority `1/0 -> 0/1` | `1.010352` | 资源/工作量不变，后三轮全部退化 |
 | VMEM/MFMA间隔`4 -> 5` | - | 后端生成与P3逐字相同的ISA，无有效旋钮 |
 | packed-local逐fragment后处理 | `1.021923` | 约256 combined档，后三轮全部退化2.0%--3.5% |
@@ -699,8 +768,9 @@ tail窗口平均长度从`2316.14`降到`2152.80 cycles/N`，降低`7.05%`。其
 转化为physical收益。更重要的是，当前tail重写的第一约束已经不是“能否保持2-wave”，而是即使仍在
 2-wave档，combined寄存器从192升到220--256也会增加调度压力；不能只看occupancy整数值。
 
-因此P6取代P3成为当前已验证的2-wave最优点：24轮吞吐为`451.739T`，相对分析Control的分阶段
-累计吞吐约提升`7.547%`，fresh ATT的MFMA union busy为`80.619%`。剩余最大owner已转为
-`vmem_issue_stall 8.115%`，其次是`structural_tail 4.954%`和`ds_wait_stall 3.061%`。P6 LDS恰好
-32KB、权威combined资源为200，下一步不能再增加LDS，也不应重复双read成组、read-ahead、packed
-FMA或cache/priority扫描；必须针对新暴露的VMEM队列状态提出保持2-wave且不增加长期live state的方案。
+因此P7取代P6成为当前已验证的2-wave最优点：24轮吞吐为`455.577T`，相对分析Control的分阶段
+累计吞吐约提升`8.597%`，fresh ATT的MFMA union busy为`81.665%`。剩余最大owner为
+`vmem_issue_stall 8.868%`，其次是`structural_tail 4.609%`；`ds_wait_stall`已降到`1.517%`。
+P7 LDS恰好32KB、权威combined资源为200，下一步不能再增加LDS，也不应重复双read成组、read-ahead、
+packed FMA、cache或priority扫描；必须针对新暴露的VMEM load/store联合状态提出不增加长期live state的
+方案。
