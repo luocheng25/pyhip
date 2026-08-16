@@ -1,0 +1,1016 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="878" viewBox="0 0 1400 878">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#e6edf3}.title{font-size:20px;font-weight:600}.label{font-size:15px;font-weight:600}.small{font-size:13px;fill:#b1bac4}.tiny{font-size:12px;fill:#8b949e}</style>
+<text x="40" y="38" class="title">Control K128: representative physical two-slot N-loop</text>
+<text x="40" y="62" class="small">SE0 CU2 SIMD1; slot 0 N11; absolute cycles [1872740, 1879312); 6572 cycles; MFMA busy 73.04%</text>
+<text x="40" y="82" class="tiny">Selected from 1079 complete windows: busy within 0.1 percentage point of 73.08%, then duration nearest the 6880-cycle median. ATT issue = first_attempt + stall.</text>
+<text x="40" y="112" class="label">Anchor slot 0 logical N-block recipe (counts validated against this ATT window)</text>
+<rect x="40" y="126" width="250" height="110" rx="4" fill="#161b22" stroke="#1f6feb"/>
+<text x="54" y="150" class="label">K0: K128 core</text>
+<text x="54" y="173" class="small">8 x ds_read + 8 x VMEM load</text>
+<text x="54" y="196" class="tiny">DSRD8 -> 8 x (VMEM1 -> MFMA4)</text>
+<text x="54" y="217" class="small">-> MFMA32 (64 MFMA total)</text>
+<rect x="300" y="126" width="250" height="110" rx="4" fill="#161b22" stroke="#388bfd"/>
+<text x="314" y="150" class="label">K1: K128 core</text>
+<text x="314" y="173" class="small">8 x ds_read + 8 x VMEM load</text>
+<text x="314" y="196" class="tiny">DSRD8 -> 8 x (VMEM1 -> MFMA4)</text>
+<text x="314" y="217" class="small">-> MFMA32 (64 MFMA total)</text>
+<rect x="560" y="126" width="250" height="110" rx="4" fill="#161b22" stroke="#58a6ff"/>
+<text x="574" y="150" class="label">K2: K128 core</text>
+<text x="574" y="173" class="small">8 x ds_read + 8 x VMEM load</text>
+<text x="574" y="196" class="tiny">DSRD8 -> 8 x (VMEM1 -> MFMA4)</text>
+<text x="574" y="217" class="small">-> MFMA32 (64 MFMA total)</text>
+<rect x="820" y="126" width="540" height="110" rx="4" fill="#161b22" stroke="#da3633"/>
+<text x="834" y="150" class="label">Postprocess / CShuffle / store</text>
+<text x="834" y="173" class="small">64 x FMA + 32 x perm</text>
+<text x="834" y="196" class="small">16 x LDS write -> wait -> 8 x LDS read</text>
+<text x="834" y="219" class="small">8 x VMEM store; next N waits for accumulator retirement</text>
+<text x="40" y="274" class="label">Actual ATT timeline (4-cycle ticks; colored runs preserve observed timing)</text>
+<line x1="190.00" y1="310" x2="190.00" y2="592" stroke="#30363d"/>
+<text x="190.00" y="302" text-anchor="start" class="tiny">+0</text>
+<line x1="368.03" y1="310" x2="368.03" y2="592" stroke="#30363d"/>
+<text x="368.03" y="302" text-anchor="middle" class="tiny">+1000</text>
+<line x1="546.06" y1="310" x2="546.06" y2="592" stroke="#30363d"/>
+<text x="546.06" y="302" text-anchor="middle" class="tiny">+2000</text>
+<line x1="724.08" y1="310" x2="724.08" y2="592" stroke="#30363d"/>
+<text x="724.08" y="302" text-anchor="middle" class="tiny">+3000</text>
+<line x1="902.11" y1="310" x2="902.11" y2="592" stroke="#30363d"/>
+<text x="902.11" y="302" text-anchor="middle" class="tiny">+4000</text>
+<line x1="1080.14" y1="310" x2="1080.14" y2="592" stroke="#30363d"/>
+<text x="1080.14" y="302" text-anchor="middle" class="tiny">+5000</text>
+<line x1="1258.17" y1="310" x2="1258.17" y2="592" stroke="#30363d"/>
+<text x="1258.17" y="302" text-anchor="middle" class="tiny">+6000</text>
+<line x1="1360.00" y1="310" x2="1360.00" y2="592" stroke="#30363d"/>
+<text x="1360.00" y="302" text-anchor="end" class="tiny">+6572</text>
+<text x="40" y="350" class="label">slot 0 phase</text>
+<text x="40" y="378" class="small">MFMA execution</text>
+<text x="40" y="404" class="small">ATT stall / issue</text>
+<rect x="190.00" y="334" width="282.00" height="22" fill="#1f6feb"><title>core0: 1584 cycles</title></rect>
+<rect x="472.00" y="334" width="11.39" height="22" fill="#484f58"><title>core0-&gt;1: 64 cycles</title></rect>
+<rect x="483.39" y="334" width="185.15" height="22" fill="#388bfd"><title>core1: 1040 cycles</title></rect>
+<rect x="668.54" y="334" width="11.39" height="22" fill="#484f58"><title>core1-&gt;2: 64 cycles</title></rect>
+<rect x="679.93" y="334" width="182.30" height="22" fill="#58a6ff"><title>core2: 1024 cycles</title></rect>
+<rect x="862.23" y="334" width="497.77" height="22" fill="#da3633"><title>tail: 2796 cycles</title></rect>
+<rect x="190.00" y="364" width="22.79" height="16" fill="#238636"><title>MFMA execution: 128 cycles</title></rect>
+<rect x="215.64" y="364" width="34.18" height="16" fill="#238636"><title>MFMA execution: 192 cycles</title></rect>
+<rect x="327.44" y="364" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="347.38" y="364" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="369.45" y="364" width="102.54" height="16" fill="#238636"><title>MFMA execution: 576 cycles</title></rect>
+<rect x="483.39" y="364" width="8.55" height="16" fill="#238636"><title>MFMA execution: 48 cycles</title></rect>
+<rect x="494.78" y="364" width="173.76" height="16" fill="#238636"><title>MFMA execution: 976 cycles</title></rect>
+<rect x="679.93" y="364" width="182.30" height="16" fill="#238636"><title>MFMA execution: 1024 cycles</title></rect>
+<rect x="190.00" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="190.71" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="191.42" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="192.85" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="193.56" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="194.27" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="195.70" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="196.41" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="197.12" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="198.55" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="199.26" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="199.97" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="200.68" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="201.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="202.11" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="204.24" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="204.95" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="207.09" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="207.80" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="209.94" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="210.65" y="390" width="2.85" height="16" fill="#d29922"><title>VMEM stall/wait: 16 cycles</title></rect>
+<rect x="213.50" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="214.21" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="214.92" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="215.64" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="216.35" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="218.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="219.20" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="221.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="222.05" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="224.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="224.89" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="225.61" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="226.32" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="227.03" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="227.74" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="229.88" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="230.59" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="232.73" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="233.44" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="235.58" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="236.29" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="237.00" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="238.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="239.14" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="241.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="241.98" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="244.12" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="244.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="246.97" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="247.68" y="390" width="79.04" height="16" fill="#d29922"><title>VMEM stall/wait: 444 cycles</title></rect>
+<rect x="326.73" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="327.44" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="328.15" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="330.29" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="331.00" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="333.13" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="333.85" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="335.98" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="336.70" y="390" width="9.97" height="16" fill="#d29922"><title>VMEM stall/wait: 56 cycles</title></rect>
+<rect x="346.66" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="347.38" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="348.09" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="350.23" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="350.94" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="353.07" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="353.79" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="355.92" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="356.63" y="390" width="12.11" height="16" fill="#d29922"><title>VMEM stall/wait: 68 cycles</title></rect>
+<rect x="368.74" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="369.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="370.16" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="372.30" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="373.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="375.15" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="375.86" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="378.00" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="378.71" y="390" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="379.42" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="380.85" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="381.56" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="382.27" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="383.69" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="384.41" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="385.12" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="386.54" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="387.26" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="387.97" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="389.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="390.10" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="390.82" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="392.24" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="392.95" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="395.09" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="395.80" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="397.94" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="398.65" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="400.79" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="401.50" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="402.21" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="403.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="404.35" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="406.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="407.19" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="409.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="410.04" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="412.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="412.89" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="413.60" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="415.03" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="415.74" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="417.88" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="418.59" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="420.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="421.44" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="423.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="424.28" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="426.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="427.13" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="429.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="429.98" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="432.12" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="432.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="434.97" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="435.68" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="437.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="438.53" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="440.66" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="441.38" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="443.51" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="444.22" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="446.36" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="447.07" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="449.21" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="449.92" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="452.06" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="452.77" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="454.91" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="455.62" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="457.75" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="458.47" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="460.60" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="461.31" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="463.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="464.16" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="466.30" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="467.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="469.15" y="390" width="1.42" height="16" fill="#6e7681"><title>other stall/issue: 8 cycles</title></rect>
+<rect x="470.57" y="390" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="473.42" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="475.56" y="390" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="478.41" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="479.12" y="390" width="4.27" height="16" fill="#f0883e"><title>mixed wait: 24 cycles</title></rect>
+<rect x="483.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="484.10" y="390" width="2.14" height="16" fill="#db6d28"><title>LDS stall/wait: 12 cycles</title></rect>
+<rect x="486.24" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="486.95" y="390" width="2.14" height="16" fill="#db6d28"><title>LDS stall/wait: 12 cycles</title></rect>
+<rect x="489.09" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="489.80" y="390" width="2.85" height="16" fill="#db6d28"><title>LDS stall/wait: 16 cycles</title></rect>
+<rect x="492.65" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="494.78" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="495.50" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="496.21" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="496.92" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="497.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="498.34" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="500.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="501.19" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="503.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="504.04" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="506.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="506.89" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="507.60" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="508.31" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="509.03" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="509.74" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="511.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="512.59" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="514.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="515.44" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="517.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="518.28" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="519.00" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="519.71" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="520.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="521.13" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="523.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="523.98" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="526.12" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="526.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="528.97" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="529.68" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="530.39" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="531.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="532.53" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="534.66" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="535.37" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="537.51" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="538.22" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="540.36" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="541.07" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="541.78" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="543.21" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="543.92" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="546.06" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="546.77" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="548.90" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="549.62" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="551.75" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="552.47" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="553.18" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="554.60" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="555.31" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="557.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="558.16" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="560.30" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="561.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="563.15" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="563.86" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="564.57" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="566.00" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="566.71" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="568.84" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="569.56" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="571.69" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="572.40" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="574.54" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="575.25" y="390" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="575.96" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="577.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="578.10" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="578.81" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="580.24" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="580.95" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="581.66" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="583.09" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="583.80" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="584.51" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="585.93" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="586.65" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="587.36" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="588.78" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="589.49" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="591.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="592.34" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="594.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="595.19" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="597.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="598.04" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="598.75" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="600.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="600.89" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="603.02" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="603.74" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="605.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="606.59" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="608.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="609.43" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="610.15" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="611.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="612.28" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="614.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="615.13" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="617.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="617.98" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="620.12" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="620.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="622.96" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="623.68" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="625.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="626.52" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="628.66" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="629.37" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="631.51" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="632.22" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="634.36" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="635.07" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="637.21" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="637.92" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="640.05" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="640.77" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="642.90" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="643.62" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="645.75" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="646.46" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="648.60" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="649.31" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="651.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="652.16" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="654.30" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="655.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="657.15" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="657.86" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="659.99" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="660.71" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="662.84" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="663.55" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="665.69" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="666.40" y="390" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="669.25" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="671.39" y="390" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="674.24" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="674.95" y="390" width="2.85" height="16" fill="#f0883e"><title>mixed wait: 16 cycles</title></rect>
+<rect x="677.80" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="679.93" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="680.65" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="681.36" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="682.78" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="683.49" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="684.21" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="685.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="686.34" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="687.05" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="688.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="689.19" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="689.90" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="690.61" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="691.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="692.04" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="694.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="694.89" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="697.02" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="697.74" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="699.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="700.58" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="701.30" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="702.01" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="702.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="703.43" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="705.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="706.28" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="708.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="709.13" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="711.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="711.98" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="712.69" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="713.40" y="390" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="714.11" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="714.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="716.96" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="717.67" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="719.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="720.52" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="722.66" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="723.37" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="724.08" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="725.51" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="726.22" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="728.36" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="729.07" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="731.21" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="731.92" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="734.05" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="734.77" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="735.48" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="736.90" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="737.61" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="739.75" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="740.46" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="742.60" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="743.31" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="745.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="746.16" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="746.87" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="748.30" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="749.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="751.14" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="751.86" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="753.99" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="754.70" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="756.84" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="757.55" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="758.27" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="759.69" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="760.40" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="762.54" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="763.25" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="765.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="766.10" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="768.23" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="768.95" y="390" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="769.66" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="771.08" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="771.80" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="772.51" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="773.93" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="774.64" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="775.36" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="776.78" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="777.49" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="778.20" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="779.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="780.34" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="781.05" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="782.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="783.19" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="785.33" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="786.04" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="788.17" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="788.89" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="791.02" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="791.73" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="792.45" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="793.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="794.58" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="796.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="797.43" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="799.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="800.28" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="802.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="803.13" y="390" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="803.84" y="390" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="805.26" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="805.98" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="808.11" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="808.83" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="810.96" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="811.67" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="813.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="814.52" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="816.66" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="817.37" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="819.51" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="820.22" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="822.36" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="823.07" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="825.20" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="825.92" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="828.05" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="828.76" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="830.90" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="831.61" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="833.75" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="834.46" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="836.60" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="837.31" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="839.45" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="840.16" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="842.29" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="843.01" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="845.14" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="845.86" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="847.99" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="848.70" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="850.84" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="851.55" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="853.69" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="854.40" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="856.54" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="857.25" y="390" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="859.39" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="860.10" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="862.23" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="862.95" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="865.08" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="865.79" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="867.93" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="868.64" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="870.78" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="871.49" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="873.63" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="874.34" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="876.48" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="877.19" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="879.32" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="880.04" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="882.17" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="882.88" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="885.02" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="885.73" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="887.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="888.58" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="890.72" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="891.43" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="893.57" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="894.28" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="896.42" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="897.13" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="899.26" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="899.98" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="902.11" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="902.82" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="904.96" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="906.38" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="907.10" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="914.22" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="914.93" y="390" width="8.55" height="16" fill="#db6d28"><title>LDS stall/wait: 48 cycles</title></rect>
+<rect x="923.48" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="924.19" y="390" width="9.97" height="16" fill="#db6d28"><title>LDS stall/wait: 56 cycles</title></rect>
+<rect x="934.16" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="934.87" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="936.29" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="939.85" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="946.98" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="947.69" y="390" width="29.91" height="16" fill="#db6d28"><title>LDS stall/wait: 168 cycles</title></rect>
+<rect x="977.60" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="978.31" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="979.02" y="390" width="10.68" height="16" fill="#db6d28"><title>LDS stall/wait: 60 cycles</title></rect>
+<rect x="989.70" y="390" width="9.97" height="16" fill="#d29922"><title>VMEM stall/wait: 56 cycles</title></rect>
+<rect x="999.67" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1000.38" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1001.81" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1002.52" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="1009.64" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1010.35" y="390" width="13.53" height="16" fill="#db6d28"><title>LDS stall/wait: 76 cycles</title></rect>
+<rect x="1023.88" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1024.60" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1025.31" y="390" width="9.26" height="16" fill="#db6d28"><title>LDS stall/wait: 52 cycles</title></rect>
+<rect x="1034.56" y="390" width="2.14" height="16" fill="#d29922"><title>VMEM stall/wait: 12 cycles</title></rect>
+<rect x="1036.70" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1037.41" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1038.84" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1039.55" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="1046.67" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1047.38" y="390" width="6.41" height="16" fill="#1f6feb"><title>VALU issue: 36 cycles</title></rect>
+<rect x="1053.79" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1054.50" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1056.64" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1057.35" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1059.49" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1060.20" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1062.34" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1063.05" y="390" width="12.11" height="16" fill="#1f6feb"><title>VALU issue: 68 cycles</title></rect>
+<rect x="1075.16" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1075.87" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1078.00" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1078.72" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1080.85" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1081.56" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1083.70" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1084.41" y="390" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<rect x="1086.55" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1087.26" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1087.97" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1089.40" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1090.11" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1090.82" y="390" width="9.26" height="16" fill="#db6d28"><title>LDS stall/wait: 52 cycles</title></rect>
+<rect x="1100.08" y="390" width="1.42" height="16" fill="#d29922"><title>VMEM stall/wait: 8 cycles</title></rect>
+<rect x="1101.50" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1102.22" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1103.64" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1104.35" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="1111.47" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1112.19" y="390" width="8.55" height="16" fill="#db6d28"><title>LDS stall/wait: 48 cycles</title></rect>
+<rect x="1120.73" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1121.44" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1122.15" y="390" width="9.26" height="16" fill="#db6d28"><title>LDS stall/wait: 52 cycles</title></rect>
+<rect x="1131.41" y="390" width="75.48" height="16" fill="#d29922"><title>VMEM stall/wait: 424 cycles</title></rect>
+<rect x="1206.90" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1207.61" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1209.03" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1209.74" y="390" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1210.46" y="390" width="3.56" height="16" fill="#f78166"><title>LDS issue: 20 cycles</title></rect>
+<rect x="1214.02" y="390" width="6.41" height="16" fill="#db6d28"><title>LDS stall/wait: 36 cycles</title></rect>
+<rect x="1220.43" y="390" width="3.56" height="16" fill="#f78166"><title>LDS issue: 20 cycles</title></rect>
+<rect x="1223.99" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1224.70" y="390" width="14.95" height="16" fill="#db6d28"><title>LDS stall/wait: 84 cycles</title></rect>
+<rect x="1239.65" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1240.37" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1241.08" y="390" width="13.53" height="16" fill="#db6d28"><title>LDS stall/wait: 76 cycles</title></rect>
+<rect x="1254.61" y="390" width="2.85" height="16" fill="#d29922"><title>VMEM stall/wait: 16 cycles</title></rect>
+<rect x="1257.46" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1258.17" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1259.59" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1260.30" y="390" width="4.27" height="16" fill="#db6d28"><title>LDS stall/wait: 24 cycles</title></rect>
+<rect x="1264.58" y="390" width="3.56" height="16" fill="#f78166"><title>LDS issue: 20 cycles</title></rect>
+<rect x="1268.14" y="390" width="6.41" height="16" fill="#db6d28"><title>LDS stall/wait: 36 cycles</title></rect>
+<rect x="1274.55" y="390" width="3.56" height="16" fill="#f78166"><title>LDS issue: 20 cycles</title></rect>
+<rect x="1278.11" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1278.82" y="390" width="10.68" height="16" fill="#db6d28"><title>LDS stall/wait: 60 cycles</title></rect>
+<rect x="1289.50" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1290.21" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1290.93" y="390" width="11.39" height="16" fill="#db6d28"><title>LDS stall/wait: 64 cycles</title></rect>
+<rect x="1302.32" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1303.03" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1304.46" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1305.17" y="390" width="1.42" height="16" fill="#db6d28"><title>LDS stall/wait: 8 cycles</title></rect>
+<rect x="1306.59" y="390" width="7.12" height="16" fill="#f78166"><title>LDS issue: 40 cycles</title></rect>
+<rect x="1313.71" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1317.27" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1317.99" y="390" width="5.70" height="16" fill="#db6d28"><title>LDS stall/wait: 32 cycles</title></rect>
+<rect x="1323.68" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1324.39" y="390" width="1.42" height="16" fill="#6e7681"><title>other stall/issue: 8 cycles</title></rect>
+<rect x="1325.82" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1326.53" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1327.24" y="390" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="1327.95" y="390" width="7.83" height="16" fill="#db6d28"><title>LDS stall/wait: 44 cycles</title></rect>
+<rect x="1335.79" y="390" width="10.68" height="16" fill="#d29922"><title>VMEM stall/wait: 60 cycles</title></rect>
+<rect x="1346.47" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1347.18" y="390" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1347.89" y="390" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="1350.74" y="390" width="2.14" height="16" fill="#f78166"><title>LDS issue: 12 cycles</title></rect>
+<rect x="1352.88" y="390" width="1.42" height="16" fill="#1f6feb"><title>VALU issue: 8 cycles</title></rect>
+<rect x="1355.73" y="390" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="1358.58" y="390" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1359.29" y="390" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<text x="190" y="424" class="tiny">se0_sm1_sl0_wv12.json</text>
+<text x="40" y="464" class="label">slot 1 phase</text>
+<text x="40" y="492" class="small">MFMA execution</text>
+<text x="40" y="518" class="small">ATT stall / issue</text>
+<rect x="190.00" y="448" width="760.54" height="22" fill="#388bfd"><title>core1: 4272 cycles</title></rect>
+<rect x="950.54" y="448" width="56.26" height="22" fill="#484f58"><title>core1-&gt;2: 316 cycles</title></rect>
+<rect x="1006.79" y="448" width="325.44" height="22" fill="#58a6ff"><title>core2: 1828 cycles</title></rect>
+<rect x="1332.23" y="448" width="27.77" height="22" fill="#da3633"><title>tail: 156 cycles</title></rect>
+<rect x="212.79" y="478" width="2.85" height="16" fill="#238636"><title>MFMA execution: 16 cycles</title></rect>
+<rect x="249.82" y="478" width="8.55" height="16" fill="#238636"><title>MFMA execution: 48 cycles</title></rect>
+<rect x="472.00" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="491.94" y="478" width="2.85" height="16" fill="#238636"><title>MFMA execution: 16 cycles</title></rect>
+<rect x="668.54" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="862.23" y="478" width="88.30" height="16" fill="#238636"><title>MFMA execution: 496 cycles</title></rect>
+<rect x="1006.79" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1022.46" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1053.79" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1075.16" y="478" width="22.79" height="16" fill="#238636"><title>MFMA execution: 128 cycles</title></rect>
+<rect x="1107.91" y="478" width="11.39" height="16" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1218.29" y="478" width="113.94" height="16" fill="#238636"><title>MFMA execution: 640 cycles</title></rect>
+<rect x="190.00" y="504" width="4.27" height="16" fill="#d29922"><title>VMEM stall/wait: 24 cycles</title></rect>
+<rect x="194.27" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="194.98" y="504" width="17.80" height="16" fill="#8957e5"><title>MFMA ATT stall: 100 cycles</title></rect>
+<rect x="212.79" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="213.50" y="504" width="36.32" height="16" fill="#8957e5"><title>MFMA ATT stall: 204 cycles</title></rect>
+<rect x="249.82" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="250.53" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="252.67" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="253.38" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="255.51" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="256.23" y="504" width="126.76" height="16" fill="#d29922"><title>VMEM stall/wait: 712 cycles</title></rect>
+<rect x="382.98" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="383.69" y="504" width="88.30" height="16" fill="#8957e5"><title>MFMA ATT stall: 496 cycles</title></rect>
+<rect x="472.00" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="472.71" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="474.84" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="475.56" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="477.69" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="478.41" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="480.54" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="481.25" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="481.97" y="504" width="9.97" height="16" fill="#8957e5"><title>MFMA ATT stall: 56 cycles</title></rect>
+<rect x="491.94" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="492.65" y="504" width="175.89" height="16" fill="#8957e5"><title>MFMA ATT stall: 988 cycles</title></rect>
+<rect x="668.54" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="669.25" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="671.39" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="672.10" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="674.24" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="674.95" y="504" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="675.66" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="677.08" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="677.80" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="678.51" y="504" width="183.72" height="16" fill="#8957e5"><title>MFMA ATT stall: 1032 cycles</title></rect>
+<rect x="862.23" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="862.95" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="863.66" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="865.08" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="865.79" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="866.51" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="867.93" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="868.64" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="869.35" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="870.78" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="871.49" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="873.63" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="874.34" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="876.48" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="877.19" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="879.32" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="880.04" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="880.75" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="882.17" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="882.88" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="885.02" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="885.73" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="887.87" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="888.58" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="890.72" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="891.43" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="892.14" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="893.57" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="894.28" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="896.42" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="897.13" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="899.26" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="899.98" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="902.11" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="902.82" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="904.96" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="905.67" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="907.81" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="908.52" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="910.66" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="911.37" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="913.51" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="914.22" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="916.35" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="917.07" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="919.20" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="919.91" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="922.05" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="922.76" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="924.90" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="925.61" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="927.75" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="928.46" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="930.60" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="931.31" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="933.44" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="934.16" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="936.29" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="937.01" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="939.14" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="939.85" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="941.99" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="942.70" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="944.84" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="945.55" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="947.69" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="948.40" y="504" width="2.14" height="16" fill="#db6d28"><title>LDS stall/wait: 12 cycles</title></rect>
+<rect x="950.54" y="504" width="2.85" height="16" fill="#f78166"><title>LDS issue: 16 cycles</title></rect>
+<rect x="953.38" y="504" width="0.71" height="16" fill="#1f6feb"><title>VALU issue: 4 cycles</title></rect>
+<rect x="955.52" y="504" width="1.42" height="16" fill="#db6d28"><title>LDS stall/wait: 8 cycles</title></rect>
+<rect x="956.94" y="504" width="0.71" height="16" fill="#f78166"><title>LDS issue: 4 cycles</title></rect>
+<rect x="957.66" y="504" width="20.65" height="16" fill="#db6d28"><title>LDS stall/wait: 116 cycles</title></rect>
+<rect x="978.31" y="504" width="2.14" height="16" fill="#f78166"><title>LDS issue: 12 cycles</title></rect>
+<rect x="980.44" y="504" width="24.92" height="16" fill="#d29922"><title>VMEM stall/wait: 140 cycles</title></rect>
+<rect x="1005.37" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1006.08" y="504" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="1006.79" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1007.50" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1008.22" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1009.64" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1010.35" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1011.07" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1012.49" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1013.20" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1013.91" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1015.34" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1016.05" y="504" width="4.98" height="16" fill="#d29922"><title>VMEM stall/wait: 28 cycles</title></rect>
+<rect x="1021.03" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1021.75" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1022.46" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1023.17" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1025.31" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1026.02" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1028.16" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1028.87" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1031.00" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1031.72" y="504" width="20.65" height="16" fill="#d29922"><title>VMEM stall/wait: 116 cycles</title></rect>
+<rect x="1052.37" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1053.08" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1053.79" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1054.50" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1056.64" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1057.35" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1059.49" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1060.20" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1062.34" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1063.05" y="504" width="10.68" height="16" fill="#d29922"><title>VMEM stall/wait: 60 cycles</title></rect>
+<rect x="1073.73" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1074.44" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1075.16" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1075.87" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1078.00" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1078.72" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1080.85" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1081.56" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1083.70" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1084.41" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1085.12" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1085.84" y="504" width="0.71" height="16" fill="#8957e5"><title>MFMA ATT stall: 4 cycles</title></rect>
+<rect x="1086.55" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1087.26" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1089.40" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1090.11" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1092.25" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1092.96" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1095.09" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1095.81" y="504" width="11.39" height="16" fill="#d29922"><title>VMEM stall/wait: 64 cycles</title></rect>
+<rect x="1107.20" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1107.91" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1108.62" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1110.76" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1111.47" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1113.61" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1114.32" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1116.46" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1117.17" y="504" width="100.41" height="16" fill="#d29922"><title>VMEM stall/wait: 564 cycles</title></rect>
+<rect x="1217.58" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1218.29" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1219.00" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1221.14" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1221.85" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1223.99" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1224.70" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1226.84" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1227.55" y="504" width="0.71" height="16" fill="#e3b341"><title>VMEM issue: 4 cycles</title></rect>
+<rect x="1228.26" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1229.68" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1230.40" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1232.53" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1233.24" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1235.38" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1236.09" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1238.23" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1238.94" y="504" width="0.71" height="16" fill="#f0883e"><title>mixed wait: 4 cycles</title></rect>
+<rect x="1239.65" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1241.08" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1241.79" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1242.50" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1243.93" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1244.64" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1245.35" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1246.77" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1247.49" y="504" width="0.71" height="16" fill="#db6d28"><title>LDS stall/wait: 4 cycles</title></rect>
+<rect x="1248.20" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1249.62" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1250.33" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1251.05" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1252.47" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1253.18" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1255.32" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1256.03" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1258.17" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1258.88" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1261.02" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1261.73" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1262.44" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1263.86" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1264.58" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1266.71" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1267.43" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1269.56" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1270.27" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1272.41" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1273.12" y="504" width="0.71" height="16" fill="#d29922"><title>VMEM stall/wait: 4 cycles</title></rect>
+<rect x="1273.83" y="504" width="1.42" height="16" fill="#8957e5"><title>MFMA ATT stall: 8 cycles</title></rect>
+<rect x="1275.26" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1275.97" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1278.11" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1278.82" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1280.96" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1281.67" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1283.80" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1284.52" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1286.65" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1287.36" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1289.50" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1290.21" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1292.35" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1293.06" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1295.20" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1295.91" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1298.05" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1298.76" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1300.89" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1301.61" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1303.74" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1304.46" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1306.59" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1307.30" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1309.44" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1310.15" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1312.29" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1313.00" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1315.14" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1315.85" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1317.99" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1318.70" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1320.83" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1321.55" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1323.68" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1324.39" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1326.53" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1327.24" y="504" width="2.14" height="16" fill="#8957e5"><title>MFMA ATT stall: 12 cycles</title></rect>
+<rect x="1329.38" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1330.09" y="504" width="17.80" height="16" fill="#1f6feb"><title>VALU issue: 100 cycles</title></rect>
+<rect x="1347.89" y="504" width="0.71" height="16" fill="#6e7681"><title>other stall/issue: 4 cycles</title></rect>
+<rect x="1348.61" y="504" width="4.98" height="16" fill="#1f6feb"><title>VALU issue: 28 cycles</title></rect>
+<rect x="1354.30" y="504" width="2.85" height="16" fill="#1f6feb"><title>VALU issue: 16 cycles</title></rect>
+<rect x="1357.86" y="504" width="2.14" height="16" fill="#1f6feb"><title>VALU issue: 12 cycles</title></rect>
+<text x="190" y="538" class="tiny">se0_sm1_sl1_wv12.json</text>
+<text x="40" y="600" class="label">physical union</text>
+<rect x="190.00" y="582" width="68.36" height="28" fill="#238636"><title>MFMA execution: 384 cycles</title></rect>
+<rect x="258.36" y="582" width="69.07" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 388 cycles</title></rect>
+<rect x="327.44" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="338.83" y="582" width="8.55" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 48 cycles</title></rect>
+<rect x="347.38" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="358.77" y="582" width="10.68" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 60 cycles</title></rect>
+<rect x="369.45" y="582" width="581.08" height="28" fill="#238636"><title>MFMA execution: 3264 cycles</title></rect>
+<rect x="950.54" y="582" width="4.98" height="28" fill="#6e7681"><title>scheduler/other: 28 cycles</title></rect>
+<rect x="955.52" y="582" width="1.42" height="28" fill="#db6d28"><title>LDS stall/wait candidate: 8 cycles</title></rect>
+<rect x="956.94" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="957.66" y="582" width="20.65" height="28" fill="#db6d28"><title>LDS stall/wait candidate: 116 cycles</title></rect>
+<rect x="978.31" y="582" width="2.14" height="28" fill="#6e7681"><title>scheduler/other: 12 cycles</title></rect>
+<rect x="980.44" y="582" width="24.92" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 140 cycles</title></rect>
+<rect x="1005.37" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1006.08" y="582" width="0.71" height="28" fill="#f0883e"><title>mixed vmcnt/lgkmcnt wait candidate: 4 cycles</title></rect>
+<rect x="1006.79" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1018.19" y="582" width="2.85" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 16 cycles</title></rect>
+<rect x="1021.03" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1021.75" y="582" width="0.71" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 4 cycles</title></rect>
+<rect x="1022.46" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1033.85" y="582" width="18.51" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 104 cycles</title></rect>
+<rect x="1052.37" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1053.08" y="582" width="0.71" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 4 cycles</title></rect>
+<rect x="1053.79" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1065.19" y="582" width="8.55" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 48 cycles</title></rect>
+<rect x="1073.73" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1074.44" y="582" width="0.71" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 4 cycles</title></rect>
+<rect x="1075.16" y="582" width="22.79" height="28" fill="#238636"><title>MFMA execution: 128 cycles</title></rect>
+<rect x="1097.94" y="582" width="9.26" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 52 cycles</title></rect>
+<rect x="1107.20" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1107.91" y="582" width="11.39" height="28" fill="#238636"><title>MFMA execution: 64 cycles</title></rect>
+<rect x="1119.31" y="582" width="98.27" height="28" fill="#d29922"><title>VMEM stall/wait candidate: 552 cycles</title></rect>
+<rect x="1217.58" y="582" width="0.71" height="28" fill="#6e7681"><title>scheduler/other: 4 cycles</title></rect>
+<rect x="1218.29" y="582" width="113.94" height="28" fill="#238636"><title>MFMA execution: 640 cycles</title></rect>
+<rect x="1332.23" y="582" width="27.77" height="28" fill="#da3633"><title>structural tail: 156 cycles</title></rect>
+<text x="190" y="638" class="small">Any-slot MFMA execution: 4,800 / 6,572 cycles = 73.04%. Idle colors use the same conservative two-wave classifier as the overview.</text>
+<rect x="40.00" y="653" width="14" height="14" fill="#1f6feb"/>
+<text x="60.00" y="666" class="small">phase core0</text>
+<rect x="370.00" y="653" width="14" height="14" fill="#388bfd"/>
+<text x="390.00" y="666" class="small">phase core1</text>
+<rect x="700.00" y="653" width="14" height="14" fill="#58a6ff"/>
+<text x="720.00" y="666" class="small">phase core2</text>
+<rect x="1030.00" y="653" width="14" height="14" fill="#da3633"/>
+<text x="1050.00" y="666" class="small">phase tail</text>
+<rect x="40.00" y="685" width="14" height="14" fill="#d29922"/>
+<text x="60.00" y="698" class="small">VMEM stall/wait</text>
+<rect x="370.00" y="685" width="14" height="14" fill="#e3b341"/>
+<text x="390.00" y="698" class="small">VMEM issue</text>
+<rect x="700.00" y="685" width="14" height="14" fill="#db6d28"/>
+<text x="720.00" y="698" class="small">LDS stall/wait</text>
+<rect x="1030.00" y="685" width="14" height="14" fill="#f78166"/>
+<text x="1050.00" y="698" class="small">LDS issue</text>
+<rect x="40.00" y="717" width="14" height="14" fill="#f0883e"/>
+<text x="60.00" y="730" class="small">mixed wait</text>
+<rect x="370.00" y="717" width="14" height="14" fill="#8957e5"/>
+<text x="390.00" y="730" class="small">MFMA ATT stall</text>
+<rect x="700.00" y="717" width="14" height="14" fill="#1f6feb"/>
+<text x="720.00" y="730" class="small">VALU issue</text>
+<rect x="1030.00" y="717" width="14" height="14" fill="#6e7681"/>
+<text x="1050.00" y="730" class="small">other stall/issue</text>
+<rect x="40.00" y="749" width="14" height="14" fill="#d29922"/>
+<text x="60.00" y="762" class="small">VMEM stall/wait candidate</text>
+<rect x="304.00" y="749" width="14" height="14" fill="#db6d28"/>
+<text x="324.00" y="762" class="small">LDS stall/wait candidate</text>
+<rect x="568.00" y="749" width="14" height="14" fill="#f0883e"/>
+<text x="588.00" y="762" class="small">mixed vmcnt/lgkmcnt wait candidate</text>
+<rect x="832.00" y="749" width="14" height="14" fill="#da3633"/>
+<text x="852.00" y="762" class="small">structural tail</text>
+<rect x="1096.00" y="749" width="14" height="14" fill="#6e7681"/>
+<text x="1116.00" y="762" class="small">scheduler/other</text>
+<text x="40" y="806" class="small">Reading rule: a wave can issue VMEM/LDS/VALU while an earlier MFMA remains in its 16-cycle execution window, so the MFMA and ATT-event rows are intentionally separate.</text>
+<text x="40" y="828" class="small">An idle physical segment means neither resident slot executes MFMA. Its color describes the observed two-wave blockers; it is not a claim that every colored cycle is locally removable.</text>
+<text x="40" y="850" class="tiny">The anchor excludes N0/N1 and the final two N blocks; both wave files cover the full window with no slot replacement, prologue, drain, or incomplete stitching.</text>
+</svg>

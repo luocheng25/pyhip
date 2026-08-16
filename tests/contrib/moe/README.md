@@ -92,12 +92,19 @@ ATT稳态trace：
 
 ### MFMA stall解释
 
-`v_mfma_f32_16x16x32_fp8_fp8`的issue间隔约4 cycles，同一accumulator的RAW延迟约
-16 cycles，所以连续依赖MFMA在准备发射时理论上还需要等待约`16-4=12` cycles。
 ATT的`stall_cycles`记录的是“该条MFMA准备发射但被阻塞”的周期，不是相邻两条MFMA的
-总间隔。当前静态MFMA的stall/exec中位数为gateup 11.90、down 11.83 cycles，说明典型
-accumulator链已经接近12-cycle RAW下限；但按动态执行加权的均值为16.73和13.91 cycles，
-其中还包含操作数未就绪、pipeline争用和wave调度，不能解释成“MFMA总延迟接近16所以已最优”。
+总间隔，也不携带“accumulator RAW”“A/B operand未ready”或“issue port冲突”的根因编码。
+历史trace中静态MFMA的stall/exec中位数为gateup 11.90、down 11.83 cycles；仅凭它接近
+`16-cycle execution - 4-cycle issue cadence = 12 cycles`，不能推出accumulator链已到RAW下限。
+
+Control K128现在由[`analyze_down_stall_exposure.py`](analyze_down_stall_exposure.py)直接解析动态
+MFMA操作数和waitcnt：N2--N13的`534,528`个相邻MFMA对中背靠背accumulator RAW为0，accumulator
+最短复用issue距离为256 cycles；全部A/VMEM与B/DS producer边分别被有效`vmcnt`/`lgkmcnt`覆盖。
+原先称为MFMA dependency的`2,991,620` wave-cycles全部被同physical SIMD的peer MFMA execution
+window覆盖，physical暴露为0。合并两wave的成功MFMA issue最小间隔为16 cycles，低于16 cycles的
+间隔为0；ATT的4-cycle `issue_cost`不是硬件initiation interval。因此改称
+`mfma_issue_unavailable`：它是跨wave priority/仲裁候选，只有优先级消融同时改善physical union和
+墙钟时才说明原调度不佳，不能把single-wave比例直接当性能差距。
 
 gfx942每条MFMA提供约12-cycle shadow，可以隐藏3条独立的普通4-cycle scalar VALU；依据
 [`mfma-valu-coissue.md`](../../flydsl/attn_4wave/tools/mfma-valu-coissue.md)，
@@ -181,9 +188,9 @@ MFMA链之后，且`v_pk_mul_f32`不能利用MFMA的12-cycle scalar VALU shadow�
 
 - 每条weight load包含两个K-step的wave operand，支持`2 K-step x 4 token-tile = 8`条MFMA。
     每个输出块是6条weight load对48条MFMA。
-- 48条MFMA按4-cycle issue间隔提供约192 cycles的同wave计算窗口。当前scheduler按
+- 48条MFMA按约16-cycle physical initiation interval提供约768 cycles的同wave计算窗口。当前scheduler按
     `6 MFMA + 1 memory group`排布，最早发出的weight load可获得接近整个窗口，最后几条load
-    只有约24 cycles到下一次消费。
+    只有约96 cycles到下一次消费。ATT中的4-cycle `issue_cost`不能用于计算MFMA initiation interval。
 - 因此L2 hit通常可大部分遮盖，但300--500 cycle量级的HBM miss无法保证全部遮盖；2 wave/SIMD
     只能提供额外独立工作，不能消除同wave最后一批load到consumer的短距离。ATT中VMEM
     load+wait仍占down总stall的13.2%，说明weight/global读取是**大部分但未完全遮盖**。
@@ -965,7 +972,7 @@ bank-conflict计数下降。
 |---|---:|---:|---|
 | 架构dense MFMA | 585.98 | 69.59% | 16 cycles/MFMA，不含搬运和后处理 |
 | 微基准dense MFMA | 535.73 | 76.11% | 17.500793 cycles/MFMA |
-| 架构MFMA + 后处理0%遮盖 | 484.95 | 84.08% | 192 MFMA，加64 MUL、64 FMA和32 PERM；均按名义4-cycle issue |
+| 架构MFMA + 后处理0%遮盖 | 484.95 | 84.08% | 192 MFMA按16 cycles/inst，加64 MUL、64 FMA和32 PERM按名义4-cycle issue |
 | 微基准MFMA + 后处理0%遮盖 | 450.02 | 90.61% | 单wave操作计数敏感性点，不是roof或硬件上限 |
 | 全部6.09375GiB均走HBM | 500.97 | 81.39% | 极保守假设；PMC证明实际HBM字节远少于该值 |
 
@@ -1645,6 +1652,14 @@ MFMA stall/MFMA降低6.7%、LDS-wait降低5.5%和总stall/MFMA降低0.8%，方�
 恰好只有一个处于MFMA的双活时间中位占比为control 58.01%、v1 58.27%，基本不变；至少一个slot
 处于MFMA反而从60.05%降到58.86%。但单wave中位时长从140,912降到137,172 cycles。因此收益来自
 单wave内部VMEM/MFMA交织和operand-ready改善，不是更高的双wave反相比例。
+
+> **2026-08-15更正：上段raw-wave相位比例作废。** 旧临时脚本把gfx9 ATT的
+> `first_attempt`误当successful issue，并使用了错误的`code[pc_index - 1]`。ROCm SDK明确定义
+> `successful_issue = first_attempt + stall`；按正确口径重采无context-save trace并合并同物理
+> SIMD的两个resident slot后，`VECTOR,F8`下K128 sched-group Control的steady MFMA busy为
+> `73.08%`，`9aa595d` setprio对照为`78.22%`。Control新增空槽几乎全部来自两slot同时进入VMEM
+> stall/wait，而结构tail逐字相同。完整模型、PMC反证、图形和复现命令见
+> [`CONTROL_K128_MFMA_SLOT_ANALYSIS.md`](CONTROL_K128_MFMA_SLOT_ANALYSIS.md)。
 
 最终ISA保持192条MFMA、38条buffer load、32条DS read、8条store；`setprio`从12降到0，机器
 指令从793降到765。资源保持next-free VGPR 190、accum offset 192、28,672B LDS、0 scratch和

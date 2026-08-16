@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="464" viewBox="0 0 1200 464">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#e6edf3}.label{font-size:18px;font-weight:600}.small{font-size:14px;fill:#b1bac4}.legend{font-size:13px;fill:#d0d7de}</style>
+<text x="40" y="42" class="label">Physical SIMD MFMA execution slots (two resident waves)</text>
+<text x="40" y="66" class="small">Steady N-loop only. Green = 16-cycle MFMA execution; other colors classify uncovered physical cycles. ATT issue = first_attempt + stall.</text>
+<text x="40" y="120" class="label">Control K128</text>
+<text x="40" y="145" class="small">steady busy 73.08%; idle 26.92%; lifecycle busy 69.45%</text>
+<rect x="40.00" y="150" width="818.54" height="30" fill="#238636"><title>busy: 73.08%</title></rect>
+<rect x="858.54" y="150" width="139.50" height="30" fill="#d29922"><title>VMEM stall/wait candidate: 12.46%</title></rect>
+<rect x="998.04" y="150" width="132.56" height="30" fill="#da3633"><title>structural tail: 11.84%</title></rect>
+<rect x="1130.60" y="150" width="14.96" height="30" fill="#db6d28"><title>LDS stall/wait candidate: 1.34%</title></rect>
+<rect x="1145.56" y="150" width="5.21" height="30" fill="#f78166"><title>LDS issue scheduling: 0.47%</title></rect>
+<rect x="1150.77" y="150" width="4.31" height="30" fill="#f0883e"><title>mixed vmcnt/lgkmcnt wait candidate: 0.39%</title></rect>
+<rect x="1155.08" y="150" width="2.48" height="30" fill="#e3b341"><title>VMEM issue scheduling: 0.22%</title></rect>
+<rect x="1157.56" y="150" width="1.59" height="30" fill="#58a6ff"><title>scheduler/ready candidate: 0.14%</title></rect>
+<rect x="1159.16" y="150" width="0.83" height="30" fill="#1f6feb"><title>VALU issue scheduling: 0.07%</title></rect>
+<rect x="1159.99" y="150" width="0.01" height="30" fill="#8957e5"><title>VALU dependency stall: 0.00%</title></rect>
+<rect x="40.00" y="196" width="14" height="14" fill="#238636"/>
+<text x="60.00" y="208" class="legend">busy 73.1%</text>
+<rect x="413.33" y="196" width="14" height="14" fill="#d29922"/>
+<text x="433.33" y="208" class="legend">VMEM stall/wait candidate 12.5%</text>
+<rect x="786.67" y="196" width="14" height="14" fill="#da3633"/>
+<text x="806.67" y="208" class="legend">structural tail 11.8%</text>
+<rect x="40.00" y="220" width="14" height="14" fill="#db6d28"/>
+<text x="60.00" y="232" class="legend">LDS stall/wait candidate 1.3%</text>
+<rect x="413.33" y="220" width="14" height="14" fill="#f78166"/>
+<text x="433.33" y="232" class="legend">LDS issue scheduling 0.5%</text>
+<rect x="786.67" y="220" width="14" height="14" fill="#f0883e"/>
+<text x="806.67" y="232" class="legend">mixed vmcnt/lgkmcnt wait candidate 0.4%</text>
+<rect x="40.00" y="244" width="14" height="14" fill="#e3b341"/>
+<text x="60.00" y="256" class="legend">VMEM issue scheduling 0.2%</text>
+<rect x="413.33" y="244" width="14" height="14" fill="#58a6ff"/>
+<text x="433.33" y="256" class="legend">scheduler/ready candidate 0.1%</text>
+<rect x="786.67" y="244" width="14" height="14" fill="#1f6feb"/>
+<text x="806.67" y="256" class="legend">VALU issue scheduling 0.1%</text>
+<text x="40" y="304" class="label">9aa595d</text>
+<text x="40" y="329" class="small">steady busy 78.22%; idle 21.78%; lifecycle busy 73.24%</text>
+<rect x="40.00" y="334" width="876.11" height="30" fill="#238636"><title>busy: 78.22%</title></rect>
+<rect x="916.11" y="334" width="145.30" height="30" fill="#da3633"><title>structural tail: 12.97%</title></rect>
+<rect x="1061.41" y="334" width="44.80" height="30" fill="#d29922"><title>VMEM stall/wait candidate: 4.00%</title></rect>
+<rect x="1106.21" y="334" width="15.37" height="30" fill="#db6d28"><title>LDS stall/wait candidate: 1.37%</title></rect>
+<rect x="1121.58" y="334" width="9.11" height="30" fill="#e3b341"><title>VMEM issue scheduling: 0.81%</title></rect>
+<rect x="1130.69" y="334" width="8.27" height="30" fill="#f78166"><title>LDS issue scheduling: 0.74%</title></rect>
+<rect x="1138.96" y="334" width="7.91" height="30" fill="#f0883e"><title>mixed vmcnt/lgkmcnt wait candidate: 0.71%</title></rect>
+<rect x="1146.87" y="334" width="7.02" height="30" fill="#bc8cff"><title>other core exposure: 0.63%</title></rect>
+<rect x="1153.89" y="334" width="4.30" height="30" fill="#58a6ff"><title>scheduler/ready candidate: 0.38%</title></rect>
+<rect x="1158.19" y="334" width="1.14" height="30" fill="#1f6feb"><title>VALU issue scheduling: 0.10%</title></rect>
+<rect x="1159.33" y="334" width="0.67" height="30" fill="#58a6ff"><title>other issue scheduling: 0.06%</title></rect>
+<rect x="40.00" y="380" width="14" height="14" fill="#238636"/>
+<text x="60.00" y="392" class="legend">busy 78.2%</text>
+<rect x="413.33" y="380" width="14" height="14" fill="#da3633"/>
+<text x="433.33" y="392" class="legend">structural tail 13.0%</text>
+<rect x="786.67" y="380" width="14" height="14" fill="#d29922"/>
+<text x="806.67" y="392" class="legend">VMEM stall/wait candidate 4.0%</text>
+<rect x="40.00" y="404" width="14" height="14" fill="#db6d28"/>
+<text x="60.00" y="416" class="legend">LDS stall/wait candidate 1.4%</text>
+<rect x="413.33" y="404" width="14" height="14" fill="#e3b341"/>
+<text x="433.33" y="416" class="legend">VMEM issue scheduling 0.8%</text>
+<rect x="786.67" y="404" width="14" height="14" fill="#f78166"/>
+<text x="806.67" y="416" class="legend">LDS issue scheduling 0.7%</text>
+<rect x="40.00" y="428" width="14" height="14" fill="#f0883e"/>
+<text x="60.00" y="440" class="legend">mixed vmcnt/lgkmcnt wait candidate 0.7%</text>
+<rect x="413.33" y="428" width="14" height="14" fill="#bc8cff"/>
+<text x="433.33" y="440" class="legend">other core exposure 0.6%</text>
+<rect x="786.67" y="428" width="14" height="14" fill="#58a6ff"/>
+<text x="806.67" y="440" class="legend">scheduler/ready candidate 0.4%</text>
+</svg>

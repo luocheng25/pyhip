@@ -1,0 +1,1142 @@
+{
+  "config": {
+    "blocks": 160,
+    "blocks_per_cu": 2,
+    "busy_limits": {
+      "gpu_busy_percent": 5,
+      "vram_allocated_percent": 20
+    },
+    "data_bytes": 805306368,
+    "expected_resources": {
+      "agpr": 128,
+      "scratch_bytes_per_lane": 0,
+      "vgpr": 64
+    },
+    "expected_waves_per_simd": 2,
+    "lds_bytes_per_block": 28672,
+    "samples_per_metric": 40960,
+    "samples_per_wave": 64,
+    "threads": 256,
+    "waves_per_block": 4
+  },
+  "created_utc": "2026-08-15T11:50:05.019105+00:00",
+  "device": {
+    "gcn_arch": "gfx942:sramecc+:xnack-",
+    "name": "AMD Instinct MI308X",
+    "num_cu": 80,
+    "physical_device": 4,
+    "pyhip_arch": "gfx942",
+    "pyhip_gfx": 942
+  },
+  "formal_result": true,
+  "full_raw_artifact": {
+    "bytes": 24153714,
+    "path": "/tmp/control-k128-two-wave-hardware-distributions-20260815.json",
+    "sha256": "04d85607f57c92adedb50b36a15e23674962b8f3b0338d47cf52b0eb1911a22e"
+  },
+  "invalidity_reasons": [],
+  "mapping_validation": {
+    "overlap_fraction_min": 0.9998371758782326,
+    "overlap_fraction_p50": 0.9998635617729922,
+    "overlap_fraction_p95": 1.0,
+    "physical_simds": 320,
+    "waves_per_physical_simd": 2
+  },
+  "observed_resources": {
+    "agpr": 128,
+    "lds_bytes_per_block": 28672,
+    "path": "/tmp/control-k128-two-wave-hardware-distributions-20260815.stderr",
+    "scratch_bytes_per_lane": 0,
+    "sha256": "03c463c0d37653351c7d902dff840e8eed912e3db90f97856117c15e633c7c2c",
+    "vgpr": 64
+  },
+  "postprocess": {
+    "note": "Summary recomputed from unchanged raw arrays with fixed-P50 timer correction and resident-pair statistics"
+  },
+  "results": {
+    "lds_read_burst8": {
+      "definition": "eight balanced ds_read_b128 requests plus lgkmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 4724.0,
+        "mean": 343.17734375,
+        "min": 36.0,
+        "p50": 180.0,
+        "p90": 856.0,
+        "p95": 1332.0,
+        "p99": 2144.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 4728.0,
+        "mean": 347.17734375,
+        "min": 40.0,
+        "p50": 184.0,
+        "p90": 860.0,
+        "p95": 1336.0,
+        "p99": 2148.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.062109375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 4724.0,
+          "mean": 497.8857421875,
+          "min": 36.0,
+          "p50": 260.0,
+          "p90": 1308.0,
+          "p95": 1700.0,
+          "p99": 2476.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 2596.0,
+          "mean": 188.4689453125,
+          "min": 36.0,
+          "p50": 172.0,
+          "p90": 240.0,
+          "p95": 292.0,
+          "p99": 928.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.037255859375,
+        "pearson_correlation": 0.02361420315527267,
+        "skew_cycles": {
+          "max": 4272.0,
+          "mean": 309.416796875,
+          "min": 0.0,
+          "p50": 104.0,
+          "p90": 1048.0,
+          "p95": 1440.0,
+          "p99": 2220.0,
+          "samples": 20480
+        }
+      }
+    },
+    "lds_read_service_interval": {
+      "definition": "paired same-wave same-sample (lds_read_burst8 - lds_read_single) / 7; negative values are retained",
+      "max": 570.8571428571429,
+      "mean": 25.679813058035712,
+      "min": -580.0,
+      "negative_fraction": 0.114404296875,
+      "p50": 16.571428571428573,
+      "p90": 98.85714285714286,
+      "p95": 170.85714285714286,
+      "p99": 285.14285714285717,
+      "samples": 40960
+    },
+    "lds_read_single": {
+      "definition": "one balanced ds_read_b128 plus lgkmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 4260.0,
+        "mean": 163.41865234375,
+        "min": 36.0,
+        "p50": 64.0,
+        "p90": 420.0,
+        "p95": 880.0,
+        "p99": 1728.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 4264.0,
+        "mean": 167.41865234375,
+        "min": 40.0,
+        "p50": 68.0,
+        "p90": 424.0,
+        "p95": 884.0,
+        "p99": 1732.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.051318359375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 4260.0,
+          "mean": 261.3767578125,
+          "min": 36.0,
+          "p50": 68.0,
+          "p90": 860.0,
+          "p95": 1252.0,
+          "p99": 2088.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 2616.0,
+          "mean": 65.460546875,
+          "min": 36.0,
+          "p50": 60.0,
+          "p90": 64.0,
+          "p95": 76.0,
+          "p99": 444.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.06572265625,
+        "pearson_correlation": 0.0115176730229991,
+        "skew_cycles": {
+          "max": 4196.0,
+          "mean": 195.9162109375,
+          "min": 0.0,
+          "p50": 16.0,
+          "p90": 756.0,
+          "p95": 1152.0,
+          "p99": 1952.0,
+          "samples": 20480
+        }
+      }
+    },
+    "lds_read_wait_after_burst8": {
+      "definition": "lgkmcnt(0) timed after issuing eight ds_read_b128 requests",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 3852.0,
+        "mean": 223.74970703125,
+        "min": 36.0,
+        "p50": 136.0,
+        "p90": 392.0,
+        "p95": 964.0,
+        "p99": 1765.6399999999849,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 3856.0,
+        "mean": 227.74970703125,
+        "min": 40.0,
+        "p50": 140.0,
+        "p90": 396.0,
+        "p95": 968.0,
+        "p99": 1769.6399999999849,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.059228515625,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 3852.0,
+          "mean": 321.0876953125,
+          "min": 36.0,
+          "p50": 148.0,
+          "p90": 944.0,
+          "p95": 1320.0,
+          "p99": 2048.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 2064.0,
+          "mean": 126.41171875,
+          "min": 36.0,
+          "p50": 132.0,
+          "p90": 148.0,
+          "p95": 156.0,
+          "p99": 512.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.0759765625,
+        "pearson_correlation": 0.023995010853202575,
+        "skew_cycles": {
+          "max": 3692.0,
+          "mean": 194.6759765625,
+          "min": 0.0,
+          "p50": 20.0,
+          "p90": 764.0,
+          "p95": 1152.0,
+          "p99": 1860.0,
+          "samples": 20480
+        }
+      }
+    },
+    "lds_write_burst8": {
+      "definition": "eight balanced ds_write_b128 requests plus lgkmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 5684.0,
+        "mean": 449.769921875,
+        "min": 36.0,
+        "p50": 256.0,
+        "p90": 1076.0,
+        "p95": 1528.0,
+        "p99": 2365.639999999985,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 5688.0,
+        "mean": 453.769921875,
+        "min": 40.0,
+        "p50": 260.0,
+        "p90": 1080.0,
+        "p95": 1532.0,
+        "p99": 2369.639999999985,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.06845703125,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 5684.0,
+          "mean": 627.0095703125,
+          "min": 36.0,
+          "p50": 356.0,
+          "p90": 1512.0,
+          "p95": 1928.0,
+          "p99": 2676.8399999999965,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 2896.0,
+          "mean": 272.5302734375,
+          "min": 36.0,
+          "p50": 252.0,
+          "p90": 352.0,
+          "p95": 404.0,
+          "p99": 1120.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.065283203125,
+        "pearson_correlation": 0.01714444429122455,
+        "skew_cycles": {
+          "max": 4956.0,
+          "mean": 354.479296875,
+          "min": 0.0,
+          "p50": 108.0,
+          "p90": 1164.0,
+          "p95": 1592.0,
+          "p99": 2320.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "lds_write_service_interval": {
+      "definition": "paired same-wave same-sample (lds_write_burst8 - lds_write_single) / 7; negative values are retained",
+      "max": 801.1428571428571,
+      "mean": 43.3189453125,
+      "min": -784.5714285714286,
+      "negative_fraction": 0.0738525390625,
+      "p50": 26.285714285714285,
+      "p90": 133.14285714285714,
+      "p95": 198.85714285714286,
+      "p99": 314.85714285714283,
+      "samples": 40960
+    },
+    "lds_write_single": {
+      "definition": "one balanced ds_write_b128 plus lgkmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 5532.0,
+        "mean": 146.5373046875,
+        "min": 36.0,
+        "p50": 76.0,
+        "p90": 136.0,
+        "p95": 684.0,
+        "p99": 1516.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 5536.0,
+        "mean": 150.5373046875,
+        "min": 40.0,
+        "p50": 80.0,
+        "p90": 140.0,
+        "p95": 688.0,
+        "p99": 1520.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.049609375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 5532.0,
+          "mean": 217.021875,
+          "min": 36.0,
+          "p50": 76.0,
+          "p90": 656.0,
+          "p95": 1104.0,
+          "p99": 1812.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 1620.0,
+          "mean": 76.052734375,
+          "min": 36.0,
+          "p50": 72.0,
+          "p90": 76.0,
+          "p95": 80.0,
+          "p99": 172.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.025390625,
+        "pearson_correlation": 0.013714429608859243,
+        "skew_cycles": {
+          "max": 5448.0,
+          "mean": 140.969140625,
+          "min": 0.0,
+          "p50": 4.0,
+          "p90": 548.0,
+          "p95": 996.0,
+          "p99": 1688.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "lds_write_wait_after_burst8": {
+      "definition": "lgkmcnt(0) timed after issuing eight ds_write_b128 requests",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 3688.0,
+        "mean": 161.28212890625,
+        "min": 36.0,
+        "p50": 48.0,
+        "p90": 508.0,
+        "p95": 912.0,
+        "p99": 1624.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 3692.0,
+        "mean": 165.28212890625,
+        "min": 40.0,
+        "p50": 52.0,
+        "p90": 512.0,
+        "p95": 916.0,
+        "p99": 1628.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.04306640625,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 3688.0,
+          "mean": 264.3009765625,
+          "min": 36.0,
+          "p50": 52.0,
+          "p90": 896.0,
+          "p95": 1228.0,
+          "p99": 1900.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 1624.0,
+          "mean": 58.26328125,
+          "min": 36.0,
+          "p50": 48.0,
+          "p90": 52.0,
+          "p95": 52.0,
+          "p99": 520.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.058154296875,
+        "pearson_correlation": 0.005739431867592408,
+        "skew_cycles": {
+          "max": 3636.0,
+          "mean": 206.0376953125,
+          "min": 0.0,
+          "p50": 8.0,
+          "p90": 800.0,
+          "p95": 1132.0,
+          "p99": 1784.0,
+          "samples": 20480
+        }
+      }
+    },
+    "mfma_dependent64": {
+      "definition": "64 FP8 MFMAs on one dependent accumulator chain",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 6436.0,
+        "mean": 1475.891796875,
+        "min": 0.0,
+        "p50": 1140.0,
+        "p90": 2564.0,
+        "p95": 2916.0,
+        "p99": 3716.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 6440.0,
+        "mean": 1479.891796875,
+        "min": 4.0,
+        "p50": 1144.0,
+        "p90": 2568.0,
+        "p95": 2920.0,
+        "p99": 3720.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.061865234375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 6436.0,
+          "mean": 1875.774609375,
+          "min": 8.0,
+          "p50": 1792.0,
+          "p90": 2900.0,
+          "p95": 3248.0,
+          "p99": 4036.8399999999965,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4232.0,
+          "mean": 1076.008984375,
+          "min": 0.0,
+          "p50": 1012.0,
+          "p90": 1712.0,
+          "p95": 2004.0,
+          "p99": 2524.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.063671875,
+        "pearson_correlation": -0.00900847750117589,
+        "skew_cycles": {
+          "max": 4972.0,
+          "mean": 799.765625,
+          "min": 0.0,
+          "p50": 648.0,
+          "p90": 1840.0,
+          "p95": 2152.0,
+          "p99": 2980.0,
+          "samples": 20480
+        }
+      }
+    },
+    "mfma_dependent_cycles_per_instruction": {
+      "definition": "fixed-timer-corrected mfma_dependent64 divided by 64",
+      "max": 100.5625,
+      "mean": 23.060809326171874,
+      "min": 0.0,
+      "p50": 17.8125,
+      "p90": 40.0625,
+      "p95": 45.5625,
+      "p99": 58.0625,
+      "samples": 40960
+    },
+    "mfma_four_chain64": {
+      "definition": "64 FP8 MFMAs round-robin over four accumulator chains",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 6384.0,
+        "mean": 1393.7251953125,
+        "min": 0.0,
+        "p50": 1012.0,
+        "p90": 2448.0,
+        "p95": 2872.0,
+        "p99": 3688.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 6388.0,
+        "mean": 1397.7251953125,
+        "min": 4.0,
+        "p50": 1016.0,
+        "p90": 2452.0,
+        "p95": 2876.0,
+        "p99": 3692.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.063671875,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 6384.0,
+          "mean": 1782.66015625,
+          "min": 0.0,
+          "p50": 1652.0,
+          "p90": 2856.0,
+          "p95": 3200.0,
+          "p99": 4012.8399999999965,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4212.0,
+          "mean": 1004.790234375,
+          "min": 0.0,
+          "p50": 1012.0,
+          "p90": 1576.0,
+          "p95": 1896.0,
+          "p99": 2448.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.08818359375,
+        "pearson_correlation": -0.011622787898966067,
+        "skew_cycles": {
+          "max": 5372.0,
+          "mean": 777.869921875,
+          "min": 0.0,
+          "p50": 612.0,
+          "p90": 1804.0,
+          "p95": 2180.0,
+          "p99": 3036.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "mfma_four_chain_cycles_per_instruction": {
+      "definition": "fixed-timer-corrected mfma_four_chain64 divided by 64",
+      "max": 99.75,
+      "mean": 21.776956176757814,
+      "min": 0.0,
+      "p50": 15.8125,
+      "p90": 38.25,
+      "p95": 44.875,
+      "p99": 57.625,
+      "samples": 40960
+    },
+    "timer_overhead": {
+      "definition": "back-to-back s_memtime calls plus lgkmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 1696.0,
+        "mean": 15.6419921875,
+        "min": 4.0,
+        "p50": 4.0,
+        "p90": 8.0,
+        "p95": 16.0,
+        "p99": 416.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 1696.0,
+        "mean": 15.6419921875,
+        "min": 4.0,
+        "p50": 4.0,
+        "p90": 8.0,
+        "p95": 16.0,
+        "p99": 416.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.022705078125,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 1696.0,
+          "mean": 26.876171875,
+          "min": 4.0,
+          "p50": 4.0,
+          "p90": 16.0,
+          "p95": 108.19999999999709,
+          "p99": 540.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 456.0,
+          "mean": 4.4078125,
+          "min": 4.0,
+          "p50": 4.0,
+          "p90": 4.0,
+          "p95": 4.0,
+          "p99": 8.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.0,
+        "pearson_correlation": 0.00709471721209059,
+        "skew_cycles": {
+          "max": 1692.0,
+          "mean": 22.468359375,
+          "min": 0.0,
+          "p50": 0.0,
+          "p90": 8.0,
+          "p95": 100.0,
+          "p99": 532.0,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_load_burst8": {
+      "definition": "eight untouched 1024-byte-per-wave loads plus vmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 7768.0,
+        "mean": 2325.7943359375,
+        "min": 0.0,
+        "p50": 2228.0,
+        "p90": 3428.0,
+        "p95": 3832.0,
+        "p99": 4660.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 7772.0,
+        "mean": 2329.7943359375,
+        "min": 4.0,
+        "p50": 2232.0,
+        "p90": 3432.0,
+        "p95": 3836.0,
+        "p99": 4664.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.0623046875,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 7768.0,
+          "mean": 2788.2822265625,
+          "min": 228.0,
+          "p50": 2696.0,
+          "p90": 3816.4000000000087,
+          "p95": 4180.0,
+          "p99": 5032.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 5060.0,
+          "mean": 1863.3064453125,
+          "min": 0.0,
+          "p50": 1872.0,
+          "p90": 2640.0,
+          "p95": 2912.0,
+          "p99": 3420.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.119873046875,
+        "pearson_correlation": 0.018322369123413517,
+        "skew_cycles": {
+          "max": 6436.0,
+          "mean": 924.97578125,
+          "min": 0.0,
+          "p50": 748.0,
+          "p90": 1956.0,
+          "p95": 2376.0,
+          "p99": 3316.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_load_cold": {
+      "definition": "one untouched 1024-byte-per-wave buffer_load_dwordx4 request plus vmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 6744.0,
+        "mean": 1858.9798828125,
+        "min": 0.0,
+        "p50": 1780.0,
+        "p90": 2960.0,
+        "p95": 3356.0,
+        "p99": 4169.639999999985,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 6748.0,
+        "mean": 1862.9798828125,
+        "min": 4.0,
+        "p50": 1784.0,
+        "p90": 2964.0,
+        "p95": 3360.0,
+        "p99": 4173.639999999985,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.06484375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 6744.0,
+          "mean": 2318.49765625,
+          "min": 0.0,
+          "p50": 2224.0,
+          "p90": 3336.4000000000087,
+          "p95": 3716.0,
+          "p99": 4468.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4332.0,
+          "mean": 1399.462109375,
+          "min": 0.0,
+          "p50": 1372.0,
+          "p90": 2180.0,
+          "p95": 2448.0,
+          "p99": 2988.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.1236328125,
+        "pearson_correlation": 0.011958992190091947,
+        "skew_cycles": {
+          "max": 6424.0,
+          "mean": 919.035546875,
+          "min": 0.0,
+          "p50": 760.0,
+          "p90": 1932.0,
+          "p95": 2328.0,
+          "p99": 3216.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_load_l2_hit": {
+      "definition": "same address immediately after vmem_load_cold plus vmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 6872.0,
+        "mean": 1350.1498046875,
+        "min": 0.0,
+        "p50": 1328.0,
+        "p90": 2700.0,
+        "p95": 3128.0,
+        "p99": 3933.639999999985,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 6876.0,
+        "mean": 1354.1498046875,
+        "min": 4.0,
+        "p50": 1332.0,
+        "p90": 2704.0,
+        "p95": 3132.0,
+        "p99": 3937.639999999985,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.064013671875,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 6872.0,
+          "mean": 1926.1357421875,
+          "min": 0.0,
+          "p50": 1920.0,
+          "p90": 3112.0,
+          "p95": 3496.0,
+          "p99": 4252.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4148.0,
+          "mean": 774.1638671875,
+          "min": 0.0,
+          "p50": 512.0,
+          "p90": 1856.0,
+          "p95": 2148.0,
+          "p99": 2700.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.12265625,
+        "pearson_correlation": 0.005491615388523209,
+        "skew_cycles": {
+          "max": 6444.0,
+          "mean": 1151.971875,
+          "min": 0.0,
+          "p50": 1016.0,
+          "p90": 2340.0,
+          "p95": 2768.0,
+          "p99": 3648.0,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_load_service_interval": {
+      "definition": "paired same-wave same-sample (vmem_load_burst8 - vmem_load_cold) / 7; negative values are retained",
+      "max": 957.1428571428571,
+      "mean": 66.68777901785714,
+      "min": -690.8571428571429,
+      "negative_fraction": 0.33076171875,
+      "p50": 68.57142857142857,
+      "p90": 274.85714285714283,
+      "p95": 340.57142857142856,
+      "p99": 473.7142857142857,
+      "samples": 40960
+    },
+    "vmem_load_wait_after_burst8": {
+      "definition": "vmcnt(0) timed after issuing eight untouched loads",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 7472.0,
+        "mean": 2003.29306640625,
+        "min": 0.0,
+        "p50": 1928.0,
+        "p90": 3104.0,
+        "p95": 3476.0,
+        "p99": 4256.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 7476.0,
+        "mean": 2007.29306640625,
+        "min": 4.0,
+        "p50": 1932.0,
+        "p90": 3108.0,
+        "p95": 3480.0,
+        "p99": 4260.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.06279296875,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 7472.0,
+          "mean": 2463.157421875,
+          "min": 16.0,
+          "p50": 2364.0,
+          "p90": 3456.0,
+          "p95": 3820.0,
+          "p99": 4584.8399999999965,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 5256.0,
+          "mean": 1543.4287109375,
+          "min": 0.0,
+          "p50": 1580.0,
+          "p90": 2320.4000000000087,
+          "p95": 2580.0,
+          "p99": 3124.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.123876953125,
+        "pearson_correlation": 0.015610277834852184,
+        "skew_cycles": {
+          "max": 5796.0,
+          "mean": 919.7287109375,
+          "min": 0.0,
+          "p50": 744.0,
+          "p90": 1960.0,
+          "p95": 2368.0,
+          "p99": 3232.8399999999965,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_store_burst8": {
+      "definition": "eight 1024-byte-per-wave stores plus vmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 7004.0,
+        "mean": 1983.0814453125,
+        "min": 0.0,
+        "p50": 1992.0,
+        "p90": 3264.0,
+        "p95": 3664.0,
+        "p99": 4500.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 7008.0,
+        "mean": 1987.0814453125,
+        "min": 4.0,
+        "p50": 1996.0,
+        "p90": 3268.0,
+        "p95": 3668.0,
+        "p99": 4504.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.064794921875,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 7004.0,
+          "mean": 2547.034765625,
+          "min": 0.0,
+          "p50": 2492.0,
+          "p90": 3648.0,
+          "p95": 4044.199999999997,
+          "p99": 4876.8399999999965,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4752.0,
+          "mean": 1419.128125,
+          "min": 0.0,
+          "p50": 1468.0,
+          "p90": 2452.0,
+          "p95": 2732.0,
+          "p99": 3276.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.121484375,
+        "pearson_correlation": 0.015240805835433888,
+        "skew_cycles": {
+          "max": 6136.0,
+          "mean": 1127.906640625,
+          "min": 0.0,
+          "p50": 956.0,
+          "p90": 2320.0,
+          "p95": 2764.0,
+          "p99": 3664.0,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_store_service_interval": {
+      "definition": "paired same-wave same-sample (vmem_store_burst8 - vmem_store_single) / 7; negative values are retained",
+      "max": 972.0,
+      "mean": 119.95382254464285,
+      "min": -834.8571428571429,
+      "negative_fraction": 0.25830078125,
+      "p50": 129.14285714285714,
+      "p90": 371.48571428571347,
+      "p95": 437.14285714285717,
+      "p99": 564.5714285714286,
+      "samples": 40960
+    },
+    "vmem_store_single": {
+      "definition": "one 1024-byte-per-wave store plus vmcnt(0)",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 6800.0,
+        "mean": 1143.4046875,
+        "min": 0.0,
+        "p50": 944.0,
+        "p90": 2448.399999999994,
+        "p95": 2912.0,
+        "p99": 3805.639999999985,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 6804.0,
+        "mean": 1147.4046875,
+        "min": 4.0,
+        "p50": 948.0,
+        "p90": 2452.399999999994,
+        "p95": 2916.0,
+        "p99": 3809.639999999985,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.063330078125,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 6800.0,
+          "mean": 1652.6412109375,
+          "min": 0.0,
+          "p50": 1592.0,
+          "p90": 2892.0,
+          "p95": 3320.0,
+          "p99": 4199.359999999986,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4556.0,
+          "mean": 634.1681640625,
+          "min": 0.0,
+          "p50": 396.0,
+          "p90": 1520.0,
+          "p95": 1844.0,
+          "p99": 2492.8399999999965,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.123291015625,
+        "pearson_correlation": 0.009106777555680064,
+        "skew_cycles": {
+          "max": 6412.0,
+          "mean": 1018.473046875,
+          "min": 0.0,
+          "p50": 844.0,
+          "p90": 2192.0,
+          "p95": 2644.199999999997,
+          "p99": 3571.359999999986,
+          "samples": 20480
+        }
+      }
+    },
+    "vmem_store_wait_after_burst8": {
+      "definition": "vmcnt(0) timed after issuing eight stores",
+      "fixed_timer_baseline_cycles": 4.0,
+      "fixed_timer_corrected_cycles": {
+        "max": 7044.0,
+        "mean": 1413.58916015625,
+        "min": 0.0,
+        "p50": 1388.0,
+        "p90": 2724.0,
+        "p95": 3120.0,
+        "p99": 3908.0,
+        "samples": 40960
+      },
+      "raw_cycles": {
+        "max": 7048.0,
+        "mean": 1417.58916015625,
+        "min": 4.0,
+        "p50": 1392.0,
+        "p90": 2728.0,
+        "p95": 3124.0,
+        "p99": 3912.0,
+        "samples": 40960
+      },
+      "resident_pair_same_ordinal": {
+        "both_upper_quartile_fraction": 0.06552734375,
+        "definition": "min/max/skew across the two mapped resident waves at the same loop ordinal; ordinals are not hardware issue timestamps",
+        "max_fixed_timer_corrected_cycles": {
+          "max": 7044.0,
+          "mean": 1954.57890625,
+          "min": 0.0,
+          "p50": 1904.0,
+          "p90": 3104.0,
+          "p95": 3468.0,
+          "p99": 4256.0,
+          "samples": 20480
+        },
+        "min_fixed_timer_corrected_cycles": {
+          "max": 4452.0,
+          "mean": 872.5994140625,
+          "min": 0.0,
+          "p50": 730.0,
+          "p90": 1868.0,
+          "p95": 2156.0,
+          "p99": 2760.0,
+          "samples": 20480
+        },
+        "opposite_quartiles_fraction": 0.12080078125,
+        "pearson_correlation": 0.024193125638919403,
+        "skew_cycles": {
+          "max": 6168.0,
+          "mean": 1081.9794921875,
+          "min": 0.0,
+          "p50": 916.0,
+          "p90": 2240.0,
+          "p95": 2684.0,
+          "p99": 3508.0,
+          "samples": 20480
+        }
+      }
+    }
+  },
+  "schema_version": 1,
+  "state": {
+    "managed": {
+      "amdsmi_stderr": "",
+      "fclk": "(1300Mhz)",
+      "gpu_busy_percent": 0,
+      "mclk": "(900Mhz)",
+      "memory_activity_percent": 0,
+      "numa_balancing": 1,
+      "performance_level": "perf_determinism",
+      "physical_device": 4,
+      "power_cap_w": 650,
+      "ptl_format": "VECTOR,F8",
+      "ptl_state": "Enabled",
+      "rocm_smi_stderr": "WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status",
+      "sclk": "(89Mhz)",
+      "socket_power_w": 166.0,
+      "vram_allocated_percent": 0
+    },
+    "original": {
+      "amdsmi_stderr": "",
+      "fclk": "(1300Mhz)",
+      "gpu_busy_percent": 0,
+      "mclk": "(900Mhz)",
+      "memory_activity_percent": 0,
+      "numa_balancing": 1,
+      "performance_level": "auto",
+      "physical_device": 4,
+      "power_cap_w": 650,
+      "ptl_format": "F16,BF16",
+      "ptl_state": "Enabled",
+      "rocm_smi_stderr": "WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status",
+      "sclk": "(89Mhz)",
+      "socket_power_w": 163.0,
+      "vram_allocated_percent": 0
+    },
+    "restored": {
+      "amdsmi_stderr": "",
+      "fclk": "(1300Mhz)",
+      "gpu_busy_percent": 0,
+      "mclk": "(900Mhz)",
+      "memory_activity_percent": 0,
+      "numa_balancing": 1,
+      "performance_level": "auto",
+      "physical_device": 4,
+      "power_cap_w": 650,
+      "ptl_format": "F16,BF16",
+      "ptl_state": "Enabled",
+      "rocm_smi_stderr": "WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status",
+      "sclk": "(1425Mhz)",
+      "socket_power_w": 170.0,
+      "vram_allocated_percent": 1
+    }
+  }
+}

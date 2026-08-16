@@ -1,0 +1,94 @@
+{
+  "constants": {
+    "architecture_roof_tflops": 582.944,
+    "useful_flops": 927712935936
+  },
+  "hardware_checks": {
+    "lds_read_single_cycles": {
+      "max": 4260.0,
+      "p50": 64.0,
+      "p95": 880.0,
+      "p99": 1728.0
+    },
+    "mfma_four_chain_cycles_per_instruction": {
+      "max": 99.75,
+      "p50": 15.8125,
+      "p95": 44.875,
+      "p99": 57.625
+    },
+    "overlap_fraction_min": 0.9998371758782326,
+    "physical_simds": 320,
+    "samples_per_metric": 40960,
+    "vmem_load_cold_cycles": {
+      "max": 6744.0,
+      "p50": 1780.0,
+      "p95": 3356.0,
+      "p99": 4169.639999999985
+    },
+    "waves_per_physical_simd": 2
+  },
+  "scenarios": {
+    "algebraic_remove_all_memory_exposure": {
+      "estimated_ms": 1.903511366451132,
+      "estimated_tflops": 487.36926518364277,
+      "gain": 0.16517665147177873,
+      "removed_steady_fraction": 0.14176103791913258,
+      "status": "algebraic bound; not a performance promise"
+    },
+    "conservative_25pct_memory_recovery": {
+      "estimated_ms": 2.1393230916127832,
+      "estimated_tflops": 433.64788590049767,
+      "gain": 0.03674242039240516,
+      "removed_steady_fraction": 0.035440259479783146,
+      "status": "conditional sensitivity; not yet demonstrated"
+    },
+    "measured_control": {
+      "estimated_ms": 2.217927,
+      "estimated_tflops": 418.27929230132463,
+      "gain": 0.0,
+      "status": "measured"
+    },
+    "measured_same_work_ablation": {
+      "estimated_ms": 2.194646,
+      "estimated_tflops": 422.71643624347615,
+      "gain": 0.010608088958310224,
+      "status": "measured reachable"
+    },
+    "optimistic_retain_ablation_residual": {
+      "estimated_ms": 2.0383221364037185,
+      "estimated_tflops": 455.1355840018475,
+      "gain": 0.08811407205397104,
+      "removed_steady_fraction": 0.08097870831469267,
+      "status": "optimistic local bound; retains ablation memory residual"
+    }
+  },
+  "schema_version": 1,
+  "steady_fractions": {
+    "control_specific_memory_exposure": 0.08097870831469267,
+    "edge_prologue_drain_lifecycle": 0.047049006690950426,
+    "memory_exposure_ablation": 0.060782329604439904,
+    "memory_exposure_control": 0.14176103791913258,
+    "structural_tail": 0.11835576989280144
+  },
+  "wall_time_closure": {
+    "ablation": {
+      "att_ms": 2.194649,
+      "att_relative_error": 0.01007635899256698,
+      "att_tflops": 422.7158584065151,
+      "lifecycle_mfma_busy": 0.7324465045487565,
+      "slot_prediction_tflops": 426.9752951476703
+    },
+    "control": {
+      "att_ms": 2.28001,
+      "att_relative_error": -0.005017521392641,
+      "att_tflops": 406.88985396379843,
+      "lifecycle_mfma_busy": 0.694489136893229,
+      "slot_prediction_tflops": 404.8482754170865,
+      "stable_ms": 2.217927,
+      "stable_prediction_tflops": 416.1805670041039,
+      "stable_relative_error": -0.005017521392641222,
+      "stable_tflops": 418.27929230132463,
+      "trace_to_stable_factor": 1.027991453280473
+    }
+  }
+}
