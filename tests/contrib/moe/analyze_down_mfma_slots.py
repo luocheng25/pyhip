@@ -82,6 +82,14 @@ TAIL_PHASES = {PHASE_TAIL}
 EDGE_PHASES = {PHASE_PROLOGUE, PHASE_DRAIN}
 
 
+def configure_n_blocks(n_blocks: int) -> None:
+    if n_blocks <= 0:
+        raise ValueError("n_blocks must be positive")
+    global N_BLOCKS, EXPECTED_MFMA_PER_WAVE
+    N_BLOCKS = n_blocks
+    EXPECTED_MFMA_PER_WAVE = MFMA_PER_N_BLOCK * N_BLOCKS
+
+
 @dataclass(frozen=True)
 class CodeInfo:
     asm: str
@@ -1384,6 +1392,12 @@ def main() -> None:
     parser.add_argument(
         "--workers", type=int, default=max(1, min(8, (mp.cpu_count() or 1)))
     )
+    parser.add_argument(
+        "--n-blocks",
+        type=int,
+        default=N_BLOCKS,
+        help="N blocks executed by each complete wave (default: 16)",
+    )
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--svg", type=Path)
@@ -1391,6 +1405,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.n_blocks <= 0:
+        parser.error("--n-blocks must be positive")
+    configure_n_blocks(args.n_blocks)
 
     results = [
         summarize_trace(label, dispatch, args.workers) for label, dispatch in args.trace

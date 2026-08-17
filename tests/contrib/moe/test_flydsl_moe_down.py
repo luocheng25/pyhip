@@ -241,11 +241,91 @@ def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
     assert _relative_l2(logical_output, expected) < 3e-2
 
 
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+def test_down_prefill_physical_n512_8wave_sorted_sum(hidden_size):
+    torch.manual_seed(19)
+    batch_size = 64
+    intermediate_size = 384
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    activation = 0.1 * torch.randn(
+        batch_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    activation_scale = activation.float().abs().amax().reshape(1) / fp8_max
+    activation_fp8 = (
+        (activation.float() / activation_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    )
+    weight = 0.1 * torch.randn(
+        1, hidden_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    weight_scale = weight.float().abs().amax().reshape(1) / fp8_max
+    weight_fp8 = (weight.float() / weight_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    shuffled_weight = shuffle_weight(weight_fp8, layout=(16, 16))
+
+    routing_weight = torch.linspace(
+        0.25, 1.0, batch_size, dtype=torch.float32, device="cuda"
+    )
+    sorted_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+    sorted_expert_ids = torch.zeros(1, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.tensor(
+        [batch_size, batch_size], dtype=torch.int32, device="cuda"
+    )
+    physical_output = torch.full(
+        (batch_size, hidden_size),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    launch = compile_gemm(
+        N=hidden_size,
+        K=intermediate_size,
+        weight_dtype="fp8",
+        weight_quant_type="per_tensor",
+        act_quant_type="per_tensor",
+        TOPK=1,
+        BLOCK_TILE_SIZE_M=64,
+        BLOCK_TILE_SIZE_N=512,
+        stage="down",
+        alg="prefill_1x4",
+        E=1,
+        USE_ATOMIC_WRITE=False,
+        down_physical_n512=True,
+        down_output_padding_bytes=0,
+    )
+    launch(
+        _ptr(activation_fp8),
+        _ptr(shuffled_weight),
+        _ptr(physical_output),
+        _ptr(sorted_ids),
+        _ptr(routing_weight),
+        _ptr(sorted_expert_ids),
+        _ptr(num_valid_ids),
+        _ptr(weight_scale),
+        _ptr(activation_scale),
+        batch_size,
+        1,
+        torch.cuda.current_stream(),
+    )
+    logical_output = torch.empty_like(physical_output)
+    loc_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda").view(
+        batch_size, 1
+    )
+    sorted_sum(1, hidden_size, 0)(loc_ids, physical_output, logical_output, batch_size)
+    torch.cuda.synchronize()
+
+    expected = (activation_fp8.float() * activation_scale) @ (
+        weight_fp8[0].float() * weight_scale
+    ).T
+    expected = (expected * routing_weight[:, None]).to(torch.bfloat16)
+    assert torch.isfinite(logical_output).all()
+    assert _relative_l2(logical_output, expected) < 3e-2
+
+
 @pytest.mark.parametrize("intermediate_size", [192, 384])
 @pytest.mark.parametrize("act_quant_type", ["per_tensor", "ptpc"])
-def test_down_prefill_physical_per_tensor_cshuffle(
-    intermediate_size, act_quant_type
-):
+def test_down_prefill_physical_per_tensor_cshuffle(intermediate_size, act_quant_type):
     torch.manual_seed(17)
     batch_size = 64
     hidden_size = 512

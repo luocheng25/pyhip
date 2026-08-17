@@ -1,0 +1,132 @@
+diff --git a/src/contrib/flydsl/moe_gemm_splitk.py b/src/contrib/flydsl/moe_gemm_splitk.py
+--- a/src/contrib/flydsl/moe_gemm_splitk.py
++++ b/src/contrib/flydsl/moe_gemm_splitk.py
+@@ -2183,10 +2183,23 @@ def compile_gemm(
+             cshuffle_lds = None
+             if const_expr(down_physical_n256):
+                 cshuffle_storage = shared_allocator.allocate(
+-                    fx.Array[fx.BFloat16, physical_num_waves * 16 * 64, 16]
++                    fx.Array[
++                        fx.BFloat16,
++                        physical_num_waves
++                        * (2 if down_physical_n512 else 1)
++                        * 16
++                        * 64,
++                        16,
++                    ]
+                 )
+                 cshuffle_lds = cshuffle_storage.peek().view(
+-                    fx.make_layout(physical_num_waves * 16 * 64, 1)
++                    fx.make_layout(
++                        physical_num_waves
++                        * (2 if down_physical_n512 else 1)
++                        * 16
++                        * 64,
++                        1,
++                    )
+                 )
+             ldsA0 = lds.A.peek().view(
+                 fx.make_composed_layout(
+@@ -2558,7 +2571,13 @@ def compile_gemm(
+                 fx.BFloat16, 128
+             )
+ 
+-            def store_cshuffle_n256(output, block_n, cshuffle_lds_arg):
++            def store_cshuffle_n256(
++                output,
++                block_n,
++                cshuffle_lds_arg,
++                defer_last_two=False,
++                finish_deferred=False,
++            ):
+                 lane_id = fx.Int32(fx.thread_idx.x % 64)
+                 wave_id = fx.Int32(
+                     fx.thread_idx.x // 64
+@@ -2572,11 +2591,14 @@ def compile_gemm(
+                 )
+                 lane_group = lane_id // 16
+                 lane_row = lane_id % 16
+-                wave_lds_base = wave_id * (16 * 64)
++                cshuffle_slot_size = 16 * 64
++                wave_lds_base = wave_id * (
++                    (2 if down_physical_n512 else 1) * cshuffle_slot_size
++                )
+ 
+                 # All 64 lanes produce one M16 pair, halving the DS writes used
+                 # by the previous two masked M8 producers.
+-                def write_row_pair(row_pair):
++                def write_row_pair(row_pair, cshuffle_slot=0):
+                     row_in_8 = lane_row % 8
+                     row_half = lane_row // 8
+                     for channel_piece in range_constexpr(2):
+@@ -2601,6 +2623,7 @@ def compile_gemm(
+                         physical_atom = logical_atom ^ row_in_8
+                         lds_offset = (
+                             wave_lds_base
++                            + cshuffle_slot * cshuffle_slot_size
+                             + ((row_half * 8 + row_in_8) * 8 + physical_atom) * 8
+                         )
+                         lds_dst = fx.make_view(
+@@ -2611,7 +2634,7 @@ def compile_gemm(
+                         lds_frag.store(packed_bf16)
+                         fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
+ 
+-                def read_store_row_pair(row_pair):
++                def read_store_row_pair(row_pair, cshuffle_slot=0):
+                     out_frags = []
+                     byte_offsets = []
+                     fx.rocdl.sched_barrier(0)
+@@ -2621,6 +2644,7 @@ def compile_gemm(
+                         physical_atom = output_atom ^ (lane_id // 8)
+                         lds_offset = (
+                             wave_lds_base
++                            + cshuffle_slot * cshuffle_slot_size
+                             + ((row_half * 8 + lane_id // 8) * 8 + physical_atom) * 8
+                         )
+                         lds_src = fx.make_view(
+@@ -2662,9 +2686,19 @@ def compile_gemm(
+                         offset_is_bytes=True,
+                     )
+ 
+-                for row_pair in range_constexpr(4):
+-                    write_row_pair(row_pair)
+-                    read_store_row_pair(row_pair)
++                if const_expr(finish_deferred):
++                    read_store_row_pair(2, 0)
++                    read_store_row_pair(3, 1)
++                elif const_expr(defer_last_two):
++                    for row_pair in range_constexpr(2):
++                        write_row_pair(row_pair)
++                        read_store_row_pair(row_pair)
++                    write_row_pair(2, 0)
++                    write_row_pair(3, 1)
++                else:
++                    for row_pair in range_constexpr(4):
++                        write_row_pair(row_pair)
++                        read_store_row_pair(row_pair)
+ 
+             cp_atom_out_128b = None
+             thrv_out = None
+@@ -2885,6 +2919,7 @@ def compile_gemm(
+                                     fragC_bf16,
+                                     block_n - 1,
+                                     cshuffle_lds,
++                                    defer_last_two=True,
+                                 )
+                         if const_expr(down_physical_n512):
+                             enter_compute_stage()
+@@ -2906,6 +2941,14 @@ def compile_gemm(
+                             not (merge_k192_first_two_cores and k_core == 0)
+                         ):
+                             enter_read_write_stage()
++                        if const_expr(down_physical_n512 and k_core == 2):
++                            if block_n > 0:
++                                store_cshuffle_n256(
++                                    fragC_bf16,
++                                    block_n - 1,
++                                    cshuffle_lds,
++                                    finish_deferred=True,
++                                )
+                         if const_expr(
+                             k_core + 1 == nBK and weight_quant_type == "ptpc"
+                         ):

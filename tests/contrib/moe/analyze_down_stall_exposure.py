@@ -1022,6 +1022,12 @@ def parse_trace(value: str) -> tuple[str, Path]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", action="append", required=True, type=parse_trace)
+    parser.add_argument(
+        "--n-blocks",
+        type=int,
+        default=slots.N_BLOCKS,
+        help="N blocks executed by each complete wave (default: 16)",
+    )
     parser.add_argument("--first-n", type=int, default=2)
     parser.add_argument("--last-n-exclusive", type=int, default=14)
     parser.add_argument("--resident-waves", type=int)
@@ -1033,8 +1039,14 @@ def main() -> None:
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
     args = parser.parse_args()
+    if args.n_blocks <= 0:
+        parser.error("--n-blocks must be positive")
+    slots.configure_n_blocks(args.n_blocks)
     if not 0 <= args.first_n < args.last_n_exclusive <= slots.N_BLOCKS - 1:
-        parser.error("single-wave N range must satisfy 0 <= first < last <= 15")
+        parser.error(
+            "single-wave N range must satisfy "
+            f"0 <= first < last <= {slots.N_BLOCKS - 1}"
+        )
     targets = set(args.software_target or DEFAULT_SOFTWARE_TARGETS)
     results = [
         analyze_trace(

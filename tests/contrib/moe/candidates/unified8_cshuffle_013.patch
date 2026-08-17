@@ -1,0 +1,53 @@
+diff --git a/src/contrib/flydsl/moe_gemm_splitk.py b/src/contrib/flydsl/moe_gemm_splitk.py
+--- a/src/contrib/flydsl/moe_gemm_splitk.py
++++ b/src/contrib/flydsl/moe_gemm_splitk.py
+@@ -2558,7 +2558,13 @@ def compile_gemm(
+                 fx.BFloat16, 128
+             )
+ 
+-            def store_cshuffle_n256(output, block_n, cshuffle_lds_arg):
++            def store_cshuffle_n256(
++                output,
++                block_n,
++                cshuffle_lds_arg,
++                row_pair_begin=0,
++                row_pair_end=4,
++            ):
+                 lane_id = fx.Int32(fx.thread_idx.x % 64)
+                 wave_id = fx.Int32(
+                     fx.thread_idx.x // 64
+@@ -2662,7 +2668,7 @@ def compile_gemm(
+                         offset_is_bytes=True,
+                     )
+ 
+-                for row_pair in range_constexpr(4):
++                for row_pair in range_constexpr(row_pair_begin, row_pair_end):
+                     write_row_pair(row_pair)
+                     read_store_row_pair(row_pair)
+ 
+@@ -2879,12 +2885,15 @@ def compile_gemm(
+                                 [None, None, next_block_n, 0],
+                                 frag_weight_slots[next_slot],
+                             )
+-                        if const_expr(down_physical_n512 and k_core == 2):
++                        if const_expr(down_physical_n512 and k_core > 0):
+                             if block_n > 0:
++                                row_pair_begin = 0 if k_core == 1 else 1
+                                 store_cshuffle_n256(
+                                     fragC_bf16,
+                                     block_n - 1,
+                                     cshuffle_lds,
++                                    row_pair_begin,
++                                    1 if k_core == 1 else 4,
+                                 )
+                         if const_expr(down_physical_n512):
+                             enter_compute_stage()
+@@ -2938,6 +2947,8 @@ def compile_gemm(
+                         fragC_bf16,
+                         group_n_blocks - 1,
+                         cshuffle_lds,
++                        0,
++                        4,
+                     )
+                 fx.rocdl.sched_barrier(0)
+                 if const_expr(
