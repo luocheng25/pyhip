@@ -1,23 +1,137 @@
 # Unified 8-wave PA MoE Down 中间状态与续跑手册
 
-> 状态：实验继续；当前最佳在同轮ABBA24中比physical4快12.13%，但仍未达到固定绝对时间线。
+> 状态：已将formal best合入production；同轮ABBA24吞吐比physical4高12.46%，但仍未达到固定绝对时间线。
 >
 > 更新时间：2026-08-19。
 >
 > 目标平台：AMD Instinct MI308X / gfx942，ROCm 7.2。
 >
-> 本文档是当前实验的唯一跨机器handoff入口。生产源码保持严格per-K PA反相与
-> `A0/A1/A2 = 0/0/4` CShuffle延迟写回；不要把下文待测patch直接当成生产实现。
+> 本文档是当前实验的唯一跨机器handoff入口。production SHA256为
+> `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`，H3 specialization保持512 threads、
+> 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
+> 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
 
 ## 0. 最新结论（覆盖下文旧待测描述）
 
 本轮要求同时满足：真实512-thread/8-wave workgroup、两组logical 4-wave严格反相、group1
 落后一rendezvous、三个K128、每个Stage B源码只有对应K的MFMA，以及相对physical4快10%以上。
-实验没有找到同时满足正确性、结构约束和性能目标的候选，因此production kernel未修改。
+当前production满足正确性、全部结构约束和相对physical4的性能目标；固定绝对目标
+`1.895517 ms`仍未达到。
 
-### 0.1 2026-08-19 checkpoint：suffix XCC + SE-local + XCC rotation-2
+### 0.1 2026-08-19 production promotion
 
-production源码保持未修改，SHA256为
+已将此前immutable formal best合入`src/contrib/flydsl/moe_gemm_splitk.py`。production SHA256为
+`83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；它比formal best源码
+`3270deb8af709ec4363b044c21e1c5b384c2516447a79a2345efabf30f0123bd`只多一个编译期安全fallback：
+非H3的`down_physical_n512`调用回退到已验证的physical4路径，避免paired packed布局改变通用API
+输出契约。仓库MoE down回归为13/13通过。重新从production路径
+编译并执行完整H3门禁：296,448个有效physical rows逐bit一致，完整reduced output逐bit一致，
+10,816个inactive tail rows保持各自sentinel。
+
+H3 specialization的规范化最终ISA与formal best逐条一致，共919条指令；保持254 VGPR、
+49,152B LDS、0 private/scratch、192条MFMA、39条
+`buffer_load_dwordx4`、16条output store和恰好10条真实barrier。三个Stage B各自只含64条
+MFMA；没有把任何尚未计时的调度探针带入production。
+
+正式clean 10-buffer exact-grid ABBA24复测：
+
+| 路径 | down中位数 | paired ratio | 胜轮 |
+| --- | ---: | ---: | ---: |
+| 同轮physical4 control | 2.151333 ms | 1.000000 | - |
+| promoted production | 1.913011 ms | 0.890060 | 24/24 |
+
+对应latency降低11.08%、吞吐提高12.46%。固定验收线仍为`1.895517 ms`，还差`17.494 us`，
+即必须再降低`0.9145%`，所需paired ratio为`0.990855`。
+
+#### 成功尝试简表
+
+| 尝试 | control -> candidate中位数 | paired ratio / 胜轮 | 结论 |
+| --- | ---: | ---: | --- |
+| complementary packed store | 2.072853 -> 2.027153 ms | 0.979634 / ABBA16 | 确立跨组store错峰方向 |
+| suffix + SE-local + XCC rotation-2 | 2.158432 -> 1.919671 ms | 0.891783 / 24/24 | strict-PA主干晋级 |
+| exact-map + drain group0 priority | 1.944631 -> 1.929531 ms | 0.994470 / 15/24 | 小幅增益，形成formal best |
+| formal best对physical4复测 | 2.151333 -> 1.913011 ms | 0.890060 / 24/24 | 本次promotion依据 |
+
+#### 失败尝试简表
+
+| 尝试 | paired ratio / 胜轮 | 结论 |
+| --- | ---: | --- |
+| exact-map fallback消除 | 1.006252 / 1/8 | 回退 |
+| final mid-priority / compute priority 2 | 1.002994 / 8/24；0.998184 / 14/24 | ABBA24无稳定收益 |
+| slot priority 1/2 / group1 final priority | 1.029335 / 0/8；1.003852 / 3/8 | 回退 |
+| expert-stripe2 / grid3d / grid2d | 1.005637 / 1/8；1.005300 / 4/8；1.000011 / 4/8 | 映射变体关闭 |
+| store26 / sched12x2 / pure-permute | 1.019395 / 0/8；1.000053 / 4/8；1.020263 / 0/8 | 局部调度关闭 |
+| LDS共享weight 1 atom / 3 atom | 1.286286 / 0/8；1.099853 / 0/8 | DS与wait代价过高；4 atom达到256 VGPR |
+
+#### 待进行尝试与预期
+
+fresh exact-map ATT的physical-union MFMA busy为`95.58%`。MFMA-idle owner主要为
+`other_dependency 1.52%`、`VMEM issue 1.07%`和`structural tail 1.01%`；进一步逐opcode归因
+显示`other_dependency`的98.2%是`s_barrier`等待，VMEM issue中load/store约占57.2%/42.8%，
+严格VMEM-wait witness为0。因此不再放宽waitcnt，也不继续LDS共享weight。
+
+| 顺序 | 待测项 | 预期收益 | 硬门禁 |
+| ---: | --- | --- | --- |
+| 1 | 仅允许VMEM read跨A阶段compiler scheduling barrier（`0x20`），真实barrier不变 | 实用估计0.2%-0.5%，约3.8-9.6 us；ATT归因硬上界约0.612%，11.7 us | 先看最终ISA；三个Stage B必须仍各64条纯MFMA |
+| 2 | 若全局`0x20`改变Stage B，只分别在K0->K1、K1->K2边界做单点mask | 每项估计0.1%-0.35%，约1.9-6.7 us；与上一项互斥、不可相加 | 254 VGPR、0 scratch、10 barrier、完整H3逐bit |
+| 3 | 对首个通过结构/正确性的mask做exact-grid ABBA8，再决定ABBA24和fresh ATT | 无直接收益；用于确认是否真实缩短`barrier + VMEM-load`joint空洞 | 晋级线至少ratio < 0.997，最终仍需接近0.990855 |
+
+VMEM-read归因上界小于当前`0.9145%`缺口，因此上述路线即使达到乐观上界也不能单独保证过线。
+目前没有另一项已证据支持、预期大于缺口且不增加barrier/LDS/VGPR的候选；若mask失败，应先采集
+新的production ATT再决定是否值得重新打开structural-tail路线。
+
+### 0.2 2026-08-19 checkpoint：suffix XCC + SE-local + XCC rotation-2（promotion前历史）
+
+#### 2026-08-19 continuation：drain/exact-map复测
+
+当时未合入候选SHA256为
+`3270deb8af709ec4363b044c21e1c5b384c2516447a79a2345efabf30f0123bd`；当时production
+仍为`959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674`。
+当前时段重新执行physical4对candidate的clean ABBA24，结果保存于
+`/tmp/production-physical4-vs-currentbest-recheck-abba24.json`：physical4中位
+`2.151333 ms`，candidate中位`1.913011 ms`，paired ratio `0.890060`。固定验收线仍为
+`1.895517 ms`，因此复测仍差`17.494 us`；该时点尚未promotion。
+
+本轮关闭的局部路线包括：exact-map fallback消除、末块prefetch guard、tail prewarm、
+head2、2320-WG补齐、final-drain priority 2/4/6-store扫描、group1 final priority、compute
+priority 2、slot非对称priority、tail-first、expert stripe2、rotation-0按buffer着色、以及
+exact `4x579`/`4x20x29`多维grid。短测正向的final-drain中点priority与compute priority 2
+均在ABBA24反转或降为噪声，不能晋级。K0 activation常驻会生成256 VGPR、private segment和
+scratch；activation-resident历史变体又增加真实barrier，因此不能用于strict 10-barrier定义。
+
+fresh exact-grid ATT位于`/tmp/moe-exactmap-best-att/ui_output_agent_41852_dispatch_18`，
+dispatch为2316 WG、解释性时长`1.815931 ms`。16-block slot ledger仍显示steady MFMA busy
+`95.77%`、lifecycle busy`89.31%`；主要steady idle为VMEM stall/wait与barrier imbalance。
+ATT用于定位，不替代clean ABBA24。
+
+#### 2026-08-19 continuation：共享weight与pure-permute关闭
+
+本时段formal best源码SHA256为
+`3270deb8af709ec4363b044c21e1c5b384c2516447a79a2345efabf30f0123bd`，当时production为
+`959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674`。所有scratch探针
+结束后均逐字节回退到formal best；该时点production尚未修改。
+
+重复weight-load消除路线已关闭。通用tiled-copy的16KB/8KB/4KB fragment handoff分别触发
+`256 VGPR`、private segment或scratch；改用线性raw LDS后，单atom可保持`254 VGPR`、0 scratch，
+并通过296,448行physical output、完整reduced output和inactive tail逐bit门禁。正确的EXEC掩码
+必须在单个inline-asm块内保存/恢复EXEC和SCC；拆开的saveexec/restore会允许LLVM把无关VALU
+调入masked区，直接破坏结果。尽管如此，单atom候选的ABBA8中位ratio为`1.286286`；正确的
+3-atom K1-tail候选为`1.099853`。4 atom达到`256 VGPR`；shared-first的`vmcnt(4/3/2/1)`均不满足
+逐bit正确性，只有`vmcnt(0)`正确。新增DS read/write和强制等待无法由减少的重复VMEM抵消，
+因此不要继续扩展LDS weight sharing。
+
+另一个零内存流量探针只把`postprocess_store_vector_packed_pair_m`内64条`v_perm_b32`的
+`has_side_effects`从true改为false。最终ISA确实重排FMA/perm/store，但资源和严格结构仍为
+254 VGPR、49,152B LDS、0 scratch、10 barrier、192 MFMA，三个Stage B仍各64条纯MFMA；完整
+H3逐bit门禁通过。正式ABBA8却8/8轮回退，中位ratio为`1.020263`（candidate/control中位
+`1.951051/1.918571 ms`），因此pure-permute也已关闭。
+
+fresh exact-map fine exposure保存于`/tmp/exactmap-best-att-exposure.{json,md}`：physical-union
+MFMA busy为`95.58%`，可恢复oracle上界`3.34%`，其中VMEM issue`1.07%`、structural tail
+`1.01%`、other dependency`1.52%`。这些是物理union归因上界，不可线性相加，也没有支持上述
+两条局部路线。固定验收线仍未达到。
+
+该历史checkpoint的production源码SHA256为
 `959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674`。当前最佳候选源码
 SHA256为`6ccc253d57367a2c2fa45ef802288c325ebc50c0bbbe762bae9f122b78110171`，可由
 `tests/contrib/moe/candidates/unified8_strict_pa_xccrot2.patch`从本checkpoint父提交重建；patch
@@ -53,7 +167,7 @@ logical_pair = logical_xcc * 576 + 144 * se_slot + se_rank
 
 24/24轮candidate均快于control；paired latency降低10.82%，对应吞吐提高12.13%。但是固定验收
 仍以早先正式physical4基线`2.085069 ms`为准：候选只提高8.62%，固定目标为`1.895517 ms`，
-当前还慢24.154 us（1.274%）。因此候选不得合入production。
+当前还慢24.154 us（1.274%）。因此在该历史checkpoint中候选未合入production。
 
 natural SE-local的正式结果为`1.920991 ms`，rotation-2只额外降低约1.32 us；该微增益在短测
 中为paired ratio `0.994366`，但绝对中位受10-buffer allocation和同轮调用位置影响明显。fresh
@@ -67,10 +181,10 @@ VMEM-wait witness仍为0。
 VMEM/DS burst拆分和read interleave、compute-stage mask不对称、group1 `5/3` store split。
 当前scratch worktree中存在尚未编译/计时的group1 `3/5`草稿，它不是有效候选，也不属于本提交。
 
-重建当前最佳：
+重建该历史checkpoint候选：
 
 ```bash
-git worktree add --detach /tmp/unified8-strict-pa-xccrot2 HEAD
+git worktree add --detach /tmp/unified8-strict-pa-xccrot2 7600ec0
 git -C /tmp/unified8-strict-pa-xccrot2 apply \
   "$PWD/tests/contrib/moe/candidates/unified8_strict_pa_xccrot2.patch"
 sha256sum \
@@ -207,13 +321,13 @@ sha256sum src/contrib/flydsl/moe_gemm_splitk.py
 
 | 仓库/组件 | 版本 |
 | --- | --- |
-| pyhip父提交 | `238f871` |
+| promotion父提交 | `7600ec0` |
 | pyhip分支 | `luocheng/try-opt-down-308` |
-| 生产源码SHA256 | `959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674` |
+| 生产源码SHA256 | `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335` |
 | FlyDSL提交 | `eb7d69c18f8675c4aa26e8fa01b3277f35a3b57f` |
 | llvm-project提交 | `7f77ca0dbda4abbf9af06537b2c475f20ccd6007` |
 
-`pyhip父提交`是中间检查点提交前的HEAD。实际handoff提交应使用“包含本文档的提交”，
+`promotion父提交`是本次promotion前的HEAD。实际handoff提交应使用“包含本文档的提交”，
 由`git log -1 --oneline -- docs/UNIFIED8_PA_INTERMEDIATE_CONTEXT.md`获得。
 
 ### 1.2 先做功能门禁
@@ -227,17 +341,29 @@ export PYTHONPATH=src:.
 export FLYDSL_RUNTIME_ENABLE_CACHE=0
 
 pytest -q tests/contrib/moe/test_flydsl_moe_down.py
-python tests/contrib/moe/check_unified8_n4096.py
 ```
 
-预期：MoE down完整文件`13 passed`；N4096输出包含：
+预期：MoE down完整文件`13 passed`。其中原N512/N1024用例验证非H3调用透明回退到physical4路径。
+`check_unified8_n4096.py`使用`E=1, TOPK=1`，因此promotion后也只验证该通用fallback，不再作为
+H3 specialization门禁。
 
-```text
-N=4096 blocks=8 physical_bit_equal=True rel_l2=0.00405590
+未来H3候选必须以当前production作为同布局control，先跑exact-grid完整physical/reduced/tail
+逐bit门禁，再看性能：
+
+```bash
+HIP_VISIBLE_DEVICES=4 PYTHONPATH=src:tests/contrib/moe \
+python tests/contrib/moe/compare_unified8_candidates.py \
+  --control src/contrib/flydsl/moe_gemm_splitk.py \
+  --candidate /path/to/candidate.py \
+  --control-path unified8 \
+  --candidate-path unified8 \
+  --exact-valid-grid \
+  --rounds 2 \
+  --physical-device 4 \
+  --output /tmp/h3-candidate-gate.json
 ```
 
-N512覆盖单N块drain，N1024覆盖跨N稳态延迟写回，N4096覆盖8个N512块。
-任何候选都必须先通过这三层，再看性能。
+正式晋级仍需10-buffer ABBA8筛选和ABBA24确认；两轮命令只用于功能与资源前置门禁。
 
 ### 1.3 选择空闲GPU
 
@@ -620,6 +746,7 @@ rocprofv3 \
   -i tests/contrib/moe/unified8_att.yaml \
   -- python tests/contrib/moe/profile_unified8_att.py \
        --module src/contrib/flydsl/moe_gemm_splitk.py \
+      --exact-valid-grid \
        --dispatches 6
 ```
 
@@ -629,17 +756,17 @@ N512 down kernel，而不是sorting、gateup或JIT warmup。
 使用官方`rocprof-trace-decoder`将`.att`解码为`ui_output_agent_*_dispatch_*`目录。
 仓库不提交decoder二进制；版本应与rocprof 1.1.0/ROCm 7.2兼容。
 
-### 5.5 分析N4096 trace
+### 5.5 分析N4096 H3 specialization trace
 
-N4096每个完整wave执行8个N512块，因此必须传`--n-blocks 8`。省略该参数会沿用历史默认16，
-阶段ordinal和steady-state窗口都会错误。
+promoted H3 specialization中每个logical 4-wave group执行16个N256块，paired WG合计覆盖N512；
+因此必须传`--n-blocks 16`。历史N512实现使用8块语义，不适用于当前production trace。
 
 ```bash
 TRACE=/tmp/moe-unified8-att/ui_output_agent_PID_dispatch_ID
 
 python tests/contrib/moe/analyze_down_mfma_slots.py \
   --trace "production=$TRACE" \
-  --n-blocks 8 \
+  --n-blocks 16 \
   --workers 4 \
   --json /tmp/unified8-production-slots.json \
   --markdown /tmp/unified8-production-slots.md \
@@ -647,7 +774,7 @@ python tests/contrib/moe/analyze_down_mfma_slots.py \
 
 python tests/contrib/moe/analyze_down_stall_exposure.py \
   --trace "production=$TRACE" \
-  --n-blocks 8 \
+  --n-blocks 16 \
   --first-n 2 \
   --last-n-exclusive 7 \
   --json /tmp/unified8-production-exposure.json \

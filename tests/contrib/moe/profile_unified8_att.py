@@ -49,6 +49,7 @@ def main():
         choices=("physical4", "unified8"),
         default="unified8",
     )
+    parser.add_argument("--exact-valid-grid", action="store_true")
     args = parser.parse_args()
     if args.dispatches < 5:
         parser.error("--dispatches must be at least 5 for the checked-in ATT YAML")
@@ -75,6 +76,7 @@ def main():
     )
     grid = sorted_expert_ids.shape[0]
     padded_rows = int(num_valid_ids[0].item())
+    task_num = padded_rows // BLOCK_M if args.exact_valid_grid else grid
     activation = torch.ones(BATCH, TOPK, K, dtype=FP8, device="cuda")
     weight = shuffle_weight(
         torch.ones(EXPERTS, N, K, dtype=FP8, device="cuda"), layout=(16, 16)
@@ -122,7 +124,7 @@ def main():
             ptr(weight_scale),
             ptr(activation_scale),
             BATCH,
-            grid,
+            task_num,
             stream,
         )
     torch.cuda.synchronize()
@@ -130,6 +132,7 @@ def main():
         raise AssertionError("profile output contains non-finite values")
     print(
         f"module={args.module.resolve()} path={args.path} grid={grid} "
+        f"task_num={task_num} "
         f"padded_rows={padded_rows} dispatches={args.dispatches}"
     )
 
