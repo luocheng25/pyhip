@@ -1,13 +1,195 @@
 # Unified 8-wave PA MoE Down 中间状态与续跑手册
 
-> 状态：中间检查点，不是最终优化结论。
+> 状态：实验继续；当前最佳在同轮ABBA24中比physical4快12.13%，但仍未达到固定绝对时间线。
 >
-> 更新时间：2026-08-17。
+> 更新时间：2026-08-19。
 >
 > 目标平台：AMD Instinct MI308X / gfx942，ROCm 7.2。
 >
 > 本文档是当前实验的唯一跨机器handoff入口。生产源码保持严格per-K PA反相与
 > `A0/A1/A2 = 0/0/4` CShuffle延迟写回；不要把下文待测patch直接当成生产实现。
+
+## 0. 最新结论（覆盖下文旧待测描述）
+
+本轮要求同时满足：真实512-thread/8-wave workgroup、两组logical 4-wave严格反相、group1
+落后一rendezvous、三个K128、每个Stage B源码只有对应K的MFMA，以及相对physical4快10%以上。
+实验没有找到同时满足正确性、结构约束和性能目标的候选，因此production kernel未修改。
+
+### 0.1 2026-08-19 checkpoint：suffix XCC + SE-local + XCC rotation-2
+
+production源码保持未修改，SHA256为
+`959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674`。当前最佳候选源码
+SHA256为`6ccc253d57367a2c2fa45ef802288c325ebc50c0bbbe762bae9f122b78110171`，可由
+`tests/contrib/moe/candidates/unified8_strict_pa_xccrot2.patch`从本checkpoint父提交重建；patch
+SHA256为`07c31b20773f84dd3413d2cd0c50f85c740d8e2d2b9c13bd0fbf0e7ccf049448`。
+
+候选保留512 threads、严格4+4反相、group1落后一rendezvous、3个K128、10个真实barrier和
+三个各64条MFMA的纯Stage B。资源为254 VGPR、36 SGPR、49,152B LDS、0 scratch；静态ISA为
+192条MFMA、39条`buffer_load_dwordx4`和16条output store。full-H3验证覆盖296,448个有效行：
+physical output和完整reduced output均逐bit一致，inactive tail未被写入。
+
+H3 exact-valid-grid把2,316个paired WG映射为：前2,304个WG按XCC连续分成四段，每XCC 576个；
+XCC内先按四个名义SE槽分组，再把每SE的五个名义CU列转置为长度`29/29/29/29/28`的连续列。
+最后把四个48-expert逻辑段相对物理XCC循环移动2位；E192的12个tail WG仍以`3/3/3/3`
+分布。核心rank公式为：
+
+```python
+se_slot = xcc_local_idx % 4
+within_se = xcc_local_idx // 4
+cu_column = within_se % 5
+cohort = within_se // 5
+se_rank = select(cu_column < 4, 29 * cu_column + cohort, 116 + cohort)
+logical_xcc = (physical_xcc + 2) % 4
+logical_pair = logical_xcc * 576 + 144 * se_slot + se_rank
+```
+
+正式结果保存在
+`/tmp/production-physical4-vs-xcc-suffix-selocal-xccrot2-clean-abba24.json`：
+
+| 路径 | down中位数 | 有效TFLOPS | paired ratio |
+| --- | ---: | ---: | ---: |
+| 同轮production physical4 | 2.158432 ms | 429.81 | 1.000000 |
+| strict-PA rotation-2 | 1.919671 ms | 483.27 | 0.891783 |
+
+24/24轮candidate均快于control；paired latency降低10.82%，对应吞吐提高12.13%。但是固定验收
+仍以早先正式physical4基线`2.085069 ms`为准：候选只提高8.62%，固定目标为`1.895517 ms`，
+当前还慢24.154 us（1.274%）。因此候选不得合入production。
+
+natural SE-local的正式结果为`1.920991 ms`，rotation-2只额外降低约1.32 us；该微增益在短测
+中为paired ratio `0.994366`，但绝对中位受10-buffer allocation和同轮调用位置影响明显。fresh
+SE-local ATT dispatch为`1.823170 ms`（仅解释性，不能作为计时），steady MFMA busy由suffix的
+90.95%提高到95.14%，fixed-window physical union busy由90.49%提高到95.00%。剩余idle主要为
+`other_dependency_stall 37.13%`、`structural_tail 24.64%`、`vmem_issue_stall 23.23%`，严格
+VMEM-wait witness仍为0。
+
+本checkpoint已关闭：SE列逆序/相位、20-column与dual-column映射、运行时CU-ID映射、exact-H3
+双kernel、packed FMA、K2 high-first、VMEM credit、output store split/order的大部分扫描、K2
+VMEM/DS burst拆分和read interleave、compute-stage mask不对称、group1 `5/3` store split。
+当前scratch worktree中存在尚未编译/计时的group1 `3/5`草稿，它不是有效候选，也不属于本提交。
+
+重建当前最佳：
+
+```bash
+git worktree add --detach /tmp/unified8-strict-pa-xccrot2 HEAD
+git -C /tmp/unified8-strict-pa-xccrot2 apply \
+  "$PWD/tests/contrib/moe/candidates/unified8_strict_pa_xccrot2.patch"
+sha256sum \
+  /tmp/unified8-strict-pa-xccrot2/src/contrib/flydsl/moe_gemm_splitk.py
+```
+
+预期源码SHA256为
+`6ccc253d57367a2c2fa45ef802288c325ebc50c0bbbe762bae9f122b78110171`。
+
+### 0.2 2026-08-18增量：complementary packed store（历史）
+
+当前最佳有效候选位于`/tmp/unified8-paired-sharedw`，源码SHA256为
+`647dd44e1d57f7b2c274ebf21560858a79b05fa371b3c9f79af2f04520e90945`。它保持真实
+512-thread/8-wave、严格反相和10个真实barrier，只改变上一N块的packed MUBUF写回相位：
+
+```text
+group0 A0/A1/A2 = 0/2/6
+group1 A0/A1/A2 = 0/6/2
+```
+
+对应control位于`/tmp/unified8-paired-store26`，两组均为`0/2/6`，源码SHA256为
+`182f59b38ca1ce931107ab573522718d8de617f98cc1b8736c15f6b86746e631`。受控
+10-buffer ABBA16结果为：
+
+| 版本 | down中位数 | paired ratio中位数 | 有效TFLOPS |
+| --- | ---: | ---: | ---: |
+| paired control | 2.072853 ms | 1.000000 | 447.55 |
+| complementary store | 2.027153 ms | 0.979634 | 457.64 |
+
+10份有效physical rows、完整reduced outputs均逐bit一致，inactive tail未被写入。候选资源为
+`96 VGPR + 128 AGPR`、49,152B LDS、0 scratch；静态ISA仍为192条MFMA和10个barrier。
+相对正式physical4的2.085069 ms，它仅降低约2.78%延迟；10%目标仍是1.895517 ms，当前候选
+还需降低约6.9%。因此不得合入production。
+
+complementary性能扫描中，`A1/A2`分别为`0/8 vs 8/0`、`1/7 vs 7/1`、
+`2/6 vs 6/2`、`3/5 vs 5/3`时，短测paired ratio依次为`1.017577`、`0.994213`、
+`0.979634`、`0.992727`；只有最优的`2/6 vs 6/2`继续完成了完整正确性和ABBA16门禁。
+下文“组间非对称store被否证”只描述更早的vector-major producer-only布局，不适用于这个保留
+原physical/reduced输出契约的packed MUBUF调度。
+
+fresh ATT的匹配对比为：
+
+| 指标 | paired control | complementary store |
+| --- | ---: | ---: |
+| steady MFMA busy | 81.82% | 83.23% |
+| lifecycle MFMA busy | 76.47% | 77.71% |
+| physical-union MFMA busy | 80.43% | 81.89% |
+| `VMEM-store + barrier` idle cycles | 1,924,796 | 556,528 |
+| `barrier + barrier` idle cycles | 3,391,892 | 3,165,404 |
+| `VMEM-load + barrier` idle cycles | 2,764,584 | 2,919,520 |
+
+store错峰共减少约1,006,524 steady MFMA-idle cycles，但剩余空洞已迁移到barrier/barrier、
+load/barrier和wait-vmcnt。fixed-window归因中，complementary的MFMA-idle由
+`other_dependency_stall 41.51%`、`vmem_issue_stall 24.74%`、`structural_tail 20.77%`
+主导；oracle上界由control的16.31%降到13.48%，residual由3.26%升到4.63%，严格
+VMEM-wait witness仍为0。因此继续只扫描A1/A2 store比例没有证据支持达到目标。
+
+唯一尚待受控判定的store探针位于`/tmp/unified8-paired-a0`，源码SHA256为
+`f7e69e30469d8996ae76806da5b578fd39f91e6d70302b9e906df2c03dfc0d48`：
+
+```text
+group0 A0/A1/A2 = 1/1/6
+group1 A0/A1/A2 = 0/6/2
+```
+
+它已通过AST/Pylance检查、真实FlyDSL编译和正式shape的paired单buffer门禁：296,448个有效
+physical rows、完整reduced output均与complementary候选逐bit一致，10,816个inactive tail rows
+未被写入。旧`check_unified8_n4096.py`也显示两候选逐bit相同，但其单组PyTorch oracle不适用于
+paired双组输出契约，因此该旧脚本整体退出。A0仍未通过10-buffer门禁；正式ABBA2在任何编译前
+被硬件门禁阻止：当时全部8张卡均由外部作业占用约79% VRAM。待GPU4恢复到不超过20% VRAM后，
+必须从同一ABBA2命令重跑，不得绕过空闲门禁或引用污染状态下的计时。
+
+所有早期N-split timing均无效：相关变体存在两组工作重叠和越界写，未实现同一输出契约。
+不要引用这些计时；任何N-split路线必须先重新证明边界、完整写覆盖和inactive-tail不变。
+
+正式24轮、10-buffer、ABBA基线为：
+
+| 路径 | down中位数 | 相对physical4 |
+| --- | ---: | ---: |
+| physical4 | 2.085069 ms | 1.000000 |
+| production unified8 | 2.286270 ms | 1.094621 |
+
+consumer ratio约为`0.99945`，combined ratio为`1.072512`。目标时间是
+`2.085069 / 1.10 = 1.895517 ms`，production仍需缩短约17.1%。
+
+strict-PA oracle证明计算本身不是硬件MFMA吞吐瓶颈：
+
+| oracle | down中位数 | 相对production control |
+| --- | ---: | ---: |
+| compute-only（无output store） | 1.743390 ms | 0.767612 |
+| compute + routing/BF16（无output store） | 1.807410 ms | 0.797958 |
+
+这意味着达到目标只剩约`0.088 ms`的完整输出预算；当前可实现的输出路径远超该预算。
+
+最接近的producer-only下界是vector-major packed输出，布局为
+`[N512 block][vector_index][thread_id][8 BF16]`。它保留所有真实barrier、seed/drain、三个K128
+和MFMA-only Stage B，但没有matching consumer，正式运行使用`--skip-correctness --down-only`，
+因此不能采纳：
+
+| vector-major候选 | down约值 | 相对production |
+| --- | ---: | ---: |
+| MUBUF、policy2、统一A2 `0/0/8` | 2.1833 ms | 0.96024 |
+| group0 A2 / group1 A1 | 2.2197 ms | 0.97311 |
+| group0 A1 / group1 A2 | 2.2026 ms | 0.96775 |
+| `global_store_dwordx4 ... nt` | 2.2355 ms | 0.98216 |
+
+最后一个候选的最终ISA已确认是16条静态`global_store_dwordx4`，并非后端折回MUBUF。
+组间非对称store和global-store指令族都被ABBA8否证；即使忽略consumer和正确性，最佳producer
+仍比目标慢约15.2%。因此没有为vector-major布局实现consumer，也没有对这些下界做ABBA24。
+
+fresh vector-packed ATT显示steady MFMA busy由production的`77.51%`提高到`81.29%`，但idle
+的`61.25%`已迁移为VMEM stall/wait，`26.44%`为barrier imbalance。最大joint blocker是
+`VMEM-store + peer barrier`（5,569,168 cycles，占idle 54.65%）；非对称store的实测退化说明
+简单错峰不能抵消缩短store retirement距离的代价。
+
+本轮已关闭的其他路线包括CShuffle重分布、pair barrier、dual4、K192、priority、提前K0/K1
+prefetch、MFMA32、transposed MFMA/DPP、register CShuffle和cache-policy扫描。除非底层约束改变
+或出现新的physical-union ATT证据，不要重复这些实验。第7、8节的“待测”描述仅保留为早期
+检查点历史，已由本节覆盖。
 
 ## 1. 五分钟续跑
 
@@ -25,7 +207,7 @@ sha256sum src/contrib/flydsl/moe_gemm_splitk.py
 
 | 仓库/组件 | 版本 |
 | --- | --- |
-| pyhip父提交 | `23d4e52c6d170a74ccc6de2e48bb6c3646baf0da` |
+| pyhip父提交 | `238f871` |
 | pyhip分支 | `luocheng/try-opt-down-308` |
 | 生产源码SHA256 | `959dd745328c54506e73ec9cbd1aebd91ffa995b6478df328faf714e1bb2a674` |
 | FlyDSL提交 | `eb7d69c18f8675c4aa26e8fa01b3277f35a3b57f` |

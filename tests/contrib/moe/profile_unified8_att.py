@@ -44,6 +44,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", type=Path, default=DEFAULT_MODULE)
     parser.add_argument("--dispatches", type=int, default=6)
+    parser.add_argument(
+        "--path",
+        choices=("physical4", "unified8"),
+        default="unified8",
+    )
     args = parser.parse_args()
     if args.dispatches < 5:
         parser.error("--dispatches must be at least 5 for the checked-in ATT YAML")
@@ -77,7 +82,7 @@ def main():
     output = torch.empty(grid * BLOCK_M, N, dtype=torch.bfloat16, device="cuda")
     weight_scale = torch.ones(EXPERTS, dtype=torch.float32, device="cuda")
     activation_scale = torch.ones(1, dtype=torch.float32, device="cuda")
-    launch = module.compile_gemm(
+    common = dict(
         N=N,
         K=K,
         weight_dtype="fp8",
@@ -85,13 +90,24 @@ def main():
         act_quant_type="per_tensor",
         TOPK=TOPK,
         BLOCK_TILE_SIZE_M=BLOCK_M,
-        BLOCK_TILE_SIZE_N=512,
         stage="down",
         alg="prefill_1x4",
         E=EXPERTS,
         USE_ATOMIC_WRITE=False,
-        down_physical_n512=True,
         down_output_padding_bytes=0,
+    )
+    launch = (
+        module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+        )
+        if args.path == "unified8"
+        else module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=256,
+            down_physical_n256=True,
+        )
     )
     stream = torch.cuda.current_stream()
     for _ in range(args.dispatches):
@@ -113,7 +129,7 @@ def main():
     if not torch.isfinite(output[:padded_rows]).all():
         raise AssertionError("profile output contains non-finite values")
     print(
-        f"module={args.module.resolve()} N512 grid={grid} "
+        f"module={args.module.resolve()} path={args.path} grid={grid} "
         f"padded_rows={padded_rows} dispatches={args.dispatches}"
     )
 

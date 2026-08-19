@@ -89,14 +89,36 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, default=DEFAULT_MODULE)
+    parser.add_argument(
+        "--control-path",
+        choices=("physical4", "unified8"),
+        default="unified8",
+    )
+    parser.add_argument(
+        "--candidate-path",
+        choices=("physical4", "unified8"),
+        default="unified8",
+    )
+    parser.add_argument("--candidate-packed-direct", action="store_true")
+    parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--down-only", action="store_true")
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--physical-device", type=int, default=4)
+    parser.add_argument("--max-initial-vram-percent", type=int, default=20)
     parser.add_argument("--amdsmi-root", type=Path, default=DEFAULT_AMDSMI_ROOT)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--exact-valid-grid", action="store_true")
     args = parser.parse_args()
     if args.rounds < 2:
         parser.error("--rounds must be at least 2")
+    if (
+        not args.skip_correctness
+        and args.control_path != args.candidate_path
+    ):
+        parser.error(
+            "cross-path comparisons require --skip-correctness; validate "
+            "bitwise output against a control using the same physical layout"
+        )
     return args
 
 
@@ -133,7 +155,8 @@ def run(args):
         )
     if (
         original_state["gpu_busy_percent"] > 5
-        or original_state["vram_allocated_percent"] > 20
+        or original_state["vram_allocated_percent"]
+        > args.max_initial_vram_percent
     ):
         raise RuntimeError(f"GPU{args.physical_device} is not idle: {original_state}")
 
@@ -223,30 +246,24 @@ def run(args):
 
         labels = ("control", "candidate")
         output_sentinels = {"control": -3.0, "candidate": 5.0}
-        physical_outputs = {
-            label: [
-                torch.full(
-                    (allocated_rows, HIDDEN),
-                    output_sentinels[label],
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-                for _ in range(BUFFER_COPIES)
-            ]
-            for label in labels
-        }
-        reduced_outputs = {
-            label: [
-                torch.full(
-                    (BATCH, HIDDEN),
-                    output_sentinels[label],
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-                for _ in range(BUFFER_COPIES)
-            ]
-            for label in labels
-        }
+        physical_outputs = [
+            torch.empty(
+                (allocated_rows, HIDDEN),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for _ in range(BUFFER_COPIES)
+        ]
+        reduced_outputs = [
+            torch.empty(
+                (BATCH, HIDDEN),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for _ in range(BUFFER_COPIES)
+        ]
+        candidate_physical_output = torch.empty_like(physical_outputs[0])
+        candidate_reduced_output = torch.empty_like(reduced_outputs[0])
 
         common = dict(
             N=HIDDEN,
@@ -262,20 +279,53 @@ def run(args):
             USE_ATOMIC_WRITE=False,
             down_output_padding_bytes=0,
         )
-        down_launch = {
-            "control": control.compile_gemm(
-                **common, BLOCK_TILE_SIZE_N=512, down_physical_n512=True
-            ),
-            "candidate": candidate.compile_gemm(
-                **common, BLOCK_TILE_SIZE_N=512, down_physical_n512=True
-            ),
+        modules = {"control": control, "candidate": candidate}
+        paths = {
+            "control": args.control_path,
+            "candidate": args.candidate_path,
         }
-        sum_launch = {
-            label: (control if label == "control" else candidate).sorted_sum(
-                TOPK, HIDDEN, 0
+
+        def compile_down(label):
+            if paths[label] == "unified8":
+                return modules[label].compile_gemm(
+                    **common,
+                    BLOCK_TILE_SIZE_N=512,
+                    down_physical_n512=True,
+                )
+            return modules[label].compile_gemm(
+                **common,
+                BLOCK_TILE_SIZE_N=256,
+                down_physical_n256=True,
             )
-            for label in labels
+
+        down_launch = {label: compile_down(label) for label in labels}
+        sum_launch = {
+            "control": control.sorted_sum(TOPK, HIDDEN, 0),
+            "candidate": (
+                candidate.sorted_sum(TOPK, HIDDEN, 0, packed_direct=True)
+                if args.candidate_packed_direct
+                else candidate.sorted_sum(TOPK, HIDDEN, 0)
+            ),
         }
+        decode_candidate = (
+            candidate.sorted_sum(1, HIDDEN, 0, packed_direct=True)
+            if args.candidate_packed_direct
+            else None
+        )
+        identity_locs = (
+            torch.arange(padded_rows, dtype=torch.int32, device="cuda").view(-1, 1)
+            if args.candidate_packed_direct
+            else None
+        )
+        decoded_candidate = (
+            torch.empty(
+                (padded_rows, HIDDEN),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            if args.candidate_packed_direct
+            else None
+        )
 
         gate_input = torch.ones(BATCH, HIDDEN, dtype=FP8, device="cuda")
         gate_weight = shuffle_weight(
@@ -317,11 +367,11 @@ def run(args):
                 stream,
             )
 
-        def launch_down(label, index):
+        def launch_down(label, index, output=None):
             down_launch[label](
                 ptr(activations[index]),
                 ptr(weights[index]),
-                ptr(physical_outputs[label][index]),
+                ptr(physical_outputs[index] if output is None else output),
                 ptr(sorted_ids),
                 ptr(sorted_weights),
                 ptr(sorted_expert_ids),
@@ -333,48 +383,86 @@ def run(args):
                 stream,
             )
 
-        def launch_sum(label, index):
+        def launch_sum(label, index, physical_output=None, reduced_output=None):
             sum_launch[label](
                 loc_ids,
-                physical_outputs[label][index],
-                reduced_outputs[label][index],
+                (
+                    physical_outputs[index]
+                    if physical_output is None
+                    else physical_output
+                ),
+                reduced_outputs[index] if reduced_output is None else reduced_output,
                 BATCH,
             )
+
+        if not args.skip_correctness:
+            for index in range(BUFFER_COPIES):
+                physical_outputs[index].fill_(output_sentinels["control"])
+                reduced_outputs[index].fill_(output_sentinels["control"])
+                candidate_physical_output.fill_(output_sentinels["candidate"])
+                candidate_reduced_output.fill_(output_sentinels["candidate"])
+                launch_down("control", index)
+                launch_sum("control", index)
+                launch_down("candidate", index, candidate_physical_output)
+                launch_sum(
+                    "candidate",
+                    index,
+                    candidate_physical_output,
+                    candidate_reduced_output,
+                )
+                if args.candidate_packed_direct:
+                    decode_candidate(
+                        identity_locs,
+                        candidate_physical_output,
+                        decoded_candidate,
+                        padded_rows,
+                    )
+                torch.cuda.synchronize()
+
+                physical_lhs = physical_outputs[index][:padded_rows]
+                physical_rhs = (
+                    decoded_candidate
+                    if args.candidate_packed_direct
+                    else candidate_physical_output[:padded_rows]
+                )
+                if not torch.equal(physical_lhs, physical_rhs):
+                    bad_rows = (physical_lhs != physical_rhs).any(dim=1)
+                    bad_blocks = (
+                        bad_rows.reshape(padded_rows // BLOCK_M, BLOCK_M)
+                        .any(dim=1)
+                        .nonzero()
+                        .flatten()
+                    )
+                    raise AssertionError(
+                        f"physical mismatch buffer={index} "
+                        f"blocks={bad_blocks[:32].tolist()}"
+                    )
+                for label, output in (
+                    ("control", physical_outputs[index]),
+                    ("candidate", candidate_physical_output),
+                ):
+                    inactive_tail = output[padded_rows:]
+                    if inactive_tail.numel() and not torch.all(
+                        inactive_tail == output_sentinels[label]
+                    ):
+                        raise AssertionError(
+                            f"{label} wrote inactive tail rows in buffer={index}"
+                        )
+                if not torch.equal(
+                    reduced_outputs[index],
+                    candidate_reduced_output,
+                ):
+                    raise AssertionError(f"reduced output mismatch buffer={index}")
+
+        del candidate_physical_output, candidate_reduced_output
+        torch.cuda.empty_cache()
 
         for index in range(BUFFER_COPIES):
             for label in labels:
                 launch_down(label, index)
-                launch_sum(label, index)
+                if not args.down_only:
+                    launch_sum(label, index)
         torch.cuda.synchronize()
-
-        for index in range(BUFFER_COPIES):
-            physical_lhs = physical_outputs["control"][index][:padded_rows]
-            physical_rhs = physical_outputs["candidate"][index][:padded_rows]
-            if not torch.equal(physical_lhs, physical_rhs):
-                bad_rows = (physical_lhs != physical_rhs).any(dim=1)
-                bad_blocks = (
-                    bad_rows.reshape(padded_rows // BLOCK_M, BLOCK_M)
-                    .any(dim=1)
-                    .nonzero()
-                    .flatten()
-                )
-                raise AssertionError(
-                    f"physical mismatch buffer={index} "
-                    f"blocks={bad_blocks[:32].tolist()}"
-                )
-            for label in labels:
-                inactive_tail = physical_outputs[label][index][padded_rows:]
-                if inactive_tail.numel() and not torch.all(
-                    inactive_tail == output_sentinels[label]
-                ):
-                    raise AssertionError(
-                        f"{label} wrote inactive tail rows in buffer={index}"
-                    )
-            if not torch.equal(
-                reduced_outputs["control"][index],
-                reduced_outputs["candidate"][index],
-            ):
-                raise AssertionError(f"reduced output mismatch buffer={index}")
 
         orders = (
             ("control", "candidate", "candidate", "control"),
@@ -385,6 +473,16 @@ def run(args):
             samples = {label: [] for label in labels}
             ratios = []
             call_index = 0
+            for warmup_index in range(BUFFER_COPIES):
+                for label in labels:
+                    launch_gate()
+                    if phase == "consumer":
+                        launch_sum(label, warmup_index)
+                    else:
+                        launch_down(label, warmup_index)
+                        if phase == "combined":
+                            launch_sum(label, warmup_index)
+            torch.cuda.synchronize()
             for round_index in range(args.rounds):
                 events = []
                 for label in orders[round_index % 2]:
@@ -394,9 +492,12 @@ def run(args):
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     start.record()
-                    launch_down(label, index)
-                    if phase == "combined":
+                    if phase == "consumer":
                         launch_sum(label, index)
+                    else:
+                        launch_down(label, index)
+                        if phase == "combined":
+                            launch_sum(label, index)
                     end.record()
                     events.append((label, start, end))
                 torch.cuda.synchronize()
@@ -416,10 +517,12 @@ def run(args):
                 "candidate_over_control": summarize(ratios),
             }
 
-        phases = {
-            "down": measure("down"),
-            "combined": measure("combined"),
-        }
+        phases = {"down": measure("down")}
+        if not args.down_only:
+            phases.update(
+                consumer=measure("consumer"),
+                combined=measure("combined"),
+            )
         useful_flops = 2 * useful_rows * HIDDEN * K
         for entry in phases["down"]["versions"].values():
             entry["useful_tflops"] = useful_flops / (entry["median"] * 1e9)
@@ -427,6 +530,8 @@ def run(args):
         result = {
             "control": str(args.control.resolve()),
             "candidate": str(args.candidate.resolve()),
+            "paths": paths,
+            "candidate_packed_direct": args.candidate_packed_direct,
             "source_sha256": {
                 "control": sha256(args.control.resolve()),
                 "candidate": sha256(args.candidate.resolve()),
@@ -447,10 +552,11 @@ def run(args):
             "rounds": args.rounds,
             "buffer_copies": BUFFER_COPIES,
             "correctness": {
-                "all_valid_physical_rows_bit_equal": True,
-                "inactive_tail_rows_untouched": True,
-                "full_reduced_outputs_bit_equal": True,
-                "buffers_checked": BUFFER_COPIES,
+                "skipped": args.skip_correctness,
+                "all_valid_physical_rows_bit_equal": not args.skip_correctness,
+                "inactive_tail_rows_untouched": not args.skip_correctness,
+                "full_reduced_outputs_bit_equal": not args.skip_correctness,
+                "buffers_checked": 0 if args.skip_correctness else BUFFER_COPIES,
             },
             "padded_rows": padded_rows,
             "allocated_rows": allocated_rows,

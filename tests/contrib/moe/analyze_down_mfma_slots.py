@@ -329,6 +329,8 @@ def load_group_payload(
     trace_stats = {
         "waves": 0,
         "complete_waves": 0,
+        "early_exit_waves": 0,
+        "active_waves": 0,
         "context_records": 0,
         "opcode_stats": defaultdict(lambda: {"count": 0, "stall": 0, "issue": 0}),
     }
@@ -372,10 +374,14 @@ def load_group_payload(
             op_entry["stall"] += stall
             op_entry["issue"] += duration - stall
             records.append(record)
+        if mfma_ordinal == 0 and data["num_insts"] == data["num_stitched"]:
+            trace_stats["early_exit_waves"] += 1
+            continue
         if mfma_ordinal != EXPECTED_MFMA_PER_WAVE:
             raise RuntimeError(
                 f"{path}: expected {EXPECTED_MFMA_PER_WAVE} MFMA, got {mfma_ordinal}"
             )
+        trace_stats["active_waves"] += 1
         key = (int(match.group(1)), int(wave["cu"]), int(wave["simd"]))
         groups[key].append(
             {
