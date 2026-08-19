@@ -6,8 +6,10 @@
 >
 > 目标平台：AMD Instinct MI308X / gfx942，ROCm 7.2。
 >
-> 本文档是当前实验的唯一跨机器handoff入口。production SHA256为
-> `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`，H3 specialization保持512 threads、
+> 本文档是当前实验的唯一跨机器handoff入口。packed-best promotion源码SHA256为
+> `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；当前all-down集成源码
+> SHA256为`929b36f77ebcbe282f01251f1105748cecdfe8f2911ffa78153875c4dafd184d`，且packed H3最终ISA
+> 与promotion产物逐字节一致。H3 specialization保持512 threads、
 > 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
 > 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
 
@@ -17,6 +19,31 @@
 落后一rendezvous、三个K128、每个Stage B源码只有对应K的MFMA，以及相对physical4快10%以上。
 当前production满足正确性、全部结构约束和相对physical4的性能目标；固定绝对目标
 `1.895517 ms`仍未达到。
+
+### 0.0.1 2026-08-19 all-down集成checkpoint
+
+本轮把严格paired方法逐条评估到所有down分支，但只在结构与性能都成立处启用：
+
+- packed H3 formal best保持不变。重新编译的最终ISA与promotion产物逐字节一致，仍为192条MFMA、
+  39条128-bit load、16条store、10个真实barrier、254 VGPR、49,152B LDS和0 scratch。
+- generic dispatcher新增expert-safe M128 sorting、M64 metadata复制和row-major paired适配。真实H3
+  端到端精度为`diff=0.00017182`，N512/N1024两组M64 oracle均通过；但random-route ABBA8中
+  direct row-major相对physical4为`1.232053`、相对packed paired为`1.363678`，均0/8胜。
+  因此exact H3默认使用修复后的physical4/0B padding；`MOE_DOWN_PAIRED_N512=1`只保留实验入口。
+- physical4原先把`pair_e_idx=e_idx*2`误用于4-wave路径，跳过全部奇数M64 block；现已按实际
+  `paired_m_groups`计算，并由两个M64 block回归覆盖。
+- batch1复用了可兼容的VMEM-read scheduling思路，没有引入paired WG或新barrier。H3维度
+  ABBA24中FP8 ratio为`0.956752`（24/24胜），BF16为`0.997616`（21/24胜）；两种精度的
+  TOPK atomic reduction oracle均通过。该mask仅在`stage=down, alg=batch1`时启用。
+- 相同mask用于splitk时从`0.872255`退化到`1.626202 ms`，ratio `1.865054`、0/8胜，已回退。
+- paired PTPC的首个group-local scale-LDS原型在合法padding metadata下仍于kernel launch崩溃；
+  尚未达到正确性门禁，已完整回退。64KB CShuffle row-major原型产生27个VGPR spill/88B private，
+  wave-local bpermute原型产生4个spill/12B private，也均回退。
+- paired A-stage全局`0x20`探针的最终ISA与control逐字节相同，没有可执行效果，已删除。
+
+当前剩余优先级记录在`docs/UNIFIED8_DOWN_TODO.md`：先做独立exact-H3数学/tail持久回归，再诊断
+PTPC scale-LDS launch fault；paired性能只继续测试能恢复coalesced row-major写回且保持254 VGPR、
+0 scratch、49,152B LDS和10 barriers的方案。splitk不再复用全局`0x20`。
 
 ### 0.1 2026-08-19 production promotion
 

@@ -78,6 +78,7 @@ def compile_gemm(
     down_physical_n256=False,
     down_physical_n512=False,
     down_output_padding_bytes=None,
+    down_paired_row_major=False,
 ):
 
     TILE_K = 64
@@ -115,6 +116,7 @@ def compile_gemm(
     if activation == "swiglu":
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
     assert not (down_physical_n256 and down_physical_n512)
+    assert not down_paired_row_major or down_physical_n512
     use_exact_h3_paired = (
         down_physical_n512
         and E == 193
@@ -122,7 +124,10 @@ def compile_gemm(
         and K == 384
         and TOPK == 9
     )
-    if down_physical_n512 and not use_exact_h3_paired:
+    use_paired_down = down_physical_n512 and (
+        use_exact_h3_paired or down_paired_row_major
+    )
+    if down_physical_n512 and not use_paired_down:
         down_physical_n512 = False
         down_physical_n256 = True
         BLOCK_TILE_SIZE_N = 256
@@ -895,7 +900,8 @@ def compile_gemm(
             )  # uint32 dwords -> 128b loads
         vmcnt_per_prefetch = a_vmem_cnt + b_vmem_cnt
 
-        rocdl.sched_barrier(0)
+        splitk_stage_mask = 0x20 if stage == "down" and alg == "batch1" else 0
+        rocdl.sched_barrier(splitk_stage_mask)
 
         # Main loop: 2x unrolled ping-pong (even iter uses buf 0, odd iter uses buf 1)
         for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
@@ -909,11 +915,11 @@ def compile_gemm(
                 b_frag_retile[1],
             )
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
-            rocdl.sched_barrier(0)
+            rocdl.sched_barrier(splitk_stage_mask)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
             fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
-            rocdl.sched_barrier(0)
+            rocdl.sched_barrier(splitk_stage_mask)
             # --- odd iteration: compute buf[1], prefetch into buf[0] ---
             _prefetch_a(k_base + 2, 0)
             fx.copy(
@@ -922,11 +928,11 @@ def compile_gemm(
                 b_frag_retile[0],
             )
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
-            rocdl.sched_barrier(0)
+            rocdl.sched_barrier(splitk_stage_mask)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[1], b_frag[1])
             fx.gemm(tiled_mma, c_frag, b_frag[1], a_frag[1], c_frag)
-            rocdl.sched_barrier(0)
+            rocdl.sched_barrier(splitk_stage_mask)
 
             results = yield [c_frag.load()]
         c_frag.store(results)
@@ -2128,7 +2134,8 @@ def compile_gemm(
         wave_group = fx.Int32(fx.thread_idx.x // 256)
         wave_group_index = fx.Index(wave_group)
         local_tid = fx.Int32(fx.thread_idx.x % 256)
-        pair_e_idx = fx.Int32(e_idx * 2)
+        paired_m_groups = 2 if down_physical_n512 else 1
+        pair_e_idx = fx.Int32(e_idx * paired_m_groups)
         group_e_idx = pair_e_idx + wave_group
         pair_e_offset = fx.Int64(pair_e_idx)
         group_e_offset = fx.Int64(group_e_idx)
@@ -2140,18 +2147,21 @@ def compile_gemm(
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
                 + pair_e_offset * (BLOCK_TILE_SIZE_M * output_row_stride),
-                (2 * BLOCK_TILE_SIZE_M, output_row_stride),
+                (paired_m_groups * BLOCK_TILE_SIZE_M, output_row_stride),
             )
             physical_store_rsrc = None
             if const_expr(down_physical_n256):
                 physical_store_rsrc = fx.buffer_ops.create_buffer_resource(
                     arg_p_output,
                     max_size=False,
-                    num_records_bytes=2 * BLOCK_TILE_SIZE_M * output_row_stride * 2,
+                    num_records_bytes=paired_m_groups
+                    * BLOCK_TILE_SIZE_M
+                    * output_row_stride
+                    * 2,
                 )
             arg_p_sorted_ids_pair = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_sorted_ids) + pair_e_offset * BLOCK_TILE_SIZE_M,
-                (2 * BLOCK_TILE_SIZE_M,),
+                (paired_m_groups * BLOCK_TILE_SIZE_M,),
                 fx.Int32,
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
@@ -2234,7 +2244,7 @@ def compile_gemm(
 
             @fx.union
             class SharedStorage:
-                A: fx.Array[act_dtype, 2 * BLOCK_M * K]
+                A: fx.Array[act_dtype, paired_m_groups * BLOCK_M * K]
                 C: fx.Array[fx.BFloat16, 2 * BLOCK_M * C_BLOCK_N]
 
             shared_allocator = fx.SharedAllocator()
@@ -2260,7 +2270,7 @@ def compile_gemm(
             ldsA0 = lds.A.peek().view(
                 fx.make_composed_layout(
                     fx.static(a_swz),
-                    fxh.torch_layout(2 * BLOCK_M, K),
+                    fxh.torch_layout(paired_m_groups * BLOCK_M, K),
                 )
             )
             layoutC = fx.make_composed_layout(
@@ -2696,11 +2706,44 @@ def compile_gemm(
                 fx.BFloat16, 128
             )
 
+            def paired_store_byte_offset(block_n, vector_index):
+                if const_expr(down_paired_row_major):
+                    group_id = fx.Int64(fx.thread_idx.x // 256)
+                    group_tid = fx.Int64(fx.thread_idx.x % 256)
+                    wave_id = group_tid // 64
+                    source_lane = group_tid % 64
+                    lane_group = source_lane // 16
+                    lane_in_16 = source_lane % 16
+                    output_row = (
+                        group_id * 64
+                        + fx.Int64(vector_index // 2) * 16
+                        + lane_in_16
+                    )
+                    output_column = (
+                        fx.Int64(block_n) * BLOCK_N
+                        + wave_id * 64
+                        + lane_group * 16
+                        + fx.Int64(vector_index % 2) * 8
+                    )
+                    return (
+                        (output_row * output_row_stride + output_column) * 2
+                    ).to(fx.Int32)
+                return (
+                    (
+                        fx.Int64(block_n) * (2 * BLOCK_M * BLOCK_N)
+                        + (
+                            fx.Int64(vector_index) * 512
+                            + fx.Int64(fx.thread_idx.x)
+                        )
+                        * 8
+                    )
+                    * 2
+                ).to(fx.Int32)
+
             def store_vector_packed_pair_m(
                 output, block_n, vector_begin=0, vector_count=8
             ):
                 packed_output = Vec(output.load()).bitcast(fx.Int32)
-                tile_base = fx.Int64(block_n) * (2 * BLOCK_M * BLOCK_N)
                 for vector_offset in range_constexpr(vector_count):
                     vector_index = vector_begin + vector_offset
                     fx.buffer_ops.buffer_store(
@@ -2712,17 +2755,7 @@ def compile_gemm(
                             fx.Int32,
                         ),
                         physical_store_rsrc,
-                        (
-                            (
-                                tile_base
-                                + (
-                                    vector_index * 512
-                                    + fx.Int64(fx.thread_idx.x)
-                                )
-                                * 8
-                            )
-                            * 2
-                        ).to(fx.Int32),
+                        paired_store_byte_offset(block_n, vector_index),
                         cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
                         offset_is_bytes=True,
                     )
@@ -2771,18 +2804,9 @@ def compile_gemm(
                                     packed_store, fx.Int32
                                 ),
                                 physical_store_rsrc,
-                                (
-                                    (
-                                        fx.Int64(block_n)
-                                        * (2 * BLOCK_M * BLOCK_N)
-                                        + (
-                                            vector_index * 512
-                                            + fx.Int64(fx.thread_idx.x)
-                                        )
-                                        * 8
-                                    )
-                                    * 2
-                                ).to(fx.Int32),
+                                paired_store_byte_offset(
+                                    block_n, vector_index
+                                ),
                                 cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
                                 offset_is_bytes=True,
                             )
@@ -3215,18 +3239,13 @@ def compile_gemm(
                         loop_results.append(frag_weight_head.load())
                     results = yield loop_results
                 if const_expr(down_physical_n512):
+                    previous_fragC.store(results[2])
+                    postprocess_store_vector_packed_pair_m(
+                        previous_fragC, group_n_blocks - 1
+                    )
                     if wave_group == 0:
-                        previous_fragC.store(results[2])
-                        postprocess_store_vector_packed_pair_m(
-                            previous_fragC, group_n_blocks - 1
-                        )
                         fx.rocdl.s_setprio(0)
                         fx.gpu.barrier()
-                    else:
-                        previous_fragC.store(results[2])
-                        postprocess_store_vector_packed_pair_m(
-                            previous_fragC, group_n_blocks - 1
-                        )
                 else:
                     fragC_bf16.store(results[2])
                 fx.rocdl.sched_barrier(0)
@@ -3503,6 +3522,7 @@ def sorted_sum(
     TOPK,
     N,
     row_padding_bytes=None,
+    packed_direct=False,
 ):
     if row_padding_bytes is not None:
         assert row_padding_bytes in (0, 32, 64, 128)
@@ -3534,8 +3554,47 @@ def sorted_sum(
             (A + fx.Int64(token_locs[topk]) * source_row_stride)
             for topk in fx.range_constexpr(TOPK)
         ]
+        packed_input_rsrc = None
+        if fx.const_expr(packed_direct):
+            packed_input = fx.make_view(A, fx.make_layout(N, 1))
+            packed_input_rsrc = fx.buffer_ops.create_buffer_resource(
+                packed_input,
+                max_size=True,
+            )
 
         def load_atom(topk_id, off):
+            if fx.const_expr(packed_direct):
+                token_loc = fx.Int64(token_locs[topk_id])
+                pair_row = token_loc % 128
+                group_id = pair_row // 64
+                block_row = pair_row % 64
+                column = fx.Int64(off)
+                block_n = column // 256
+                column_in_block = column % 256
+                wave_id = column_in_block // 64
+                column_in_wave = column_in_block % 64
+                lane_group = column_in_wave // 16
+                channel_piece = (column_in_wave % 16) // 8
+                token_repeat = block_row // 16
+                lane_in_16 = block_row % 16
+                store_index = token_repeat * 2 + channel_piece
+                source_lane = lane_group * 16 + lane_in_16
+                physical_atom = (
+                    (token_loc // 128) * (128 * N // 8)
+                    + block_n * (128 * 256 // 8)
+                    + store_index * 512
+                    + group_id * 256
+                    + wave_id * 64
+                    + source_lane
+                )
+                return fx.Vector(
+                    fx.buffer_ops.buffer_load(
+                        packed_input_rsrc,
+                        (physical_atom * 8).to(fx.Int32),
+                        vec_width=8,
+                        dtype=fx.BFloat16,
+                    )
+                )
             atom = fxh.atom_tensor(token_ptrs[topk_id], fx.Int32(off), copy_bits)
             frag = fx.make_fragment_like(atom)
             fx.copy(copy_atom, atom, frag)
@@ -3545,9 +3604,17 @@ def sorted_sum(
             return [load_atom(topk, off) for topk in fx.range_constexpr(TOPK)]
 
         def reduce_store(dst, frag):
-            vec_sum = frag[0].load().to(fx.Float32)
+            vec_sum = (
+                frag[0].to(fx.Float32)
+                if const_expr(packed_direct)
+                else frag[0].load().to(fx.Float32)
+            )
             for m in fx.range_constexpr(1, TOPK):
-                vec_sum += frag[m].load().to(fx.Float32)
+                vec_sum += (
+                    frag[m].to(fx.Float32)
+                    if const_expr(packed_direct)
+                    else frag[m].load().to(fx.Float32)
+                )
             vec_sum = vec_sum.to(dst.dtype)
             out_frag = fx.make_fragment_like(dst)
             out_frag.store(vec_sum)

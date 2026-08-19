@@ -186,7 +186,11 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
         wei_is_fp8(weight_type)
         and (
             quant_type == 'ptpc'
-            or (quant_type == 'per_tensor' and n == 4096 and k == 192)
+            or (
+                quant_type == 'per_tensor'
+                and n == 4096
+                and k in (192, 384)
+            )
         )
         and block_m == 64
         and n % 256 == 0
@@ -206,9 +210,25 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
 def _select_fly_down_padding_bytes(quant_type, n, k, down_physical_n256):
     if not down_physical_n256:
         return None
-    if quant_type == 'per_tensor' and n == 4096 and k == 192:
+    if quant_type == 'per_tensor' and n == 4096 and k in (192, 384):
         return 0
     return 128
+
+
+def _select_fly_down_paired_layout(
+    weight_type, quant_type, block_m, n, k, topk, experts
+):
+    paired_setting = os.getenv("MOE_DOWN_PAIRED_N512", "0").lower()
+    assert paired_setting in ("0", "1")
+    return paired_setting == "1" and (
+        wei_is_fp8(weight_type)
+        and quant_type == 'per_tensor'
+        and block_m == 64
+        and n == 4096
+        and k == 384
+        and topk == 9
+        and experts == 193
+    )
 
 
 def _select_fly_gateup_layout(use_prefill, n, requested_tile_n):
@@ -256,6 +276,7 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
     ("quant_type", "n", "k", "expected"),
     [
         ("per_tensor", 4096, 192, True),
+        ("per_tensor", 4096, 384, True),
         ("per_tensor", 4096, 256, False),
         ("ptpc", 4096, 512, False),
         ("ptpc", 2048, 512, False),
@@ -292,6 +313,7 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
     ("quant_type", "n", "k", "physical", "expected"),
     [
         ("per_tensor", 4096, 192, True, 0),
+        ("per_tensor", 4096, 384, True, 0),
         ("ptpc", 6144, 256, True, 128),
         ("ptpc", 6144, 384, True, 128),
         ("per_tensor", 4096, 192, False, None),
@@ -299,6 +321,48 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
 )
 def test_select_fly_down_padding_bytes(quant_type, n, k, physical, expected):
     assert _select_fly_down_padding_bytes(quant_type, n, k, physical) == expected
+
+
+@pytest.mark.parametrize(
+    ("quant_type", "block_m", "n", "k", "topk", "experts", "expected"),
+    [
+        ("per_tensor", 64, 4096, 384, 9, 193, True),
+        ("ptpc", 64, 4096, 384, 9, 193, False),
+        ("per_tensor", 64, 4096, 192, 9, 193, False),
+        ("per_tensor", 64, 6144, 384, 4, 128, False),
+        ("per_tensor", 32, 4096, 384, 9, 193, False),
+    ],
+)
+def test_select_fly_down_paired_layout(
+    monkeypatch, quant_type, block_m, n, k, topk, experts, expected
+):
+    monkeypatch.setenv("MOE_DOWN_PAIRED_N512", "1")
+    assert (
+        _select_fly_down_paired_layout(
+            torch.float8_e4m3fnuz,
+            quant_type,
+            block_m,
+            n,
+            k,
+            topk,
+            experts,
+        )
+        == expected
+    )
+
+
+def test_select_fly_down_paired_layout_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("MOE_DOWN_PAIRED_N512", raising=False)
+    assert not _select_fly_down_paired_layout(
+        torch.float8_e4m3fnuz,
+        "per_tensor",
+        64,
+        4096,
+        384,
+        9,
+        193,
+    )
+
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == 'ptpc':
@@ -586,19 +650,34 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 N2,
                 K2,
             )
+            down_paired_n512 = B > 32 and _select_fly_down_paired_layout(
+                weight_type,
+                quant_type,
+                TILE_M,
+                N2,
+                K2,
+                TOPK,
+                E,
+            )
+            if down_paired_n512:
+                down_physical_n256 = False
             down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
             down_output_padding_bytes = (
                 int(down_padding_env)
                 if down_padding_env is not None
-                else _select_fly_down_padding_bytes(
-                    quant_type,
-                    N2,
-                    K2,
-                    down_physical_n256,
+                else (
+                    0
+                    if down_paired_n512
+                    else _select_fly_down_padding_bytes(
+                        quant_type,
+                        N2,
+                        K2,
+                        down_physical_n256,
+                    )
                 )
             )
             if down_output_padding_bytes is not None:
-                assert down_physical_n256
+                assert down_physical_n256 or down_paired_n512
                 assert down_output_padding_bytes in (0, 32, 64, 128)
             if down_physical_n256:
                 assert down_physical_n256
@@ -663,17 +742,20 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
+                sorting_block_m = 128 if down_paired_n512 else TILE_M
                 sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                     topk_ids,
                     topk_weight,
                     E,
                     K1,
                     hidden_states.dtype,
-                    TILE_M,
+                    sorting_block_m,
                     None,
                     None,
                     0,
                 )
+                if down_paired_n512:
+                    sorted_expert_ids = sorted_expert_ids.repeat_interleave(2)
                 if 0:
                     _num_valid_tokens = num_valid_ids[0].cpu().item()
                     _num_actual_tokens = B * TOPK
@@ -768,12 +850,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
-                    down_tile_n = 256 if down_physical_n256 else TILE_N
+                    down_tile_n = (
+                        512
+                        if down_paired_n512
+                        else 256 if down_physical_n256 else TILE_N
+                    )
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
                         ('down_physical_n256', down_physical_n256),
+                        ('down_physical_n512', down_paired_n512),
+                        ('down_paired_row_major', down_paired_n512),
                         ('down_output_padding_bytes', down_output_padding_bytes),
                     )
                     if down_alg == "prefill_1x4":
