@@ -1,7 +1,7 @@
 # FlyDSL MoE down optimization TODO
 
 > Packed-best promotion commit: `c82e2df`; current integrated kernel source SHA256:
-> `7d30e540558dd22eae4bfa34443b876fdca03be50dee05b6b7293a80be57cf6c`.
+> `ceb45548316522b0dc2c316aa6a8d23114da1a4af36dd0d4e164fbd5e99891a8`.
 >
 > Fixed H3 target: `1.895517 ms`; promoted result: `1.913011 ms`; gap: `17.494 us` (`0.9145%`).
 >
@@ -13,11 +13,12 @@
 
 - Paired 8-wave now accepts every requested FP8 down-prefill combination with `BM=64`, `N % 512 == 0`, `K % 64 == 0`, and `64 <= K <= 512`: PTPC weight + PTPC activation, or per-tensor weight + PTPC/per-tensor activation. The exhaustive persistent matrix crosses N512/N1024, all eight K points, and all three quant combinations (48/48), while checking M128 padding and inactive tails. The real dispatcher also passes forced PTPC K256/K512.
 - PTPC scale ownership is fixed by indexing both four-wave groups with `local_tid`; both groups stage the same N256 scale block. K512 cannot fit the extra 1KB scale LDS, so it uses direct global-to-C-fragment scale loads. It is numerically correct, but final ISA has 256 VGPR, 19 spills, and 80B private memory, so it is never auto-selected.
-- Controlled 10-buffer ABBA8 compared base, physical N256, and row-major paired 8-wave, including `sorted_sum`. Across K64/K128/K192/K256/K320/K384/K448/K512 and all three quant combinations, generic row-major 8-wave was never the combined winner. Therefore `MOE_DOWN_PAIRED_N512=1` is the explicit capability override; automatic dispatch selects the measured best of base and physical N256.
+- Controlled 10-buffer ABBA8 compared base, physical N256, and row-major paired 8-wave, including `sorted_sum`. Generic shapes still select the measured best of base and physical N256. A later streaming wave-private CShuffle removed the exact-H3 consumer penalty and all epilogue spills, so exact H3 per-tensor now auto-selects paired N512; `MOE_DOWN_PAIRED_N512=0/1` remains the disable/force override.
 - Automatic winner boundaries: physical N256 for K64-K320; physical N256 for K384 only with per-tensor weights; base for PTPC K384 and all K448/K512 cases. Shape-specific row padding preserves measured combined winners: Hy3 K192 and per-tensor H3 K384 use 0B, Xiaomi PTPC K256 uses 0B, generic physical cases use 128B except per-tensor N4096 K64/K128.
 
 - The packed H3 formal best is unchanged: its rebuilt final ISA is byte-identical to the promoted artifact. It still has 192 MFMA, 39 128-bit loads, 16 stores, 10 real barriers, 254 VGPR, 49,152B LDS, and zero scratch.
-- The generic dispatcher cannot consume the packed layout directly. The direct row-major paired epilogue is mathematically correct, but realistic random-route ABBA8 regressed versus physical4 (`1.232053`, 0/8 wins) and versus packed paired (`1.363678`, 0/8 wins). Exact H3 therefore defaults to repaired physical4 with 0B row padding; `MOE_DOWN_PAIRED_N512=1` retains the row-major paired route as an explicit experiment only.
+- The generic dispatcher does not consume the packed layout directly. The promoted row-major epilogue streams each staged BF16 vector pair through wave-private LDS, retaining the original K-stage overlap and delaying global address generation until after DS reads. Exact-H3 ABBA24 versus physical4 improved down `2.4743 -> 2.3552 ms` (24/24 wins) and full pipeline `8.6356 -> 8.5859 ms` (22/24 wins), with bitwise-equal reduced output.
+- Timing-contract clarification: historical `1.913011 ms` is the packed producer only, while streamed row-major down includes the layout conversion needed by standard `sorted_sum`. The formal same-process exact-grid ABBA24 harness measured packed `1.9350 + 3.6740 ms` versus streamed row-major `2.0943 + 0.7415 ms` for down + consumer. The producer cost is `+8.23%`, but combined drops from `5.8432` to `2.7887 ms`. Against physical N256 in the same formal harness, streamed row-major has down ratio `0.94760` and combined ratio `0.96644`. The packed ISA remains byte-identical.
 - The batch1 down path now allows VMEM reads to cross its compiler scheduling barriers. H3-dimension ABBA24 improved FP8 by `4.32%` (`0.956752`, 24/24 wins) and BF16 by `0.24%` (`0.997616`, 21/24 wins). BF16 and FP8 dispatcher accuracy gates pass.
 - Applying the same mask to splitk is rejected: `0.872255 -> 1.626202 ms`, ratio `1.865054`, 0/8 wins. Splitk remains unchanged.
 - The focused selector suite covers all 24 K/quant winner cells plus boundaries; the complete down suite includes the exhaustive 48-case paired matrix, repaired physical4 two-block, and batch1 BF16/FP8 atomic coverage.
@@ -26,7 +27,7 @@
 
 | Down path | Current implementation | Strict paired method applicability | Required gate |
 | --- | --- | --- | --- |
-| H3 fp8 per-tensor `prefill_1x4`, N4096/K384/TOPK9/E193 | packed paired formal best; generic dispatcher defaults to physical4/0B | Strict paired kernel remains the performance reference; row-major adapter is opt-in because it regresses | exact-grid physical/reduced/tail bitwise gate; 254 VGPR, 49,152B LDS, 10 barriers; ABBA8/24 |
+| H3 fp8 per-tensor `prefill_1x4`, N4096/K384/TOPK9/E193 | packed paired formal best plus auto-selected streaming row-major adapter | Paired N512 streams through wave-private CShuffle; packed default remains unchanged | exact-grid physical/reduced/tail bitwise gate; 256 VGPR, 65,536B LDS, 0 scratch; ABBA8/24 |
 | Generic fp8 per-tensor `prefill_1x4` | physical4 fallback | Direct row-major pairing passes correctness but fails performance; do not expose packed block-major stores to the generic consumer | N512/N1024 PyTorch oracle plus odd logical-block tail |
 | fp8 PTPC `prefill_1x4` | auto-selects base or physical4; paired8 is explicit | Paired8 supports K64-K512; staged scale uses group-local thread numbering, K512 uses direct scale loads | all eight K points, multi-N, and inactive tail |
 | Non-physical `prefill_1x4` (bf16/fp8) | original 4-wave path | Reuse scheduling ideas only; physical pairing changes its output and LDS contract | existing prefill tests plus shape matrix |
@@ -38,7 +39,7 @@
 - [x] Compare H3 paired output against an independently correct physical4/PyTorch path, not only against a descendant of the same packed layout. Random unique-top-k H3 produced zero reduced-output mismatches; the real dispatcher reports `diff=0.00017182`.
 - [x] Determine whether the H3 packed store is row-major or requires a matching consumer/decode step. It is block-major packed; the repaired `packed_direct` decoder is correct but too slow for production consumption.
 - [ ] Add an exact-H3 regression that checks mathematical output and inactive tail independently of the candidate module.
-- [x] Keep the generic dispatcher on physical4 unless explicitly opted into row-major pairing. N512/N1024 and real-H3 correctness pass, but the row-major performance gate fails.
+- [x] Keep generic shapes on physical4/base; auto-promote only exact H3 after the streaming row-major performance gate passed.
 
 ## P1: generic per-tensor prefill pairing
 
@@ -51,7 +52,7 @@
 
 - [x] Keep the split weight-head prefetch restricted to the original per-tensor K384 schedule; PTPC uses the generic K-core path.
 - [x] Test K64-K512 with per-token activation scale and per-channel weight scale, including two N256 blocks and inactive tails.
-- [x] Measure base, physical4, and paired8 using 10-buffer ABBA8. Generic row-major paired8 did not beat the best existing path, so it remains explicit-only while auto dispatch uses the winner table above.
+- [x] Measure base, physical4, and paired8 using 10-buffer ABBA8. The original direct row-major adapter did not beat the best existing path and remained explicit-only; the later zero-spill streaming adapter supersedes that result for exact H3 only.
 
 ## P3: zero-memory scheduling probes
 

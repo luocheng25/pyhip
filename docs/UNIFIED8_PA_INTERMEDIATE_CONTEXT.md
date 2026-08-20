@@ -2,13 +2,13 @@
 
 > 状态：已将formal best合入production；同轮ABBA24吞吐比physical4高12.46%，但仍未达到固定绝对时间线。
 >
-> 更新时间：2026-08-19。
+> 更新时间：2026-08-20。
 >
 > 目标平台：AMD Instinct MI308X / gfx942，ROCm 7.2。
 >
 > 本文档是当前实验的唯一跨机器handoff入口。packed-best promotion源码SHA256为
 > `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；当前all-down集成源码
-> SHA256为`7d30e540558dd22eae4bfa34443b876fdca03be50dee05b6b7293a80be57cf6c`，且packed H3最终ISA
+> SHA256为`ceb45548316522b0dc2c316aa6a8d23114da1a4af36dd0d4e164fbd5e99891a8`，且packed H3最终ISA
 > 与promotion产物逐字节一致。H3 specialization保持512 threads、
 > 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
 > 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
@@ -29,7 +29,8 @@
 - generic dispatcher新增expert-safe M128 sorting、M64 metadata复制和row-major paired适配。真实H3
   端到端精度为`diff=0.00017182`，N512/N1024两组M64 oracle均通过；但random-route ABBA8中
   direct row-major相对physical4为`1.232053`、相对packed paired为`1.363678`，均0/8胜。
-  因此exact H3默认使用修复后的physical4/0B padding；`MOE_DOWN_PAIRED_N512=1`只保留实验入口。
+  当时exact H3因此默认使用修复后的physical4/0B padding，paired只保留实验入口；该结论已被上方
+  2026-08-20的zero-spill流式CShuffle promotion取代。
 - physical4原先把`pair_e_idx=e_idx*2`误用于4-wave路径，跳过全部奇数M64 block；现已按实际
   `paired_m_groups`计算，并由两个M64 block回归覆盖。
 - batch1复用了可兼容的VMEM-read scheduling思路，没有引入paired WG或新barrier。H3维度
@@ -42,9 +43,23 @@
   两条输出转置路线均回退。
 - paired A-stage全局`0x20`探针的最终ISA与control逐字节相同，没有可执行效果，已删除。
 
-当前剩余优先级记录在`docs/UNIFIED8_DOWN_TODO.md`：先做独立exact-H3数学/tail持久回归；
-paired性能只继续测试能恢复coalesced row-major写回且保持254 VGPR、
-0 scratch、49,152B LDS和10 barriers的方案。splitk不再复用全局`0x20`。
+2026-08-20后续联合优化解决了exact H3的consumer问题：paired epilogue不再直接散写row-major，
+也不再整块物化CShuffle，而是沿用原K-stage的`4+4`分段，把每对BF16向量流式写入wave-private
+LDS并立即连续读出。global地址延后到DS read之后计算，资源从7 spill降到0；最终为64KB LDS、
+256 VGPR、0 private。相对physical4生产control的10-buffer ABBA24，down ratio `0.95577`
+（24/24胜），完整链路ratio中位数`0.99549`、四分位`0.9900--0.9987`（22/24胜），reduced输出
+逐bit一致。因此exact H3 per-tensor现在auto选择paired row-major；通用shape仍保持既有赢家表。
+
+性能口径必须区分：历史`1.913011 ms`是packed producer-only，而新row-major down包含流式
+CShuffle。正式同进程exact-grid ABBA24 harness测得packed down `1.9350 ms`、streamed row-major
+down `2.0943 ms`，后者单kernel实际慢`8.23%`；但对应consumer为`3.6740`与`0.7415 ms`，
+down+consumer从`5.8432`降到`2.7887 ms`。当前packed仅比历史值慢约`1.15%`且ISA逐字节不变，
+所以完整pipeline分阶段harness中的`2.35 ms`不是相对历史packed的23%代码回归。正式harness中
+streamed row-major相对physical N256的down ratio为`0.94760`，combined ratio为`0.96644`。
+
+当前剩余优先级记录在`docs/UNIFIED8_DOWN_TODO.md`：补充独立exact-H3数学/tail持久回归，
+并继续降低64KB流式row-major路径的资源成本；默认packed specialization继续保持254 VGPR、
+0 scratch、49,152B LDS和10 barriers。splitk不再复用全局`0x20`。
 
 #### 2026-08-19 expanded paired8 matrix
 

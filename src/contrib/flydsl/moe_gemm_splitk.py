@@ -134,6 +134,13 @@ def compile_gemm(
     physical_block_n = 512 if down_physical_n512 else 256
     physical_num_waves = 8 if down_physical_n512 else 4
     physical_num_threads = physical_num_waves * 64
+    paired_cshuffle_bytes = physical_num_waves * 16 * 64 * 2
+    use_paired_row_major_cshuffle = (
+        down_physical_n512
+        and down_paired_row_major
+        and 2 * BLOCK_TILE_SIZE_M * K + paired_cshuffle_bytes
+        <= 64 * 1024
+    )
     if down_physical_n512:
         down_physical_n256 = True
     if down_physical_n256:
@@ -2262,7 +2269,13 @@ def compile_gemm(
             use_direct_ptpc_scale = (
                 down_physical_n512
                 and weight_quant_type == "ptpc"
-                and paired_m_groups * BLOCK_M * K + BLOCK_N * 4
+                and paired_m_groups * BLOCK_M * K
+                + (
+                    paired_cshuffle_bytes
+                    if use_paired_row_major_cshuffle
+                    else 0
+                )
+                + BLOCK_N * 4
                 > 64 * 1024
             )
             if const_expr(
@@ -2277,7 +2290,13 @@ def compile_gemm(
                     fx.make_layout(BLOCK_N, 1)
                 )
             cshuffle_lds = None
-            if const_expr(down_physical_n256 and not down_physical_n512):
+            if const_expr(
+                down_physical_n256
+                and (
+                    not down_physical_n512
+                    or use_paired_row_major_cshuffle
+                )
+            ):
                 cshuffle_storage = shared_allocator.allocate(
                     fx.Array[fx.BFloat16, physical_num_waves * 16 * 64, 16]
                 )
@@ -2774,6 +2793,95 @@ def compile_gemm(
                     * 2
                 ).to(fx.Int32)
 
+            def store_packed_vector_cshuffle_pair_m(
+                packed_store, block_n, vector_index
+            ):
+                lane_id = fx.Int32(fx.thread_idx.x % 64)
+                wave_id = fx.Int32(fx.thread_idx.x // 64)
+                logical_wave_id = fx.Int32(local_tid // 64)
+                lane_group = lane_id // 16
+                lane_row = lane_id % 16
+                row_in_8 = lane_row % 8
+                row_half = lane_row // 8
+                channel_piece = vector_index % 2
+                row_pair = vector_index // 2
+                physical_atom = (
+                    lane_group * 2 + channel_piece
+                ) ^ row_in_8
+                wave_lds_base = wave_id * (16 * 64)
+                lds_offset = (
+                    wave_lds_base
+                    + ((row_half * 8 + row_in_8) * 8 + physical_atom) * 8
+                )
+                lds_dst = fx.make_view(
+                    fx.get_iter(cshuffle_lds) + lds_offset,
+                    fx.make_layout(8, 1),
+                )
+                lds_frag = fx.make_fragment_like(lds_dst)
+                lds_frag.store(
+                    Vec.from_elements(packed_store, fx.Int32).bitcast(
+                        fx.BFloat16
+                    )
+                )
+                fx.copy(cshuffle_copy_atom, lds_frag, lds_dst)
+
+                if const_expr(channel_piece == 1):
+                    out_frags = []
+                    fx.rocdl.sched_barrier(0)
+                    for output_row_half in range_constexpr(2):
+                        output_atom = lane_id % 8
+                        physical_atom = output_atom ^ (lane_id // 8)
+                        lds_offset = (
+                            wave_lds_base
+                            + (
+                                (output_row_half * 8 + lane_id // 8) * 8
+                                + physical_atom
+                            )
+                            * 8
+                        )
+                        lds_src = fx.make_view(
+                            fx.get_iter(cshuffle_lds) + lds_offset,
+                            fx.make_layout(8, 1),
+                        )
+                        out_frag = fx.make_fragment_like(lds_src)
+                        fx.copy(cshuffle_copy_atom, lds_src, out_frag)
+                        out_frags.append(out_frag)
+
+                    output_column = (
+                        fx.Int64(block_n) * BLOCK_N
+                        + fx.Int64(logical_wave_id) * WAVE_N
+                        + fx.Int64(lane_id % 8) * 8
+                    )
+                    output_row = (
+                        fx.Int64(wave_group) * BLOCK_M
+                        + row_pair * 16
+                        + fx.Int64(lane_id // 8)
+                    )
+
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
+                    fx.buffer_ops.buffer_store(
+                        Vec(out_frags[0].load()).bitcast(fx.Int32),
+                        physical_store_rsrc,
+                        (
+                            (output_row * output_row_stride + output_column)
+                            * 2
+                        ).to(fx.Int32),
+                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                        offset_is_bytes=True,
+                    )
+                    output_row += 8
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    fx.buffer_ops.buffer_store(
+                        Vec(out_frags[1].load()).bitcast(fx.Int32),
+                        physical_store_rsrc,
+                        (
+                            (output_row * output_row_stride + output_column)
+                            * 2
+                        ).to(fx.Int32),
+                        cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                        offset_is_bytes=True,
+                    )
+
             def store_vector_packed_pair_m(
                 output, block_n, vector_begin=0, vector_count=8
             ):
@@ -2833,17 +2941,22 @@ def compile_gemm(
                             )
                         if const_expr(group_index % 2 == 1):
                             vector_index = group_index // 2
-                            fx.buffer_ops.buffer_store(
-                                Vec.from_elements(
-                                    packed_store, fx.Int32
-                                ),
-                                physical_store_rsrc,
-                                paired_store_byte_offset(
-                                    block_n, vector_index
-                                ),
-                                cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
-                                offset_is_bytes=True,
-                            )
+                            if const_expr(use_paired_row_major_cshuffle):
+                                store_packed_vector_cshuffle_pair_m(
+                                    packed_store, block_n, vector_index
+                                )
+                            else:
+                                fx.buffer_ops.buffer_store(
+                                    Vec.from_elements(
+                                        packed_store, fx.Int32
+                                    ),
+                                    physical_store_rsrc,
+                                    paired_store_byte_offset(
+                                        block_n, vector_index
+                                    ),
+                                    cache_modifier=_PHYSICAL_N256_STORE_CACHE_MODIFIER,
+                                    offset_is_bytes=True,
+                                )
                             packed_store = []
                     group_index += 1
 

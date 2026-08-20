@@ -1,0 +1,282 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 1600 1180" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Packed down versus streamed row-major down</title>
+  <desc id="desc">Comparison of the H3 paired down output layouts, their consumer access patterns, and exact-grid ABBA24 timings.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#315a8a"/>
+    </marker>
+    <style>
+      .bg { fill: #f5f7fa; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .title { font: 700 31px 'DejaVu Sans', sans-serif; fill: #172033; }
+      .subtitle { font: 400 17px 'DejaVu Sans', sans-serif; fill: #526174; }
+      .panel-title { font: 700 22px 'DejaVu Sans', sans-serif; fill: #172033; }
+      .section { font: 700 16px 'DejaVu Sans', sans-serif; fill: #344256; }
+      .body { font: 400 15px 'DejaVu Sans', sans-serif; fill: #344256; }
+      .small { font: 400 13px 'DejaVu Sans', sans-serif; fill: #526174; }
+      .tiny { font: 600 11px 'DejaVu Sans Mono', monospace; fill: #344256; }
+      .mono { font: 500 14px 'DejaVu Sans Mono', monospace; fill: #213047; }
+      .mono-small { font: 500 12px 'DejaVu Sans Mono', monospace; fill: #344256; }
+      .packed { fill: #315a8a; }
+      .packed-soft { fill: #dce8f5; stroke: #8badcf; stroke-width: 1.5; }
+      .rowmajor { fill: #168a75; }
+      .rowmajor-soft { fill: #d9f0ea; stroke: #71b8aa; stroke-width: 1.5; }
+      .shuffle-soft { fill: #fff0ce; stroke: #d9a73c; stroke-width: 1.5; }
+      .danger-soft { fill: #fae2e0; stroke: #d57a73; stroke-width: 1.5; }
+      .neutral-soft { fill: #edf1f5; stroke: #b7c1cc; stroke-width: 1.5; }
+      .memory { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; }
+      .atom { fill: #e7edf4; stroke: #9aa8b7; stroke-width: 1; }
+      .highlight { fill: #f4c95d; stroke: #a86e00; stroke-width: 1.5; }
+      .line { stroke: #4b5563; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .line-blue { stroke: #315a8a; stroke-width: 2.5; fill: none; marker-end: url(#arrow-blue); }
+      .dash { stroke: #9aa8b7; stroke-width: 1.5; stroke-dasharray: 6 5; fill: none; }
+      .badge-good { fill: #d9f0ea; stroke: #71b8aa; stroke-width: 1.5; }
+      .badge-cost { fill: #fff0ce; stroke: #d9a73c; stroke-width: 1.5; }
+      .bar-packed { fill: #315a8a; }
+      .bar-rowmajor { fill: #168a75; }
+      .white { fill: #ffffff; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1180"/>
+  <text id="diagram-title" class="title" x="50" y="48">Packed down vs streamed row-major down</text>
+  <text class="subtitle" x="50" y="78">H3 paired workgroup: 512 threads = two M64 groups; each group computes an M64 x N256 logical tile</text>
+  <rect class="neutral-soft" x="1290" y="31" width="260" height="48" rx="5"/>
+  <text class="mono" x="1312" y="60">1 atom = 8 BF16 = 16 B</text>
+
+  <!-- Packed panel -->
+  <rect class="panel" x="40" y="105" width="740" height="700" rx="6"/>
+  <rect class="packed" x="40" y="105" width="10" height="700" rx="4"/>
+  <text class="panel-title" x="72" y="145">A. Packed global output</text>
+  <text class="subtitle" x="72" y="172">Producer-first: preserve the MFMA execution/store order</text>
+
+  <rect class="packed-soft" x="72" y="193" width="676" height="48" rx="4"/>
+  <text class="mono" x="91" y="223">global = [N256 block][vector 0..7][thread 0..511][8 BF16]</text>
+
+  <rect class="neutral-soft" x="72" y="270" width="158" height="178" rx="5"/>
+  <text class="section" x="93" y="300">MFMA fragment</text>
+  <text class="small" x="92" y="326">Each thread owns</text>
+  <text class="small" x="92" y="347">eight 128-bit</text>
+  <text class="small" x="92" y="368">output vectors.</text>
+  <rect class="packed-soft" x="92" y="386" width="50" height="24" rx="2"/>
+  <rect class="packed-soft" x="150" y="386" width="50" height="24" rx="2"/>
+  <rect class="packed-soft" x="92" y="416" width="50" height="24" rx="2"/>
+  <rect class="packed-soft" x="150" y="416" width="50" height="24" rx="2"/>
+  <text class="tiny" x="106" y="403">V0</text>
+  <text class="tiny" x="164" y="403">V1</text>
+  <text class="tiny" x="106" y="433">...</text>
+  <text class="tiny" x="164" y="433">V7</text>
+
+  <path class="line-blue" d="M 240 359 L 300 359"/>
+  <text class="small" x="245" y="337">direct</text>
+  <text class="small" x="239" y="382">stores</text>
+
+  <rect class="memory" x="310" y="260" width="438" height="290" rx="5"/>
+  <text class="section" x="330" y="288">Global memory, one N256 block</text>
+  <text class="small" x="330" y="311">Example: logical row 5, wave 0, columns 0..63</text>
+
+  <text class="mono-small" x="330" y="343">V0</text>
+  <rect class="memory" x="365" y="326" width="360" height="58" rx="3"/>
+  <rect class="atom" x="372" y="335" width="80" height="39"/>
+  <rect class="atom" x="460" y="335" width="80" height="39"/>
+  <rect class="atom" x="548" y="335" width="80" height="39"/>
+  <rect class="atom" x="636" y="335" width="80" height="39"/>
+  <rect class="highlight" x="394" y="343" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="482" y="343" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="570" y="343" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="658" y="343" width="24" height="23" rx="2"/>
+  <text class="tiny" x="397" y="359">A0</text>
+  <text class="tiny" x="485" y="359">A2</text>
+  <text class="tiny" x="573" y="359">A4</text>
+  <text class="tiny" x="661" y="359">A6</text>
+  <text class="tiny" x="377" y="373">T0..15</text>
+  <text class="tiny" x="465" y="373">T16..31</text>
+  <text class="tiny" x="553" y="373">T32..47</text>
+  <text class="tiny" x="641" y="373">T48..63</text>
+
+  <path class="dash" d="M 365 400 L 725 400"/>
+  <text class="small" x="487" y="420">512 atoms = 8 KB apart</text>
+
+  <text class="mono-small" x="330" y="452">V1</text>
+  <rect class="memory" x="365" y="435" width="360" height="58" rx="3"/>
+  <rect class="atom" x="372" y="444" width="80" height="39"/>
+  <rect class="atom" x="460" y="444" width="80" height="39"/>
+  <rect class="atom" x="548" y="444" width="80" height="39"/>
+  <rect class="atom" x="636" y="444" width="80" height="39"/>
+  <rect class="highlight" x="394" y="452" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="482" y="452" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="570" y="452" width="24" height="23" rx="2"/>
+  <rect class="highlight" x="658" y="452" width="24" height="23" rx="2"/>
+  <text class="tiny" x="397" y="468">A1</text>
+  <text class="tiny" x="485" y="468">A3</text>
+  <text class="tiny" x="573" y="468">A5</text>
+  <text class="tiny" x="661" y="468">A7</text>
+  <text class="tiny" x="377" y="482">T0..15</text>
+  <text class="tiny" x="465" y="482">T16..31</text>
+  <text class="tiny" x="553" y="482">T32..47</text>
+  <text class="tiny" x="641" y="482">T48..63</text>
+
+  <rect class="neutral-soft" x="365" y="510" width="360" height="25" rx="3"/>
+  <text class="mono-small" x="471" y="528">V2 ... V7 (other M16 rows)</text>
+
+  <rect class="neutral-soft" x="72" y="570" width="676" height="76" rx="4"/>
+  <text class="mono-small" x="91" y="598">row = group*64 + (vector/2)*16 + lane_in_16</text>
+  <text class="mono-small" x="91" y="622">col = block*256 + wave*64 + lane_group*16 + (vector%2)*8</text>
+
+  <rect class="danger-soft" x="72" y="671" width="676" height="92" rx="5"/>
+  <text class="section" x="92" y="700">Consumer path</text>
+  <text class="body" x="92" y="727">loc -&gt; decode pair / row / vector / wave / lane -&gt; scattered 128-bit atoms</text>
+  <text class="small" x="92" y="750">The producer stores one contiguous 1 KB per wave instruction, but one logical row is fragmented.</text>
+
+  <!-- Row-major panel -->
+  <rect class="panel" x="820" y="105" width="740" height="700" rx="6"/>
+  <rect class="rowmajor" x="820" y="105" width="10" height="700" rx="4"/>
+  <text class="panel-title" x="852" y="145">B. Streamed row-major global output</text>
+  <text class="subtitle" x="852" y="172">Consumer-first: transpose each M16 x N64 slice before global stores</text>
+
+  <rect class="rowmajor-soft" x="852" y="193" width="676" height="48" rx="4"/>
+  <text class="mono" x="871" y="223">global = [sorted row 0..127][logical channel 0..N-1]</text>
+
+  <rect class="neutral-soft" x="852" y="270" width="145" height="178" rx="5"/>
+  <text class="section" x="872" y="300">MFMA fragment</text>
+  <text class="small" x="871" y="328">Same V0..V7</text>
+  <text class="small" x="871" y="349">register layout</text>
+  <text class="small" x="871" y="370">as packed down.</text>
+  <rect class="packed-soft" x="873" y="389" width="48" height="24" rx="2"/>
+  <rect class="packed-soft" x="929" y="389" width="48" height="24" rx="2"/>
+  <rect class="packed-soft" x="873" y="419" width="48" height="24" rx="2"/>
+  <rect class="packed-soft" x="929" y="419" width="48" height="24" rx="2"/>
+  <text class="tiny" x="886" y="406">V0</text>
+  <text class="tiny" x="942" y="406">V1</text>
+  <text class="tiny" x="886" y="436">...</text>
+  <text class="tiny" x="942" y="436">V7</text>
+
+  <path class="line" d="M 1007 359 L 1042 359"/>
+
+  <rect class="shuffle-soft" x="1052" y="260" width="218" height="290" rx="5"/>
+  <text class="section" x="1070" y="288">Wave-private XOR LDS</text>
+  <text class="small" x="1070" y="310">16 rows x 64 BF16 = 2 KB/wave</text>
+  <text class="small" x="1070" y="331">8 waves = 16 KB extra LDS</text>
+
+  <g transform="translate(1074,352)">
+    <rect class="memory" x="0" y="0" width="176" height="160"/>
+    <path class="dash" d="M 22 0 L 22 160 M 44 0 L 44 160 M 66 0 L 66 160 M 88 0 L 88 160 M 110 0 L 110 160 M 132 0 L 132 160 M 154 0 L 154 160"/>
+    <path class="dash" d="M 0 10 L 176 10 M 0 20 L 176 20 M 0 30 L 176 30 M 0 40 L 176 40 M 0 50 L 176 50 M 0 60 L 176 60 M 0 70 L 176 70 M 0 80 L 176 80 M 0 90 L 176 90 M 0 100 L 176 100 M 0 110 L 176 110 M 0 120 L 176 120 M 0 130 L 176 130 M 0 140 L 176 140 M 0 150 L 176 150"/>
+    <rect class="highlight" x="0" y="50" width="22" height="10"/>
+    <rect class="highlight" x="22" y="50" width="22" height="10"/>
+    <rect class="highlight" x="44" y="50" width="22" height="10"/>
+    <rect class="highlight" x="66" y="50" width="22" height="10"/>
+    <rect class="highlight" x="88" y="50" width="22" height="10"/>
+    <rect class="highlight" x="110" y="50" width="22" height="10"/>
+    <rect class="highlight" x="132" y="50" width="22" height="10"/>
+    <rect class="highlight" x="154" y="50" width="22" height="10"/>
+    <text class="tiny" x="3" y="59">A0</text>
+    <text class="tiny" x="25" y="59">A1</text>
+    <text class="tiny" x="47" y="59">A2</text>
+    <text class="tiny" x="69" y="59">A3</text>
+    <text class="tiny" x="91" y="59">A4</text>
+    <text class="tiny" x="113" y="59">A5</text>
+    <text class="tiny" x="135" y="59">A6</text>
+    <text class="tiny" x="157" y="59">A7</text>
+  </g>
+  <text class="small" x="1070" y="533">V(2r), V(2r+1) -&gt; XOR write/read</text>
+
+  <path class="line" d="M 1280 359 L 1315 359"/>
+
+  <rect class="memory" x="1325" y="260" width="203" height="290" rx="5"/>
+  <text class="section" x="1343" y="288">Global row-major</text>
+  <text class="small" x="1343" y="310">One row = N contiguous BF16</text>
+  <g transform="translate(1344,338)">
+    <text class="tiny" x="0" y="14">r0</text>
+    <text class="tiny" x="0" y="38">r1</text>
+    <text class="tiny" x="0" y="62">r2</text>
+    <text class="tiny" x="0" y="86">r3</text>
+    <text class="tiny" x="0" y="110">r4</text>
+    <text class="tiny" x="0" y="134">r5</text>
+    <text class="tiny" x="0" y="158">r6</text>
+    <text class="tiny" x="0" y="182">r7</text>
+    <g transform="translate(26,0)">
+      <rect class="atom" x="0" y="0" width="19" height="18"/>
+      <rect class="atom" x="20" y="0" width="19" height="18"/>
+      <rect class="atom" x="40" y="0" width="19" height="18"/>
+      <rect class="atom" x="60" y="0" width="19" height="18"/>
+      <rect class="atom" x="80" y="0" width="19" height="18"/>
+      <rect class="atom" x="100" y="0" width="19" height="18"/>
+      <rect class="atom" x="120" y="0" width="19" height="18"/>
+      <rect class="atom" x="140" y="0" width="19" height="18"/>
+      <rect class="atom" x="0" y="24" width="159" height="18"/>
+      <rect class="atom" x="0" y="48" width="159" height="18"/>
+      <rect class="atom" x="0" y="72" width="159" height="18"/>
+      <rect class="atom" x="0" y="96" width="159" height="18"/>
+      <rect class="highlight" x="0" y="120" width="19" height="18"/>
+      <rect class="highlight" x="20" y="120" width="19" height="18"/>
+      <rect class="highlight" x="40" y="120" width="19" height="18"/>
+      <rect class="highlight" x="60" y="120" width="19" height="18"/>
+      <rect class="highlight" x="80" y="120" width="19" height="18"/>
+      <rect class="highlight" x="100" y="120" width="19" height="18"/>
+      <rect class="highlight" x="120" y="120" width="19" height="18"/>
+      <rect class="highlight" x="140" y="120" width="19" height="18"/>
+      <rect class="atom" x="0" y="144" width="159" height="18"/>
+      <rect class="atom" x="0" y="168" width="159" height="18"/>
+      <text class="tiny" x="3" y="134">A0</text>
+      <text class="tiny" x="23" y="134">A1</text>
+      <text class="tiny" x="43" y="134">A2</text>
+      <text class="tiny" x="63" y="134">A3</text>
+      <text class="tiny" x="83" y="134">A4</text>
+      <text class="tiny" x="103" y="134">A5</text>
+      <text class="tiny" x="123" y="134">A6</text>
+      <text class="tiny" x="143" y="134">A7</text>
+    </g>
+  </g>
+
+  <rect class="neutral-soft" x="852" y="570" width="676" height="76" rx="4"/>
+  <text class="mono-small" x="871" y="598">row = group*64 + row_pair*16 + lane/8 (+0 or +8)</text>
+  <text class="mono-small" x="871" y="622">col = block*256 + logical_wave*64 + (lane%8)*8</text>
+
+  <rect class="badge-good" x="852" y="671" width="676" height="92" rx="5"/>
+  <text class="section" x="872" y="700">Consumer path</text>
+  <text class="body" x="872" y="727">loc -&gt; row_base -&gt; standard coalesced 128-bit row loads</text>
+  <text class="small" x="872" y="750">Cost moved into down: DS write/read, 16 KB extra LDS, and a larger register footprint.</text>
+
+  <!-- Performance panel -->
+  <rect class="panel" x="40" y="835" width="1520" height="305" rx="6"/>
+  <text class="panel-title" x="72" y="875">C. H3 formal exact-grid ABBA24</text>
+  <text class="subtitle" x="72" y="902">Same process, 2,316 paired workgroups, 10 buffers, decoded physical rows and reduced output bitwise equal</text>
+
+  <rect class="bar-packed" x="1020" y="855" width="20" height="14" rx="2"/>
+  <text class="small" x="1048" y="867">Packed</text>
+  <rect class="bar-rowmajor" x="1127" y="855" width="20" height="14" rx="2"/>
+  <text class="small" x="1155" y="867">Streamed row-major</text>
+
+  <text class="section" x="72" y="950">Down</text>
+  <rect class="bar-packed" x="270" y="926" width="290" height="20" rx="3"/>
+  <text class="small" x="570" y="942">1.9350 ms</text>
+  <rect class="bar-rowmajor" x="270" y="952" width="314" height="20" rx="3"/>
+  <text class="small" x="594" y="968">2.0943 ms (+8.23%)</text>
+
+  <text class="section" x="72" y="1012">Consumer</text>
+  <rect class="bar-packed" x="270" y="988" width="551" height="20" rx="3"/>
+  <text class="small" x="831" y="1004">3.6740 ms</text>
+  <rect class="bar-rowmajor" x="270" y="1014" width="111" height="20" rx="3"/>
+  <text class="small" x="391" y="1030">0.7415 ms (-79.82%)</text>
+
+  <text class="section" x="72" y="1074">Combined event</text>
+  <rect class="bar-packed" x="270" y="1050" width="876" height="20" rx="3"/>
+  <text class="small" x="1156" y="1066">5.8432 ms</text>
+  <rect class="bar-rowmajor" x="270" y="1076" width="418" height="20" rx="3"/>
+  <text class="small" x="698" y="1092">2.7887 ms (-52.27%)</text>
+
+  <rect class="badge-cost" x="1235" y="925" width="285" height="177" rx="5"/>
+  <text class="section" x="1255" y="953">Trade-off</text>
+  <text class="body" x="1255" y="981">Producer: +0.1593 ms</text>
+  <text class="body" x="1255" y="1008">Consumer: -2.9326 ms</text>
+  <text class="body" x="1255" y="1035">Combined: -52.27%</text>
+  <path class="dash" d="M 1255 1051 L 1500 1051"/>
+  <text class="small" x="1255" y="1075">Vs physical N256:</text>
+  <text class="small" x="1255" y="1095">down -5.24%, combined -3.36%</text>
+
+  <text class="tiny" x="72" y="1125">Layout formulas correspond to paired_store_byte_offset(), store_packed_vector_cshuffle_pair_m(), and sorted_sum(packed_direct=True).</text>
+</svg>

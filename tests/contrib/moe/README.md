@@ -1388,7 +1388,7 @@ LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；�
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
 | Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle，0B padding |
 | H3 PTPC | 384 | 6144 | 4 | PTPC | prefill BN256 | base N64 |
-| H3 per-tensor | 384 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding |
+| H3 per-tensor | 384 | 4096 | 9 | per-tensor | prefill BN128 | paired N512 + 流式 CShuffle row-major，0B padding |
 
 2026-08-19重新对base、physical N256和row-major paired8执行10-buffer ABBA8，计时包含
 `sorted_sum`。通用矩阵固定`B8192/N4096/TOPK8/E128`，覆盖K64--K512全部64步长及三种
@@ -1402,9 +1402,37 @@ quant组合；另外单独覆盖上述生产shape。auto赢家边界为：
 
 paired8能力本身已放宽到FP8、BM64、`N % 512 == 0`、`K % 64 == 0`且K64--K512，支持
 PTPC+PTPC以及per-tensor weight + PTPC/per-tensor activation。N512/N1024 × 全部8个K × 三种
-quant的48项回归全部通过，并检查M128 padding与inactive tail。由于通用row-major paired8在本轮combined
-ABBA中没有成为赢家，auto不会选择它；可用`MOE_DOWN_PAIRED_N512=1`强制进入，用于能力验证和
-后续优化。原H3 packed specialization不受影响，最终ISA与promotion产物逐字节一致。
+quant的48项回归全部通过，并检查M128 padding与inactive tail。通用shape仍按上表选择base或
+physical N256；`MOE_DOWN_PAIRED_N512=1`可强制进入完整paired能力矩阵。
+
+2026-08-20针对H3的联合优化不再让`sorted_sum`解码packed布局，而是在paired down epilogue中把
+每对已量化BF16向量流式写入wave-private LDS，并立即连续读出row-major结果。它复用原本分散在
+K-stage中的`4+4` epilogue，不增加WG barrier或额外global流量；将global地址计算延后到DS read
+之后，把最终kernel从7个spill降为0。H3资源为64KB LDS、256 VGPR、0 private，默认packed H3
+ISA仍与`bbaae3e`逐字节一致。相对当前physical N256生产control的10-buffer ABBA24：down
+`2.4743 -> 2.3552 ms`（24/24胜），完整链路`8.6356 -> 8.5859 ms`（22/24胜），ratio四分位
+`0.9900--0.9987`，最终输出逐bit一致。因此exact H3 per-tensor现在自动选择paired row-major；
+`MOE_DOWN_PAIRED_N512=0`可禁用，其他shape的auto选择不变。
+
+这里的`2.3552 ms`不能直接与历史packed formal best的`1.9130 ms`比较：前者来自完整pipeline
+分阶段harness且已在down内部完成row-major CShuffle，后者来自down专用formal harness且只产生
+packed中间布局。2026-08-20用最终代码、2,316个exact-valid paired WG和正式10-buffer同进程
+ABBA24 harness交错重测两种输出契约，并对packed结果解码后逐bit校验：
+
+![Packed down与streamed row-major down布局对比](packed_vs_row_major_down.svg)
+
+| 输出契约 | Down | Consumer | Down + Consumer | Full pipeline |
+|---|---:|---:|---:|---:|
+| packed producer + packed decoder | **1.9350 ms** | 3.6740 ms | 5.8432 ms | - |
+| streamed row-major + standard `sorted_sum` | 2.0943 ms | **0.7415 ms** | **2.7887 ms** | - |
+
+因此联合方案让down本身增加`0.1593 ms`（`+8.23%`），但consumer减少`2.9326 ms`，combined
+降低`52.27%`。当前packed down相对历史`1.9130 ms`只慢约`1.15%`，且规范化ISA逐字节不变；
+此前看到的`2.35 ms`主要是不同harness上下文，不能视为相对历史packed的23%代码回归。
+
+同一正式harness另测physical N256与streamed row-major：down paired ratio为`0.94760`
+（约快`5.24%`），down+consumer ratio为`0.96644`（约快`3.36%`）。所以新路径不是更快的
+packed producer，而是牺牲约8.2%的paired producer速度，换掉昂贵packed consumer后仍优于原生产路径。
 
 ### Hy3不完整gateup tile
 

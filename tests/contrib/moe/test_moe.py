@@ -244,14 +244,23 @@ def _select_fly_down_paired_layout(
 ):
     if act_quant_type is None:
         act_quant_type = quant_type
-    paired_setting = os.getenv("MOE_DOWN_PAIRED_N512", "0").lower()
-    assert paired_setting in ("0", "1")
-    return paired_setting == "1" and (
+    paired_setting = os.getenv("MOE_DOWN_PAIRED_N512", "auto").lower()
+    assert paired_setting in ("0", "1", "auto")
+    supported = (
         _supports_fly_down_quant(weight_type, quant_type, act_quant_type)
         and block_m == 64
         and n % 512 == 0
         and k % 64 == 0
         and 64 <= k <= 512
+    )
+    auto_paired = (
+        weight_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+        and quant_type == "per_tensor"
+        and act_quant_type == "per_tensor"
+        and (n, k, topk, experts) == (4096, 384, 9, 193)
+    )
+    return supported and (
+        auto_paired if paired_setting == "auto" else paired_setting == "1"
     )
 
 
@@ -417,8 +426,30 @@ def test_select_fly_down_paired_layout(
     )
 
 
-def test_select_fly_down_paired_layout_disabled_by_default(monkeypatch):
+def test_select_fly_down_paired_layout_auto_h3(monkeypatch):
     monkeypatch.delenv("MOE_DOWN_PAIRED_N512", raising=False)
+    assert _select_fly_down_paired_layout(
+        torch.float8_e4m3fnuz,
+        "per_tensor",
+        64,
+        4096,
+        384,
+        9,
+        193,
+    )
+    assert not _select_fly_down_paired_layout(
+        torch.float8_e4m3fnuz,
+        "per_tensor",
+        64,
+        4096,
+        384,
+        8,
+        128,
+    )
+
+
+def test_select_fly_down_paired_layout_explicit_disable(monkeypatch):
+    monkeypatch.setenv("MOE_DOWN_PAIRED_N512", "0")
     assert not _select_fly_down_paired_layout(
         torch.float8_e4m3fnuz,
         "per_tensor",
