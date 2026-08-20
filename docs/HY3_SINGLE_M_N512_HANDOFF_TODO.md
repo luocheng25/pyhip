@@ -42,6 +42,16 @@ Clean 10-buffer ABBA24 on GPU4, 1800MHz, PTL `VECTOR,F8`:
 
 This is a 9.35% down latency reduction and 6.45% combined reduction relative to N256.
 
+Independent clean retest using the tracked formal harness on the same source:
+
+| Phase | Physical N256 -> single-M N512 | Candidate/control ratio | IQR | Wins |
+| --- | ---: | ---: | ---: | ---: |
+| down | `1.557529 -> 1.417749 ms` | `0.909806` | `0.908210--0.912926` | 24/24 |
+| sorted_sum | `0.712085 -> 0.711784 ms` | `1.000015` | `0.998096--1.001698` | 12/24 |
+| down + sorted_sum | `2.283913 -> 2.141253 ms` | `0.937691` | `0.934980--0.940317` | 24/24 |
+
+The second clean run confirms that the gain comes from down; the row-major consumer is neutral. Its output JSON is `/tmp/hy3_single_idle_retest.json` on the source node with SHA256 `de86615dba85f616e87facc4d08a2e30fe0238011ab8e1e490feaaf93997e651`. The harness checked ten buffers, all valid physical and reduced outputs bitwise, untouched inactive tails, idle initial state, managed `VECTOR,F8` state, and restored `auto`/`F16,BF16` state.
+
 Two later retests ran while an external all-GPU job held every card at 100% busy and 83% VRAM. They are stress evidence only, not replacements for the clean result:
 
 | Retest | Down ratio / wins | Combined ratio / wins |
@@ -252,7 +262,7 @@ The breakthrough was changing ownership from M128 pairing to single-M N512 and t
 
 ## 7. Remaining TODO
 
-1. Run the tracked formal benchmark above on the new node and confirm the clean ratio remains close to `0.906541` down / `0.935520` combined.
+1. [x] Run the tracked formal benchmark independently and confirm reproducibility: `0.909806` down / `0.937691` combined versus the original `0.906541` / `0.935520`.
 2. Run production Hy3 at B=32768 when enough VRAM is free; confirm accuracy and capture full-pipeline latency if required.
 3. Optionally collect fresh ATT for physical N256 vs single-M N512. Verify the expected occupancy change and attribute remaining stalls; do not change code solely from single-wave counters.
 4. Decide whether to merge this branch back into `luocheng/try-opt-down-308` after the new-node clean run.

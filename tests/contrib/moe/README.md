@@ -1451,6 +1451,9 @@ K512的最终ISA均与变更前逐字节一致。
 `0.903067--0.910706`，24/24）；combined `2.511415 -> 2.347834 ms`，ratio `0.935520`
 （IQR `0.931968--0.939437`，24/24）。即down时延降低9.35%，`down+sorted_sum`降低6.45%，
 稳定覆盖原M128相对N256约3%的回退。`MOE_DOWN_SINGLE_M_N512=0`可禁用该精确Hy3自动路径。
+独立clean复测得到down `1.557529 -> 1.417749 ms`、ratio `0.909806`（24/24），combined
+`2.283913 -> 2.141253 ms`、ratio `0.937691`（24/24）；consumer ratio为`1.000015`且IQR跨1，
+确认收益来自down而非`sorted_sum`波动。
 
 2026-08-20针对H3的联合优化不再让`sorted_sum`解码packed布局，而是在paired down epilogue中把
 每对已量化BF16向量流式写入wave-private LDS，并立即连续读出row-major结果。它复用原本分散在
