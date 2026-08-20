@@ -2278,6 +2278,11 @@ def compile_gemm(
                 + BLOCK_N * 4
                 > 64 * 1024
             )
+            late_direct_ptpc_scale = (
+                use_direct_ptpc_scale
+                and down_physical_n512
+                and K == 384
+            )
             if const_expr(
                 down_physical_n256
                 and weight_quant_type == "ptpc"
@@ -3246,11 +3251,17 @@ def compile_gemm(
                     fragC_bf16.fill(0)
                     output_state = fragC_bf16.load()
 
-                loop_init = [
-                    frag_weight.load(),
-                    frag_pc_scale.load(),
-                    output_state,
-                ]
+                if const_expr(late_direct_ptpc_scale):
+                    loop_init = [
+                        frag_weight.load(),
+                        output_state,
+                    ]
+                else:
+                    loop_init = [
+                        frag_weight.load(),
+                        frag_pc_scale.load(),
+                        output_state,
+                    ]
                 if const_expr(use_postprocess_weight_head):
                     loop_init.append(frag_weight_head.load())
                 for block_n, state in range(
@@ -3260,13 +3271,21 @@ def compile_gemm(
                     init=loop_init,
                 ):
                     frag_weight_slots[0].store(state[0])
-                    frag_pc_scale.store(state[1])
-                    if const_expr(down_physical_n512):
-                        previous_fragC.store(state[2])
+                    if const_expr(late_direct_ptpc_scale):
+                        if const_expr(down_physical_n512):
+                            previous_fragC.store(state[1])
+                        else:
+                            fragC_bf16.store(state[1])
+                        if const_expr(use_postprocess_weight_head):
+                            frag_weight_head.store(state[2])
                     else:
-                        fragC_bf16.store(state[2])
-                    if const_expr(use_postprocess_weight_head):
-                        frag_weight_head.store(state[3])
+                        frag_pc_scale.store(state[1])
+                        if const_expr(down_physical_n512):
+                            previous_fragC.store(state[2])
+                        else:
+                            fragC_bf16.store(state[2])
+                        if const_expr(use_postprocess_weight_head):
+                            frag_weight_head.store(state[3])
                     fragC[0].fill(0)
                     next_scale_vec = None
 
@@ -3347,13 +3366,16 @@ def compile_gemm(
                             )
                             if const_expr(weight_quant_type == "ptpc"):
                                 if const_expr(use_direct_ptpc_scale):
-                                    flyobj.load_tiled_mma_fragC(
-                                        mm,
-                                        arg_w_scale,
-                                        [None, None, next_block_n, 0],
-                                        next_frag_pc_scale,
-                                        copy_atom_bits=32,
-                                    )
+                                    if not const_expr(
+                                        late_direct_ptpc_scale
+                                    ):
+                                        flyobj.load_tiled_mma_fragC(
+                                            mm,
+                                            arg_w_scale,
+                                            [None, None, next_block_n, 0],
+                                            next_frag_pc_scale,
+                                            copy_atom_bits=32,
+                                        )
                                 else:
                                     next_scale_vec = issue_scale_block_global(
                                         next_block_n
@@ -3400,6 +3422,14 @@ def compile_gemm(
                             1,
                             frag_weight_head,
                         )
+                    if const_expr(late_direct_ptpc_scale):
+                        flyobj.load_tiled_mma_fragC(
+                            mm,
+                            arg_w_scale,
+                            [None, None, logical_block_n, 0],
+                            frag_pc_scale,
+                            copy_atom_bits=32,
+                        )
                     if const_expr(weight_quant_type != "per_tensor"):
                         for fc, fpc in fxh.all_elements(fragC[0], frag_pc_scale):
                             fc.store(fc.load() * fpc.load())
@@ -3411,20 +3441,33 @@ def compile_gemm(
                             fragC_bf16, block_n, cshuffle_lds
                         )
 
-                    loop_results = [
-                        frag_weight_slots[nBK % 2].load(),
-                        next_frag_pc_scale.load(),
-                        (
+                    if const_expr(late_direct_ptpc_scale):
+                        loop_results = [
+                            frag_weight_slots[nBK % 2].load(),
+                            (
+                                fragC[0].load()
+                                if down_physical_n512
+                                else fragC_bf16.load()
+                            ),
+                        ]
+                    else:
+                        loop_results = [
+                            frag_weight_slots[nBK % 2].load(),
+                            next_frag_pc_scale.load(),
+                            (
                             fragC[0].load()
                             if down_physical_n512
                             else fragC_bf16.load()
-                        ),
-                    ]
+                            ),
+                        ]
                     if const_expr(use_postprocess_weight_head):
                         loop_results.append(frag_weight_head.load())
                     results = yield loop_results
                 if const_expr(down_physical_n512):
-                    previous_fragC.store(results[2])
+                    if const_expr(late_direct_ptpc_scale):
+                        previous_fragC.store(results[1])
+                    else:
+                        previous_fragC.store(results[2])
                     postprocess_store_vector_packed_pair_m(
                         previous_fragC, group_n_blocks - 1
                     )

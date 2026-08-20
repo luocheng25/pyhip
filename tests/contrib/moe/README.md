@@ -1386,8 +1386,8 @@ LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；�
 | Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding（K64） |
 | Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
-| Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle，0B padding |
-| H3 PTPC | 384 | 6144 | 4 | PTPC | prefill BN256 | base N64 |
+| Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle，128B padding |
+| H3 PTPC | 384 | 6144 | 4 | PTPC | prefill BN256 | paired N512 + 流式 CShuffle row-major，128B padding |
 | H3 per-tensor | 384 | 4096 | 9 | per-tensor | prefill BN128 | paired N512 + 流式 CShuffle row-major，0B padding |
 
 2026-08-19重新对base、physical N256和row-major paired8执行10-buffer ABBA8，计时包含
@@ -1399,6 +1399,37 @@ quant组合；另外单独覆盖上述生产shape。auto赢家边界为：
 | 64--320 | physical N256 | physical N256 | physical N256 |
 | 384 | base N64 | physical N256 | physical N256 |
 | 448--512 | base N64 | base N64 | base N64 |
+
+2026-08-20用流式row-major M128重新覆盖`N=512/1024/4096`、K64--K512和三种FP8量化组合，
+共72个通用单元；另覆盖Hy3、Xiaomi、H3 PTPC和Qwen K512四个生产shape。每个单元比较base、
+physical N256（0/128B）和paired M128（0/128B），所有五条路径的最终reduced输出逐bit一致。
+ABBA4仅用于候选筛选，可能改变auto的单元再做直接ABBA24。结论：**除exact H3 per-tensor外，
+没有新的M128单元通过ABBA24晋级门槛**。因此paired auto仍保持精确H3条件，其他shape不会因推广
+而退化。
+
+每个单元先取M128的最佳padding，再除以`min(base, physical-0B, physical-128B)`：
+
+| N | 单元数 | M128/best-non-M128中位 | 初筛M128赢家 | ABBA24晋级 |
+|---:|---:|---:|---:|---:|
+| 512 | 24 | 1.1831（慢18.31%） | 0 | 0 |
+| 1024 | 24 | 1.1282（慢12.82%） | 1 | 0 |
+| 4096 generic | 24 | 1.0574（慢5.74%） | 3 | 0 |
+| **合计** | **72** | **1.1212（慢12.12%）** | **4** | **0** |
+
+四个初筛候选分别是N1024/K64 per-tensor+per-tensor，以及N4096/K64 per-tensor+per-tensor、
+K256 per-tensor+PTPC、K256 per-tensor+per-tensor。直接ABBA24后，前者combined ratio为
+`1.00255`，N4096三项分别为`1.02040`、`1.01782`（对真实physical-128B control）和
+`0.99842`（14/24胜）；均不满足稳定最快门槛。
+
+边缘复测还修正了Xiaomi PTPC K256的padding：128B相对0B的`down+consumer` ABBA24 ratio为
+`0.99756`（18/24胜，Q1--Q3 `0.99547--0.99993`），因此auto改为128B。generic K256
+per-tensor+PTPC的M128初筛看似领先，但对真实physical-128B control的ABBA24 ratio为`1.01782`
+（0B paired）和`1.04287`（128B paired），明确不晋级。
+
+N512/N1024的48项结果仍可作为五条路径逐bit正确性和M128候选筛选证据；但小N kernel只有
+约0.07--0.24ms，后续base/physical边界复测时外部8-GPU作业占满整机，微秒级ratio受到污染。
+因此本轮不据此改小N auto winner table，待空闲GPU上重新做直接ABBA24后再晋级，避免以受污染
+数据宣称“最快”。
 
 paired8能力本身已放宽到FP8、BM64、`N % 512 == 0`、`K % 64 == 0`且K64--K512，支持
 PTPC+PTPC以及per-tensor weight + PTPC/per-tensor activation。N512/N1024 × 全部8个K × 三种
@@ -1433,6 +1464,52 @@ ABBA24 harness交错重测两种输出契约，并对packed结果解码后逐bit
 同一正式harness另测physical N256与streamed row-major：down paired ratio为`0.94760`
 （约快`5.24%`），down+consumer ratio为`0.96644`（约快`3.36%`）。所以新路径不是更快的
 packed producer，而是牺牲约8.2%的paired producer速度，换掉昂贵packed consumer后仍优于原生产路径。
+
+#### H3 PTPC K384 late-scale promotion
+
+PTPC 8-wave原实现把current/next两份per-channel scale fragment作为SCF loop-carried state跨越
+整段MFMA，最终达到256 VGPR、18个VGPR spill、76B private，并实际生成25条scratch load和
+17条scratch store。新实现仅对`paired + direct PTPC scale + K384`延迟scale读取：当前N block
+完成MFMA后才加载scale并立即用于epilogue，从loop state移除scale fragment。fresh ISA保持
+64KB LDS/256 VGPR，但变为0 spill、0 private、0 scratch。
+
+N512/N1024 K384 PTPC oracle、完整48项paired矩阵和production H3 PTPC入口均通过；production
+`calc_diff=0.00019035`。10-buffer直接ABBA24，以下每行ratio均来自control/candidate同轮配对，
+不使用跨窗口绝对中位数相除：
+
+| Candidate / Control | Down ms | Combined ms | Down ratio | Combined ratio（IQR） | Combined延迟变化 | 胜轮 |
+|---|---:|---:|---:|---:|---:|---:|
+| 新8-wave / 旧spill 8-wave | 4.3325 -> 2.3890 | 4.7823 -> 2.8703 | 0.55218 | 0.60734（0.59718--0.61312） | **-39.27%** | 24/24 |
+| 新8-wave / Base M64 | 2.7871 -> 2.5146 | 2.6980 -> 2.5941 | 0.90269 | 0.95473（0.94869--0.96441） | **-4.53%** | 24/24 |
+| 新8-wave / 4-wave N256 128B | 3.3562 -> 2.5098 | 4.0186 -> 3.1692 | 0.75123 | 0.79605（0.78506--0.80110） | **-20.40%** | 24/24 |
+
+资源与最终选择：
+
+| 路径 | VGPR | Spill | Private | LDS | Auto |
+|---|---:|---:|---:|---:|---|
+| Base M64 | 186 | 0 | 0B | 24KB | 否 |
+| 4-wave N256 | 224 | 0 | 0B | 33KB | 否 |
+| 旧8-wave | 256 | 18 | 76B | 64KB | 否 |
+| **新8-wave late-scale** | **256** | **0** | **0B** | **64KB** | **是** |
+
+因此H3 PTPC现在也自动选择paired N512。Qwen K512同shape per-tensor对照仍有4 spills，PTPC为
+20 spills/84B private，说明除scale外还有K512 fragment压力；其8-wave combined比Base慢58.2%，
+继续保持Base auto。
+
+非目标性能影响同样按old/new直接ABBA24或最终ISA比较：
+
+| 非目标路径 | Old -> New combined ms | New / Old combined ratio（IQR） | 结论 |
+|---|---:|---:|---|
+| exact H3 per-tensor 8-wave | 4.5894 -> 4.5898 | 0.99930（0.99868--1.00121） | 中性；规范化ISA逐条一致 |
+| Qwen K512 PTPC 8-wave | 8.9005 -> 8.9068 | 0.99772（0.98087--1.01406） | 中性；最终ISA逐字节一致 |
+| Hy3 K192 physical N256 | - | - | 最终ISA逐字节一致 |
+| Xiaomi K256 physical N256 | - | - | 最终ISA逐字节一致 |
+
+这里“ISA逐字节一致”指同shape、同编译参数下生成的`21_final_isa.s`文件长度和SHA256完全相同，
+不仅opcode数量相同，连实际指令顺序、寄存器编号和调度边界也没有变化。例如Qwen K512 old/new
+均为55,158B且SHA256同为`4b631a4d...be4af8ac`；Hy3和Xiaomi也分别得到完全相同的ISA hash。
+这能证明目标kernel的GPU代码生成未受改动影响，但不等于整个pipeline运行时间必然完全相同：
+sorting、量化、缓存状态和外部负载仍可能波动，所以可稳定计时的路径仍用old/new ABBA24确认。
 
 ### Hy3不完整gateup tile
 

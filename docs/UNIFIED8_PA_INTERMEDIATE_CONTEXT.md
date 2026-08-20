@@ -8,7 +8,7 @@
 >
 > 本文档是当前实验的唯一跨机器handoff入口。packed-best promotion源码SHA256为
 > `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；当前all-down集成源码
-> SHA256为`ceb45548316522b0dc2c316aa6a8d23114da1a4af36dd0d4e164fbd5e99891a8`，且packed H3最终ISA
+> SHA256为`9c4c06a3d6fecee7205eddb1603a95e71ff92850789496397a5b06a75d54ad28`，且packed H3最终ISA
 > 与promotion产物逐字节一致。H3 specialization保持512 threads、
 > 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
 > 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
@@ -79,6 +79,22 @@ combined赢家。自动策略因此按实测边界选择：K64--K320用physical 
 weight用physical N256；PTPC K384及全部K448/K512用base。`MOE_DOWN_PAIRED_N512=1`放宽为上述
 完整能力矩阵的强制入口，不改变auto最快路径。原H3 packed specialization最终ISA仍与promotion
 产物逐字节一致。
+
+2026-08-20在zero-spill流式row-major实现上重新筛选`N=512/1024/4096`、K64--K512和三种FP8
+量化组合，共72个通用单元，另覆盖四个生产shape；base、physical N256 0/128B、paired M128
+0/128B五条路径的reduced输出全部逐bit一致。best-paired / best-non-paired combined ratio中位数
+在N512/N1024/N4096分别为`1.1831/1.1282/1.0574`。ABBA4出现四个表面M128赢家，但直接
+ABBA24 ratio为`1.00255/1.02040/1.01782/0.99842`（最后一项仅14/24胜），全部未晋级；
+因此该通用矩阵没有新增auto M128 shape；后续H3 PTPC通过下述专项spill修复单独晋级。Xiaomi PTPC K256的clean-window padding ABBA24则确认
+128B优于0B，combined ratio `0.99756`、18/24胜，selector已修正。后续N512/N1024的
+base/physical微秒级边界复测遭遇外部8-GPU作业占满整机，污染结果未进入production selector。
+
+后续H3 PTPC K384专项移除了direct scale的跨MFMA live range：scale改为当前N block完成MFMA后
+才加载并立即消费，SCF loop state不再携带current/next scale fragment。fresh ISA从256 VGPR、
+18 spills、76B private、25/17条scratch load/store降为同样256 VGPR/64KB LDS但0 spill、0 private、
+0 scratch。48项paired矩阵与production H3 PTPC入口通过（`diff=0.00019035`）。最终同进程
+ABBA24相对旧8-wave、Base和4-wave N256的combined ratio分别为`0.60734/0.95473/0.79605`，
+均24/24胜；因此H3 PTPC也进入auto M128。独立较早Base复测ratio为`0.94722`，方向一致。
 
 ### 0.1 2026-08-19 production promotion
 

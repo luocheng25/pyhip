@@ -1,7 +1,7 @@
 # FlyDSL MoE down optimization TODO
 
 > Packed-best promotion commit: `c82e2df`; current integrated kernel source SHA256:
-> `ceb45548316522b0dc2c316aa6a8d23114da1a4af36dd0d4e164fbd5e99891a8`.
+> `9c4c06a3d6fecee7205eddb1603a95e71ff92850789496397a5b06a75d54ad28`.
 >
 > Fixed H3 target: `1.895517 ms`; promoted result: `1.913011 ms`; gap: `17.494 us` (`0.9145%`).
 >
@@ -14,7 +14,7 @@
 - Paired 8-wave now accepts every requested FP8 down-prefill combination with `BM=64`, `N % 512 == 0`, `K % 64 == 0`, and `64 <= K <= 512`: PTPC weight + PTPC activation, or per-tensor weight + PTPC/per-tensor activation. The exhaustive persistent matrix crosses N512/N1024, all eight K points, and all three quant combinations (48/48), while checking M128 padding and inactive tails. The real dispatcher also passes forced PTPC K256/K512.
 - PTPC scale ownership is fixed by indexing both four-wave groups with `local_tid`; both groups stage the same N256 scale block. K512 cannot fit the extra 1KB scale LDS, so it uses direct global-to-C-fragment scale loads. It is numerically correct, but final ISA has 256 VGPR, 19 spills, and 80B private memory, so it is never auto-selected.
 - Controlled 10-buffer ABBA8 compared base, physical N256, and row-major paired 8-wave, including `sorted_sum`. Generic shapes still select the measured best of base and physical N256. A later streaming wave-private CShuffle removed the exact-H3 consumer penalty and all epilogue spills, so exact H3 per-tensor now auto-selects paired N512; `MOE_DOWN_PAIRED_N512=0/1` remains the disable/force override.
-- Automatic winner boundaries: physical N256 for K64-K320; physical N256 for K384 only with per-tensor weights; base for PTPC K384 and all K448/K512 cases. Shape-specific row padding preserves measured combined winners: Hy3 K192 and per-tensor H3 K384 use 0B, Xiaomi PTPC K256 uses 0B, generic physical cases use 128B except per-tensor N4096 K64/K128.
+- Automatic winner boundaries: physical N256 for K64-K320; physical N256 for K384 only with per-tensor weights; base for PTPC K384 and all K448/K512 cases. Shape-specific row padding preserves measured combined winners: Hy3 K192 and per-tensor H3 K384 use 0B; Xiaomi PTPC K256 and generic physical cases use 128B except per-tensor N4096 K64/K128.
 
 - The packed H3 formal best is unchanged: its rebuilt final ISA is byte-identical to the promoted artifact. It still has 192 MFMA, 39 128-bit loads, 16 stores, 10 real barriers, 254 VGPR, 49,152B LDS, and zero scratch.
 - The generic dispatcher does not consume the packed layout directly. The promoted row-major epilogue streams each staged BF16 vector pair through wave-private LDS, retaining the original K-stage overlap and delaying global address generation until after DS reads. Exact-H3 ABBA24 versus physical4 improved down `2.4743 -> 2.3552 ms` (24/24 wins) and full pipeline `8.6356 -> 8.5859 ms` (22/24 wins), with bitwise-equal reduced output.
@@ -22,13 +22,17 @@
 - The batch1 down path now allows VMEM reads to cross its compiler scheduling barriers. H3-dimension ABBA24 improved FP8 by `4.32%` (`0.956752`, 24/24 wins) and BF16 by `0.24%` (`0.997616`, 21/24 wins). BF16 and FP8 dispatcher accuracy gates pass.
 - Applying the same mask to splitk is rejected: `0.872255 -> 1.626202 ms`, ratio `1.865054`, 0/8 wins. Splitk remains unchanged.
 - The focused selector suite covers all 24 K/quant winner cells plus boundaries; the complete down suite includes the exhaustive 48-case paired matrix, repaired physical4 two-block, and batch1 BF16/FP8 atomic coverage.
+- 2026-08-20 streaming-paired expansion gate: 72 generic cells (`N=512/1024/4096`, K64-K512, three FP8 quant combinations) plus four production shapes compared base, physical N256 (0/128B), and paired M128 (0/128B); every reduced output was bitwise equal. No generic M128 cell survived a reliable direct ABBA24 versus the current winner; H3 PTPC was promoted only after the later spill-removal specialization below. Xiaomi PTPC K256 padding changed from 0B to the clean-window ABBA24-winning 128B (`combined ratio 0.99756`, 18/24 wins). N512/N1024 base/physical boundary promotion remains pending because an external all-GPU workload contaminated the follow-up microsecond-scale timings.
+- Aggregate best-paired/best-non-paired combined ratios were `1.1831` at N512, `1.1282` at N1024, and `1.0574` at generic N4096 (72-cell median `1.1212`). ABBA4 produced four apparent paired winners; direct ABBA24 rejected all four (`1.00255`, `1.02040`, `1.01782`, and `0.99842` with only 14/24 wins). Thus the generic table gained no automatic M128 promotion.
+- H3 PTPC K384 was subsequently promoted after removing current/next direct-scale fragments from the MFMA loop-carried state. Fresh ISA changed from 18 VGPR spills / 76B private / 25+17 scratch load/store to zero spill/private/scratch. Full paired correctness (48/48) and production `diff=0.00019035` pass. ABBA24 combined ratios are `0.60734` versus the old spilling 8-wave, `0.95473` versus Base, and `0.79605` versus physical N256; all are 24/24 wins. Non-target exact-H3 and Qwen-K512 old/new ratios are `0.99930` and `0.99772` with IQRs crossing 1; Hy3/Xiaomi final ISA is byte-identical. Auto M128 now covers exact H3 per-tensor and H3 PTPC.
 
 ## Path matrix
 
 | Down path | Current implementation | Strict paired method applicability | Required gate |
 | --- | --- | --- | --- |
 | H3 fp8 per-tensor `prefill_1x4`, N4096/K384/TOPK9/E193 | packed paired formal best plus auto-selected streaming row-major adapter | Paired N512 streams through wave-private CShuffle; packed default remains unchanged | exact-grid physical/reduced/tail bitwise gate; 256 VGPR, 65,536B LDS, 0 scratch; ABBA8/24 |
-| Generic fp8 per-tensor `prefill_1x4` | physical4 fallback | Direct row-major pairing passes correctness but fails performance; do not expose packed block-major stores to the generic consumer | N512/N1024 PyTorch oracle plus odd logical-block tail |
+| H3 fp8 PTPC `prefill_1x4`, N6144/K384/TOPK4/E128 | paired N512 streaming row-major with epilogue-time scale load | Late scale removes all 18 spills while preserving 64KB LDS | 48-case paired matrix, production accuracy, Base/old-paired ABBA24 |
+| Generic fp8 per-tensor `prefill_1x4` | Existing base/physical4 winner table | Streaming row-major pairing passes correctness but no non-H3 cell passed reliable direct ABBA24 performance promotion | N512/N1024/N4096 K/quant matrix plus odd logical-block tail |
 | fp8 PTPC `prefill_1x4` | auto-selects base or physical4; paired8 is explicit | Paired8 supports K64-K512; staged scale uses group-local thread numbering, K512 uses direct scale loads | all eight K points, multi-N, and inactive tail |
 | Non-physical `prefill_1x4` (bf16/fp8) | original 4-wave path | Reuse scheduling ideas only; physical pairing changes its output and LDS contract | existing prefill tests plus shape matrix |
 | `splitk` down | one-wave compute with scatter/atomic output | Do not apply 4+4 anti-phase directly; only test load scheduling and mapping independently | atomic and non-atomic oracle, multi-expert routing |

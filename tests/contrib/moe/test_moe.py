@@ -227,8 +227,6 @@ def _select_fly_down_padding_bytes(
             return 0
         if k in (192, 384) and topk == 9 and experts == 193:
             return 0
-    if quant_type == 'ptpc' and (n, k, topk, experts) == (6144, 256, 8, 384):
-        return 0
     return 128
 
 
@@ -255,9 +253,18 @@ def _select_fly_down_paired_layout(
     )
     auto_paired = (
         weight_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
-        and quant_type == "per_tensor"
-        and act_quant_type == "per_tensor"
-        and (n, k, topk, experts) == (4096, 384, 9, 193)
+        and (
+            (
+                quant_type == "per_tensor"
+                and act_quant_type == "per_tensor"
+                and (n, k, topk, experts) == (4096, 384, 9, 193)
+            )
+            or (
+                quant_type == "ptpc"
+                and act_quant_type == "ptpc"
+                and (n, k, topk, experts) == (6144, 384, 4, 128)
+            )
+        )
     )
     return supported and (
         auto_paired if paired_setting == "auto" else paired_setting == "1"
@@ -365,7 +372,7 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
         ("per_tensor", 4096, 192, True, 8, 128, 128),
         ("per_tensor", 4096, 384, True, 9, 193, 0),
         ("per_tensor", 4096, 384, True, 8, 128, 128),
-        ("ptpc", 6144, 256, True, 8, 384, 0),
+        ("ptpc", 6144, 256, True, 8, 384, 128),
         ("ptpc", 4096, 256, True, 8, 128, 128),
         ("per_tensor", 4096, 192, False, 9, 193, None),
     ],
@@ -445,6 +452,16 @@ def test_select_fly_down_paired_layout_auto_h3(monkeypatch):
         384,
         8,
         128,
+    )
+    assert _select_fly_down_paired_layout(
+        torch.float8_e4m3fnuz,
+        "ptpc",
+        64,
+        6144,
+        384,
+        4,
+        128,
+        "ptpc",
     )
 
 
