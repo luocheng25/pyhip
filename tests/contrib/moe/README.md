@@ -1375,19 +1375,36 @@ wave slot尝试了两种策略，均保持完整H3 `diff=0.00105974`：
 控制和VGPR，也破坏旧流水的指令重叠；固定slot0/slot1=`1/0`整个kernel则会长期饿死slot1，完整
 运行同样明显退化。因此本轮未保留任何`setprio`代码或环境开关，旧e6仍以128B padding为最佳。
 
-## B=32768多shape自动选择（2026-08-14）
+## B=32768多shape自动选择（2026-08-14，2026-08-19更新）
 
 H3优化不能无条件应用到所有MoE shape。当前host根据gateup的完整N tile、量化模式、down的实际
 LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；显式
 `MOE_DOWN_PHYSICAL_N256=0/1`和`MOE_DOWN_OUTPUT_PADDING_BYTES=0/32/64/128`仍可覆盖自动值。
 
-| 模型 | 本地`I` | `H` | `TOPK` | 量化 | gateup | down |
+| 模型/范围 | 本地`I` | `H` | `TOPK` | 量化 | gateup | 当前auto down |
 |---|---:|---:|---:|---|---|---|
 | Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding（K64） |
 | Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
-| Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle |
-| H3 | 384 | 6144 | 4 | PTPC | prefill BN256 | physical N256 + CShuffle |
+| Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle，0B padding |
+| H3 PTPC | 384 | 6144 | 4 | PTPC | prefill BN256 | base N64 |
+| H3 per-tensor | 384 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding |
+
+2026-08-19重新对base、physical N256和row-major paired8执行10-buffer ABBA8，计时包含
+`sorted_sum`。通用矩阵固定`B8192/N4096/TOPK8/E128`，覆盖K64--K512全部64步长及三种
+quant组合；另外单独覆盖上述生产shape。auto赢家边界为：
+
+| K | PTPC+PTPC | per-tensor+PTPC | per-tensor+per-tensor |
+|---:|---|---|---|
+| 64--320 | physical N256 | physical N256 | physical N256 |
+| 384 | base N64 | physical N256 | physical N256 |
+| 448--512 | base N64 | base N64 | base N64 |
+
+paired8能力本身已放宽到FP8、BM64、`N % 512 == 0`、`K % 64 == 0`且K64--K512，支持
+PTPC+PTPC以及per-tensor weight + PTPC/per-tensor activation。N512/N1024 × 全部8个K × 三种
+quant的48项回归全部通过，并检查M128 padding与inactive tail。由于通用row-major paired8在本轮combined
+ABBA中没有成为赢家，auto不会选择它；可用`MOE_DOWN_PAIRED_N512=1`强制进入，用于能力验证和
+后续优化。原H3 packed specialization不受影响，最终ISA与promotion产物逐字节一致。
 
 ### Hy3不完整gateup tile
 

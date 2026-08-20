@@ -241,39 +241,81 @@ def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
     assert _relative_l2(logical_output, expected) < 3e-2
 
 
-@pytest.mark.parametrize("hidden_size", [512, 1024])
-def test_down_prefill_paired_row_major_sorted_sum(hidden_size):
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size", "weight_quant_type", "act_quant_type"),
+    [
+        *[
+            (hidden_size, intermediate_size, weight_quant_type, act_quant_type)
+            for hidden_size in (512, 1024)
+            for intermediate_size in (64, 128, 192, 256, 320, 384, 448, 512)
+            for weight_quant_type, act_quant_type in (
+                ("ptpc", "ptpc"),
+                ("per_tensor", "ptpc"),
+                ("per_tensor", "per_tensor"),
+            )
+        ],
+    ],
+)
+def test_down_prefill_paired_row_major_sorted_sum(
+    hidden_size, intermediate_size, weight_quant_type, act_quant_type
+):
     torch.manual_seed(19)
-    batch_size = 128
-    intermediate_size = 384
+    valid_rows = 93
+    pair_rows = 128
+    allocated_rows = 256
     fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = torch.finfo(fp8_dtype).max
 
     activation = 0.1 * torch.randn(
-        batch_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+        valid_rows, intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
-    activation_scale = activation.float().abs().amax().reshape(1) / fp8_max
+    activation_scale = (
+        activation.float().abs().amax(dim=1, keepdim=True)
+        if act_quant_type == "ptpc"
+        else activation.float().abs().amax().reshape(1)
+    ) / fp8_max
     activation_fp8 = (
         (activation.float() / activation_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
     )
     weight = 0.1 * torch.randn(
         1, hidden_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
-    weight_scale = weight.float().abs().amax().reshape(1) / fp8_max
-    weight_fp8 = (weight.float() / weight_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    if weight_quant_type == "ptpc":
+        weight_scale = weight.float().abs().amax(dim=2) / fp8_max
+        weight_fp8 = (
+            (weight.float() / weight_scale[..., None])
+            .clamp(-fp8_max, fp8_max)
+            .to(fp8_dtype)
+        )
+        dequant_weight = weight_fp8[0].float() * weight_scale[0, :, None]
+    else:
+        weight_scale = weight.float().abs().amax(dim=(1, 2)) / fp8_max
+        weight_fp8 = (
+            (weight.float() / weight_scale[:, None, None])
+            .clamp(-fp8_max, fp8_max)
+            .to(fp8_dtype)
+        )
+        dequant_weight = weight_fp8[0].float() * weight_scale[0]
     shuffled_weight = shuffle_weight(weight_fp8, layout=(16, 16))
 
-    routing_weight = torch.linspace(
-        0.25, 1.0, batch_size, dtype=torch.float32, device="cuda"
+    routing_weight = torch.zeros(
+        allocated_rows, dtype=torch.float32, device="cuda"
     )
-    sorted_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda")
-    sorted_expert_ids = torch.zeros(2, dtype=torch.int32, device="cuda")
+    routing_weight[:valid_rows] = torch.linspace(
+        0.25, 1.0, valid_rows, dtype=torch.float32, device="cuda"
+    )
+    sorted_ids = torch.zeros(allocated_rows, dtype=torch.int32, device="cuda")
+    sorted_ids[:valid_rows] = torch.arange(
+        valid_rows, dtype=torch.int32, device="cuda"
+    )
+    sorted_expert_ids = torch.zeros(4, dtype=torch.int32, device="cuda")
     num_valid_ids = torch.tensor(
-        [batch_size, batch_size], dtype=torch.int32, device="cuda"
+        [valid_rows, valid_rows], dtype=torch.int32, device="cuda"
     )
+    sentinel = torch.tensor(-123.0, dtype=torch.bfloat16, device="cuda")
     physical_output = torch.full(
-        (batch_size, hidden_size),
-        torch.nan,
+        (allocated_rows, hidden_size),
+        sentinel,
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -282,8 +324,8 @@ def test_down_prefill_paired_row_major_sorted_sum(hidden_size):
         N=hidden_size,
         K=intermediate_size,
         weight_dtype="fp8",
-        weight_quant_type="per_tensor",
-        act_quant_type="per_tensor",
+        weight_quant_type=weight_quant_type,
+        act_quant_type=act_quant_type,
         TOPK=1,
         BLOCK_TILE_SIZE_M=64,
         BLOCK_TILE_SIZE_N=512,
@@ -305,23 +347,30 @@ def test_down_prefill_paired_row_major_sorted_sum(hidden_size):
         _ptr(num_valid_ids),
         _ptr(weight_scale),
         _ptr(activation_scale),
-        batch_size,
-        2,
+        valid_rows,
+        4,
         torch.cuda.current_stream(),
     )
-    logical_output = torch.empty_like(physical_output)
-    loc_ids = torch.arange(batch_size, dtype=torch.int32, device="cuda").view(
-        batch_size, 1
+    logical_output = torch.empty(
+        valid_rows, hidden_size, dtype=torch.bfloat16, device="cuda"
     )
-    sorted_sum(1, hidden_size, 0)(loc_ids, physical_output, logical_output, batch_size)
+    loc_ids = torch.arange(valid_rows, dtype=torch.int32, device="cuda").view(
+        valid_rows, 1
+    )
+    sorted_sum(1, hidden_size, 0)(
+        loc_ids, physical_output, logical_output, valid_rows
+    )
     torch.cuda.synchronize()
 
-    expected = (activation_fp8.float() * activation_scale) @ (
-        weight_fp8[0].float() * weight_scale
-    ).T
-    expected = (expected * routing_weight[:, None]).to(torch.bfloat16)
+    expected = (activation_fp8.float() * activation_scale) @ dequant_weight.T
+    expected = (expected * routing_weight[:valid_rows, None]).to(torch.bfloat16)
     assert torch.isfinite(logical_output).all()
     assert _relative_l2(logical_output, expected) < 3e-2
+    assert torch.all(physical_output[valid_rows:pair_rows] == 0)
+    assert torch.equal(
+        physical_output[pair_rows:],
+        torch.full_like(physical_output[pair_rows:], sentinel),
+    )
 
 
 @pytest.mark.parametrize("intermediate_size", [192, 384])

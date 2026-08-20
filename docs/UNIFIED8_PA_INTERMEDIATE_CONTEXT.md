@@ -8,7 +8,7 @@
 >
 > 本文档是当前实验的唯一跨机器handoff入口。packed-best promotion源码SHA256为
 > `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；当前all-down集成源码
-> SHA256为`929b36f77ebcbe282f01251f1105748cecdfe8f2911ffa78153875c4dafd184d`，且packed H3最终ISA
+> SHA256为`7d30e540558dd22eae4bfa34443b876fdca03be50dee05b6b7293a80be57cf6c`，且packed H3最终ISA
 > 与promotion产物逐字节一致。H3 specialization保持512 threads、
 > 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
 > 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
@@ -36,14 +36,34 @@
   ABBA24中FP8 ratio为`0.956752`（24/24胜），BF16为`0.997616`（21/24胜）；两种精度的
   TOPK atomic reduction oracle均通过。该mask仅在`stage=down, alg=batch1`时启用。
 - 相同mask用于splitk时从`0.872255`退化到`1.626202 ms`，ratio `1.865054`、0/8胜，已回退。
-- paired PTPC的首个group-local scale-LDS原型在合法padding metadata下仍于kernel launch崩溃；
-  尚未达到正确性门禁，已完整回退。64KB CShuffle row-major原型产生27个VGPR spill/88B private，
-  wave-local bpermute原型产生4个spill/12B private，也均回退。
+- paired PTPC的首个group-local scale-LDS原型曾在合法padding metadata下于kernel launch崩溃；
+  后续已定位为waves 4--7的scale索引越界并修复，详见下方expanded matrix。64KB CShuffle
+  row-major原型产生27个VGPR spill/88B private，wave-local bpermute原型产生4个spill/12B private，
+  两条输出转置路线均回退。
 - paired A-stage全局`0x20`探针的最终ISA与control逐字节相同，没有可执行效果，已删除。
 
-当前剩余优先级记录在`docs/UNIFIED8_DOWN_TODO.md`：先做独立exact-H3数学/tail持久回归，再诊断
-PTPC scale-LDS launch fault；paired性能只继续测试能恢复coalesced row-major写回且保持254 VGPR、
+当前剩余优先级记录在`docs/UNIFIED8_DOWN_TODO.md`：先做独立exact-H3数学/tail持久回归；
+paired性能只继续测试能恢复coalesced row-major写回且保持254 VGPR、
 0 scratch、49,152B LDS和10 barriers的方案。splitk不再复用全局`0x20`。
+
+#### 2026-08-19 expanded paired8 matrix
+
+后续已定位并修复上述PTPC launch fault：8-wave内两个logical 4-wave group原先直接使用
+`thread_idx.x`装载同一个N256 scale块，waves 4--7因此越界；现在使用`local_tid`，两组各自装载
+相同scale fragment。K512时`M128 x K512` activation恰好占64KB LDS，额外1KB scale无法分配，
+因此该shape改用global-to-C-fragment direct scale load。
+
+当前paired8能力条件为：FP8、BM64、`N % 512 == 0`、`K % 64 == 0`、`64 <= K <= 512`，quant
+组合支持PTPC+PTPC以及per-tensor weight + PTPC/per-tensor activation。N512/N1024、K64--K512
+全部8点和三种quant的48项笛卡尔积门禁全部通过，并检查M128 padding和inactive tail；真实dispatcher
+强制PTPC K256/K512也通过。K512 PTPC资源为64KB LDS、256 VGPR、19 spills和80B private，故仅
+作为显式能力入口，不能自动晋级。
+
+完整K64--K512（64步长）三算法10-buffer ABBA8表明generic row-major paired8没有成为任何一项
+combined赢家。自动策略因此按实测边界选择：K64--K320用physical N256；K384仅per-tensor
+weight用physical N256；PTPC K384及全部K448/K512用base。`MOE_DOWN_PAIRED_N512=1`放宽为上述
+完整能力矩阵的强制入口，不改变auto最快路径。原H3 packed specialization最终ISA仍与promotion
+产物逐字节一致。
 
 ### 0.1 2026-08-19 production promotion
 

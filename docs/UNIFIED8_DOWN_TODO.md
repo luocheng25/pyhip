@@ -1,7 +1,7 @@
 # FlyDSL MoE down optimization TODO
 
 > Packed-best promotion commit: `c82e2df`; current integrated kernel source SHA256:
-> `929b36f77ebcbe282f01251f1105748cecdfe8f2911ffa78153875c4dafd184d`.
+> `7d30e540558dd22eae4bfa34443b876fdca03be50dee05b6b7293a80be57cf6c`.
 >
 > Fixed H3 target: `1.895517 ms`; promoted result: `1.913011 ms`; gap: `17.494 us` (`0.9145%`).
 >
@@ -9,11 +9,18 @@
 
 ## 2026-08-19 all-down checkpoint
 
+### Expanded 8-wave support and three-way selection
+
+- Paired 8-wave now accepts every requested FP8 down-prefill combination with `BM=64`, `N % 512 == 0`, `K % 64 == 0`, and `64 <= K <= 512`: PTPC weight + PTPC activation, or per-tensor weight + PTPC/per-tensor activation. The exhaustive persistent matrix crosses N512/N1024, all eight K points, and all three quant combinations (48/48), while checking M128 padding and inactive tails. The real dispatcher also passes forced PTPC K256/K512.
+- PTPC scale ownership is fixed by indexing both four-wave groups with `local_tid`; both groups stage the same N256 scale block. K512 cannot fit the extra 1KB scale LDS, so it uses direct global-to-C-fragment scale loads. It is numerically correct, but final ISA has 256 VGPR, 19 spills, and 80B private memory, so it is never auto-selected.
+- Controlled 10-buffer ABBA8 compared base, physical N256, and row-major paired 8-wave, including `sorted_sum`. Across K64/K128/K192/K256/K320/K384/K448/K512 and all three quant combinations, generic row-major 8-wave was never the combined winner. Therefore `MOE_DOWN_PAIRED_N512=1` is the explicit capability override; automatic dispatch selects the measured best of base and physical N256.
+- Automatic winner boundaries: physical N256 for K64-K320; physical N256 for K384 only with per-tensor weights; base for PTPC K384 and all K448/K512 cases. Shape-specific row padding preserves measured combined winners: Hy3 K192 and per-tensor H3 K384 use 0B, Xiaomi PTPC K256 uses 0B, generic physical cases use 128B except per-tensor N4096 K64/K128.
+
 - The packed H3 formal best is unchanged: its rebuilt final ISA is byte-identical to the promoted artifact. It still has 192 MFMA, 39 128-bit loads, 16 stores, 10 real barriers, 254 VGPR, 49,152B LDS, and zero scratch.
 - The generic dispatcher cannot consume the packed layout directly. The direct row-major paired epilogue is mathematically correct, but realistic random-route ABBA8 regressed versus physical4 (`1.232053`, 0/8 wins) and versus packed paired (`1.363678`, 0/8 wins). Exact H3 therefore defaults to repaired physical4 with 0B row padding; `MOE_DOWN_PAIRED_N512=1` retains the row-major paired route as an explicit experiment only.
 - The batch1 down path now allows VMEM reads to cross its compiler scheduling barriers. H3-dimension ABBA24 improved FP8 by `4.32%` (`0.956752`, 24/24 wins) and BF16 by `0.24%` (`0.997616`, 21/24 wins). BF16 and FP8 dispatcher accuracy gates pass.
 - Applying the same mask to splitk is rejected: `0.872255 -> 1.626202 ms`, ratio `1.865054`, 0/8 wins. Splitk remains unchanged.
-- The focused selector suite passes 14/14; the down suite now has persistent paired two-M64, repaired physical4 two-block, and batch1 BF16/FP8 atomic coverage.
+- The focused selector suite covers all 24 K/quant winner cells plus boundaries; the complete down suite includes the exhaustive 48-case paired matrix, repaired physical4 two-block, and batch1 BF16/FP8 atomic coverage.
 
 ## Path matrix
 
@@ -21,7 +28,7 @@
 | --- | --- | --- | --- |
 | H3 fp8 per-tensor `prefill_1x4`, N4096/K384/TOPK9/E193 | packed paired formal best; generic dispatcher defaults to physical4/0B | Strict paired kernel remains the performance reference; row-major adapter is opt-in because it regresses | exact-grid physical/reduced/tail bitwise gate; 254 VGPR, 49,152B LDS, 10 barriers; ABBA8/24 |
 | Generic fp8 per-tensor `prefill_1x4` | physical4 fallback | Direct row-major pairing passes correctness but fails performance; do not expose packed block-major stores to the generic consumer | N512/N1024 PyTorch oracle plus odd logical-block tail |
-| fp8 PTPC `prefill_1x4` | physical4 | Pairing still needs scale-LDS ownership and cross-group synchronization proof; first group-local scale prototype crashed at launch and was reverted | PTPC per-token scale oracle for K192/K384/K512 and inactive tail |
+| fp8 PTPC `prefill_1x4` | auto-selects base or physical4; paired8 is explicit | Paired8 supports K64-K512; staged scale uses group-local thread numbering, K512 uses direct scale loads | all eight K points, multi-N, and inactive tail |
 | Non-physical `prefill_1x4` (bf16/fp8) | original 4-wave path | Reuse scheduling ideas only; physical pairing changes its output and LDS contract | existing prefill tests plus shape matrix |
 | `splitk` down | one-wave compute with scatter/atomic output | Do not apply 4+4 anti-phase directly; only test load scheduling and mapping independently | atomic and non-atomic oracle, multi-expert routing |
 | `batch1` down | one-wave compute with BF16 atomic reduction; VMEM-read crossing enabled | Pairing is structurally inapplicable; the compatible scheduling idea is promoted | batch1 TOPK reduction oracle |
@@ -42,9 +49,9 @@
 
 ## P2: PTPC physical4 and paired paths
 
-- [ ] Apply the split weight-head prefetch only after proving PTPC scale ordering remains correct.
-- [ ] Test K192/K384/K512 with per-token activation scale and per-channel weight scale.
-- [ ] Measure against physical4 using 10-buffer ABBA8; advance only if paired ratio is below `0.997`.
+- [x] Keep the split weight-head prefetch restricted to the original per-tensor K384 schedule; PTPC uses the generic K-core path.
+- [x] Test K64-K512 with per-token activation scale and per-channel weight scale, including two N256 blocks and inactive tails.
+- [x] Measure base, physical4, and paired8 using 10-buffer ABBA8. Generic row-major paired8 did not beat the best existing path, so it remains explicit-only while auto dispatch uses the winner table above.
 
 ## P3: zero-memory scheduling probes
 
@@ -72,4 +79,4 @@
 - [x] Paired row-major CShuffle: correct at N512/N1024, but 65,536B LDS caused 256 VGPR, 27 spills, and 88B private memory.
 - [x] Paired row-major bpermute: correct at N512/N1024, but 128 `ds_bpermute` instructions caused 256 VGPR, 4 spills, and 12B private memory.
 - [x] Splitk VMEM-read crossing: ratio `1.865054`, 0/8 wins.
-- [x] PTPC paired group-local scale LDS: legal padded metadata still crashed at kernel launch; reverted before timing.
+- [x] Initial PTPC paired scale prototype crashed because waves 4-7 indexed beyond the shared N256 scale block. Fixed with `local_tid`; K64-K384 staged-scale and K512 direct-scale paths now pass.

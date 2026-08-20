@@ -173,7 +173,21 @@ def wei_is_fp8(weight_type):
     return weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz
 
 
-def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
+def _supports_fly_down_quant(weight_type, quant_type, act_quant_type):
+    return wei_is_fp8(weight_type) and (
+        (quant_type == 'ptpc' and act_quant_type == 'ptpc')
+        or (
+            quant_type == 'per_tensor'
+            and act_quant_type in ('ptpc', 'per_tensor')
+        )
+    )
+
+
+def _select_fly_down_layout(
+    weight_type, quant_type, block_m, n, k, act_quant_type=None
+):
+    if act_quant_type is None:
+        act_quant_type = quant_type
     a_lds_bytes = block_m * k
     double_buffered_c_lds_bytes = 2 * block_m * 64 * 2
     scale_lds_bytes = 256 * 4 if quant_type == 'ptpc' else 0
@@ -183,19 +197,15 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
         + 4 * 8 * 64 * 2
     )
     auto_physical = (
-        wei_is_fp8(weight_type)
-        and (
-            quant_type == 'ptpc'
-            or (
-                quant_type == 'per_tensor'
-                and n == 4096
-                and k in (192, 384)
-            )
-        )
+        _supports_fly_down_quant(weight_type, quant_type, act_quant_type)
         and block_m == 64
         and n % 256 == 0
         and k % 64 == 0
         and physical_lds_bytes <= 32 * 1024
+        and (
+            k <= 320
+            or (k == 384 and quant_type == 'per_tensor')
+        )
     )
 
     physical_setting = os.getenv("MOE_DOWN_PHYSICAL_N256", "auto").lower()
@@ -207,27 +217,41 @@ def _select_fly_down_layout(weight_type, quant_type, block_m, n, k):
     return down_physical_n256
 
 
-def _select_fly_down_padding_bytes(quant_type, n, k, down_physical_n256):
+def _select_fly_down_padding_bytes(
+    quant_type, n, k, down_physical_n256, topk=None, experts=None
+):
     if not down_physical_n256:
         return None
-    if quant_type == 'per_tensor' and n == 4096 and k in (192, 384):
+    if quant_type == 'per_tensor' and n == 4096:
+        if k in (64, 128):
+            return 0
+        if k in (192, 384) and topk == 9 and experts == 193:
+            return 0
+    if quant_type == 'ptpc' and (n, k, topk, experts) == (6144, 256, 8, 384):
         return 0
     return 128
 
 
 def _select_fly_down_paired_layout(
-    weight_type, quant_type, block_m, n, k, topk, experts
+    weight_type,
+    quant_type,
+    block_m,
+    n,
+    k,
+    topk,
+    experts,
+    act_quant_type=None,
 ):
+    if act_quant_type is None:
+        act_quant_type = quant_type
     paired_setting = os.getenv("MOE_DOWN_PAIRED_N512", "0").lower()
     assert paired_setting in ("0", "1")
     return paired_setting == "1" and (
-        wei_is_fp8(weight_type)
-        and quant_type == 'per_tensor'
+        _supports_fly_down_quant(weight_type, quant_type, act_quant_type)
         and block_m == 64
-        and n == 4096
-        and k == 384
-        and topk == 9
-        and experts == 193
+        and n % 512 == 0
+        and k % 64 == 0
+        and 64 <= k <= 512
     )
 
 
@@ -273,18 +297,31 @@ def test_gateup_prefill_rejects_incomplete_n_tile():
 
 
 @pytest.mark.parametrize(
-    ("quant_type", "n", "k", "expected"),
+    ("quant_type", "act_quant_type", "n", "k", "expected"),
     [
-        ("per_tensor", 4096, 192, True),
-        ("per_tensor", 4096, 384, True),
-        ("per_tensor", 4096, 256, False),
-        ("ptpc", 4096, 512, False),
-        ("ptpc", 2048, 512, False),
-        ("ptpc", 6144, 256, True),
-        ("ptpc", 6144, 384, True),
+        *[
+            (
+                weight_quant_type,
+                act_quant_type,
+                4096,
+                k,
+                k <= 320 or (k == 384 and weight_quant_type == "per_tensor"),
+            )
+            for k in (64, 128, 192, 256, 320, 384, 448, 512)
+            for weight_quant_type, act_quant_type in (
+                ("ptpc", "ptpc"),
+                ("per_tensor", "ptpc"),
+                ("per_tensor", "per_tensor"),
+            )
+        ],
+        ("ptpc", "ptpc", 6144, 256, True),
+        ("ptpc", "ptpc", 6144, 384, False),
+        ("ptpc", "per_tensor", 4096, 128, False),
     ],
 )
-def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
+def test_select_fly_down_layout(
+    monkeypatch, quant_type, act_quant_type, n, k, expected
+):
     monkeypatch.delenv("MOE_DOWN_PHYSICAL_N256", raising=False)
     assert (
         _select_fly_down_layout(
@@ -293,6 +330,7 @@ def test_select_fly_down_layout(monkeypatch, quant_type, n, k, expected):
             block_m=64,
             n=n,
             k=k,
+            act_quant_type=act_quant_type,
         )
         == expected
     )
@@ -310,31 +348,58 @@ def test_select_fly_down_layout_explicit_physical(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("quant_type", "n", "k", "physical", "expected"),
+    ("quant_type", "n", "k", "physical", "topk", "experts", "expected"),
     [
-        ("per_tensor", 4096, 192, True, 0),
-        ("per_tensor", 4096, 384, True, 0),
-        ("ptpc", 6144, 256, True, 128),
-        ("ptpc", 6144, 384, True, 128),
-        ("per_tensor", 4096, 192, False, None),
+        ("per_tensor", 4096, 64, True, 8, 128, 0),
+        ("per_tensor", 4096, 128, True, 8, 128, 0),
+        ("per_tensor", 4096, 192, True, 9, 193, 0),
+        ("per_tensor", 4096, 192, True, 8, 128, 128),
+        ("per_tensor", 4096, 384, True, 9, 193, 0),
+        ("per_tensor", 4096, 384, True, 8, 128, 128),
+        ("ptpc", 6144, 256, True, 8, 384, 0),
+        ("ptpc", 4096, 256, True, 8, 128, 128),
+        ("per_tensor", 4096, 192, False, 9, 193, None),
     ],
 )
-def test_select_fly_down_padding_bytes(quant_type, n, k, physical, expected):
-    assert _select_fly_down_padding_bytes(quant_type, n, k, physical) == expected
+def test_select_fly_down_padding_bytes(
+    quant_type, n, k, physical, topk, experts, expected
+):
+    assert (
+        _select_fly_down_padding_bytes(
+            quant_type, n, k, physical, topk, experts
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
-    ("quant_type", "block_m", "n", "k", "topk", "experts", "expected"),
+    (
+        "quant_type",
+        "act_quant_type",
+        "block_m",
+        "n",
+        "k",
+        "expected",
+    ),
     [
-        ("per_tensor", 64, 4096, 384, 9, 193, True),
-        ("ptpc", 64, 4096, 384, 9, 193, False),
-        ("per_tensor", 64, 4096, 192, 9, 193, False),
-        ("per_tensor", 64, 6144, 384, 4, 128, False),
-        ("per_tensor", 32, 4096, 384, 9, 193, False),
+        ("ptpc", "ptpc", 64, 4096, 64, True),
+        ("per_tensor", "ptpc", 64, 4096, 192, True),
+        ("per_tensor", "per_tensor", 64, 6144, 384, True),
+        ("ptpc", "ptpc", 64, 2048, 512, True),
+        ("ptpc", "per_tensor", 64, 4096, 128, False),
+        ("per_tensor", "per_tensor", 64, 4032, 384, False),
+        ("per_tensor", "per_tensor", 64, 4096, 576, False),
+        ("per_tensor", "per_tensor", 32, 4096, 384, False),
     ],
 )
 def test_select_fly_down_paired_layout(
-    monkeypatch, quant_type, block_m, n, k, topk, experts, expected
+    monkeypatch,
+    quant_type,
+    act_quant_type,
+    block_m,
+    n,
+    k,
+    expected,
 ):
     monkeypatch.setenv("MOE_DOWN_PAIRED_N512", "1")
     assert (
@@ -344,8 +409,9 @@ def test_select_fly_down_paired_layout(
             block_m,
             n,
             k,
-            topk,
-            experts,
+            7,
+            31,
+            act_quant_type,
         )
         == expected
     )
@@ -649,6 +715,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 TILE_M,
                 N2,
                 K2,
+                quant_type,
             )
             down_paired_n512 = B > 32 and _select_fly_down_paired_layout(
                 weight_type,
@@ -658,6 +725,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 K2,
                 TOPK,
                 E,
+                quant_type,
             )
             if down_paired_n512:
                 down_physical_n256 = False
@@ -673,6 +741,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         N2,
                         K2,
                         down_physical_n256,
+                        TOPK,
+                        E,
                     )
                 )
             )

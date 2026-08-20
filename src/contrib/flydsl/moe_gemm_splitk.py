@@ -140,13 +140,22 @@ def compile_gemm(
         assert stage == "down" and alg == "prefill_1x4"
         assert BLOCK_TILE_SIZE_N == physical_block_n
         assert N % BLOCK_TILE_SIZE_N == 0
-        assert K % (128 if down_physical_n512 else 64) == 0
+        assert K % 64 == 0
         assert weight_dtype == "fp8"
         assert weight_quant_type in ("ptpc", "per_tensor")
         assert down_output_padding_bytes in (0, 32, 64, 128)
         if down_physical_n512:
-            assert weight_quant_type == "per_tensor"
-            assert act_quant_type == "per_tensor"
+            assert BLOCK_TILE_SIZE_M == 64
+            assert 2 * BLOCK_TILE_SIZE_M * K <= 64 * 1024, (
+                "paired 8-wave keeps two M64 activation tiles resident in LDS; "
+                f"got BM={BLOCK_TILE_SIZE_M}, K={K}"
+            )
+            assert (
+                weight_quant_type == "ptpc" and act_quant_type == "ptpc"
+            ) or (
+                weight_quant_type == "per_tensor"
+                and act_quant_type in ("ptpc", "per_tensor")
+            )
     else:
         assert down_output_padding_bytes is None
     output_row_stride = N + (
@@ -2250,8 +2259,16 @@ def compile_gemm(
             shared_allocator = fx.SharedAllocator()
             lds = shared_allocator.allocate(SharedStorage)
             scale_lds = None
+            use_direct_ptpc_scale = (
+                down_physical_n512
+                and weight_quant_type == "ptpc"
+                and paired_m_groups * BLOCK_M * K + BLOCK_N * 4
+                > 64 * 1024
+            )
             if const_expr(
-                down_physical_n256 and weight_quant_type == "ptpc"
+                down_physical_n256
+                and weight_quant_type == "ptpc"
+                and not use_direct_ptpc_scale
             ):
                 scale_storage = shared_allocator.allocate(
                     fx.Array[fx.Float32, BLOCK_N, 16]
@@ -2347,7 +2364,9 @@ def compile_gemm(
                 group_n_blocks = fx.Int64(nBN)
             nBK = fxh.div_up(K, BLOCK_K)
             merge_k192_first_two_cores = K == 192 and weight_quant_type == "per_tensor"
-            use_postprocess_weight_head = down_physical_n512 and nBK == 3
+            use_postprocess_weight_head = (
+                down_physical_n512 and BLOCK_K == 128 and nBK == 3
+            )
 
             mm = flyobj.create_thr_mma(
                 weight_dtype,
@@ -2454,13 +2473,14 @@ def compile_gemm(
                         max_size=False,
                         num_records_bytes=N * (fx.Float32.width // 8),
                     )
-                    scale_lds_logical = fx.make_view(
-                        fx.get_iter(scale_lds),
-                        fx.make_layout(
-                            ((4, 2, 2, 4, 4), 1),
-                            ((1, 16, 32, 64, 4), 0),
-                        ),
-                    )
+                    if not const_expr(use_direct_ptpc_scale):
+                        scale_lds_logical = fx.make_view(
+                            fx.get_iter(scale_lds),
+                            fx.make_layout(
+                                ((4, 2, 2, 4, 4), 1),
+                                ((1, 16, 32, 64, 4), 0),
+                            ),
+                        )
                     arg_w_scale = fx.make_view(
                         fxh._as_ptr(p_w_scale) + expert_id * N,
                         fx.make_layout(
@@ -2475,6 +2495,12 @@ def compile_gemm(
                     )
                 # (BLOCK_N, 1, num_block_N, 1)
                 arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
+                if const_expr(use_direct_ptpc_scale):
+                    arg_w_scale = fx.rocdl.make_buffer_tensor(
+                        arg_w_scale,
+                        max_size=False,
+                        num_records_bytes=N * (fx.Float32.width // 8),
+                    )
 
             scale_lds_copy_atom = None
             if const_expr(down_physical_n256):
@@ -2483,7 +2509,11 @@ def compile_gemm(
                 )
 
             def issue_scale_block_global(block_n):
-                tid = fx.Int32(fx.thread_idx.x)
+                tid = (
+                    local_tid
+                    if const_expr(down_physical_n512)
+                    else fx.Int32(fx.thread_idx.x)
+                )
                 lane_id = tid % 64
                 wave_id = tid // 64
                 scale_local_offset = wave_id * WAVE_N + lane_id * 4
@@ -2502,7 +2532,11 @@ def compile_gemm(
                 return scale_vec
 
             def commit_scale_block_lds(scale_vec, dst=None):
-                tid = fx.Int32(fx.thread_idx.x)
+                tid = (
+                    local_tid
+                    if const_expr(down_physical_n512)
+                    else fx.Int32(fx.thread_idx.x)
+                )
                 lane_id = tid % 64
                 wave_id = tid // 64
                 if lane_id < WAVE_N // 4:
@@ -3056,7 +3090,15 @@ def compile_gemm(
                     ],
                 )
                 if const_expr(weight_quant_type == "ptpc"):
-                    frag_pc_scale = load_scale_block_via_lds(0)
+                    if const_expr(use_direct_ptpc_scale):
+                        frag_pc_scale = flyobj.load_tiled_mma_fragC(
+                            mm,
+                            arg_w_scale,
+                            [None, None, 0, 0],
+                            copy_atom_bits=32,
+                        )
+                    else:
+                        frag_pc_scale = load_scale_block_via_lds(0)
                 else:
                     frag_pc_scale = flyobj.load_tiled_mma_fragC(
                         mm,
@@ -3128,14 +3170,33 @@ def compile_gemm(
                         next_slot = (k_core + 1) % 2
                         if const_expr(down_physical_n512):
                             if block_n > 0:
-                                if const_expr(k_core == 1):
+                                if const_expr(nBK == 1 and k_core == 0):
+                                    postprocess_store_vector_packed_pair_m(
+                                        previous_fragC,
+                                        block_n - 1,
+                                    )
+                                elif const_expr(nBK == 2 and k_core == 0):
                                     postprocess_store_vector_packed_pair_m(
                                         previous_fragC,
                                         block_n - 1,
                                         vector_begin=0,
                                         vector_count=4,
                                     )
-                                elif const_expr(k_core == 2):
+                                elif const_expr(nBK == 2 and k_core == 1):
+                                    postprocess_store_vector_packed_pair_m(
+                                        previous_fragC,
+                                        block_n - 1,
+                                        vector_begin=4,
+                                        vector_count=4,
+                                    )
+                                elif const_expr(nBK >= 3 and k_core == 1):
+                                    postprocess_store_vector_packed_pair_m(
+                                        previous_fragC,
+                                        block_n - 1,
+                                        vector_begin=0,
+                                        vector_count=4,
+                                    )
+                                elif const_expr(nBK >= 3 and k_core == 2):
                                     postprocess_store_vector_packed_pair_m(
                                         previous_fragC,
                                         block_n - 1,
@@ -3172,10 +3233,19 @@ def compile_gemm(
                                 1
                             )
                             if const_expr(weight_quant_type == "ptpc"):
-                                next_scale_vec = issue_scale_block_global(
-                                    next_block_n
-                                )
-                                fx.rocdl.sched_barrier(0)
+                                if const_expr(use_direct_ptpc_scale):
+                                    flyobj.load_tiled_mma_fragC(
+                                        mm,
+                                        arg_w_scale,
+                                        [None, None, next_block_n, 0],
+                                        next_frag_pc_scale,
+                                        copy_atom_bits=32,
+                                    )
+                                else:
+                                    next_scale_vec = issue_scale_block_global(
+                                        next_block_n
+                                    )
+                                    fx.rocdl.sched_barrier(0)
                             flyobj.load_tiled_mma_fragA(
                                 mm,
                                 weight,
@@ -3203,7 +3273,9 @@ def compile_gemm(
                         ):
                             enter_read_write_stage()
                         if const_expr(
-                            k_core + 1 == nBK and weight_quant_type == "ptpc"
+                            k_core + 1 == nBK
+                            and weight_quant_type == "ptpc"
+                            and not use_direct_ptpc_scale
                         ):
                             commit_scale_block_lds(
                                 next_scale_vec, next_frag_pc_scale
