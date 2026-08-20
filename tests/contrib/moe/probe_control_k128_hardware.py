@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -113,9 +114,14 @@ def run_json(command, env=None):
 
 def amdsmi_command(root, *arguments):
     cli = root / "libexec/amdsmi_cli/amdsmi_cli.py"
-    if not cli.is_file():
-        raise RuntimeError(f"AMDSMI 26.2.2 CLI not found under {root}")
     env = os.environ.copy()
+    if not cli.is_file():
+        system_cli = shutil.which("amd-smi")
+        if system_cli is None:
+            raise RuntimeError(
+                f"AMDSMI CLI not found under {root} or on PATH"
+            )
+        return [system_cli, *arguments], env
     python_paths = [root / "share/amd_smi", root / "libexec/amdsmi_cli"]
     library_paths = [root / "lib", root / "share/amd_smi/amdsmi"]
     env["PYTHONPATH"] = ":".join(str(path) for path in python_paths) + (
