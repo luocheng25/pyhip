@@ -1,7 +1,7 @@
 # FlyDSL MoE down optimization TODO
 
 > Packed-best promotion commit: `c82e2df`; current integrated kernel source SHA256:
-> `9c4c06a3d6fecee7205eddb1603a95e71ff92850789496397a5b06a75d54ad28`.
+> `352c7b0235f4937452ce16275ab4b1da7c7b28fbcea588b90b532afffd55a8f6`.
 >
 > Fixed H3 target: `1.895517 ms`; promoted result: `1.913011 ms`; gap: `17.494 us` (`0.9145%`).
 >
@@ -25,6 +25,7 @@
 - 2026-08-20 streaming-paired expansion gate: 72 generic cells (`N=512/1024/4096`, K64-K512, three FP8 quant combinations) plus four production shapes compared base, physical N256 (0/128B), and paired M128 (0/128B); every reduced output was bitwise equal. No generic M128 cell survived a reliable direct ABBA24 versus the current winner; H3 PTPC was promoted only after the later spill-removal specialization below. Xiaomi PTPC K256 padding changed from 0B to the clean-window ABBA24-winning 128B (`combined ratio 0.99756`, 18/24 wins). N512/N1024 base/physical boundary promotion remains pending because an external all-GPU workload contaminated the follow-up microsecond-scale timings.
 - Aggregate best-paired/best-non-paired combined ratios were `1.1831` at N512, `1.1282` at N1024, and `1.0574` at generic N4096 (72-cell median `1.1212`). ABBA4 produced four apparent paired winners; direct ABBA24 rejected all four (`1.00255`, `1.02040`, `1.01782`, and `0.99842` with only 14/24 wins). Thus the generic table gained no automatic M128 promotion.
 - H3 PTPC K384 was subsequently promoted after removing current/next direct-scale fragments from the MFMA loop-carried state. Fresh ISA changed from 18 VGPR spills / 76B private / 25+17 scratch load/store to zero spill/private/scratch. Full paired correctness (48/48) and production `diff=0.00019035` pass. ABBA24 combined ratios are `0.60734` versus the old spilling 8-wave, `0.95473` versus Base, and `0.79605` versus physical N256; all are 24/24 wins. Non-target exact-H3 and Qwen-K512 old/new ratios are `0.99930` and `0.99772` with IQRs crossing 1; Hy3/Xiaomi final ISA is byte-identical. Auto M128 now covers exact H3 per-tensor and H3 PTPC.
+- Hy3 K192 now has a separate single-M N512 specialization rather than M128 pairing: M64 sorting is unchanged, eight waves span N512, and a balanced 512-thread A copy removes idle waves. K64 LDS swizzle plus `amdgpu-waves-per-eu=4,4` reaches 128 VGPR / 32KB LDS / zero scratch, allowing two 512-thread workgroups; final ISA has 96 MFMA and only two barriers. Physical N256 and single-M outputs/tails are bitwise equal, production accuracy is `diff=0.00016577`, and the full down suite is 62/62. Clean 10-buffer/1800MHz ABBA24 improved down `1.673130 -> 1.513829 ms` (`0.906541`, IQR `0.903067--0.910706`) and combined `2.511415 -> 2.347834 ms` (`0.935520`, IQR `0.931968--0.939437`), both 24/24 wins.
 
 ## Path matrix
 
@@ -32,6 +33,7 @@
 | --- | --- | --- | --- |
 | H3 fp8 per-tensor `prefill_1x4`, N4096/K384/TOPK9/E193 | packed paired formal best plus auto-selected streaming row-major adapter | Paired N512 streams through wave-private CShuffle; packed default remains unchanged | exact-grid physical/reduced/tail bitwise gate; 256 VGPR, 65,536B LDS, 0 scratch; ABBA8/24 |
 | H3 fp8 PTPC `prefill_1x4`, N6144/K384/TOPK4/E128 | paired N512 streaming row-major with epilogue-time scale load | Late scale removes all 18 spills while preserving 64KB LDS | 48-case paired matrix, production accuracy, Base/old-paired ABBA24 |
+| Hy3 fp8 per-tensor `prefill_1x4`, N4096/K192/TOPK9/E193 | single-M N512 with M64 sorting and row-major CShuffle | Eight waves span N; no M128 metadata duplication or paired rendezvous | bitwise physical/reduced/tail gate; 128 VGPR, 32KB LDS, 0 scratch; clean ABBA24 combined ratio 0.935520 |
 | Generic fp8 per-tensor `prefill_1x4` | Existing base/physical4 winner table | Streaming row-major pairing passes correctness but no non-H3 cell passed reliable direct ABBA24 performance promotion | N512/N1024/N4096 K/quant matrix plus odd logical-block tail |
 | fp8 PTPC `prefill_1x4` | auto-selects base or physical4; paired8 is explicit | Paired8 supports K64-K512; staged scale uses group-local thread numbering, K512 uses direct scale loads | all eight K points, multi-N, and inactive tail |
 | Non-physical `prefill_1x4` (bf16/fp8) | original 4-wave path | Reuse scheduling ideas only; physical pairing changes its output and LDS contract | existing prefill tests plus shape matrix |

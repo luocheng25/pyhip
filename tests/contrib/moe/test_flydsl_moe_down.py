@@ -373,6 +373,160 @@ def test_down_prefill_paired_row_major_sorted_sum(
     )
 
 
+def test_down_prefill_single_m_n512_hy3():
+    torch.manual_seed(29)
+    batch_size = 22
+    topk = 9
+    valid_rows = 93
+    active_rows = 128
+    allocated_rows = 192
+    hidden_size = 4096
+    intermediate_size = 192
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    activation = 0.1 * torch.randn(
+        batch_size,
+        topk,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    activation_scale = activation.float().abs().amax().reshape(1) / fp8_max
+    activation_fp8 = (
+        (activation.float() / activation_scale)
+        .clamp(-fp8_max, fp8_max)
+        .to(fp8_dtype)
+    )
+    weight = 0.1 * torch.randn(
+        2, hidden_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    weight_scale = weight.float().abs().amax(dim=(1, 2)) / fp8_max
+    weight_fp8 = (
+        (weight.float() / weight_scale[:, None, None])
+        .clamp(-fp8_max, fp8_max)
+        .to(fp8_dtype)
+    )
+    shuffled_weight = shuffle_weight(weight_fp8, layout=(16, 16))
+
+    routing_weight = torch.zeros(
+        allocated_rows, dtype=torch.float32, device="cuda"
+    )
+    routing_weight[:valid_rows] = torch.linspace(
+        0.25, 1.0, valid_rows, dtype=torch.float32, device="cuda"
+    )
+    sorted_ids = torch.zeros(allocated_rows, dtype=torch.int32, device="cuda")
+    row_ids = torch.arange(valid_rows, dtype=torch.int32, device="cuda")
+    sorted_ids[:valid_rows] = (row_ids // topk) | ((row_ids % topk) << 24)
+    sorted_expert_ids = torch.tensor(
+        [0, 1, 0], dtype=torch.int32, device="cuda"
+    )
+    num_valid_ids = torch.tensor(
+        [valid_rows, batch_size], dtype=torch.int32, device="cuda"
+    )
+    sentinel = torch.tensor(-123.0, dtype=torch.bfloat16, device="cuda")
+    physical_output = torch.full(
+        (allocated_rows, hidden_size),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    control_output = torch.full_like(physical_output, sentinel)
+
+    control = compile_gemm(
+        N=hidden_size,
+        K=intermediate_size,
+        weight_dtype="fp8",
+        weight_quant_type="per_tensor",
+        act_quant_type="per_tensor",
+        TOPK=topk,
+        BLOCK_TILE_SIZE_M=64,
+        BLOCK_TILE_SIZE_N=256,
+        stage="down",
+        alg="prefill_1x4",
+        E=193,
+        USE_ATOMIC_WRITE=False,
+        down_physical_n256=True,
+        down_output_padding_bytes=0,
+    )
+    control(
+        _ptr(activation_fp8),
+        _ptr(shuffled_weight),
+        _ptr(control_output),
+        _ptr(sorted_ids),
+        _ptr(routing_weight),
+        _ptr(sorted_expert_ids),
+        _ptr(num_valid_ids),
+        _ptr(weight_scale),
+        _ptr(activation_scale),
+        batch_size,
+        3,
+        torch.cuda.current_stream(),
+    )
+
+    launch = compile_gemm(
+        N=hidden_size,
+        K=intermediate_size,
+        weight_dtype="fp8",
+        weight_quant_type="per_tensor",
+        act_quant_type="per_tensor",
+        TOPK=topk,
+        BLOCK_TILE_SIZE_M=64,
+        BLOCK_TILE_SIZE_N=512,
+        stage="down",
+        alg="prefill_1x4",
+        E=193,
+        USE_ATOMIC_WRITE=False,
+        down_physical_n512=True,
+        down_paired_row_major=True,
+        down_single_m_n512=True,
+        down_output_padding_bytes=0,
+    )
+    launch(
+        _ptr(activation_fp8),
+        _ptr(shuffled_weight),
+        _ptr(physical_output),
+        _ptr(sorted_ids),
+        _ptr(routing_weight),
+        _ptr(sorted_expert_ids),
+        _ptr(num_valid_ids),
+        _ptr(weight_scale),
+        _ptr(activation_scale),
+        batch_size,
+        3,
+        torch.cuda.current_stream(),
+    )
+    logical_output = torch.empty(
+        valid_rows, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    loc_ids = torch.arange(valid_rows, dtype=torch.int32, device="cuda").view(
+        valid_rows, 1
+    )
+    sorted_sum(1, hidden_size, 0)(
+        loc_ids, physical_output, logical_output, valid_rows
+    )
+    torch.cuda.synchronize()
+
+    selected_activation = activation_fp8.reshape(-1, intermediate_size)[:valid_rows]
+    expected = torch.empty(
+        valid_rows, hidden_size, dtype=torch.float32, device="cuda"
+    )
+    expected[:64] = (selected_activation[:64].float() * activation_scale) @ (
+        weight_fp8[0].float() * weight_scale[0]
+    ).T
+    expected[64:] = (selected_activation[64:].float() * activation_scale) @ (
+        weight_fp8[1].float() * weight_scale[1]
+    ).T
+    expected = (expected * routing_weight[:valid_rows, None]).to(torch.bfloat16)
+    assert torch.equal(physical_output[:active_rows], control_output[:active_rows])
+    assert _relative_l2(logical_output, expected) < 3e-2
+    assert torch.all(physical_output[valid_rows:active_rows] == 0)
+    assert torch.equal(
+        physical_output[active_rows:],
+        torch.full_like(physical_output[active_rows:], sentinel),
+    )
+
+
 @pytest.mark.parametrize("intermediate_size", [192, 384])
 @pytest.mark.parametrize("act_quant_type", ["per_tensor", "ptpc"])
 def test_down_prefill_physical_per_tensor_cshuffle(intermediate_size, act_quant_type):

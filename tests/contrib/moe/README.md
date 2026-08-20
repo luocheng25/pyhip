@@ -1383,7 +1383,7 @@ LDS占用和`down+sorted_sum`端到端收益自动选择layout与row padding；�
 
 | 模型/范围 | 本地`I` | `H` | `TOPK` | 量化 | gateup | 当前auto down |
 |---|---:|---:|---:|---|---|---|
-| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | physical N256 + CShuffle，0B padding（K64） |
+| Hy3 | 192 | 4096 | 9 | per-tensor | prefill BN128 | single-M N512 + CShuffle，0B padding（K64） |
 | Qwen3.5-397B | 512 | 4096 | 10 | PTPC | prefill BN256 | legacy N64 |
 | Qwen3.5-35B | 512 | 2048 | 8 | PTPC | prefill BN256 | legacy N64 |
 | Xiaomi | 256 | 6144 | 8 | PTPC | prefill BN256 | physical N256 + CShuffle，128B padding |
@@ -1435,6 +1435,22 @@ paired8能力本身已放宽到FP8、BM64、`N % 512 == 0`、`K % 64 == 0`且K64
 PTPC+PTPC以及per-tensor weight + PTPC/per-tensor activation。N512/N1024 × 全部8个K × 三种
 quant的48项回归全部通过，并检查M128 padding与inactive tail。通用shape仍按上表选择base或
 physical N256；`MOE_DOWN_PAIRED_N512=1`可强制进入完整paired能力矩阵。
+
+2026-08-20后续针对Hy3 K192新增了与M128 pairing独立的single-M N512路径。它继续使用M64
+sorting，每个512-thread WG只处理一个M64 task，8个wave沿N512展开；因此不重复计算两个M64、
+不复制expert metadata，也不需要paired路径的10个循环内WG barrier。`64x192` activation tile的
+768个128-bit atom由全部512线程先各搬一个、前256线程再搬一个，避免原历史N512实现的两个空闲
+wave。A LDS使用K64 swizzle，并对该精确shape请求4 waves/SIMD；最终资源为128 VGPR、32KB LDS、
+0 private/scratch、96条MFMA和2个barrier，可驻留两个512-thread WG。physical N256与single-M
+N512的有效输出和补零区逐bit一致，inactive tail保持sentinel；production Hy3 accuracy为
+`diff=0.00016577`，完整down suite为62/62通过。exact H3 per-tensor、H3 PTPC、Xiaomi和Qwen
+K512的最终ISA均与变更前逐字节一致。
+
+最终在GPU4、1800MHz、PTL `VECTOR,F8`和10个旋转buffer下执行clean ABBA24：physical N256
+`1.673130 -> 1.513829 ms` single-M N512，down ratio `0.906541`（IQR
+`0.903067--0.910706`，24/24）；combined `2.511415 -> 2.347834 ms`，ratio `0.935520`
+（IQR `0.931968--0.939437`，24/24）。即down时延降低9.35%，`down+sorted_sum`降低6.45%，
+稳定覆盖原M128相对N256约3%的回退。`MOE_DOWN_SINGLE_M_N512=0`可禁用该精确Hy3自动路径。
 
 2026-08-20针对H3的联合优化不再让`sorted_sum`解码packed布局，而是在paired down epilogue中把
 每对已量化BF16向量流式写入wave-private LDS，并立即连续读出row-major结果。它复用原本分散在

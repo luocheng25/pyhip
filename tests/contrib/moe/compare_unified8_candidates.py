@@ -91,14 +91,15 @@ def parse_args():
     parser.add_argument("--candidate", type=Path, default=DEFAULT_MODULE)
     parser.add_argument(
         "--control-path",
-        choices=("physical4", "unified8"),
+        choices=("physical4", "unified8", "single_n512"),
         default="unified8",
     )
     parser.add_argument(
         "--candidate-path",
-        choices=("physical4", "unified8"),
+        choices=("physical4", "unified8", "single_n512"),
         default="unified8",
     )
+    parser.add_argument("--k", type=int, choices=(192, 384), default=384)
     parser.add_argument("--candidate-packed-direct", action="store_true")
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--down-only", action="store_true")
@@ -111,9 +112,13 @@ def parse_args():
     args = parser.parse_args()
     if args.rounds < 2:
         parser.error("--rounds must be at least 2")
-    if (
-        not args.skip_correctness
-        and args.control_path != args.candidate_path
+    row_major_paths = {"physical4", "single_n512"}
+    if not args.skip_correctness and (
+        args.control_path != args.candidate_path
+        and not {
+            args.control_path,
+            args.candidate_path,
+        } <= row_major_paths
     ):
         parser.error(
             "cross-path comparisons require --skip-correctness; validate "
@@ -123,6 +128,8 @@ def parse_args():
 
 
 def run(args):
+    global K
+    K = args.k
     visible_device = os.environ.get("HIP_VISIBLE_DEVICES")
     if visible_device != str(args.physical_device):
         raise RuntimeError(
@@ -286,6 +293,14 @@ def run(args):
         }
 
         def compile_down(label):
+            if paths[label] == "single_n512":
+                return modules[label].compile_gemm(
+                    **common,
+                    BLOCK_TILE_SIZE_N=512,
+                    down_physical_n512=True,
+                    down_paired_row_major=True,
+                    down_single_m_n512=True,
+                )
             if paths[label] == "unified8":
                 return modules[label].compile_gemm(
                     **common,

@@ -8,7 +8,7 @@
 >
 > 本文档是当前实验的唯一跨机器handoff入口。packed-best promotion源码SHA256为
 > `83b313a1b88f2ce8d8fdd77c4aa1dd0c4773102c2458dafd5739c93699414335`；当前all-down集成源码
-> SHA256为`9c4c06a3d6fecee7205eddb1603a95e71ff92850789496397a5b06a75d54ad28`，且packed H3最终ISA
+> SHA256为`352c7b0235f4937452ce16275ab4b1da7c7b28fbcea588b90b532afffd55a8f6`，且packed H3最终ISA
 > 与promotion产物逐字节一致。H3 specialization保持512 threads、
 > 严格4+4反相、group1落后一rendezvous、三个K128和10个真实barrier。0.1节是当前状态；
 > 0.2节及后续带“历史”标记的内容保留promotion前的实验过程。
@@ -95,6 +95,21 @@ base/physical微秒级边界复测遭遇外部8-GPU作业占满整机，污染�
 0 scratch。48项paired矩阵与production H3 PTPC入口通过（`diff=0.00019035`）。最终同进程
 ABBA24相对旧8-wave、Base和4-wave N256的combined ratio分别为`0.60734/0.95473/0.79605`，
 均24/24胜；因此H3 PTPC也进入auto M128。独立较早Base复测ratio为`0.94722`，方向一致。
+
+#### 2026-08-20 Hy3 K192 single-M N512
+
+Hy3没有继续推广M128 pairing，而是恢复并更新真正的单M64 N512算法：M64 sorting与task数量不变，
+一个512-thread WG的8个wave沿N512展开。相比M128 paired，它不重复两份M64计算、不复制expert
+metadata，也没有10个循环内WG barrier。A tile为`64x192` FP8，768个128-bit atom按
+`512 + 256`线程分工搬运；K64 LDS swizzle将强制4 waves/SIMD时的6个地址spill全部消除。
+最终资源为128 VGPR、32KB LDS、0 scratch、96 MFMA、2 barriers，可驻留两个512-thread WG。
+
+持久门禁要求single-M与physical N256有效行及M64补零区逐bit一致、inactive tail不写；完整down
+suite为62/62，production Hy3 accuracy为`diff=0.00016577`。exact H3 per-tensor、H3 PTPC、Xiaomi
+和Qwen K512 fresh最终ISA与变更前逐字节一致。最终GPU4、10-buffer、1800MHz、PTL
+`VECTOR,F8` clean ABBA24中，physical N256到single-M的down为`1.673130 -> 1.513829 ms`，ratio
+`0.906541`（IQR `0.903067--0.910706`，24/24）；combined为`2.511415 -> 2.347834 ms`，ratio
+`0.935520`（IQR `0.931968--0.939437`，24/24）。
 
 ### 0.1 2026-08-19 production promotion
 

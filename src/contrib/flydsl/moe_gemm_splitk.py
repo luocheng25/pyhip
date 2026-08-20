@@ -79,6 +79,7 @@ def compile_gemm(
     down_physical_n512=False,
     down_output_padding_bytes=None,
     down_paired_row_major=False,
+    down_single_m_n512=False,
 ):
 
     TILE_K = 64
@@ -117,6 +118,9 @@ def compile_gemm(
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
     assert not (down_physical_n256 and down_physical_n512)
     assert not down_paired_row_major or down_physical_n512
+    assert not down_single_m_n512 or (
+        down_physical_n512 and down_paired_row_major
+    )
     use_exact_h3_paired = (
         down_physical_n512
         and E == 193
@@ -131,6 +135,7 @@ def compile_gemm(
         down_physical_n512 = False
         down_physical_n256 = True
         BLOCK_TILE_SIZE_N = 256
+    use_paired_m128 = down_physical_n512 and not down_single_m_n512
     physical_block_n = 512 if down_physical_n512 else 256
     physical_num_waves = 8 if down_physical_n512 else 4
     physical_num_threads = physical_num_waves * 64
@@ -153,10 +158,22 @@ def compile_gemm(
         assert down_output_padding_bytes in (0, 32, 64, 128)
         if down_physical_n512:
             assert BLOCK_TILE_SIZE_M == 64
-            assert 2 * BLOCK_TILE_SIZE_M * K <= 64 * 1024, (
-                "paired 8-wave keeps two M64 activation tiles resident in LDS; "
+            assert (
+                (2 if use_paired_m128 else 1) * BLOCK_TILE_SIZE_M * K
+                <= 64 * 1024
+            ), (
+                "8-wave down activation tiles exceed LDS capacity; "
                 f"got BM={BLOCK_TILE_SIZE_M}, K={K}"
             )
+            if down_single_m_n512:
+                assert (
+                    E == 193
+                    and N == 4096
+                    and K == 192
+                    and TOPK == 9
+                    and weight_quant_type == "per_tensor"
+                    and act_quant_type == "per_tensor"
+                )
             assert (
                 weight_quant_type == "ptpc" and act_quant_type == "ptpc"
             ) or (
@@ -2096,7 +2113,7 @@ def compile_gemm(
         M: fx.Int32,
     ):
         physical_e_idx = fx.Int32(fx.gpu.block_idx.y)
-        if const_expr(down_physical_n512):
+        if const_expr(use_paired_m128):
             if const_expr(E == 193 and N == 4096 and K == 384 and TOPK == 9):
                 physical_e_idx_u32 = fx.Uint32(physical_e_idx)
                 xcc_id = physical_e_idx_u32 & 3
@@ -2150,9 +2167,9 @@ def compile_gemm(
         wave_group = fx.Int32(fx.thread_idx.x // 256)
         wave_group_index = fx.Index(wave_group)
         local_tid = fx.Int32(fx.thread_idx.x % 256)
-        paired_m_groups = 2 if down_physical_n512 else 1
+        paired_m_groups = 2 if use_paired_m128 else 1
         pair_e_idx = fx.Int32(e_idx * paired_m_groups)
-        group_e_idx = pair_e_idx + wave_group
+        group_e_idx = pair_e_idx + (wave_group if use_paired_m128 else 0)
         pair_e_offset = fx.Int64(pair_e_idx)
         group_e_offset = fx.Int64(group_e_idx)
 
@@ -2235,8 +2252,8 @@ def compile_gemm(
 
             BLOCK_M = BLOCK_TILE_SIZE_M
             BLOCK_N = (
-                256
-                if down_physical_n512
+                512
+                if down_single_m_n512
                 else 256 if down_physical_n256 else 64
             )
             BLOCK_K = (
@@ -2244,7 +2261,7 @@ def compile_gemm(
                 if down_physical_n256 and K % 128 == 0
                 else 64 // (weight_dtype.width // 8)
             )
-            WAVE_N = BLOCK_N // 4
+            WAVE_N = BLOCK_N // (8 if down_single_m_n512 else 4)
             C_BLOCK_N = 64
 
             # mask,base,shift, swizzle always in unit of 128b,
@@ -2253,7 +2270,10 @@ def compile_gemm(
             a_swz = fx.SwizzleType.get(
                 3,
                 swz_base,
-                4 if down_physical_n256 else 3,
+                # This keeps single-M K192 at 128 VGPR with zero scratch.
+                3
+                if down_single_m_n512
+                else 4 if down_physical_n256 else 3,
             )
 
             act_dtype = weight_dtype  # fp8 / bf16
@@ -2349,25 +2369,67 @@ def compile_gemm(
             cp_cols = flatten_A(
                 fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0))
             )
-            for dst, row, col in fxh.all_copy_atoms(
-                cp_ldsA0,
-                cp_rows,
-                cp_cols,
-                atom_bits=128,
-                num_threads=(512 if down_physical_n512 else 256),
-            ):
-                sorted_id = row[0].bitcast(fx.Uint32)
-                atom_A = fxh.atom_tensor(
-                    arg_p_input,
-                    (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]),
-                    128,
+            if const_expr(down_single_m_n512):
+                single_m_a_atoms = BLOCK_M * K // element_num
+                cp_lds_atoms = fx.logical_divide(
+                    cp_ldsA0, fx.make_layout(element_num, 1)
                 )
-                fx.copy(cp_atom, atom_A, dst)
+                cp_row_atoms = fx.logical_divide(
+                    cp_rows, fx.make_layout(element_num, 1)
+                )
+                cp_col_atoms = fx.logical_divide(
+                    cp_cols, fx.make_layout(element_num, 1)
+                )
+                for atom_offset in range_constexpr(
+                    0, single_m_a_atoms, physical_num_threads
+                ):
+                    atom_index = fx.thread_idx.x + atom_offset
+                    if atom_index < single_m_a_atoms:
+                        dst = cp_lds_atoms[None, atom_index]
+                        row = cp_row_atoms[None, atom_index]
+                        col = cp_col_atoms[None, atom_index]
+                        sorted_id = row[0].bitcast(fx.Uint32)
+                        atom_A = fxh.atom_tensor(
+                            arg_p_input,
+                            (
+                                sorted_id & 0xFFFFFF,
+                                sorted_id >> 24,
+                                col[0],
+                            ),
+                            128,
+                        )
+                        fx.copy(cp_atom, atom_A, dst)
+            else:
+                for dst, row, col in fxh.all_copy_atoms(
+                    cp_ldsA0,
+                    cp_rows,
+                    cp_cols,
+                    atom_bits=128,
+                    num_threads=(512 if down_physical_n512 else 256),
+                ):
+                    sorted_id = row[0].bitcast(fx.Uint32)
+                    atom_A = fxh.atom_tensor(
+                        arg_p_input,
+                        (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]),
+                        128,
+                    )
+                    fx.copy(cp_atom, atom_A, dst)
             fx.gpu.barrier()
 
             # (BLOCK_N, BLOCK_K, num_blocks_N, num_blocks_K)
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
-            group_lds_offset = fx.Int32(wave_group * (BLOCK_M * K))
+            if const_expr(down_single_m_n512):
+                weight_n_permute = fx.make_layout(
+                    (64, 2, 2, 2),
+                    (1, 256, 64, 128),
+                )
+                weight = fx.composition(
+                    weight,
+                    fx.make_tile(weight_n_permute, None, None, None),
+                )
+            group_lds_offset = fx.Int32(
+                wave_group * (BLOCK_M * K) if use_paired_m128 else 0
+            )
             ldsA_group = fx.make_view(
                 fx.get_iter(ldsA0) + group_lds_offset,
                 fx.make_composed_layout(
@@ -2394,8 +2456,8 @@ def compile_gemm(
 
             mm = flyobj.create_thr_mma(
                 weight_dtype,
-                (4, 1, 1),
-                tid=(local_tid if down_physical_n512 else None),
+                (8 if down_single_m_n512 else 4, 1, 1),
+                tid=(local_tid if use_paired_m128 else None),
             )
 
             weight_copy_atom = None
@@ -2969,11 +3031,11 @@ def compile_gemm(
                 lane_id = fx.Int32(fx.thread_idx.x % 64)
                 wave_id = fx.Int32(
                     fx.thread_idx.x // 64
-                    if down_physical_n512
+                    if down_single_m_n512
                     else local_tid // 64
                 )
                 logical_wave_id = fx.Int32(
-                    local_tid // 64 if down_physical_n512 else wave_id
+                    local_tid // 64 if use_paired_m128 else wave_id
                 )
                 logical_block_n = (
                     block_n + group_block_begin
@@ -3167,7 +3229,7 @@ def compile_gemm(
                     fx.rocdl.sched_barrier(0)
 
             def enter_read_write_stage():
-                if const_expr(down_physical_n512):
+                if const_expr(use_paired_m128):
                     fx.rocdl.sched_barrier(0)
                     fx.rocdl.s_barrier()
                     fx.rocdl.s_setprio(0)
@@ -3179,7 +3241,7 @@ def compile_gemm(
                     fx.rocdl.sched_barrier(0)
 
             def enter_compute_stage():
-                if const_expr(down_physical_n512):
+                if const_expr(use_paired_m128):
                     fx.rocdl.sched_barrier(0x40)
                     fx.rocdl.s_barrier()
                     fx.rocdl.s_setprio(1)
@@ -3192,7 +3254,7 @@ def compile_gemm(
 
             if fx.const_expr(down_physical_n256):
                 # Prologue: stage0 prepares N block 0 / K core 0.
-                if not const_expr(down_physical_n512):
+                if not const_expr(use_paired_m128):
                     enter_read_write_stage()
                 else:
                     if wave_group == 1:
@@ -3243,7 +3305,7 @@ def compile_gemm(
                 next_frag_pc_scale = fx.make_fragment_like(frag_pc_scale)
                 if const_expr(weight_quant_type == "per_tensor"):
                     next_frag_pc_scale.store(frag_pc_scale.load())
-                if const_expr(down_physical_n512):
+                if const_expr(use_paired_m128):
                     previous_fragC = fx.make_fragment_like(fragC[0])
                     previous_fragC.fill(0)
                     output_state = previous_fragC.load()
@@ -3272,7 +3334,7 @@ def compile_gemm(
                 ):
                     frag_weight_slots[0].store(state[0])
                     if const_expr(late_direct_ptpc_scale):
-                        if const_expr(down_physical_n512):
+                        if const_expr(use_paired_m128):
                             previous_fragC.store(state[1])
                         else:
                             fragC_bf16.store(state[1])
@@ -3280,7 +3342,7 @@ def compile_gemm(
                             frag_weight_head.store(state[2])
                     else:
                         frag_pc_scale.store(state[1])
-                        if const_expr(down_physical_n512):
+                        if const_expr(use_paired_m128):
                             previous_fragC.store(state[2])
                         else:
                             fragC_bf16.store(state[2])
@@ -3300,7 +3362,7 @@ def compile_gemm(
                         )
                         current_slot = k_core % 2
                         next_slot = (k_core + 1) % 2
-                        if const_expr(down_physical_n512):
+                        if const_expr(use_paired_m128):
                             if block_n > 0:
                                 if const_expr(nBK == 1 and k_core == 0):
                                     postprocess_store_vector_packed_pair_m(
@@ -3387,7 +3449,7 @@ def compile_gemm(
                                 [None, None, next_block_n, 0],
                                 frag_weight_slots[next_slot],
                             )
-                        if const_expr(down_physical_n512):
+                        if const_expr(use_paired_m128):
                             enter_compute_stage()
                         elif const_expr(
                             not (merge_k192_first_two_cores and k_core == 1)
@@ -3401,7 +3463,7 @@ def compile_gemm(
                             fragC[0],
                         )
                         schedule_physical_k_core()
-                        if const_expr(down_physical_n512):
+                        if const_expr(use_paired_m128):
                             enter_read_write_stage()
                         elif const_expr(
                             not (merge_k192_first_two_cores and k_core == 0)
@@ -3433,10 +3495,10 @@ def compile_gemm(
                     if const_expr(weight_quant_type != "per_tensor"):
                         for fc, fpc in fxh.all_elements(fragC[0], frag_pc_scale):
                             fc.store(fc.load() * fpc.load())
-                    if not const_expr(down_physical_n512):
+                    if not const_expr(use_paired_m128):
                         postprocess_to_bf16(fragC[0], fragC_bf16)
 
-                    if not const_expr(down_physical_n512):
+                    if not const_expr(use_paired_m128):
                         store_cshuffle_n256(
                             fragC_bf16, block_n, cshuffle_lds
                         )
@@ -3446,7 +3508,7 @@ def compile_gemm(
                             frag_weight_slots[nBK % 2].load(),
                             (
                                 fragC[0].load()
-                                if down_physical_n512
+                                if use_paired_m128
                                 else fragC_bf16.load()
                             ),
                         ]
@@ -3456,14 +3518,14 @@ def compile_gemm(
                             next_frag_pc_scale.load(),
                             (
                             fragC[0].load()
-                            if down_physical_n512
+                            if use_paired_m128
                             else fragC_bf16.load()
                             ),
                         ]
                     if const_expr(use_postprocess_weight_head):
                         loop_results.append(frag_weight_head.load())
                     results = yield loop_results
-                if const_expr(down_physical_n512):
+                if const_expr(use_paired_m128):
                     if const_expr(late_direct_ptpc_scale):
                         previous_fragC.store(results[1])
                     else:
@@ -3696,6 +3758,10 @@ def compile_gemm(
                 if const_expr(down_physical_n256)
                 else None
             )
+            if const_expr(down_single_m_n512):
+                value_attrs["passthrough"].append(
+                    ["amdgpu-waves-per-eu", "4,4"]
+                )
             moe_2stage_down_prefill_1x4(
                 p_input,
                 p_weight,
@@ -3711,7 +3777,7 @@ def compile_gemm(
             ).launch(
                 grid=(
                     1,
-                    (task_num + 1) // 2 if down_physical_n512 else task_num,
+                    (task_num + 1) // 2 if use_paired_m128 else task_num,
                     1,
                 ),
                 block=(physical_num_threads, 1, 1),
