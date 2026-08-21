@@ -1,3 +1,4 @@
+import math
 import os
 os.environ['PYHIP_JIT_LOG'] = '0'
 DUMP_DOWN = int(os.getenv("DUMP_DOWN", "0"))
@@ -297,6 +298,28 @@ def _select_fly_down_single_m_layout(
     )
 
 
+def _select_fly_down_nsplit_layout(
+    weight_type,
+    quant_type,
+    block_m,
+    n,
+    k,
+    act_quant_type=None,
+):
+    if act_quant_type is None:
+        act_quant_type = quant_type
+    nsplit_setting = os.getenv("MOE_DOWN_NSPLIT_N512", "auto").lower()
+    assert nsplit_setting in ("0", "1", "auto")
+    supported = (
+        _supports_fly_down_quant(weight_type, quant_type, act_quant_type)
+        and block_m == 64
+        and n % 512 == 0
+        and k % 64 == 0
+        and 64 <= k <= 512
+    )
+    return supported and nsplit_setting == "1"
+
+
 def _select_fly_gateup_layout(use_prefill, n, requested_tile_n):
     if not use_prefill:
         return "splitk", requested_tile_n
@@ -559,6 +582,38 @@ def test_select_fly_down_n512_paired_precedence(monkeypatch):
     )
     assert paired
     assert not single
+
+
+def test_select_fly_down_nsplit_layout(monkeypatch):
+    monkeypatch.delenv("MOE_DOWN_NSPLIT_N512", raising=False)
+    assert not _select_fly_down_nsplit_layout(
+        torch.float8_e4m3fnuz, "ptpc", 64, 6144, 256, "ptpc"
+    )
+    monkeypatch.setenv("MOE_DOWN_NSPLIT_N512", "1")
+    assert _select_fly_down_nsplit_layout(
+        torch.float8_e4m3fnuz, "ptpc", 64, 6144, 256, "ptpc"
+    )
+    assert not _select_fly_down_nsplit_layout(
+        torch.float8_e4m3fnuz, "ptpc", 32, 6144, 256, "ptpc"
+    )
+
+
+def test_acc_fly_nsplit_sparse_xiaomi(monkeypatch):
+    monkeypatch.setenv("MOE_DOWN_NSPLIT_N512", "1")
+    entry_common(
+        "fly_splitk_2s",
+        batch=[33],
+        prec=[get_fp8type()],
+        TILE_M=64,
+        TILE_N=256,
+        HIDDEN_SIZE=6144,
+        INTER_SIZE=256 * 8,
+        TOPK=8,
+        E=384,
+        TP=8,
+        run_count=0,
+        quant_type="ptpc",
+    )
 
 
 def quant_expert_weights(w1, quant_type, dtype):
@@ -848,18 +903,31 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 K2,
                 quant_type,
             )
-            down_paired_n512 = B > 32 and _select_fly_down_paired_layout(
+            down_nsplit_n512 = B > 32 and _select_fly_down_nsplit_layout(
                 weight_type,
                 quant_type,
                 TILE_M,
                 N2,
                 K2,
-                TOPK,
-                E,
                 quant_type,
             )
+            down_paired_n512 = (
+                not down_nsplit_n512
+                and B > 32
+                and _select_fly_down_paired_layout(
+                    weight_type,
+                    quant_type,
+                    TILE_M,
+                    N2,
+                    K2,
+                    TOPK,
+                    E,
+                    quant_type,
+                )
+            )
             down_single_m_n512 = (
-                not down_paired_n512
+                not down_nsplit_n512
+                and not down_paired_n512
                 and B > 32
                 and _select_fly_down_single_m_layout(
                     weight_type,
@@ -872,7 +940,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     quant_type,
                 )
             )
-            down_n512 = down_paired_n512 or down_single_m_n512
+            down_n512 = (
+                down_nsplit_n512 or down_paired_n512 or down_single_m_n512
+            )
             if down_n512:
                 down_physical_n256 = False
             down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
@@ -958,7 +1028,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
-                sorting_block_m = 128 if down_paired_n512 else TILE_M
+                sorting_block_m = (
+                    128 if down_paired_n512 or down_nsplit_n512 else TILE_M
+                )
                 sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                     topk_ids,
                     topk_weight,
@@ -970,7 +1042,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     None,
                     0,
                 )
-                if down_paired_n512:
+                if down_paired_n512 or down_nsplit_n512:
                     sorted_expert_ids = sorted_expert_ids.repeat_interleave(2)
                 if 0:
                     _num_valid_tokens = num_valid_ids[0].cpu().item()
@@ -994,6 +1066,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tile_n), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
+                    ('expanded_m64_tasks', down_paired_n512 or down_nsplit_n512),
                 )
                 if activation == 'swiglu':
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
@@ -1079,6 +1152,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         ('down_physical_n512', down_n512),
                         ('down_paired_row_major', down_n512),
                         ('down_single_m_n512', down_single_m_n512),
+                        ('down_nsplit_n512', down_nsplit_n512),
+                        ('expanded_m64_tasks', down_paired_n512 or down_nsplit_n512),
                         ('down_output_padding_bytes', down_output_padding_bytes),
                     )
                     if down_alg == "prefill_1x4":
@@ -1408,7 +1483,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         #print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, cur_out)=} ")
 
         diff = calc_diff(ref_out, cur_out)
-        if 1 and diff > 0.02:
+        output_is_finite = torch.isfinite(cur_out).all().item()
+        if not output_is_finite or not math.isfinite(diff) or diff > 0.02:
         #if not torch.allclose(ref_out, cur_out, rtol=0.02, atol=0.02):
             print('ref', ref_out)
             print('cur', cur_out)

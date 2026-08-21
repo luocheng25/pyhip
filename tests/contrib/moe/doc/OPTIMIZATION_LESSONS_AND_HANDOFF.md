@@ -1,0 +1,222 @@
+# MoE Down优化经验与当前Handoff
+
+## 一句话结论
+
+MoE down不存在通用最优tile。当前最可靠的策略是：**按完整shape选择算法，以`down + sorted_sum`的clean ABBA决策；用physical SIMD stall账本解释结果；先守住VGPR/LDS occupancy门槛，再做局部调度。**
+
+## 按重要性排序的经验
+
+### 1. 以端到端combined和完整shape决策
+
+这是最重要的结论。producer更快不代表系统更快，selector也不能只按`N/K/量化`的粗分类推广。
+
+- Hy3历史上physical N256曾使down快9.80%，但`sorted_sum`慢45.70%，combined反而回退5.96%。
+- H3 paired row-major比packed producer慢8.23%，却把consumer从3.6740ms降到0.7415ms，combined改善52.27%。
+- R2、route-major和INT8压缩都曾明显改善某一侧，但完整链路分别因consumer gather或producer转换代价失败。
+- 最新clean五shape复测比较的是59dd P4 N-split、P0/P1以及旧`a452743` P2：Hy3由P4胜出，Xiaomi由P1胜出，Qwen由P0胜出。H3结果不能代表`2b50372`之后的late-scale P2；后者对P0 Base的clean combined ratio为`0.95473`。另一个独立ABBA24证明9049 P3 true8快于Hy3 P4：P4/P3为`1.104034` down、`1.065036` combined。因此不存在“8-wave统一替代4-wave”，也不能混用不同源码代际决定selector。
+
+决策单位必须包含：`B/TOPK/E/N/K/BM`、量化、padding、metadata排序单位、producer输出布局和consumer实现。正式指标为同进程24轮`down + sorted_sum` paired ratio。
+
+### 2. Stall必须在physical SIMD union层分析
+
+单wave stall不是physical空槽。Control K128中，single-wave `mfma_issue_unavailable`全部被peer MFMA execution覆盖，physical该项为0；真正缺口是两wave同相VMEM issue。
+
+正确顺序是：
+
+```text
+successful issue -> 16-cycle MFMA window -> resident-wave union
+-> physical idle -> exclusive owner -> joint phase/PC
+```
+
+必须使用`t_issue = first_attempt + stall`和`code[pc_index]`。目标owner下降后还要检查它转移到DS、tail还是residual，并同时要求MFMA union busy和墙钟改善。详见[stall分析方法](STALL_ANALYSIS_GUIDE.md)。
+
+### 3. 单CU局部赢家可能输给整卡dispatch-tail
+
+Physical-SIMD ATT只解释被采样CU内部的resident-wave气泡，不能看到80 CU之间由WG粒度造成的尾部不平衡。
+
+- 零padding、相同1024个M64任务时，paired采样CU的steady MFMA union为90.73%，高于physical的86.29%，但整卡down/combined仍慢`1.01346/1.01946`。
+- physical有1024个4-wave WG，critical CU承担13 waves/SIMD；paired只有512个8-wave WG，但critical CU承担14 waves/SIMD。ATT恰好采到了paired的轻载48-wave CU，漏掉56-wave重尾。
+- 将任务数改为1280后，两边都恰好64 waves/CU，paired随即以`0.96455` down、`0.97949` combined胜出。
+- 72-cell矩阵中，平衡任务使down ratio中位改善约5.20%，但60个原回退cell只有11个翻转；dispatch-tail重要，却不能解释短N rendezvous、输出转换和K512资源回退。
+
+因此ATT之后还必须计算全芯片critical-wave分布并看整卡ABBA。对80 CU和`T`个M64任务，当前路径使用`ceil(T/80)`（physical）与`2*ceil(T/160)`（paired）waves/SIMD作为尾部下界。
+
+### 4. 资源是离散门槛，不是连续成本
+
+局部少几条指令常常不如跨过一个occupancy门槛重要，但“occupancy更高”也不是独立目标。
+
+- K384将资源压到168 combined VGPR、20KB LDS后达到3 waves/SIMD，clean ABBA24改善4.06%。
+- Hy3 single-M通过A swizzle shift3和`waves-per-eu=4,4`达到128 VGPR、32KB LDS、0 spill、4 waves/SIMD，成为K192 winner。
+- K512 paired/N-split达到256 VGPR并出现80B左右private/scratch；这类路径即使功能正确，也在Qwen上远落后legacy。
+- K192 8w-N256虽有4 resident waves，却因每wave工作太短、固定地址/load/CShuffle成本翻倍而回退51.26% down。
+
+因此每次候选必须记录VGPR/AGPR、LDS、private/scratch和实际resident waves；跨档后必须重新看ATT和墙钟，不能用occupancy整数单独推断胜负。
+
+### 5. 区分请求发射拥塞与完成等待
+
+`VMEM issue stall`说明请求本身发不出去；`vmcnt wait`说明已发请求没有及时完成。两者需要相反的优化动作。
+
+K192 single-M剩余physical idle中，VMEM issue占62.57%，completion wait仅4.60%；热点next-N K0 load到first consumer仍有约3.5K cycles距离。问题是weight load与output store同相争用，不是预取太晚。对应候选应改slot/role priority或请求相位，而不是继续提前load。
+
+Control K128恢复slot-aware priority只改变仲裁，保持工作量和资源不变，ABBA24改善1.31%，两waveVMEM同因从9.8934%大幅下降。这是“先分类、再改代码”的标准案例。
+
+### 6. 输出布局必须同时服务producer与consumer
+
+MoE down的输出不是kernel终点，`sorted_sum`才是契约终点。
+
+- wave-private XOR CShuffle把BN256结果恢复为标准row-major，在不引入bank conflict的前提下使combined优于R2。
+- H3 paired从packed物理布局切到row-major，牺牲少量producer，换来数量级更好的consumer。
+- direct atomic、route-major与压缩布局的共同失败原因，是producer、清零、转换或consumer中的另一端无法回本。
+- padding必须按真实route测：Hy3 0B最佳；H3/Xiaomi的历史最优可为128B或256B，不能用随机loc benchmark替代真实TOPK路由。
+
+任何新布局都必须同时报告down、sorted_sum、combined、输出容量和padding写入检查。
+
+### 7. 先改变工作所有权，再榨局部调度
+
+大收益通常来自tile/任务所有权改变，小收益才来自wait、priority和指令重排。
+
+- M128 paired N512为两个相邻M64复制metadata并支付10个WG barrier；Hy3的突破来自改为single-M N512，一个WG只处理一个M64，8 waves沿N512连续展开。
+- “8-wave”至少有三种不同算法：两个M64的`2x4`、一个M64的两个N256组`1x8`、统一N512 TiledMMA的true8 `1x8_2`。只比较线程数会误判算法。
+- K越短，wave级地址、load、stage控制和CShuffle固定成本越重要。K192不能直接照搬K384的strict PA barrier和scheduler。
+
+在局部ATT热点长期不收敛时，应重新问“谁拥有M/N/K与metadata”，而不是无限微调同一schedule。
+
+### 8. 只有四层证据闭环才晋级
+
+统一门禁：
+
+1. **正确性**：physical/reduced、finite、inactive tail、padding、真实route和`rel_l2`。
+2. **ISA/资源**：工作量、barrier、VGPR/AGPR、LDS、private/scratch、occupancy。
+3. **性能**：clean 10-buffer ABBA24，报告ratio/IQR/wins；短测仅筛选。
+4. **机制**：fresh ATT解释physical owner、原因转移和MFMA union。
+
+外部作业占用79% VRAM时，重构等价验证只能采信同进程old/new ratio；绝对时间不能与历史clean窗口比较。idle gate拒绝ABBA24不是失败，而是保护证据质量。
+
+### 9. 保留失败数字，防止重复实验
+
+失败路线是可复用资产。除非fresh ATT owner或算法契约已改变，不要原样重复：
+
+- R2/AoSoA、atomic scatter、route-major、FP8/INT8输出压缩；
+- K128跨N BF16/LDS carry、packed FMA、tail反转、盲目增加VMEM/MFMA间隔；
+- K192 paired barrier merge、K128+K64完整两stage、balanced CShuffle、K96 core；
+- 强制2-wave、通用`4 VMEM/32 MFMA`、K64 core、weight permutation和过深consumer prefetch；
+- 把H3 XCC map原样套到Hy3 K192；
+- 将“8 waves/WG”当成可跨shape推广的统一算法。
+
+详细commit、数字和保留/拒绝状态见[42提交编年史](COMMIT_CHRONICLE.md)。
+
+## 当前算法与入口
+
+当前未提交重构将算法拆为六个顶层入口；旧control中的这些路径原先都埋在`moe_2stage_down_prefill_1x4`中。
+
+| ID | 算法 | 当前入口 | 线程/waves | 所有权 |
+| --- | --- | --- | --- | --- |
+| P0 | Legacy M64xN64 | `moe_2stage_down_prefill_1x4` | 256/4 | 4-wave统一M64xN64 |
+| P1 | Physical M64xN256 | `moe_2stage_down_prefill_N256_1x4` | 256/4 | 4-wave统一N256 |
+| P2 | Paired M128xN256 | `moe_2stage_down_prefill_2x4` | 512/8 | 两个4-wave组各处理一个M64 |
+| P3 | True8 M64xN512 | `moe_2stage_down_prefill_1x8_2` | 512/8 | 统一`(8,1,1)`，8 waves连续覆盖N512 |
+| P4 | N-split M64xN512 | `moe_2stage_down_prefill_1x8` | 512/8 | 两个4-wave N256组共享一个M64 |
+| P5 | Xiaomi persistent | `moe_2stage_down_prefill_1x8_persistent` | 512/8 | P4沿N分组，同WG串行两个M64 |
+
+新入口均为薄wrapper，不调用`fxh`；copy、scale、MMA、K-stage、CShuffle和任务映射下沉到公共设备helper。legacy入口保持与`e6fe8e934859...`的decorator+函数文本一致。
+
+## 当前shape决策矩阵
+
+下表以最新clean四算法复测为主；“历史成立”与“当前推荐”分开，避免旧selector结论覆盖新证据。
+
+| Shape | 当前证据赢家 | 建议状态 | 说明 |
+| --- | --- | --- | --- |
+| Hy3：N4096/K192/E193/TopK9/per-tensor | **P3 true8 single-M N512** | 保留exact auto | 五shape复测中P4先胜P0/P1/P2；独立P3对P4 ABBA24又测得P4/P3为`1.104034` down、`1.065036` combined。HEAD role-priority仅有clean ABBA4，尚缺ABBA24和fresh ATT。 |
+| Xiaomi：N6144/K256/E384/TopK8/PTPC | **P1 physical N256** | 保留N256；P5仅实验 | 最新clean复测P5比P1慢4.01% down、2.73% combined；persistent只比paired更好，不足以auto。 |
+| H3：N6144/K384/E128/TopK4/PTPC | **P2 late-scale paired** | 保留exact auto；当前源码clean复验 | 旧`a452743` P2比P0慢56.87%/42.55%，但不含`2b50372` late-scale零spill修复；late-scale P2对P0 Base的clean combined ratio为`0.95473`，24/24胜。 |
+| H3：N4096/K384/E193/TopK9/per-tensor | P2 paired曾在历史正式窗口胜出 | 暂保留历史结论，需当前代码clean复测 | 最新五shape复测使用N6144/E128/TopK4 PTPC，不能直接推翻per-tensor结果。 |
+| Qwen3.5 35B：N2048/K512/E256/TopK8/PTPC | **P0 legacy** | P4保持forced-only | P4修复scale LDS竞争后比59dd自身快0.92% combined，但最新clean绝对算法比较仍比P0慢110.98%。 |
+| Qwen3.5 397B：N4096/K512/E512/TopK10/PTPC | **P0 legacy** | P4保持forced-only | race修复后比59dd自身快2.73% combined，但最新clean仍比P0慢103.75%。 |
+
+`MOE_DOWN_NSPLIT_N512=auto`当前不会自动选择P4，这是正确边界。不要因重构后的Qwen局部改善把N-split推广为K512默认。
+
+## 当前未提交工作状态
+
+工作分支：`luocheng/hy3-single-n512-handoff`；HEAD：`9049ddb723a1428d8dfb4c75e352d9b65bc9db56`。
+
+Tracked工作树包含：
+
+- `docs/UNIFIED8_DOWN_TODO.md`的新增实验记录；
+- 六入口公共pipeline重构；
+- down GPU回归、selector与metadata/grid回归；
+- N-split PTPC双group scale LDS隔离、copy线程、短grid、expanded M64 task、K512寻址和finite检查修复。
+
+已验证证据：
+
+- down GPU回归70项通过；
+- selector相关测试50项通过；
+- P1-P5的六个原始代表case重构前后最大中位偏差：down 0.179%，combined 0.275%；P0 legacy未单独计时；
+- Qwen K512修复组改善0.75%/0.92%和1.98%/2.73%（down/combined）；
+- H3 4632任务静态映射严格双射；
+- 详细协议、资源和8个case见[重构性能报告](REFACTOR_PERFORMANCE_REPORT.md)。
+
+注意：等价验证时外部作业占79% VRAM，使用2 buffers；ratio可用于重构等价判断，绝对时间不得替代clean 10-buffer数据。
+
+当前未提交TODO还记录了三组未保留在主line的实验资产：56KB共享CShuffle是小幅资源改善；真实`4N x 2M`原型在0 spill/2 barrier下仍输；跨CU dispatch-tail实验与72-cell falsification证明单CU ATT局部赢家可能输给整卡WG尾部。这些结论已纳入上面的第3条经验。
+
+## 后续优先级
+
+### P0：验证K512 P4 CShuffle容量门禁
+
+当前`use_paired_row_major_cshuffle`固定按双M activation计算`2 * BM * K`，但P4 N-split运行时`paired_m_groups=1`。K512 PTPC的真实静态预算约为32KB A + 16KB CShuffle + 2KB双组scale = 51,200B，而不是超过64KB。
+
+1. 只修正P4的容量谓词，不改变P2 paired与P5 persistent。
+2. 编译K512 P4并确认实际LDS、VGPR/private/scratch与CShuffle路径。
+3. 先跑Qwen35/Qwen397 physical/reduced、finite、tail和scale隔离回归。
+4. 对当前direct-store做clean ABBA短筛；若资源或墙钟不改善立即拒绝。
+5. 晋级候选再做ABBA24和fresh ATT，重点看private/scratch是否下降。
+
+### P1：完成Hy3 role-priority晋级
+
+HEAD的read/prefetch=1、MFMA=3、epilogue=0候选clean ABBA4为down `0.975036`、combined `0.980920`，但正式ABBA24被外部作业idle gate拒绝。
+
+需要：
+
+1. clean 10-buffer ABBA24对比无role-priority single-M control；
+2. fresh K192 ATT，比较MFMA union、四wave all-VMEM窗口、next-N K0 load与output-store PC；
+3. 确认128 VGPR、32KB LDS、0 private/scratch、4 waves/SIMD不变；
+4. 若墙钟与owner同时改善，再正式晋升。
+
+### P2：用当前源码复验H3 PTPC late-scale P2
+
+四算法报告中的H3 P2来自`a452743`，不能推翻`2b50372` late-scale的正式胜出结果。用当前源码对P0/P2执行clean 10-buffer ABBA24，确认重构后仍复现combined约`0.95473`方向；只有当前P2实际回退时才重审selector。per-tensor exact H3使用另一shape，必须分开复测。
+
+### P3：在空闲GPU重跑重构等价
+
+当前2-buffer污染窗口已足以证明无明显重构回退，但提交前应在`VRAM<=20%`重跑10-buffer代表case，至少覆盖P1/P2/P3/P4/P5与两个Qwen修复case。绝对时间只与同一clean窗口比较。
+
+### P4：补结构性回归
+
+- 为M32768 XCC/SE映射增加持久GPU回归，不只依赖静态双射。
+- 为K512 P4 CShuffle容量谓词增加静态资源回归，锁定单M activation与双组scale的51,200B预算。
+- 保留P4 forced-only，并覆盖PTPC两个subgroup scale隔离。
+- 继续确保gateup、down和split-k对`expanded_m64_tasks`使用同一任务单位。
+
+## 续跑检查表
+
+### 修改前
+
+- 记录branch、commit、kernel SHA和工作树diff。
+- 选择`util<=5%`、`VRAM<=20%`空闲GPU。
+- 确认初始performance level为`auto`。
+- 明确control/candidate的metadata、padding和数学输出相同。
+
+### 每个候选
+
+- 先跑目标正确性，拒绝NaN/Inf。
+- 导出ISA，记录资源、工作量和occupancy。
+- 短ABBA只淘汰；晋级用10-buffer ABBA24。
+- 有性能收益再采fresh ATT，不用旧trace解释新源码。
+- 报告结束状态，并恢复`auto / F16,BF16`。
+
+### 文档更新
+
+- 在[编年史](COMMIT_CHRONICLE.md)记录方法、数字和保留/拒绝。
+- 在[stall手册](STALL_ANALYSIS_GUIDE.md)补充新的owner判别或工具限制。
+- 在本矩阵更新当前赢家、selector边界和下一优先级。
+- 保存JSON、SHA256、ISA资源和trace目录来源；不要只写结论。
