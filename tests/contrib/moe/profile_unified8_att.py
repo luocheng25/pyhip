@@ -14,7 +14,7 @@ import flydsl.expr as fx
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_MODULE = REPO_ROOT / "src/contrib/flydsl/moe_gemm_splitk.py"
-BATCH, TOPK, N, K, EXPERTS, BLOCK_M = 32768, 9, 4096, 384, 193, 64
+BATCH, TOPK, N, EXPERTS, BLOCK_M = 32768, 9, 4096, 193, 64
 FP8 = torch.float8_e4m3fnuz
 _TORCH_TO_FX = {
     torch.bfloat16: fx.BFloat16,
@@ -46,11 +46,13 @@ def main():
     parser.add_argument("--dispatches", type=int, default=6)
     parser.add_argument(
         "--path",
-        choices=("physical4", "unified8"),
+        choices=("physical4", "unified8", "single_n512"),
         default="unified8",
     )
+    parser.add_argument("--k", type=int, choices=(192, 384), default=384)
     parser.add_argument("--exact-valid-grid", action="store_true")
     args = parser.parse_args()
+    k = args.k
     if args.dispatches < 5:
         parser.error("--dispatches must be at least 5 for the checked-in ATT YAML")
 
@@ -77,16 +79,16 @@ def main():
     grid = sorted_expert_ids.shape[0]
     padded_rows = int(num_valid_ids[0].item())
     task_num = padded_rows // BLOCK_M if args.exact_valid_grid else grid
-    activation = torch.ones(BATCH, TOPK, K, dtype=FP8, device="cuda")
+    activation = torch.ones(BATCH, TOPK, k, dtype=FP8, device="cuda")
     weight = shuffle_weight(
-        torch.ones(EXPERTS, N, K, dtype=FP8, device="cuda"), layout=(16, 16)
+        torch.ones(EXPERTS, N, k, dtype=FP8, device="cuda"), layout=(16, 16)
     )
     output = torch.empty(grid * BLOCK_M, N, dtype=torch.bfloat16, device="cuda")
     weight_scale = torch.ones(EXPERTS, dtype=torch.float32, device="cuda")
     activation_scale = torch.ones(1, dtype=torch.float32, device="cuda")
     common = dict(
         N=N,
-        K=K,
+        K=k,
         weight_dtype="fp8",
         weight_quant_type="per_tensor",
         act_quant_type="per_tensor",
@@ -98,19 +100,26 @@ def main():
         USE_ATOMIC_WRITE=False,
         down_output_padding_bytes=0,
     )
-    launch = (
-        module.compile_gemm(
+    if args.path == "single_n512":
+        launch = module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+            down_paired_row_major=True,
+            down_single_m_n512=True,
+        )
+    elif args.path == "unified8":
+        launch = module.compile_gemm(
             **common,
             BLOCK_TILE_SIZE_N=512,
             down_physical_n512=True,
         )
-        if args.path == "unified8"
-        else module.compile_gemm(
+    else:
+        launch = module.compile_gemm(
             **common,
             BLOCK_TILE_SIZE_N=256,
             down_physical_n256=True,
         )
-    )
     stream = torch.cuda.current_stream()
     for _ in range(args.dispatches):
         launch(

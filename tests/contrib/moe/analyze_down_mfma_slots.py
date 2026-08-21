@@ -7,16 +7,16 @@ rocprof ATT records gfx9 instructions as::
 
 The successful issue time is ``first_attempt + stall``.  Treating the first
 attempt as the issue time overstates cross-wave overlap.  This analyzer merges
-both resident wave slots on each physical SIMD, marks every successful MFMA as
-a 16-cycle matrix execution window, and classifies uncovered windows using the
-instructions blocking both resident waves.
+all resident wave slots on each physical SIMD, marks every successful MFMA as a
+16-cycle matrix execution window, and classifies uncovered windows using the
+instructions blocking the resident waves.
 
 The fixability labels are deliberately conservative:
 
 * local schedule candidate: a non-MFMA issue/stall occurs while a wave still has
   later MFMAs in the same K core;
 * prefetch candidate: VMEM/LDS/wait exposure occurs in a core or core boundary;
-* structural tail: both waves are outside their MFMA cores, so filling the gap
+* structural tail: all waves are outside their MFMA cores, so filling the gap
   requires cross-N double buffering or a different epilogue, not local motion;
 * edge/replacement: fewer than two resident waves are active and is excluded
   from the core utilization denominator.
@@ -87,6 +87,15 @@ def configure_n_blocks(n_blocks: int) -> None:
         raise ValueError("n_blocks must be positive")
     global N_BLOCKS, EXPECTED_MFMA_PER_WAVE
     N_BLOCKS = n_blocks
+    EXPECTED_MFMA_PER_WAVE = MFMA_PER_N_BLOCK * N_BLOCKS
+
+
+def configure_mfma_per_core(mfma_per_core: int) -> None:
+    if mfma_per_core <= 0:
+        raise ValueError("mfma_per_core must be positive")
+    global MFMA_PER_CORE, MFMA_PER_N_BLOCK, EXPECTED_MFMA_PER_WAVE
+    MFMA_PER_CORE = mfma_per_core
+    MFMA_PER_N_BLOCK = MFMA_PER_CORE * CORES_PER_N_BLOCK
     EXPECTED_MFMA_PER_WAVE = MFMA_PER_N_BLOCK * N_BLOCKS
 
 
@@ -195,7 +204,7 @@ def paint(array: np.ndarray, begin: int, end: int, origin: int, value: int) -> N
         array[left:right] = value
 
 
-def classify_fixability(phases: tuple[int, int], blockers: tuple[str, str]) -> str:
+def classify_fixability(phases: tuple[int, ...], blockers: tuple[str, ...]) -> str:
     active = [
         (phase, blocker)
         for phase, blocker in zip(phases, blockers)
@@ -262,62 +271,72 @@ def classify_fixability(phases: tuple[int, int], blockers: tuple[str, str]) -> s
     return "other core exposure"
 
 
-def counter_from_joint(
-    joint_values: np.ndarray,
+def unique_state_counts(
+    values: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    selected = values[:, mask].T
+    if selected.size == 0:
+        return (
+            np.empty((0, values.shape[0]), dtype=values.dtype),
+            np.empty(0, dtype=np.int64),
+        )
+    return np.unique(selected, axis=0, return_counts=True)
+
+
+def counter_from_states(
+    values: np.ndarray,
     mask: np.ndarray,
     names: list[str],
     cycle_scale: int,
 ) -> Counter:
     counts = Counter()
-    for joint, count in enumerate(np.bincount(joint_values[mask])):
-        if count == 0:
-            continue
-        left = joint // len(names)
-        right = joint % len(names)
-        name = "+".join(sorted((names[left], names[right])))
+    states, state_counts = unique_state_counts(values, mask)
+    for state, count in zip(states, state_counts):
+        name = "+".join(sorted(names[int(value)] for value in state))
         counts[name] += int(count) * cycle_scale
     return counts
 
 
 def blocker_counters(
-    blocker_joint: np.ndarray,
+    blockers: np.ndarray,
     mask: np.ndarray,
     blocker_names: list[str],
     cycle_scale: int,
 ) -> tuple[Counter, dict[str, float]]:
     pair_counts = Counter()
     owner_counts: dict[str, float] = defaultdict(float)
-    for joint, count in enumerate(np.bincount(blocker_joint[mask])):
-        if count == 0:
-            continue
-        left = joint // len(blocker_names)
-        right = joint % len(blocker_names)
-        pair = " + ".join(sorted((blocker_names[left], blocker_names[right])))
+    states, state_counts = unique_state_counts(blockers, mask)
+    slot_count = blockers.shape[0]
+    for state, count in zip(states, state_counts):
+        names = [blocker_names[int(value)] for value in state]
+        pair = " + ".join(sorted(names))
         cycles = int(count) * cycle_scale
         pair_counts[pair] += cycles
-        owner_counts[blocker_names[left]] += cycles / 2
-        owner_counts[blocker_names[right]] += cycles / 2
+        for name in names:
+            owner_counts[name] += cycles / slot_count
     return pair_counts, owner_counts
 
 
 def fixability_counter(
-    full_joint: np.ndarray,
+    phases: np.ndarray,
+    blockers: np.ndarray,
     mask: np.ndarray,
     blocker_names: list[str],
     cycle_scale: int,
 ) -> Counter:
     counts = Counter()
-    for joint, count in enumerate(np.bincount(full_joint[mask])):
-        if count == 0:
-            continue
-        phase_id = joint // (len(blocker_names) ** 2)
-        blocker_id = joint % (len(blocker_names) ** 2)
-        phases = (phase_id // len(PHASE_NAMES), phase_id % len(PHASE_NAMES))
-        blockers = (
-            blocker_names[blocker_id // len(blocker_names)],
-            blocker_names[blocker_id % len(blocker_names)],
+    states = np.concatenate((phases, blockers), axis=0)
+    unique_states, state_counts = unique_state_counts(states, mask)
+    slot_count = phases.shape[0]
+    for state, count in zip(unique_states, state_counts):
+        phase_values = tuple(int(value) for value in state[:slot_count])
+        blocker_values = tuple(
+            blocker_names[int(value)] for value in state[slot_count:]
         )
-        counts[classify_fixability(phases, blockers)] += int(count) * cycle_scale
+        counts[classify_fixability(phase_values, blocker_values)] += (
+            int(count) * cycle_scale
+        )
     return counts
 
 
@@ -413,11 +432,12 @@ def analyze_group(payload: tuple[tuple[int, int, int], list[dict], list[str]]) -
     origin = min(wave["begin"] for wave in waves)
     end = max(wave["end"] for wave in waves)
     ticks = tick_ceil(end, origin)
-    phase = np.zeros((2, ticks), dtype=np.uint8)
-    blocker = np.zeros((2, ticks), dtype=np.uint16)
-    active = np.zeros((2, ticks), dtype=np.bool_)
+    slot_count = max(wave["slot"] for wave in waves) + 1
+    phase = np.zeros((slot_count, ticks), dtype=np.uint8)
+    blocker = np.zeros((slot_count, ticks), dtype=np.uint16)
+    active = np.zeros((slot_count, ticks), dtype=np.bool_)
     mfma_exec = np.zeros(ticks, dtype=np.bool_)
-    non_mfma_issue = np.zeros((2, ticks), dtype=np.uint16)
+    non_mfma_issue = np.zeros((slot_count, ticks), dtype=np.uint16)
     blocker_to_id = {name: index for index, name in enumerate(blocker_names)}
 
     single_wave_gaps = Counter()
@@ -514,50 +534,45 @@ def analyze_group(payload: tuple[tuple[int, int, int], list[dict], list[str]]) -
                     True,
                 )
 
-    both_active = active[0] & active[1]
+    all_active = np.all(active, axis=0)
     in_n_loop = np.isin(
         phase,
         list(CORE_PHASES | BOUNDARY_PHASES | TAIL_PHASES),
     )
-    steady = both_active & in_n_loop[0] & in_n_loop[1]
-    busy = both_active & mfma_exec
-    idle = both_active & ~mfma_exec
+    steady = all_active & np.all(in_n_loop, axis=0)
+    busy = all_active & mfma_exec
+    idle = all_active & ~mfma_exec
     steady_busy = steady & mfma_exec
     steady_idle = steady & ~mfma_exec
     cycle_scale = TICK_CYCLES
-    phase_joint = phase[0].astype(np.int64) * len(PHASE_NAMES) + phase[1].astype(
-        np.int64
-    )
-    blocker_joint = blocker[0].astype(np.int64) * len(blocker_names) + blocker[
-        1
-    ].astype(np.int64)
-    full_joint = phase_joint * (len(blocker_names) ** 2) + blocker_joint
 
-    phase_counts = counter_from_joint(
-        phase_joint, both_active, list(PHASE_NAMES.values()), cycle_scale
+    phase_counts = counter_from_states(
+        phase, all_active, list(PHASE_NAMES.values()), cycle_scale
     )
-    phase_idle_counts = counter_from_joint(
-        phase_joint, idle, list(PHASE_NAMES.values()), cycle_scale
+    phase_idle_counts = counter_from_states(
+        phase, idle, list(PHASE_NAMES.values()), cycle_scale
     )
-    steady_phase_counts = counter_from_joint(
-        phase_joint, steady, list(PHASE_NAMES.values()), cycle_scale
+    steady_phase_counts = counter_from_states(
+        phase, steady, list(PHASE_NAMES.values()), cycle_scale
     )
-    steady_phase_idle_counts = counter_from_joint(
-        phase_joint, steady_idle, list(PHASE_NAMES.values()), cycle_scale
+    steady_phase_idle_counts = counter_from_states(
+        phase, steady_idle, list(PHASE_NAMES.values()), cycle_scale
     )
     blocker_pair_counts, blocker_owner_counts = blocker_counters(
-        blocker_joint, idle, blocker_names, cycle_scale
+        blocker, idle, blocker_names, cycle_scale
     )
     steady_blocker_pair_counts, steady_blocker_owner_counts = blocker_counters(
-        blocker_joint, steady_idle, blocker_names, cycle_scale
+        blocker, steady_idle, blocker_names, cycle_scale
     )
-    fixability_counts = fixability_counter(full_joint, idle, blocker_names, cycle_scale)
+    fixability_counts = fixability_counter(
+        phase, blocker, idle, blocker_names, cycle_scale
+    )
     steady_fixability_counts = fixability_counter(
-        full_joint, steady_idle, blocker_names, cycle_scale
+        phase, blocker, steady_idle, blocker_names, cycle_scale
     )
 
     coissue_counts = Counter()
-    for slot in range(2):
+    for slot in range(slot_count):
         values = non_mfma_issue[slot][busy]
         for blocker_id, count in enumerate(np.bincount(values)):
             if blocker_id and count:
@@ -566,8 +581,9 @@ def analyze_group(payload: tuple[tuple[int, int, int], list[dict], list[str]]) -
     return {
         "key": list(key),
         "waves": len(waves),
+        "resident_slots": slot_count,
         "wave_duration_median": statistics.median(wave_durations),
-        "both_active_cycles": int(np.count_nonzero(both_active)) * cycle_scale,
+        "both_active_cycles": int(np.count_nonzero(all_active)) * cycle_scale,
         "mfma_busy_cycles": int(np.count_nonzero(busy)) * cycle_scale,
         "mfma_idle_cycles": int(np.count_nonzero(idle)) * cycle_scale,
         "steady_cycles": int(np.count_nonzero(steady)) * cycle_scale,
@@ -751,7 +767,7 @@ def markdown_report(results: list[dict]) -> str:
     lines = [
         "# Control K128 physical MFMA slot model",
         "",
-        "ATT gfx9 timestamps use `successful_issue = first_attempt + stall`; each successful FP8 MFMA is marked as a 16-cycle matrix execution window. The main denominator is the steady N-loop where both resident slots are in core/core-boundary/tail phases; prologue, drain and slot replacement are reported separately as lifecycle context.",
+        "ATT gfx9 timestamps use `successful_issue = first_attempt + stall`; each successful FP8 MFMA is marked as a 16-cycle matrix execution window. The main denominator is the steady N-loop where all resident slots are in core/core-boundary/tail phases; prologue, drain and slot replacement are reported separately as lifecycle context.",
         "",
         "| Trace | SIMD | Waves | steady MFMA busy | steady MFMA idle | steady 16-cycle idle slots | lifecycle busy | Dispatch | Resources |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -844,7 +860,7 @@ def svg_report(results: list[dict]) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#0d1117"/>',
         "<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#e6edf3}.label{font-size:18px;font-weight:600}.small{font-size:14px;fill:#b1bac4}.legend{font-size:13px;fill:#d0d7de}</style>",
-        '<text x="40" y="42" class="label">Physical SIMD MFMA execution slots (two resident waves)</text>',
+        '<text x="40" y="42" class="label">Physical SIMD MFMA execution across resident waves</text>',
         '<text x="40" y="66" class="small">Steady N-loop only. Green = 16-cycle MFMA execution; other colors classify uncovered physical cycles. ATT issue = first_attempt + stall.</text>',
     ]
     bar_x = 40
@@ -909,6 +925,7 @@ def select_detail_window(dispatch: Path, target_busy: float) -> dict:
     _, groups, _ = load_group_payload(dispatch)
     candidates = []
     for key, waves in sorted(groups.items()):
+        resident_slots = max(wave["slot"] for wave in waves) + 1
         for anchor in waves:
             if anchor["slot"] != 0:
                 continue
@@ -918,27 +935,31 @@ def select_detail_window(dispatch: Path, target_busy: float) -> dict:
             for tile in range(2, N_BLOCKS - 2):
                 begin = anchor_mfmas[tile * MFMA_PER_N_BLOCK]["issue"]
                 end = anchor_mfmas[(tile + 1) * MFMA_PER_N_BLOCK]["issue"]
-                peers = []
-                for peer in waves:
-                    if peer["slot"] == anchor["slot"]:
-                        continue
-                    peer_mfmas = [
-                        record
-                        for record in peer["records"]
-                        if record["category"] == "MFMA"
-                    ]
-                    covers_window = peer["begin"] <= begin and peer["end"] >= end
-                    covers_mfma_lifecycle = (
-                        peer_mfmas[0]["issue"] <= begin
-                        and peer_mfmas[-1]["issue"] + MFMA_EXEC_CYCLES >= end
-                    )
-                    if covers_window and covers_mfma_lifecycle:
-                        peers.append(peer)
-                if len(peers) != 1:
+                resident_waves = []
+                for slot in range(resident_slots):
+                    covering = []
+                    for wave in waves:
+                        if wave["slot"] != slot:
+                            continue
+                        wave_mfmas = [
+                            record
+                            for record in wave["records"]
+                            if record["category"] == "MFMA"
+                        ]
+                        covers_window = wave["begin"] <= begin and wave["end"] >= end
+                        covers_mfma_lifecycle = (
+                            wave_mfmas[0]["issue"] <= begin
+                            and wave_mfmas[-1]["issue"] + MFMA_EXEC_CYCLES >= end
+                        )
+                        if covers_window and covers_mfma_lifecycle:
+                            covering.append(wave)
+                    if len(covering) != 1:
+                        break
+                    resident_waves.append(covering[0])
+                if len(resident_waves) != resident_slots:
                     continue
-                peer = peers[0]
                 intervals = []
-                for wave in (anchor, peer):
+                for wave in resident_waves:
                     for record in wave["records"]:
                         if record["category"] != "MFMA":
                             continue
@@ -955,11 +976,11 @@ def select_detail_window(dispatch: Path, target_busy: float) -> dict:
                         "end": end,
                         "busy": busy,
                         "anchor": anchor,
-                        "peer": peer,
+                        "waves": resident_waves,
                     }
                 )
     if not candidates:
-        raise RuntimeError(f"no complete two-slot N-loop windows in {dispatch}")
+        raise RuntimeError(f"no complete resident-slot N-loop windows in {dispatch}")
 
     median_duration = statistics.median(
         candidate["end"] - candidate["begin"] for candidate in candidates
@@ -1144,7 +1165,7 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
     begin = detail["begin"]
     end = detail["end"]
     duration = end - begin
-    waves = [detail["anchor"], detail["peer"]]
+    waves = detail["waves"]
     blocker_names = ["inactive", "scheduler/ready"]
     categories = sorted({info.category for info in code})
     blocker_names.extend(f"stall:{category}" for category in categories)
@@ -1164,12 +1185,11 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
     ]
     physical = np.zeros(ticks, dtype=np.uint8)
     for tick in range(ticks):
-        if slot_arrays[0][2][tick] or slot_arrays[1][2][tick]:
+        if any(arrays[2][tick] for arrays in slot_arrays):
             continue
-        phases = (int(slot_arrays[0][0][tick]), int(slot_arrays[1][0][tick]))
-        blockers = (
-            blocker_names[int(slot_arrays[0][1][tick])],
-            blocker_names[int(slot_arrays[1][1][tick])],
+        phases = tuple(int(arrays[0][tick]) for arrays in slot_arrays)
+        blockers = tuple(
+            blocker_names[int(arrays[1][tick])] for arrays in slot_arrays
         )
         bucket = classify_fixability(phases, blockers)
         if bucket == "VMEM stall/wait candidate":
@@ -1188,13 +1208,15 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
         for record in waves[0]["records"]
         if begin <= record["issue"] < end
     )
+    memory_reads_per_core = MFMA_PER_CORE // 8
+    memory_reads_per_n = CORES_PER_N_BLOCK * memory_reads_per_core
     expected_counts = {
-        "v_mfma_f32_16x16x32_fp8_fp8": 192,
-        "buffer_load_dwordx4": 24,
-        "ds_read_b128": 32,
+        "v_mfma_f32_16x16x32_fp8_fp8": MFMA_PER_N_BLOCK,
+        "buffer_load_dwordx4": memory_reads_per_n,
+        "ds_read_b128": memory_reads_per_n + 8,
         "v_fmaak_f32": 64,
         "v_perm_b32": 32,
-        "ds_write_b128": 16,
+        "ds_write_b128": 8,
         "buffer_store_dwordx4": 8,
     }
     for opcode, expected in expected_counts.items():
@@ -1236,7 +1258,10 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
     }
 
     width = 1400
-    height = 878
+    slot_row_height = 114
+    timeline_top = 334
+    physical_y = timeline_top + len(waves) * slot_row_height + 20
+    height = physical_y + 296
     plot_x = 190
     plot_width = 1170
     axis_y = 310
@@ -1244,7 +1269,7 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#0d1117"/>',
         "<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#e6edf3}.title{font-size:20px;font-weight:600}.label{font-size:15px;font-weight:600}.small{font-size:13px;fill:#b1bac4}.tiny{font-size:12px;fill:#8b949e}</style>",
-        f'<text x="40" y="38" class="title">{escape(label)}: representative physical two-slot N-loop</text>',
+        f'<text x="40" y="38" class="title">{escape(label)}: representative physical {len(waves)}-slot N-loop</text>',
         f'<text x="40" y="62" class="small">SE{detail["key"][0]} CU{detail["key"][1]} SIMD{detail["key"][2]}; slot 0 N{detail["tile"]}; absolute cycles [{begin}, {end}); {duration} cycles; MFMA busy {detail["busy"]:.2%}</text>',
         f'<text x="40" y="82" class="tiny">Selected from {detail["candidate_count"]} complete windows: busy within 0.1 percentage point of {target_busy:.2%}, then duration nearest the {detail["median_duration"]:.0f}-cycle median. ATT issue = first_attempt + stall.</text>',
         '<text x="40" y="112" class="label">Anchor slot 0 logical N-block recipe (counts validated against this ATT window)</text>',
@@ -1279,17 +1304,18 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
     for cycle in tick_values:
         x = plot_x + plot_width * cycle / duration
         parts.append(
-            f'<line x1="{x:.2f}" y1="{axis_y}" x2="{x:.2f}" y2="592" stroke="#30363d"/>'
+            f'<line x1="{x:.2f}" y1="{axis_y}" x2="{x:.2f}" y2="{physical_y + 10}" stroke="#30363d"/>'
         )
         anchor = "end" if cycle == duration else ("start" if cycle == 0 else "middle")
         parts.append(
             f'<text x="{x:.2f}" y="{axis_y - 8}" text-anchor="{anchor}" class="tiny">+{cycle}</text>'
         )
 
-    row_y = [(334, 364, 390), (448, 478, 504)]
     for slot, (wave, arrays) in enumerate(zip(waves, slot_arrays)):
         phase, _, mfma_exec, events = arrays
-        phase_y, mfma_y, event_y = row_y[slot]
+        phase_y = timeline_top + slot * slot_row_height
+        mfma_y = phase_y + 30
+        event_y = phase_y + 56
         parts.append(
             f'<text x="40" y="{phase_y + 16}" class="label">slot {slot} phase</text>'
         )
@@ -1334,7 +1360,6 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
             f'<text x="{plot_x}" y="{event_y + 34}" class="tiny">{escape(Path(wave["path"]).name)}</text>'
         )
 
-    physical_y = 582
     parts.append(
         f'<text x="40" y="{physical_y + 18}" class="label">physical union</text>'
     )
@@ -1351,12 +1376,13 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
     )
     busy_cycles = int(np.count_nonzero(physical == 0)) * TICK_CYCLES
     parts.append(
-        f'<text x="{plot_x}" y="638" class="small">Any-slot MFMA execution: {busy_cycles:,} / {duration:,} cycles = {busy_cycles / duration:.2%}. Idle colors use the same conservative two-wave classifier as the overview.</text>'
+        f'<text x="{plot_x}" y="{physical_y + 56}" class="small">Any-slot MFMA execution: {busy_cycles:,} / {duration:,} cycles = {busy_cycles / duration:.2%}. Idle colors use the same conservative resident-wave classifier as the overview.</text>'
     )
 
+    legend_top = physical_y + 84
     legend_rows = [
         (
-            666,
+            legend_top,
             [
                 ("phase core0", phase_colors["core0"]),
                 ("phase core1", phase_colors["core1"]),
@@ -1364,9 +1390,9 @@ def detail_svg_report(label: str, dispatch: Path, target_busy: float) -> str:
                 ("phase tail", phase_colors["tail"]),
             ],
         ),
-        (698, [(name, event_colors[name]) for name in DETAIL_EVENT_NAMES[1:5]]),
-        (730, [(name, event_colors[name]) for name in DETAIL_EVENT_NAMES[5:]]),
-        (762, [(name, physical_colors[name]) for name in physical_names[1:]]),
+        (legend_top + 32, [(name, event_colors[name]) for name in DETAIL_EVENT_NAMES[1:5]]),
+        (legend_top + 64, [(name, event_colors[name]) for name in DETAIL_EVENT_NAMES[5:]]),
+        (legend_top + 96, [(name, physical_colors[name]) for name in physical_names[1:]]),
     ]
     for y, entries in legend_rows:
         column_width = 1320 / len(entries)
@@ -1404,6 +1430,12 @@ def main() -> None:
         default=N_BLOCKS,
         help="N blocks executed by each complete wave (default: 16)",
     )
+    parser.add_argument(
+        "--mfma-per-core",
+        type=int,
+        default=MFMA_PER_CORE,
+        help="MFMA instructions per K core (K384 default: 64; K192: 32)",
+    )
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--svg", type=Path)
@@ -1413,6 +1445,9 @@ def main() -> None:
         parser.error("--workers must be positive")
     if args.n_blocks <= 0:
         parser.error("--n-blocks must be positive")
+    if args.mfma_per_core <= 0:
+        parser.error("--mfma-per-core must be positive")
+    configure_mfma_per_core(args.mfma_per_core)
     configure_n_blocks(args.n_blocks)
 
     results = [
@@ -1423,10 +1458,12 @@ def main() -> None:
         "model": {
             "tick_cycles": TICK_CYCLES,
             "mfma_execution_cycles": MFMA_EXEC_CYCLES,
+            "mfma_per_core": MFMA_PER_CORE,
+            "cores_per_n_block": CORES_PER_N_BLOCK,
             "successful_issue_formula": "first_attempt + stall",
             "physical_group_key": ["shader_engine", "cu", "simd"],
-            "denominator": "steady N-loop cycles with both resident slots in core, core-boundary, or tail phases",
-            "lifecycle_denominator": "all cycles with both resident wave slots active",
+            "denominator": "steady N-loop cycles with all resident slots in core, core-boundary, or tail phases",
+            "lifecycle_denominator": "all cycles with every resident wave slot active",
             "attribution_policy": "split physical idle equally between simultaneous per-wave blockers",
         },
         "results": results,

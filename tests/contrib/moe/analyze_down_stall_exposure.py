@@ -1028,6 +1028,12 @@ def main() -> None:
         default=slots.N_BLOCKS,
         help="N blocks executed by each complete wave (default: 16)",
     )
+    parser.add_argument(
+        "--mfma-per-core",
+        type=int,
+        default=slots.MFMA_PER_CORE,
+        help="MFMA instructions per K core (K384 default: 64; K192: 32)",
+    )
     parser.add_argument("--first-n", type=int, default=2)
     parser.add_argument("--last-n-exclusive", type=int, default=14)
     parser.add_argument("--resident-waves", type=int)
@@ -1041,6 +1047,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.n_blocks <= 0:
         parser.error("--n-blocks must be positive")
+    if args.mfma_per_core <= 0:
+        parser.error("--mfma-per-core must be positive")
+    slots.configure_mfma_per_core(args.mfma_per_core)
     slots.configure_n_blocks(args.n_blocks)
     if not 0 <= args.first_n < args.last_n_exclusive <= slots.N_BLOCKS - 1:
         parser.error(
@@ -1064,6 +1073,8 @@ def main() -> None:
         "model": {
             "tick_cycles": slots.TICK_CYCLES,
             "mfma_execution_cycles": slots.MFMA_EXEC_CYCLES,
+            "mfma_per_core": slots.MFMA_PER_CORE,
+            "cores_per_n_block": slots.CORES_PER_N_BLOCK,
             "reason_priority": "explicit memory blocker, then structural tail, then residual",
             "physical_owner_policy": "split each physical idle tick equally across resident waves",
             "mfma_issue_unavailable_policy": (

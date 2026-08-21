@@ -3237,7 +3237,10 @@ def compile_gemm(
                 elif const_expr(down_physical_n256):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(_PHYSICAL_N256_USE_SETPRIO):
-                        _set_hw_slot_priority(hw_wave_slot, 1, 0)
+                        if const_expr(down_single_m_n512):
+                            fx.rocdl.s_setprio(1)
+                        else:
+                            _set_hw_slot_priority(hw_wave_slot, 1, 0)
                     fx.rocdl.sched_barrier(0)
 
             def enter_compute_stage():
@@ -3350,6 +3353,8 @@ def compile_gemm(
                             frag_weight_head.store(state[3])
                     fragC[0].fill(0)
                     next_scale_vec = None
+                    if const_expr(down_single_m_n512):
+                        fx.rocdl.s_setprio(1)
 
                     # Every K core alternates Stage A (all non-MFMA work) and
                     # Stage B (MFMA only). After issuing the current K2 reads and
@@ -3499,6 +3504,8 @@ def compile_gemm(
                         postprocess_to_bf16(fragC[0], fragC_bf16)
 
                     if not const_expr(use_paired_m128):
+                        if const_expr(down_single_m_n512):
+                            fx.rocdl.s_setprio(0)
                         store_cshuffle_n256(
                             fragC_bf16, block_n, cshuffle_lds
                         )

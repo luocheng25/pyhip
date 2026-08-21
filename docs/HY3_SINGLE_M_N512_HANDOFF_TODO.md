@@ -52,6 +52,23 @@ Independent clean retest using the tracked formal harness on the same source:
 
 The second clean run confirms that the gain comes from down; the row-major consumer is neutral. Its output JSON is `/tmp/hy3_single_idle_retest.json` on the source node with SHA256 `de86615dba85f616e87facc4d08a2e30fe0238011ab8e1e490feaaf93997e651`. The harness checked ten buffers, all valid physical and reduced outputs bitwise, untouched inactive tails, idle initial state, managed `VECTOR,F8` state, and restored `auto`/`F16,BF16` state.
 
+An ATT-guided operation-role priority candidate is currently retained but not
+yet promoted. It uses priority 1 for single-M read/prefetch stages, priority 3
+for MFMA stages, and priority 0 for the CShuffle/output-store epilogue. Clean
+10-buffer ABBA4 against the retained single-M baseline produced:
+
+| Phase | Baseline -> role priority | Candidate/control ratio | IQR | Wins |
+| --- | ---: | ---: | ---: | ---: |
+| down | `1.425609 -> 1.364588 ms` | `0.975036` | `0.961352--0.976084` | 4/4 |
+| down + sorted_sum | `2.155953 -> 2.106072 ms` | `0.980920` | `0.977686--0.984050` | 4/4 |
+
+Useful down throughput was `325.374 -> 339.924 TFLOPS`. The harness checked
+ten buffers bitwise and started from an idle GPU. ABBA24 was attempted
+immediately afterward but correctly rejected at the idle gate because an
+external all-GPU job had started; it did not produce mixed timing data. The
+candidate source SHA256 is
+`4951a4878bbd290a8dce702180675a545b9478ba85039c4be6421ba360cb280c`.
+
 Two later retests ran while an external all-GPU job held every card at 100% busy and 83% VRAM. They are stress evidence only, not replacements for the clean result:
 
 | Retest | Down ratio / wins | Combined ratio / wins |
@@ -260,6 +277,52 @@ These were correct or compilable but did not solve the N256 gap:
 
 The breakthrough was changing ownership from M128 pairing to single-M N512 and then crossing the 128-VGPR occupancy boundary without spills.
 
+## 6.1 K192 ATT diagnosis
+
+Retained baseline captures:
+
+```text
+physical N256: /tmp/hy3-k192-att-physical/ui_output_agent_1245_dispatch_18
+single-M N512: /tmp/hy3-k192-att-single/ui_output_agent_27020_dispatch_18
+```
+
+The physical MFMA-union result is not an occupancy failure:
+
+| Path | Resident waves/SIMD | MFMA union busy | MFMA union idle |
+| --- | ---: | ---: | ---: |
+| physical N256 | 2 | 64.42% | 35.58% |
+| single-M N512 | 4 | 70.32% | 29.68% |
+
+Single-M raises MFMA utilization, but VMEM issue stalls own 62.57% of its
+remaining physical idle cycles, or 18.57% of total steady cycles. VMEM
+completion waits are only 4.60% of idle, so the problem is instruction issue
+contention rather than late data completion.
+
+Four-wave simultaneous VMEM-issue windows occupy 6.01% of steady cycles. Their
+instruction mix is:
+
+| Active VMEM blockers | Share of all-VMEM windows |
+| --- | ---: |
+| 1 weight load + 3 output stores | 54.07% |
+| 2 weight loads + 2 output stores | 36.80% |
+| 3 weight loads + 1 output store | 7.68% |
+| 4 weight loads | 0.95% |
+| 4 output stores | 0.51% |
+
+The dominant joint phase is one wave at `core1->2` while three peers are in
+their output tail. The hottest next-N K0 load is baseline ISA PC286 with about
+1.494M aggregate ATT stall cycles and 17,720 cycles inside four-wave all-VMEM
+windows. Its issue-to-first-consumer lead remains roughly 3.5K cycles at the
+median and at least 1.7K cycles, so reordering or delaying that burst merely
+redistributes queue stall and does not fix a `vmcnt` critical path.
+
+This evidence motivated the retained role-priority candidate: let weight/DS
+read stages issue at priority 1, keep MFMA at priority 3, and lower the complete
+CShuffle/output epilogue to priority 0. Raising reads to priority 2 regressed;
+lowering only the first store of each pair regressed; repeatedly switching
+priority around every store pair was inconclusive and added six transitions per
+N block.
+
 ## 7. Remaining TODO
 
 1. [x] Run the tracked formal benchmark independently and confirm reproducibility: `0.909806` down / `0.937691` combined versus the original `0.906541` / `0.935520`.
@@ -267,6 +330,13 @@ The breakthrough was changing ownership from M128 pairing to single-M N512 and t
 3. Optionally collect fresh ATT for physical N256 vs single-M N512. Verify the expected occupancy change and attribute remaining stalls; do not change code solely from single-wave counters.
 4. Decide whether to merge this branch back into `luocheng/try-opt-down-308` after the new-node clean run.
 5. Keep `tests/flydsl/flash_attn_api/` untouched; it is user-owned and intentionally absent from commits.
+6. Resolve the retained operation-role priority candidate with clean ABBA24.
+7. Capture fresh K192 single-M ATT for that candidate and compare MFMA union
+  busy, four-wave all-VMEM issue windows, and the next-N K0/output-store PCs
+  against the retained baseline capture.
+8. [x] Generalize `analyze_down_mfma_slots.py` from two hard-coded resident
+  slots to dynamic 2/4-slot analysis. The four-slot single-M replay now closes;
+  all existing two-slot physical JSON fields remain unchanged.
 
 ## 8. New-node recovery checklist
 
