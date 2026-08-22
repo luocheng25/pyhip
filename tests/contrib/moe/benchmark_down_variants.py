@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Historical P4 benchmark harness; run only with its pinned old modules."""
+
 import argparse
 import hashlib
 import importlib

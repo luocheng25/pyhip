@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""逐bit比较两个统一8-wave N512 kernel，并与PyTorch参考比较。"""
+"""逐bit比较两个P12 paired M128xN256 kernel，并与PyTorch参考比较。"""
 
 import argparse
 import importlib.util
+import inspect
 from pathlib import Path
 
 import torch
@@ -40,7 +41,7 @@ def ptr(tensor):
 
 
 def build(module):
-    return module.compile_gemm(
+    common = dict(
         N=N,
         K=K,
         weight_dtype="fp8",
@@ -48,13 +49,25 @@ def build(module):
         act_quant_type="per_tensor",
         TOPK=1,
         BLOCK_TILE_SIZE_M=64,
-        BLOCK_TILE_SIZE_N=512,
         stage="down",
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n512=True,
         down_output_padding_bytes=0,
+    )
+    if "down_path" in inspect.signature(module.compile_gemm).parameters:
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=256,
+            down_path="physical_n256",
+            down_m_groups=2,
+            metadata_m_groups=2,
+        )
+    return module.compile_gemm(
+        **common,
+        BLOCK_TILE_SIZE_N=512,
+        down_physical_n512=True,
+        down_paired_row_major=True,
     )
 
 
@@ -85,14 +98,21 @@ def main():
     weight = (weight_fp16.float() / weight_scale).clamp(-fp8_max, fp8_max).to(FP8)
     shuffled_weight = shuffle_weight(weight, layout=(16, 16))
 
-    sorted_ids = torch.arange(BATCH, dtype=torch.int32, device="cuda")
-    sorted_weights = torch.linspace(
+    allocated_rows = 128
+    sorted_ids = torch.zeros(allocated_rows, dtype=torch.int32, device="cuda")
+    sorted_ids[:BATCH] = torch.arange(BATCH, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.zeros(
+        allocated_rows, dtype=torch.float32, device="cuda"
+    )
+    sorted_weights[:BATCH] = torch.linspace(
         0.25, 1.0, BATCH, dtype=torch.float32, device="cuda"
     )
-    sorted_expert_ids = torch.zeros(1, dtype=torch.int32, device="cuda")
+    sorted_expert_ids = torch.zeros(2, dtype=torch.int32, device="cuda")
     num_valid_ids = torch.tensor([BATCH, BATCH], dtype=torch.int32, device="cuda")
     outputs = {
-        name: torch.full((BATCH, N), torch.nan, dtype=torch.bfloat16, device="cuda")
+        name: torch.full(
+            (allocated_rows, N), torch.nan, dtype=torch.bfloat16, device="cuda"
+        )
         for name in ("reference", "candidate")
     }
     launches = {
@@ -113,7 +133,7 @@ def main():
             ptr(weight_scale),
             ptr(activation_scale),
             BATCH,
-            1,
+            2,
             stream,
         )
     torch.cuda.synchronize()
@@ -133,13 +153,15 @@ def main():
     expected = (activation.float() * activation_scale) @ (
         weight[0].float() * weight_scale
     ).T
-    expected = (expected * sorted_weights[:, None]).to(torch.bfloat16)
-    rel_l2 = relative_l2(outputs["candidate"], expected)
-    if not torch.isfinite(outputs["candidate"]).all():
+    expected = (expected * sorted_weights[:BATCH, None]).to(torch.bfloat16)
+    rel_l2 = relative_l2(outputs["candidate"][:BATCH], expected[:BATCH])
+    if not torch.isfinite(outputs["candidate"][:BATCH]).all():
         raise AssertionError("candidate output contains non-finite values")
+    if not torch.all(outputs["candidate"][BATCH:] == 0):
+        raise AssertionError("candidate did not zero the padded M64 half")
     if rel_l2 >= 3e-2:
         raise AssertionError(f"rel_l2={rel_l2}")
-    print(f"N={N} blocks={N // 512} physical_bit_equal=True " f"rel_l2={rel_l2:.8f}")
+    print(f"N={N} blocks={N // 256} physical_bit_equal=True " f"rel_l2={rel_l2:.8f}")
 
 
 if __name__ == "__main__":

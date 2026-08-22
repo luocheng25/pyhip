@@ -3,6 +3,7 @@
 
 import argparse
 import importlib.util
+import inspect
 from pathlib import Path
 
 import torch
@@ -40,14 +41,52 @@ def ptr(tensor):
     return flyc.from_c_void_p(_TORCH_TO_FX[tensor.dtype], tensor.data_ptr())
 
 
+def compile_down(module, common, path):
+    if "down_path" in inspect.signature(module.compile_gemm).parameters:
+        if path == "single_n512":
+            return module.compile_gemm(
+                **common,
+                BLOCK_TILE_SIZE_N=512,
+                down_path="true8_hy3",
+            )
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=256,
+            down_path="physical_n256",
+            down_m_groups=2 if path == "paired" else 1,
+            metadata_m_groups=2 if path == "paired" else 1,
+        )
+    if path == "single_n512":
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+            down_paired_row_major=True,
+            down_single_m_n512=True,
+        )
+    if path == "paired":
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+            down_paired_row_major=True,
+            expanded_m64_tasks=True,
+        )
+    return module.compile_gemm(
+        **common,
+        BLOCK_TILE_SIZE_N=256,
+        down_physical_n256=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", type=Path, default=DEFAULT_MODULE)
     parser.add_argument("--dispatches", type=int, default=6)
     parser.add_argument(
         "--path",
-        choices=("physical4", "unified8", "single_n512"),
-        default="unified8",
+        choices=("physical4", "paired", "single_n512"),
+        default="paired",
     )
     parser.add_argument("--k", type=int, choices=(192, 384), default=384)
     parser.add_argument("--exact-valid-grid", action="store_true")
@@ -55,6 +94,8 @@ def main():
     k = args.k
     if args.dispatches < 5:
         parser.error("--dispatches must be at least 5 for the checked-in ATT YAML")
+    if args.path == "single_n512" and k != 192:
+        parser.error("single_n512 is the exact Hy3 K192 path")
 
     module = load_module(args.module)
     torch.manual_seed(20260817)
@@ -65,20 +106,28 @@ def main():
         .reshape(BATCH, TOPK)
     )
     topk_weights = torch.ones(BATCH, TOPK, dtype=torch.float32, device="cuda")
+    paired_metadata = args.path == "paired"
+    sorting_block_m = 2 * BLOCK_M if paired_metadata else BLOCK_M
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids,
         topk_weights,
         EXPERTS,
         N,
         torch.bfloat16,
-        BLOCK_M,
+        sorting_block_m,
         None,
         None,
         0,
     )
+    if paired_metadata:
+        sorted_expert_ids = sorted_expert_ids.repeat_interleave(2)
     grid = sorted_expert_ids.shape[0]
     padded_rows = int(num_valid_ids[0].item())
-    task_num = padded_rows // BLOCK_M if args.exact_valid_grid else grid
+    task_num = (
+        ((padded_rows + BLOCK_M - 1) // BLOCK_M)
+        if args.exact_valid_grid
+        else grid
+    )
     activation = torch.ones(BATCH, TOPK, k, dtype=FP8, device="cuda")
     weight = shuffle_weight(
         torch.ones(EXPERTS, N, k, dtype=FP8, device="cuda"), layout=(16, 16)
@@ -100,26 +149,7 @@ def main():
         USE_ATOMIC_WRITE=False,
         down_output_padding_bytes=0,
     )
-    if args.path == "single_n512":
-        launch = module.compile_gemm(
-            **common,
-            BLOCK_TILE_SIZE_N=512,
-            down_physical_n512=True,
-            down_paired_row_major=True,
-            down_single_m_n512=True,
-        )
-    elif args.path == "unified8":
-        launch = module.compile_gemm(
-            **common,
-            BLOCK_TILE_SIZE_N=512,
-            down_physical_n512=True,
-        )
-    else:
-        launch = module.compile_gemm(
-            **common,
-            BLOCK_TILE_SIZE_N=256,
-            down_physical_n256=True,
-        )
+    launch = compile_down(module, common, args.path)
     stream = torch.cuda.current_stream()
     for _ in range(args.dispatches):
         launch(

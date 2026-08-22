@@ -5,7 +5,7 @@ DUMP_DOWN = int(os.getenv("DUMP_DOWN", "0"))
 
 import torch
 import pytest
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import pyhip
 from pyhip import cudaPerf, torchPerf, calc_diff, div_up
@@ -298,26 +298,84 @@ def _select_fly_down_single_m_layout(
     )
 
 
-def _select_fly_down_nsplit_layout(
+class _FlyDownPlan(NamedTuple):
+    path: str
+    m_groups: int
+    metadata_m_groups: int
+    padding_bytes: Optional[int]
+
+
+def _select_fly_down_plan(
     weight_type,
     quant_type,
     block_m,
     n,
     k,
+    topk,
+    experts,
+    batch_size,
     act_quant_type=None,
 ):
     if act_quant_type is None:
         act_quant_type = quant_type
-    nsplit_setting = os.getenv("MOE_DOWN_NSPLIT_N512", "auto").lower()
-    assert nsplit_setting in ("0", "1", "auto")
-    supported = (
-        _supports_fly_down_quant(weight_type, quant_type, act_quant_type)
-        and block_m == 64
-        and n % 512 == 0
-        and k % 64 == 0
-        and 64 <= k <= 512
+    paired = batch_size > 32 and _select_fly_down_paired_layout(
+        weight_type,
+        quant_type,
+        block_m,
+        n,
+        k,
+        topk,
+        experts,
+        act_quant_type,
     )
-    return supported and nsplit_setting == "1"
+    true8 = (
+        not paired
+        and batch_size > 32
+        and _select_fly_down_single_m_layout(
+            weight_type,
+            quant_type,
+            block_m,
+            n,
+            k,
+            topk,
+            experts,
+            act_quant_type,
+        )
+    )
+    physical = (
+        batch_size > 32
+        and not paired
+        and not true8
+        and _select_fly_down_layout(
+            weight_type,
+            quant_type,
+            block_m,
+            n,
+            k,
+            act_quant_type,
+        )
+    )
+    path = "true8_hy3" if true8 else "physical_n256" if paired or physical else "legacy"
+    m_groups = 2 if paired else 1
+    padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
+    padding_bytes = (
+        int(padding_env)
+        if padding_env is not None
+        else 0
+        if paired or true8
+        else _select_fly_down_padding_bytes(
+            quant_type,
+            n,
+            k,
+            physical,
+            topk,
+            experts,
+        )
+    )
+    if padding_bytes is not None:
+        assert path != "legacy"
+        assert padding_bytes in (0, 32, 64, 128)
+    return _FlyDownPlan(path, m_groups, m_groups, padding_bytes)
 
 
 def _select_fly_gateup_layout(use_prefill, n, requested_tile_n):
@@ -584,36 +642,84 @@ def test_select_fly_down_n512_paired_precedence(monkeypatch):
     assert not single
 
 
-def test_select_fly_down_nsplit_layout(monkeypatch):
-    monkeypatch.delenv("MOE_DOWN_NSPLIT_N512", raising=False)
-    assert not _select_fly_down_nsplit_layout(
-        torch.float8_e4m3fnuz, "ptpc", 64, 6144, 256, "ptpc"
-    )
-    monkeypatch.setenv("MOE_DOWN_NSPLIT_N512", "1")
-    assert _select_fly_down_nsplit_layout(
-        torch.float8_e4m3fnuz, "ptpc", 64, 6144, 256, "ptpc"
-    )
-    assert not _select_fly_down_nsplit_layout(
-        torch.float8_e4m3fnuz, "ptpc", 32, 6144, 256, "ptpc"
+@pytest.mark.parametrize(
+    (
+        "quant_type",
+        "n",
+        "k",
+        "topk",
+        "experts",
+        "expected",
+    ),
+    [
+        ("ptpc", 4096, 512, 10, 512, _FlyDownPlan("legacy", 1, 1, None)),
+        ("ptpc", 6144, 256, 8, 384, _FlyDownPlan("physical_n256", 1, 1, 128)),
+        ("ptpc", 6144, 384, 4, 128, _FlyDownPlan("physical_n256", 2, 2, 0)),
+        ("per_tensor", 4096, 192, 9, 193, _FlyDownPlan("true8_hy3", 1, 1, 0)),
+    ],
+)
+def test_select_fly_down_plan(
+    monkeypatch,
+    quant_type,
+    n,
+    k,
+    topk,
+    experts,
+    expected,
+):
+    monkeypatch.delenv("MOE_DOWN_PHYSICAL_N256", raising=False)
+    monkeypatch.delenv("MOE_DOWN_PAIRED_N512", raising=False)
+    monkeypatch.delenv("MOE_DOWN_SINGLE_M_N512", raising=False)
+    monkeypatch.delenv("MOE_DOWN_OUTPUT_PADDING_BYTES", raising=False)
+    assert (
+        _select_fly_down_plan(
+            torch.float8_e4m3fnuz,
+            quant_type,
+            64,
+            n,
+            k,
+            topk,
+            experts,
+            32768,
+            quant_type,
+        )
+        == expected
     )
 
 
-def test_acc_fly_nsplit_sparse_xiaomi(monkeypatch):
-    monkeypatch.setenv("MOE_DOWN_NSPLIT_N512", "1")
-    entry_common(
-        "fly_splitk_2s",
-        batch=[33],
-        prec=[get_fp8type()],
-        TILE_M=64,
-        TILE_N=256,
-        HIDDEN_SIZE=6144,
-        INTER_SIZE=256 * 8,
-        TOPK=8,
-        E=384,
-        TP=8,
-        run_count=0,
-        quant_type="ptpc",
+def test_select_fly_down_plan_paired_force_precedes_true8(monkeypatch):
+    monkeypatch.setenv("MOE_DOWN_PAIRED_N512", "1")
+    monkeypatch.delenv("MOE_DOWN_SINGLE_M_N512", raising=False)
+    plan = _select_fly_down_plan(
+        torch.float8_e4m3fnuz,
+        "per_tensor",
+        64,
+        4096,
+        192,
+        9,
+        193,
+        32768,
+        "per_tensor",
     )
+    assert plan == _FlyDownPlan("physical_n256", 2, 2, 0)
+
+
+def test_select_fly_down_plan_small_batch_uses_legacy(monkeypatch):
+    monkeypatch.delenv("MOE_DOWN_PHYSICAL_N256", raising=False)
+    monkeypatch.delenv("MOE_DOWN_PAIRED_N512", raising=False)
+    monkeypatch.delenv("MOE_DOWN_SINGLE_M_N512", raising=False)
+    plan = _select_fly_down_plan(
+        torch.float8_e4m3fnuz,
+        "ptpc",
+        64,
+        6144,
+        256,
+        8,
+        384,
+        32,
+        "ptpc",
+    )
+    assert plan == _FlyDownPlan("legacy", 1, 1, None)
 
 
 def quant_expert_weights(w1, quant_type, dtype):
@@ -895,79 +1001,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            down_physical_n256 = _select_fly_down_layout(
+            down_plan = _select_fly_down_plan(
                 weight_type,
                 quant_type,
                 TILE_M,
                 N2,
                 K2,
+                TOPK,
+                E,
+                B,
                 quant_type,
             )
-            down_nsplit_n512 = B > 32 and _select_fly_down_nsplit_layout(
-                weight_type,
-                quant_type,
-                TILE_M,
-                N2,
-                K2,
-                quant_type,
-            )
-            down_paired_n512 = (
-                not down_nsplit_n512
-                and B > 32
-                and _select_fly_down_paired_layout(
-                    weight_type,
-                    quant_type,
-                    TILE_M,
-                    N2,
-                    K2,
-                    TOPK,
-                    E,
-                    quant_type,
-                )
-            )
-            down_single_m_n512 = (
-                not down_nsplit_n512
-                and not down_paired_n512
-                and B > 32
-                and _select_fly_down_single_m_layout(
-                    weight_type,
-                    quant_type,
-                    TILE_M,
-                    N2,
-                    K2,
-                    TOPK,
-                    E,
-                    quant_type,
-                )
-            )
-            down_n512 = (
-                down_nsplit_n512 or down_paired_n512 or down_single_m_n512
-            )
-            if down_n512:
-                down_physical_n256 = False
-            down_padding_env = os.getenv("MOE_DOWN_OUTPUT_PADDING_BYTES")
-            down_output_padding_bytes = (
-                int(down_padding_env)
-                if down_padding_env is not None
-                else (
-                    0
-                    if down_n512
-                    else _select_fly_down_padding_bytes(
-                        quant_type,
-                        N2,
-                        K2,
-                        down_physical_n256,
-                        TOPK,
-                        E,
-                    )
-                )
-            )
-            if down_output_padding_bytes is not None:
-                assert down_physical_n256 or down_n512
-                assert down_output_padding_bytes in (0, 32, 64, 128)
-            if down_physical_n256:
-                assert down_physical_n256
-                assert down_output_padding_bytes in (0, 32, 64, 128)
 
             def flydsl_quant_fp8_per_tensor(x, quant_dtype):
                 amax = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -1028,9 +1072,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
-                sorting_block_m = (
-                    128 if down_paired_n512 or down_nsplit_n512 else TILE_M
-                )
+                sorting_block_m = TILE_M * down_plan.metadata_m_groups
                 sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                     topk_ids,
                     topk_weight,
@@ -1042,7 +1084,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     None,
                     0,
                 )
-                if down_paired_n512 or down_nsplit_n512:
+                if down_plan.metadata_m_groups == 2:
                     sorted_expert_ids = sorted_expert_ids.repeat_interleave(2)
                 if 0:
                     _num_valid_tokens = num_valid_ids[0].cpu().item()
@@ -1066,7 +1108,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tile_n), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
-                    ('expanded_m64_tasks', down_paired_n512 or down_nsplit_n512),
+                    ('metadata_m_groups', down_plan.metadata_m_groups),
                 )
                 if activation == 'swiglu':
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
@@ -1117,8 +1159,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         gemm2_out = cur_out
                     else:
                         gemm2_row_size = N2 + (
-                            down_output_padding_bytes // hidden_states.element_size()
-                            if down_output_padding_bytes is not None
+                            down_plan.padding_bytes // hidden_states.element_size()
+                            if down_plan.padding_bytes is not None
                             else 0
                         )
                         gemm2_out = torch.empty(
@@ -1141,20 +1183,19 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                     down_tile_n = (
                         512
-                        if down_n512
-                        else 256 if down_physical_n256 else TILE_N
+                        if down_plan.path == "true8_hy3"
+                        else 256
+                        if down_plan.path == "physical_n256"
+                        else TILE_N
                     )
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', down_alg), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type),
-                        ('down_physical_n256', down_physical_n256),
-                        ('down_physical_n512', down_n512),
-                        ('down_paired_row_major', down_n512),
-                        ('down_single_m_n512', down_single_m_n512),
-                        ('down_nsplit_n512', down_nsplit_n512),
-                        ('expanded_m64_tasks', down_paired_n512 or down_nsplit_n512),
-                        ('down_output_padding_bytes', down_output_padding_bytes),
+                        ('down_path', down_plan.path),
+                        ('down_m_groups', down_plan.m_groups),
+                        ('metadata_m_groups', down_plan.metadata_m_groups),
+                        ('down_output_padding_bytes', down_plan.padding_bytes),
                     )
                     if down_alg == "prefill_1x4":
                         #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)
@@ -1216,7 +1257,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         _moe_sorted_sum(
                             TOPK,
                             N2,
-                            down_output_padding_bytes,
+                            down_plan.padding_bytes,
                         )(loc_ids, gemm2_out, cur_out, B)
 
                         """

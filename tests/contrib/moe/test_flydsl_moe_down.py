@@ -45,10 +45,8 @@ def _check_down_prefill_n512(
     valid_rows,
     weight_quant_type,
     act_quant_type,
-    mode,
 ):
-    """统一验证M128 paired、普通N-split与双M64 persistent的metadata和写回边界。"""
-    assert mode in ("paired", "nsplit", "persistent")
+    """验证M128 paired路径的metadata和写回边界。"""
     torch.manual_seed(41)
     allocated_rows = 256
     fp8_dtype = torch.float8_e4m3fnuz
@@ -115,7 +113,6 @@ def _check_down_prefill_n512(
         device="cuda",
     )
 
-    down_nsplit_n512 = mode in ("nsplit", "persistent")
     launch = compile_gemm(
         N=hidden_size,
         K=intermediate_size,
@@ -124,15 +121,14 @@ def _check_down_prefill_n512(
         act_quant_type=act_quant_type,
         TOPK=topk,
         BLOCK_TILE_SIZE_M=64,
-        BLOCK_TILE_SIZE_N=512,
+        BLOCK_TILE_SIZE_N=256,
         stage="down",
         alg="prefill_1x4",
         E=experts,
         USE_ATOMIC_WRITE=False,
-        down_physical_n512=True,
-        down_paired_row_major=True,
-        down_nsplit_n512=down_nsplit_n512,
-        expanded_m64_tasks=True,
+        down_path="physical_n256",
+        down_m_groups=2,
+        metadata_m_groups=2,
         down_output_padding_bytes=0,
     )
     launch(
@@ -169,11 +165,7 @@ def _check_down_prefill_n512(
     assert torch.isfinite(logical_output).all()
     assert _relative_l2(logical_output, expected) < 3e-2
 
-    active_rows = (
-        ((valid_rows + 127) // 128) * 128
-        if mode in ("paired", "persistent")
-        else ((valid_rows + 63) // 64) * 64
-    )
+    active_rows = ((valid_rows + 127) // 128) * 128
     assert torch.all(physical_output[valid_rows:active_rows] == 0)
     assert torch.equal(
         physical_output[active_rows:],
@@ -191,7 +183,7 @@ def test_absmax_reuse_clears_output():
         assert amax.item() == value
 
 
-def test_gateup_splitk_expanded_m64_tasks():
+def test_gateup_splitk_metadata_m_groups():
     torch.manual_seed(47)
     batch_size = 2
     topk = 1
@@ -236,7 +228,7 @@ def test_gateup_splitk_expanded_m64_tasks():
         alg="splitk",
         E=num_experts,
         USE_ATOMIC_WRITE=False,
-        expanded_m64_tasks=True,
+        metadata_m_groups=2,
     )
     launch(
         _ptr(activation),
@@ -348,6 +340,26 @@ def test_down_prefill_1x4_fp8_ptpc(hidden_size):
     assert _relative_l2(output, expected) < 3e-2, block_errors
 
 
+def test_down_physical_n256_requires_m64():
+    with pytest.raises(AssertionError):
+        compile_gemm(
+            N=256,
+            K=128,
+            weight_dtype="fp8",
+            weight_quant_type="ptpc",
+            act_quant_type="ptpc",
+            TOPK=1,
+            BLOCK_TILE_SIZE_M=128,
+            BLOCK_TILE_SIZE_N=256,
+            stage="down",
+            alg="prefill_1x4",
+            E=1,
+            USE_ATOMIC_WRITE=False,
+            down_path="physical_n256",
+            down_output_padding_bytes=0,
+        )
+
+
 @pytest.mark.parametrize(
     "padding_bytes",
     [0, 32, 64, 128],
@@ -412,7 +424,7 @@ def test_down_prefill_physical_cshuffle_sorted_sum(padding_bytes):
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n256=True,
+        down_path="physical_n256",
         down_output_padding_bytes=padding_bytes,
     )
     launch(
@@ -534,13 +546,14 @@ def test_down_prefill_paired_row_major_sorted_sum(
         act_quant_type=act_quant_type,
         TOPK=1,
         BLOCK_TILE_SIZE_M=64,
-        BLOCK_TILE_SIZE_N=512,
+        BLOCK_TILE_SIZE_N=256,
         stage="down",
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n512=True,
-        down_paired_row_major=True,
+        down_path="physical_n256",
+        down_m_groups=2,
+        metadata_m_groups=2,
         down_output_padding_bytes=0,
     )
     launch(
@@ -577,23 +590,7 @@ def test_down_prefill_paired_row_major_sorted_sum(
     )
 
 
-@pytest.mark.parametrize("intermediate_size", [64, 192, 384, 512])
-def test_down_prefill_nsplit_n512_k_matrix(intermediate_size):
-    _check_down_prefill_n512(
-        hidden_size=512,
-        intermediate_size=intermediate_size,
-        topk=1,
-        experts=1,
-        batch_size=93,
-        valid_rows=93,
-        weight_quant_type="ptpc",
-        act_quant_type="ptpc",
-        mode="nsplit",
-    )
-
-
-@pytest.mark.parametrize("mode", ["paired", "nsplit"])
-def test_down_prefill_short_h3_task_mapping(mode):
+def test_down_prefill_short_h3_task_mapping():
     _check_down_prefill_n512(
         hidden_size=4096,
         intermediate_size=384,
@@ -603,21 +600,19 @@ def test_down_prefill_short_h3_task_mapping(mode):
         valid_rows=18,
         weight_quant_type="per_tensor",
         act_quant_type="per_tensor",
-        mode=mode,
     )
 
 
-def test_down_prefill_xiaomi_persistent_n512():
+def test_down_prefill_h3_xcc_short_valid_prefix():
     _check_down_prefill_n512(
-        hidden_size=6144,
-        intermediate_size=256,
-        topk=8,
-        experts=384,
-        batch_size=64,
-        valid_rows=93,
-        weight_quant_type="ptpc",
-        act_quant_type="ptpc",
-        mode="persistent",
+        hidden_size=4096,
+        intermediate_size=384,
+        topk=9,
+        experts=193,
+        batch_size=32768,
+        valid_rows=18,
+        weight_quant_type="per_tensor",
+        act_quant_type="per_tensor",
     )
 
 
@@ -688,7 +683,7 @@ def test_down_prefill_single_m_n512_hy3():
         alg="prefill_1x4",
         E=193,
         USE_ATOMIC_WRITE=False,
-        down_physical_n256=True,
+        down_path="physical_n256",
         down_output_padding_bytes=0,
     )
     control(
@@ -719,9 +714,7 @@ def test_down_prefill_single_m_n512_hy3():
         alg="prefill_1x4",
         E=193,
         USE_ATOMIC_WRITE=False,
-        down_physical_n512=True,
-        down_paired_row_major=True,
-        down_single_m_n512=True,
+        down_path="true8_hy3",
         down_output_padding_bytes=0,
     )
     launch(
@@ -823,7 +816,7 @@ def test_down_prefill_physical_per_tensor_cshuffle(intermediate_size, act_quant_
         alg="prefill_1x4",
         E=1,
         USE_ATOMIC_WRITE=False,
-        down_physical_n256=True,
+        down_path="physical_n256",
         down_output_padding_bytes=0,
     )
     launch(

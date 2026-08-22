@@ -3,24 +3,24 @@
 ## 当前快照
 
 - 分支：`luocheng/hy3-single-n512-handoff`
-- HEAD：`9049ddb723a1428d8dfb4c75e352d9b65bc9db56`
+- HEAD基线：`de7887be185cd7acbf4b45c938d295e91eab49b7`
 - 历史范围：`a6a1632`（含）至`9049ddb`（含），共42个线性commit
-- 当前工作树：包含六入口公共pipeline重构、N-split/persistent修复与测试，以及未提交的`docs/UNIFIED8_DOWN_TODO.md`
+- 当前工作树：已从`de7887b`六入口实现收敛为P0、P12、P3三条路径。
 - 平台：MI308X / gfx942 / 80 CU / wave64，ROCm 7.2
 - 正式性能态：1800MHz determinism，PTL `Enabled / VECTOR,F8`，10 rotating buffers，24轮ABBA
 
-当前最优先事项是验证K512 P4 N-split的CShuffle容量门禁：代码按双M activation预算排除了一个理论51,200B的单M候选。第二优先级是完成Hy3 role-priority候选的clean ABBA24与fresh ATT；H3 PTPC保留late-scale paired auto，四算法报告里的旧`a452743` P2不能用于关闭当前selector。
+当前实现：P0保持不动；P1/P2已合并为P12 physical N256；P3已抽为exact Hy3 true8独立主循环；P4/P5及`MOE_DOWN_NSPLIT_N512`已删除。
 
 ## 阅读顺序
 
 1. [优化经验与当前Handoff](OPTIMIZATION_LESSONS_AND_HANDOFF.md)
-   - 先读。按重要性归纳可复用经验，给出当前六入口、shape选择矩阵、已知风险和下一步。
+   - 先读。按重要性归纳可复用经验，给出三路径实现、shape选择矩阵、资源门禁和后续验证。
 2. [重构性能报告](REFACTOR_PERFORMANCE_REPORT.md)
-   - 核对当前未提交重构在P1-P5代表case上是否保持性能，以及Qwen K512 scale竞争修复的收益；P0未单独计时。
+   - 核对`de7887b`重构在P1-P5代表case上是否保持性能，以及Qwen K512 scale竞争修复的收益；P0未单独计时。
 3. [ATT与Stall分析方法](STALL_ANALYSIS_GUIDE.md)
    - 采集或解释trace前读。固定successful issue、`pc_index`、physical SIMD union和owner账本口径。
 4. [42提交编年史](COMMIT_CHRONICLE.md)
-   - 查询某个方案何时尝试、结果数字、为何保留或拒绝；末节另列当前未提交工作。
+   - 查询某个方案何时尝试、结果数字、为何保留或拒绝；末节另列历史范围之后的`de7887b`集成检查点。
 
 ## 文档职责
 
@@ -45,7 +45,7 @@
 
 不得跨量化推广。例如最新H3 clean复测是PTPC，不能直接推翻历史H3 per-tensor paired结论；应分别复测和选择。
 
-## 当前算法速查
+## `de7887b`历史六路径
 
 | 路径 | 入口 | 结构 | 当前用途 |
 | --- | --- | --- | --- |
@@ -56,17 +56,36 @@
 | P4 N-split | `moe_2stage_down_prefill_1x8` | 两个4-wave N256组，共享M64 | forced实验；默认auto关闭 |
 | P5 persistent | `moe_2stage_down_prefill_1x8_persistent` | P4串行两个M64 | Xiaomi实验；未胜过P1 |
 
+## 当前三路径速查
+
+| 目标路径 | 来源 | 生产case | 处理方式 |
+| --- | --- | --- | --- |
+| P0 legacy | P0 | Qwen、通用fallback | `moe_2stage_down_prefill_1x4`文本哈希保持`a6ac0289...`。 |
+| P12 physical N256 | P1 + P2 | Xiaomi使用`m_groups=1`；H3使用`m_groups=2` | 唯一`_moe_2stage_down_prefill_physical_n256`主循环；入口线程数为`256*m_groups`。 |
+| P3 true8 Hy3 | P3 | exact Hy3 K192 | 独立`_moe_2stage_down_prefill_true8_hy3`主循环。 |
+| 已删除 | P4 + P5 | 无 | selector、环境变量、kernel和专用状态均移除；历史JSON保留。 |
+
+公共编译API为：
+
+```text
+down_path = legacy | physical_n256 | true8_hy3
+down_m_groups = 1 | 2
+metadata_m_groups = 1 | 2
+```
+
+host由四字段`_FlyDownPlan(path, m_groups, metadata_m_groups, padding_bytes)`一次决定路径、任务展开和padding；output allocation与`sorted_sum`共用该plan。task map、output schedule和scale schedule由P12内部根据受限shape/量化唯一派生，不暴露为公共参数。
+
 ## 当前必须保留的边界
 
 - 原legacy `moe_2stage_down_prefill_1x4`保持与`e6fe8e934859...`一致。
-- 新入口不调用`fxh`；共享逻辑留在本地device helper中。
-- `expanded_m64_tasks`必须在gateup、down和split-k之间保持同一metadata/grid契约。
-- N-split的两个N256 subgroup必须使用隔离的PTPC scale LDS。
-- `MOE_DOWN_NSPLIT_N512=auto`保持forced-only，不因Qwen局部修复改成默认。
+- P12与P3复用`fxh`中的`all_elements/all_copy_atoms/view/atom_tensor/eltwise_op/FlyObjCache`等叶子helper，不共享task map、K-loop、barrier或epilogue状态。仅`_down_copy_threads`因`fxh`无等价实现而保留本地。
+- P12固定BM64/N256；P2要求`down_m_groups=metadata_m_groups=2`。
 - H3 PTPC四算法报告中的P2来自`a452743`；当前late-scale P2以`2b50372`的clean ABBA24为准，不能跨源码代际关闭auto。
-- K512 P4容量门禁必须按`paired_m_groups=1`计算；当前双M谓词高估activation LDS。
+- P4/P5删除后不再推进K512 P4容量候选；51,200B结论仅保留为历史证据。
 - accuracy必须显式拒绝NaN/Inf，不能让`diff=NaN`通过阈值比较。
 - 正式测试前核验idle与PTL，结束后恢复`auto / F16,BF16`。
+
+当前验证：完整down回归66项与selector/plan回归55项通过；新增BM64、小batch和H3短prefix门禁通过。fresh ISA资源为：P1 Xiaomi `208 VGPR/25KB LDS/0 scratch`，P2 K384 PTPC `256 VGPR/64KB/0 scratch`，P3 `128 VGPR/32KB/0 scratch`。规范化kernel符号后，P1/P2/P3 final ISA均与`de7887b`逐字一致；切换到`fxh`前后也逐字一致，哈希分别为`3b94b124...`/`b0e4b654...`/`e4e4fd6a...`。由于GPU显存被外部作业占78%，尚未执行正式10-buffer ABBA24。
 
 ## 相关历史资料
 

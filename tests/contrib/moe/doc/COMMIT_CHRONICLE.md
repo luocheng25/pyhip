@@ -2,7 +2,7 @@
 
 ## 范围与读法
 
-本文覆盖线性历史 `a6a1632a40d2b520261b0380d8d2896e671f6df3^..9049ddb723a1428d8dfb4c75e352d9b65bc9db56`，即从`a6a1632`（含）到当前分支HEAD（含）的42个commit；最后一节补充当前未提交工作，不把工作树内容伪装成commit。
+本文覆盖线性历史 `a6a1632a40d2b520261b0380d8d2896e671f6df3^..9049ddb723a1428d8dfb4c75e352d9b65bc9db56`，即从`a6a1632`（含）到`9049ddb`（含）的42个commit；最后一节补充该范围之后的`de7887b`集成检查点，不计入上述42个历史commit。
 
 状态含义：
 
@@ -70,9 +70,9 @@
 | `4abc3cb` record clean Hy3 retest | 独立clean 10-buffer ABBA24复现single-M。 | down ratio `0.909806`，combined `0.937691`，consumer `1.000015`。 | **验证**：收益来自down。 |
 | `9049ddb` tune Hy3 N512 | role priority：read/prefetch=1、MFMA=3、完整epilogue=0；slot分析扩展2/4 resident waves。 | clean ABBA4 down `0.975036`、combined `0.980920`；128 VGPR、32KB、0 scratch不变。ABBA24被外部作业idle gate拒绝。 | **当前HEAD候选**，相对516缺clean ABBA24正式晋升。 |
 
-## 当前未提交检查点（不属于上述42个commit）
+## `de7887b`集成检查点（不属于上述42个历史commit）
 
-当前工作树还包含以下未提交成果，必须与commit历史一起阅读：
+`de7887b`已经提交以下成果，必须与前述历史一起阅读：
 
 1. **M64xN512 N-split实验（59dd stash）**：两个独立4-wave N256组共享M64 activation，构成M64xN512；增加row-major/XCC映射、K192 immediate-store、K384 delayed CShuffle、K512 direct packed-store和Xiaomi双M64 persistent。
 2. **六个顶层入口重构**：legacy `_1x4`、`_N256_1x4`、`_2x4`、`_1x8_2`、`_1x8`、`_1x8_persistent`，共享本地copy/MMA/scale/epilogue/K-stage helper；新入口不调用`fxh`。
@@ -85,10 +85,23 @@
 9. **72-cell falsification限定dispatch-tail解释力**：平衡任务数使down ratio中位从`1.1280`改善到`1.0600`，但60个原回退cell仅11个翻转；dispatch-tail通常贡献约5个百分点，却不是短N rendezvous、输出转换和K512资源回退的唯一原因。
 10. **K512 P4 CShuffle被保守门禁误排除**：当前判定固定使用`2 * BM * K`的双M activation预算，但N-split运行时`paired_m_groups=1`。P4 K512实际估算为32KB A + 16KB CShuffle + 2KB双组PTPC scale = 51,200B，低于64KB；当前34,816B direct-store ISA不是容量下限。该row-major CShuffle候选尚未编译、验证或计时。
 
+## 三路径简化检查点（2026-08-22，尚未提交）
+
+基于上述证据，当前工作树完成结构收口：
+
+1. **P0不动**：`moe_2stage_down_prefill_1x4`的decorator+函数文本SHA256继续为`a6ac02899cfdb525a63b5bdd3f888f63134755565e1d85281a19615283bda260`。
+2. **P1/P2合并为P12**：唯一`_moe_2stage_down_prefill_physical_n256`主循环，`down_m_groups=1/2`派生256/512线程，设备N tile固定256。
+3. **P3独立**：`_moe_2stage_down_prefill_true8_hy3`独占task map、K-loop、loop state、priority和CShuffle；规范化final ISA与抽离前逐字一致。
+4. **P4/P5删除**：`MOE_DOWN_NSPLIT_N512`、selector、kernel入口、persistent second-M64、双group scale LDS和N-split状态机均移除；历史报告与JSON保留。
+5. **API收口**：生产编译参数改为`down_path/down_m_groups/metadata_m_groups`，host `_FlyDownPlan`一次决定path、metadata展开和padding。
+6. **门禁补强**：P12强制BM64；B<=32回退legacy；paired工具使用BM128 sorting；H3固定XCC映射仅在至少2316 valid pairs时启用，短prefix回退线性映射。
+7. **验证**：完整down回归66项、selector/plan回归55项；P1/P2/P3均0 private/scratch，规范化final ISA均与`de7887b`逐字一致。当前GPU约78% VRAM占用，正式10-buffer ABBA24待空闲环境。
+8. **共享helper收口**：删除重复`_down_all_elements/_down_all_copy_atoms/_down_view/_down_atom_tensor/_down_eltwise_op/_DownOps`等实现，改用`fxh`共享helper和独立`fxh.FlyObjCache`实例；仅保留无`fxh`等价项的`_down_copy_threads`。P1/P2/P3 final ISA逐字不变。
+
 ## 来源索引
 
 - [主README历史](../README.md)
-- [当前未提交8-wave TODO](../../../../docs/UNIFIED8_DOWN_TODO.md)
+- [8-wave实验TODO](../../../../docs/UNIFIED8_DOWN_TODO.md)
 - [Hy3 single-M handoff](../../../../docs/HY3_SINGLE_M_N512_HANDOFF_TODO.md)
 - [8-wave PA中间上下文](../../../../docs/UNIFIED8_PA_INTERMEDIATE_CONTEXT.md)
 - [四算法clean复测](../results/down_variants_20260821_retest/REPORT.md)

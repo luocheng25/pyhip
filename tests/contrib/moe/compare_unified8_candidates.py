@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import statistics
@@ -58,6 +59,43 @@ def sha256(path: Path):
     return digest.hexdigest()
 
 
+def _compile_down_path(module, common, path):
+    if "down_path" in inspect.signature(module.compile_gemm).parameters:
+        if path == "single_n512":
+            return module.compile_gemm(
+                **common,
+                BLOCK_TILE_SIZE_N=512,
+                down_path="true8_hy3",
+            )
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=256,
+            down_path="physical_n256",
+            down_m_groups=2 if path == "paired" else 1,
+            metadata_m_groups=2 if path == "paired" else 1,
+        )
+    if path == "single_n512":
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+            down_paired_row_major=True,
+            down_single_m_n512=True,
+        )
+    if path == "paired":
+        return module.compile_gemm(
+            **common,
+            BLOCK_TILE_SIZE_N=512,
+            down_physical_n512=True,
+            down_paired_row_major=True,
+        )
+    return module.compile_gemm(
+        **common,
+        BLOCK_TILE_SIZE_N=256,
+        down_physical_n256=True,
+    )
+
+
 def summarize(values):
     q1, _, q3 = statistics.quantiles(values, n=4)
     return {
@@ -91,13 +129,13 @@ def parse_args():
     parser.add_argument("--candidate", type=Path, default=DEFAULT_MODULE)
     parser.add_argument(
         "--control-path",
-        choices=("physical4", "unified8", "single_n512"),
-        default="unified8",
+        choices=("physical4", "paired", "single_n512"),
+        default="paired",
     )
     parser.add_argument(
         "--candidate-path",
-        choices=("physical4", "unified8", "single_n512"),
-        default="unified8",
+        choices=("physical4", "paired", "single_n512"),
+        default="paired",
     )
     parser.add_argument("--k", type=int, choices=(192, 384), default=384)
     parser.add_argument("--candidate-packed-direct", action="store_true")
@@ -112,6 +150,13 @@ def parse_args():
     args = parser.parse_args()
     if args.rounds < 2:
         parser.error("--rounds must be at least 2")
+    if args.k != 192 and "single_n512" in (
+        args.control_path,
+        args.candidate_path,
+    ):
+        parser.error("single_n512 is the exact Hy3 K192 path")
+    if (args.control_path == "paired") != (args.candidate_path == "paired"):
+        parser.error("paired comparisons require paired metadata on both paths")
     row_major_paths = {"physical4", "single_n512"}
     if not args.skip_correctness and (
         args.control_path != args.candidate_path
@@ -192,20 +237,30 @@ def run(args):
         topk_weights = torch.linspace(
             0.5, 1.0, useful_rows, dtype=torch.float32, device="cuda"
         ).reshape(BATCH, TOPK)
+        paired_metadata = (
+            args.control_path == "paired" and args.candidate_path == "paired"
+        )
+        sorting_block_m = 2 * BLOCK_M if paired_metadata else BLOCK_M
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
             topk_ids,
             topk_weights,
             EXPERTS,
             HIDDEN,
             torch.bfloat16,
-            BLOCK_M,
+            sorting_block_m,
             None,
             None,
             0,
         )
+        if paired_metadata:
+            sorted_expert_ids = sorted_expert_ids.repeat_interleave(2)
         grid = sorted_expert_ids.shape[0]
         padded_rows = int(num_valid_ids[0].item())
-        down_grid = padded_rows // BLOCK_M if args.exact_valid_grid else grid
+        down_grid = (
+            ((padded_rows + BLOCK_M - 1) // BLOCK_M)
+            if args.exact_valid_grid
+            else grid
+        )
         allocated_rows = grid * BLOCK_M
         loc_ids = torch.zeros(BATCH, TOPK, dtype=torch.int32, device="cuda")
         control.invert_sorted_ids(TOPK)(
@@ -293,25 +348,7 @@ def run(args):
         }
 
         def compile_down(label):
-            if paths[label] == "single_n512":
-                return modules[label].compile_gemm(
-                    **common,
-                    BLOCK_TILE_SIZE_N=512,
-                    down_physical_n512=True,
-                    down_paired_row_major=True,
-                    down_single_m_n512=True,
-                )
-            if paths[label] == "unified8":
-                return modules[label].compile_gemm(
-                    **common,
-                    BLOCK_TILE_SIZE_N=512,
-                    down_physical_n512=True,
-                )
-            return modules[label].compile_gemm(
-                **common,
-                BLOCK_TILE_SIZE_N=256,
-                down_physical_n256=True,
-            )
+            return _compile_down_path(modules[label], common, paths[label])
 
         down_launch = {label: compile_down(label) for label in labels}
         sum_launch = {

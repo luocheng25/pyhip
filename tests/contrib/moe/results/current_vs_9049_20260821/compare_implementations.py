@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Historical P4-vs-9049 harness; P4 was removed from the production API."""
 import argparse
 import builtins
 import json

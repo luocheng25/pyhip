@@ -44,6 +44,10 @@ Qwen性能测试显式设置`down_nsplit_n512=True`。生产默认`MOE_DOWN_NSPL
 
 ## 4. N-split按K特化
 
+> 简化决策（2026-08-22）：本节记录的是P4 N-split内部的历史特化，不是后续生产计划。
+> 目标架构删除P4与P5；P0保持不动，P1/P2合并为physical N256路径，P3保持独立。
+> 下列K192/K384/K512结果继续用于解释删除依据，不再派生新的P4优化任务。
+
 三个版本均为512线程/8 waves，拆成两个独立4-wave组；两个组共享一个M64 activation，分别处理偶数/奇数N256块并合成M64xN512。
 
 | K / Case | K core | 同步与写回 | 资源 | 性能结论 |
@@ -115,4 +119,4 @@ K192采用最轻的barrier-free/immediate-store流水；K384进入同步、延�
 - `tool-qwen-final.sha256`
 - `compare_refactor_perf.py`（与`tool-qwen-final.sha256`匹配的最终harness快照）
 
-`tool-final.sha256`记录前六个代表case使用的早期harness哈希；该前驱脚本未保留，不能仅凭哈希重建。最终快照仍依赖报告中的旧源码路径，复跑前应重建9049与59dd control并更新本机路径。
+`tool-final.sha256`记录前六个代表case使用的早期harness哈希；该前驱脚本未保留，不能仅凭哈希重建。`compare_refactor_perf.py`及两个tool SHA均为`de7887b`之前的历史证据快照，必须保持字节不变；它仍使用已删除的P4/P5旧编译参数，不能对当前三路径API执行。复核历史结果时应重建9049与59dd control，并在独立历史worktree运行。
