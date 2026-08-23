@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 1600 1040" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Where the K384 2/3/3 speedup comes from</title>
+  <desc id="desc">The diagram compares the old 0/4/4 and new 2/3/3 epilogue distributions, then reconciles the speedup on the same four critical physical SIMDs.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .bg { fill: #f4f7fa; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .title { font: 700 30px 'DejaVu Sans', sans-serif; fill: #162033; }
+      .subtitle { font: 400 16px 'DejaVu Sans', sans-serif; fill: #526174; }
+      .panel-title { font: 700 21px 'DejaVu Sans', sans-serif; fill: #162033; }
+      .section { font: 700 16px 'DejaVu Sans', sans-serif; fill: #27364a; }
+      .body { font: 400 15px 'DejaVu Sans', sans-serif; fill: #344256; }
+      .small { font: 400 13px 'DejaVu Sans', sans-serif; fill: #526174; }
+      .mono { font: 600 14px 'DejaVu Sans Mono', monospace; fill: #25344a; }
+      .mono-small { font: 500 12px 'DejaVu Sans Mono', monospace; fill: #344256; }
+      .compute { fill: #287f70; stroke: #17695c; stroke-width: 1.5; }
+      .read { fill: #3976a8; stroke: #285d88; stroke-width: 1.5; }
+      .epi { fill: #e6ad3c; stroke: #b47c11; stroke-width: 1.5; }
+      .wait { fill: #d9695f; stroke: #aa433b; stroke-width: 1.5; }
+      .hidden { fill: #a8b4c2; stroke: #778596; stroke-width: 1.5; }
+      .vmem { fill: #d98a31; stroke: #a96318; stroke-width: 1.5; }
+      .other { fill: #6b9f67; stroke: #477843; stroke-width: 1.5; }
+      .neutral { fill: #edf1f5; stroke: #aeb9c6; stroke-width: 1.5; }
+      .good { fill: #dcefe8; stroke: #68a792; stroke-width: 1.5; }
+      .warn { fill: #fff0cf; stroke: #d2a042; stroke-width: 1.5; }
+      .axis { stroke: #94a3b8; stroke-width: 1.5; }
+      .grid { stroke: #dbe2ea; stroke-width: 1; stroke-dasharray: 5 5; }
+      .arrow { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 6 5; fill: none; }
+      .white { fill: #ffffff; }
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="1040"/>
+  <text class="title" x="48" y="48">K384 paired 8-wave: where the 2/3/3 speedup actually comes from</text>
+  <text class="subtitle" x="48" y="77">Matched critical path: same SE1/CU0 SIMD0-3, 14 waves per SIMD, 56 active waves per side</text>
+
+  <rect class="panel" x="40" y="106" width="815" height="555" rx="6"/>
+  <text class="panel-title" x="68" y="143">1. Move existing epilogue work; do not remove work</text>
+  <text class="small" x="68" y="169">Each N step still has 3 x 64 MFMA, 16 stores, and the same VMEM/DS instruction counts.</text>
+  <text class="section" x="68" y="214">Old split: 0 / 4 / 4 output vectors</text>
+  <text class="small" x="68" y="238">K0 reaches the barrier early; K1 and K2 carry the previous-N output conversion and stores.</text>
+
+  <text class="mono" x="70" y="275">K0</text>
+  <rect class="read" x="115" y="253" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="275">read</text>
+  <rect class="compute" x="228" y="253" width="178" height="34" rx="3"/>
+  <text class="small white" x="272" y="275">64 MFMA</text>
+  <rect class="wait" x="414" y="253" width="105" height="34" rx="3"/>
+  <text class="small white" x="433" y="275">barrier</text>
+  <text class="mono-small" x="534" y="275">0 vectors</text>
+
+  <text class="mono" x="70" y="320">K1</text>
+  <rect class="read" x="115" y="298" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="320">read</text>
+  <rect class="epi" x="228" y="298" width="188" height="34" rx="3"/>
+  <text class="small" x="261" y="320">4 vectors</text>
+  <rect class="compute" x="424" y="298" width="178" height="34" rx="3"/>
+  <text class="small white" x="468" y="320">64 MFMA</text>
+  <text class="mono-small" x="616" y="320">long read stage</text>
+
+  <text class="mono" x="70" y="365">K2</text>
+  <rect class="read" x="115" y="343" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="365">read</text>
+  <rect class="epi" x="228" y="343" width="188" height="34" rx="3"/>
+  <text class="small" x="261" y="365">4 vectors</text>
+  <rect class="compute" x="424" y="343" width="178" height="34" rx="3"/>
+  <text class="small white" x="468" y="365">64 MFMA</text>
+  <text class="mono-small" x="616" y="365">long read stage</text>
+
+  <path class="arrow" d="M 377 389 C 377 417, 319 419, 319 442"/>
+  <text class="small" x="397" y="414">move 2 vectors into K0 slack</text>
+  <text class="section" x="68" y="466">New split: 2 / 3 / 3 output vectors</text>
+
+  <text class="mono" x="70" y="507">K0</text>
+  <rect class="read" x="115" y="485" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="507">read</text>
+  <rect class="epi" x="228" y="485" width="94" height="34" rx="3"/>
+  <text class="small" x="243" y="507">2 vec</text>
+  <rect class="compute" x="330" y="485" width="178" height="34" rx="3"/>
+  <text class="small white" x="374" y="507">64 MFMA</text>
+
+  <text class="mono" x="70" y="552">K1</text>
+  <rect class="read" x="115" y="530" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="552">read</text>
+  <rect class="epi" x="228" y="530" width="141" height="34" rx="3"/>
+  <text class="small" x="265" y="552">3 vectors</text>
+  <rect class="compute" x="377" y="530" width="178" height="34" rx="3"/>
+  <text class="small white" x="421" y="552">64 MFMA</text>
+
+  <text class="mono" x="70" y="597">K2</text>
+  <rect class="read" x="115" y="575" width="105" height="34" rx="3"/>
+  <text class="small white" x="139" y="597">read</text>
+  <rect class="epi" x="228" y="575" width="141" height="34" rx="3"/>
+  <text class="small" x="265" y="597">3 vectors</text>
+  <rect class="compute" x="377" y="575" width="178" height="34" rx="3"/>
+  <text class="small white" x="421" y="597">64 MFMA</text>
+
+  <rect class="good" x="585" y="482" width="238" height="129" rx="5"/>
+  <text class="section" x="604" y="509">Measured effect</text>
+  <text class="mono-small" x="604" y="535">matched physical SIMDs</text>
+  <text class="mono" x="604" y="560">4 -&gt; 4</text>
+  <text class="mono-small" x="604" y="585">active waves</text>
+  <text class="mono" x="604" y="607">56 -&gt; 56</text>
+
+  <rect class="panel" x="875" y="106" width="685" height="555" rx="6"/>
+  <text class="panel-title" x="903" y="143">2. Match the critical SIMD before conserving cycles</text>
+  <text class="small" x="903" y="169">Raw wave stalls double-count overlap; physical-SIMD union idle counts each exposed cycle once.</text>
+  <text class="section" x="903" y="215">Raw barrier reduction: 232,812 cycles across the same 56 waves</text>
+  <rect class="hidden" x="903" y="238" width="416" height="48" rx="3"/>
+  <rect class="wait" x="1319" y="238" width="126" height="48" rx="3"/>
+  <text class="small white" x="980" y="267">not union-visible: 178,564 (76.7%)</text>
+  <text class="mono-small white" x="1336" y="257">steady barrier</text>
+  <text class="mono-small white" x="1348" y="275">-54,248</text>
+  <text class="small" x="903" y="309">The ledger below uses the same four 14-wave physical SIMDs on both sides.</text>
+
+  <text class="section" x="903" y="348">Steady exposed-idle conservation: cumulative cycles</text>
+  <text class="mono-small" x="903" y="371">sum of 4 matched critical-SIMD ledgers each side</text>
+  <rect class="neutral" x="903" y="380" width="629" height="235" rx="4"/>
+  <text class="mono-small" x="918" y="400">category</text>
+  <text class="mono-small" x="1263" y="400">old</text>
+  <text class="mono-small" x="1365" y="400">new</text>
+  <text class="mono-small" x="1470" y="400">delta</text>
+  <line class="axis" x1="916" y1="408" x2="1519" y2="408"/>
+  <text class="mono-small" x="918" y="422">barrier imbalance</text>
+  <text class="mono-small" x="1250" y="422">139,608</text>
+  <text class="mono-small" x="1352" y="422">85,360</text>
+  <text class="mono-small" x="1464" y="422">-54,248</text>
+  <text class="mono-small" x="918" y="438">VMEM stall/wait</text>
+  <text class="mono-small" x="1258" y="438">34,272</text>
+  <text class="mono-small" x="1352" y="438">51,712</text>
+  <text class="mono-small" x="1464" y="438">+17,440</text>
+  <text class="mono-small" x="918" y="454">mixed vmcnt/lgkmcnt wait</text>
+  <text class="mono-small" x="1258" y="454">21,636</text>
+  <text class="mono-small" x="1352" y="454">10,328</text>
+  <text class="mono-small" x="1464" y="454">-11,308</text>
+  <text class="mono-small" x="918" y="470">LDS issue scheduling</text>
+  <text class="mono-small" x="1258" y="470">14,864</text>
+  <text class="mono-small" x="1360" y="470">4,692</text>
+  <text class="mono-small" x="1464" y="470">-10,172</text>
+  <text class="mono-small" x="918" y="486">structural tail</text>
+  <text class="mono-small" x="1258" y="486">15,012</text>
+  <text class="mono-small" x="1360" y="486">4,732</text>
+  <text class="mono-small" x="1464" y="486">-10,280</text>
+  <text class="mono-small" x="918" y="502">LDS stall/wait</text>
+  <text class="mono-small" x="1266" y="502">9,348</text>
+  <text class="mono-small" x="1360" y="502">1,180</text>
+  <text class="mono-small" x="1472" y="502">-8,168</text>
+  <text class="mono-small" x="918" y="518">other core exposure</text>
+  <text class="mono-small" x="1266" y="518">6,672</text>
+  <text class="mono-small" x="1360" y="518">2,748</text>
+  <text class="mono-small" x="1472" y="518">-3,924</text>
+  <text class="mono-small" x="918" y="534">VMEM issue scheduling</text>
+  <text class="mono-small" x="1266" y="534">4,256</text>
+  <text class="mono-small" x="1360" y="534">4,328</text>
+  <text class="mono-small" x="1488" y="534">+72</text>
+  <text class="mono-small" x="918" y="550">other issue scheduling</text>
+  <text class="mono-small" x="1266" y="550">1,724</text>
+  <text class="mono-small" x="1376" y="550">100</text>
+  <text class="mono-small" x="1472" y="550">-1,624</text>
+  <text class="mono-small" x="918" y="566">scheduler/ready</text>
+  <text class="mono-small" x="1282" y="566">84</text>
+  <text class="mono-small" x="1376" y="566">608</text>
+  <text class="mono-small" x="1480" y="566">+524</text>
+  <text class="mono-small" x="918" y="582">VALU issue scheduling</text>
+  <text class="mono-small" x="1282" y="582">60</text>
+  <text class="mono-small" x="1360" y="582">1,828</text>
+  <text class="mono-small" x="1472" y="582">+1,768</text>
+  <line class="axis" x1="916" y1="590" x2="1519" y2="590"/>
+  <text class="mono" x="918" y="608">exposed idle total</text>
+  <text class="mono" x="1235" y="608">247,536</text>
+  <text class="mono" x="1345" y="608">167,616</text>
+  <text class="mono" x="1457" y="608">-79,920</text>
+  <rect class="warn" x="912" y="619" width="620" height="26" rx="4"/>
+  <text class="mono-small" x="929" y="637">all-32-SIMD aggregate was invalid: old/new had 400/392 waves</text>
+
+  <rect class="panel" x="40" y="685" width="1520" height="310" rx="6"/>
+  <text class="panel-title" x="68" y="724">3. Matched critical-SIMD conservation explains the speedup</text>
+  <rect class="neutral" x="68" y="752" width="455" height="112" rx="5"/>
+  <text class="section" x="89" y="781">Steady physical-SIMD union</text>
+  <text class="mono" x="89" y="813">busy: 2,695,168 -&gt; 2,695,168</text>
+  <text class="mono" x="89" y="839">idle:   247,536 -&gt;   167,616</text>
+  <path class="arrow" d="M 540 808 L 600 808"/>
+  <rect class="neutral" x="617" y="752" width="394" height="112" rx="5"/>
+  <text class="section" x="638" y="781">Steady utilization</text>
+  <text class="mono" x="638" y="816">91.5881% -&gt; 94.1450%</text>
+  <text class="small" x="638" y="842">Same four 14-wave SIMDs</text>
+  <path class="arrow" d="M 1028 808 L 1088 808"/>
+  <rect class="good" x="1105" y="752" width="427" height="112" rx="5"/>
+  <text class="section" x="1126" y="781">Critical-path agreement</text>
+  <text class="mono" x="1126" y="813">SIMD full span: -2.79%</text>
+  <text class="mono-small" x="1126" y="840">ATT dispatch: -2.73%</text>
+  <text class="body" x="68" y="907">Of 92,772 both-active cycles saved, steady exposed idle supplies 79,920 (86.1%); non-steady prologue/drain supplies 12,852 (13.9%).</text>
+  <text class="body" x="68" y="933">Wave-lifetime saving: first-to-last-MFMA envelope 85.5%, prologue 13.9%, final drain 0.6%. Inter-N tail is included in steady.</text>
+  <text class="small" x="68" y="968">Source: padding-neutral K384 double-per-tensor ATT; values are cumulative over the same four critical physical SIMDs per side.</text>
+</svg>

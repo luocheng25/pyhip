@@ -141,6 +141,23 @@ def compile_gemm(
     physical_num_waves = 8 if use_true8_hy3 else 4 * physical_n256_m_groups
     physical_num_threads = physical_num_waves * 64
     paired_cshuffle_bytes = physical_num_waves * 16 * 64 * 2
+    share_paired_cshuffle = (
+        use_paired_m128
+        and E == 128
+        and N == 6144
+        and K == 384
+        and TOPK == 4
+        and weight_quant_type == "ptpc"
+        and act_quant_type == "ptpc"
+    )
+    cshuffle_storage_waves = 4 if share_paired_cshuffle else physical_num_waves
+    use_balanced_k384_epilogue = (
+        use_paired_m128
+        and K == 384
+        and weight_quant_type == "per_tensor"
+        and act_quant_type == "per_tensor"
+        and not share_paired_cshuffle
+    )
     use_paired_row_major_cshuffle = (
         use_paired_m128
         and 2 * BLOCK_TILE_SIZE_M * K + paired_cshuffle_bytes
@@ -3137,10 +3154,10 @@ def compile_gemm(
                 not use_paired_m128 or use_paired_row_major_cshuffle
             ):
                 cshuffle_storage = shared_allocator.allocate(
-                    fx.Array[fx.BFloat16, physical_num_waves * 16 * 64, 16]
+                    fx.Array[fx.BFloat16, cshuffle_storage_waves * 16 * 64, 16]
                 )
                 cshuffle_lds = cshuffle_storage.peek().view(
-                    fx.make_layout(physical_num_waves * 16 * 64, 1)
+                    fx.make_layout(cshuffle_storage_waves * 16 * 64, 1)
                 )
             ldsA0 = lds.A.peek().view(
                 fx.make_composed_layout(
@@ -3561,7 +3578,9 @@ def compile_gemm(
                 physical_atom = (
                     lane_group * 2 + channel_piece
                 ) ^ row_in_8
-                wave_lds_base = wave_id * (16 * 64)
+                wave_lds_base = (
+                    logical_wave_id if share_paired_cshuffle else wave_id
+                ) * (16 * 64)
                 lds_offset = (
                     wave_lds_base
                     + ((row_half * 8 + row_in_8) * 8 + physical_atom) * 8
@@ -3929,6 +3948,42 @@ def compile_gemm(
                                     block_n - 1,
                                     vector_begin=4,
                                     vector_count=4,
+                                )
+                            elif const_expr(
+                                use_balanced_k384_epilogue
+                                and nBK == 3
+                                and k_core == 0
+                            ):
+                                postprocess_store_vector_packed_pair_m(
+                                    previous_fragC,
+                                    frag_sorted_weight,
+                                    block_n - 1,
+                                    vector_begin=0,
+                                    vector_count=2,
+                                )
+                            elif const_expr(
+                                use_balanced_k384_epilogue
+                                and nBK == 3
+                                and k_core == 1
+                            ):
+                                postprocess_store_vector_packed_pair_m(
+                                    previous_fragC,
+                                    frag_sorted_weight,
+                                    block_n - 1,
+                                    vector_begin=2,
+                                    vector_count=3,
+                                )
+                            elif const_expr(
+                                use_balanced_k384_epilogue
+                                and nBK == 3
+                                and k_core == 2
+                            ):
+                                postprocess_store_vector_packed_pair_m(
+                                    previous_fragC,
+                                    frag_sorted_weight,
+                                    block_n - 1,
+                                    vector_begin=5,
+                                    vector_count=3,
                                 )
                             elif const_expr(nBK >= 3 and k_core == 1):
                                 postprocess_store_vector_packed_pair_m(
