@@ -1,0 +1,13 @@
+jobs:
+  - kernel_include_regex: ".*antiphase_att.*"
+    kernel_iteration_range: "[1, [2-2]]"
+    output_file: out
+    output_directory: /tmp/setprio-antiphase-att
+    output_format: [csv]
+    truncate_kernels: true
+    sys_trace: true
+    advanced_thread_trace: true
+    att_target_cu: 0
+    att_shader_engine_mask: "0xf"
+    att_simd_select: "0xf"
+    att_buffer_size: "0x60000000"
