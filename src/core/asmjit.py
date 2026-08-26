@@ -3842,6 +3842,14 @@ class jit_kernel:
             cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{kernel_key}.cpp"
         else:
             cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
+        if len(os.path.basename(cpp_src_fpath)) > 240:
+            path_hash = hashlib.sha256(
+                cpp_src_fpath.encode("utf-8")
+            ).hexdigest()[:16]
+            cpp_src_fpath = (
+                f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-"
+                f"key={path_hash}-{self.line_no}.cpp"
+            )
 
         J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}", self.no_pass)
 
