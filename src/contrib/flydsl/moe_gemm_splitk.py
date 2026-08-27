@@ -40,7 +40,11 @@ def compile_gemm(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    force_batch1_path=False,
 ):
+
+    if force_batch1_path:
+        alg = "batch1"
 
     TILE_K = 64
     # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
@@ -1642,12 +1646,18 @@ def compile_gemm(
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        # grid.y selects the TOPK route and grid.z selects the input batch row.
+        route_idx = batch_idx * TOPK + e_idx
 
-        arg_p_input = fx.make_view(fxh._as_ptr(p_input), fx.make_layout((1, K), (K, 1)))
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx * K),
+            fx.make_layout((1, K), (K, 1)),
+        )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
-        expert_id = arg_p_expert_ids[e_idx]
+        expert_id = arg_p_expert_ids[route_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # gate/up group width. BN==32 keeps the 4-wave split-K but uses a dedicated reduce below;
         # BN>=64 uses the coalesced reduce in gemm_splitk.
@@ -1673,7 +1683,7 @@ def compile_gemm(
         )
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx * TOPK * (N // 2)),
             fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
         )
         out_tensor = fx.rocdl.make_buffer_tensor(
@@ -1914,20 +1924,21 @@ def compile_gemm(
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
-        # batch1: input is gemm1_out[0, e_idx, :] (single token, expert slot e_idx). Point at that
-        # row and broadcast it across the TILE_M MFMA rows (stride 0); every computed row is then
-        # identical, so any single row is the real result.
+        # Input is gemm1_out[batch_idx, e_idx, :]. Broadcast that route across the TILE_M
+        # MFMA rows (stride 0); every computed row is identical, so any row is the result.
         arg_p_input = fx.make_view(
-            fxh._as_ptr(p_input) + fx.Int64(e_idx * K),
+            fxh._as_ptr(p_input) + fx.Int64(route_idx * K),
             fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
         )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
-        expert_id = arg_p_topk_ids[e_idx]
-        topk_weight = arg_p_topk_weights[e_idx]
+        expert_id = arg_p_topk_ids[route_idx]
+        topk_weight = arg_p_topk_weights[route_idx]
         arg_p_weight = _make_down_weight_view(p_weight, expert_id)
 
         c_frag = gemm_splitk(
@@ -1951,7 +1962,8 @@ def compile_gemm(
 
         # write to mem
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output), fx.make_layout((1, N), (N, 1))
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx * N),
+            fx.make_layout((1, N), (N, 1)),
         )
         cp_atom_w = fx.make_copy_atom(
             fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
@@ -2442,7 +2454,7 @@ def compile_gemm(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
-        task_num: fx.Int32,
+        M: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
@@ -2451,7 +2463,7 @@ def compile_gemm(
             moe_2stage_gateup_batch1(
                 p_input, p_weight, p_output, p_topk_ids, p_w_scale
             ).launch(
-                grid=(num_n_blocks, task_num, 1),
+                grid=(num_n_blocks, TOPK, M),
                 block=(256, 1, 1),
                 stream=stream,
             )
@@ -2459,7 +2471,7 @@ def compile_gemm(
             moe_2stage_down_batch1(
                 p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
             ).launch(
-                grid=(num_n_blocks, task_num, 1),
+                grid=(num_n_blocks, TOPK, M),
                 block=(64, 1, 1),
                 stream=stream,
             )
