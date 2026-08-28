@@ -457,7 +457,13 @@ def moe_2stage_splitk(J:JIT,
         if weight_dtype == torch.float4_e2m1fn_x2:
             if USE_FP4_SHUFFLE_WEIGHT:
                 # shffled
-                voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x) * stride_B + J.lane_id * 16 + J.warp_id * (16 * get_k_bytes(K) // 4)
+                warp_weight_offset = J.gpr("su32")
+                J.s_mul_i32(
+                    warp_weight_offset,
+                    warp_id,
+                    J.get_sgpr_const(16 * get_k_bytes(K) // 4),
+                )
+                voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x) * stride_B + J.lane_id * 16 + warp_weight_offset
             else:
                 # not shuffled
                 voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
@@ -526,7 +532,13 @@ def moe_2stage_splitk(J:JIT,
             if weight_dtype != torch.float4_e2m1fn_x2:
                 voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (J.threadIdx.x // 16) * (a_element_num_per_thread * sizeof_bf16))
             else:
-                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (lane_div_16) * (a_element_num_per_thread * sizeof_bf16) + J.warp_id * (K // 4 * sizeof_bf16))
+                warp_input_offset = J.gpr("su32")
+                J.s_mul_i32(
+                    warp_input_offset,
+                    warp_id,
+                    J.get_sgpr_const(K // 4 * sizeof_bf16),
+                )
+                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (lane_div_16) * (a_element_num_per_thread * sizeof_bf16) + warp_input_offset)
         else:
             v_topk_id[m] = v_sorted_id[m] >> 24
             # input layout: [B, TOPK, INTER_MEDIA]
@@ -540,7 +552,13 @@ def moe_2stage_splitk(J:JIT,
         k_scale_stride = div_up(div_up(K, 32), 8) * 8
         p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * k_scale_stride * J.blockIdx.x
         if with_silu:
-            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.lane_id * sizeof_f32 + J.warp_id * (k_scale_stride // 8 // 4 * 64 * sizeof_f32)
+            warp_scale_offset = J.gpr("su32")
+            J.s_mul_i32(
+                warp_scale_offset,
+                warp_id,
+                J.get_sgpr_const(k_scale_stride // 8 // 4 * 64 * sizeof_f32),
+            )
+            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.lane_id * sizeof_f32 + warp_scale_offset
             voffset_scale[B_horz // 4] = voffset_scale[0] + N // 2 * k_scale_stride
             for m in range(1, B_horz // 4):
                 voffset_scale[m] = voffset_scale[0] + 32 * k_scale_stride * m
