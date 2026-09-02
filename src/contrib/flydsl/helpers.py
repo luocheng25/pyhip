@@ -13,6 +13,7 @@ from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
+from flydsl.runtime.device import get_rocm_arch
 
 
 def div_up(x, y):
@@ -484,13 +485,15 @@ class FlyObjCache:
         return thrcopy.retile(frag)
 
     @flyc.jit
-    def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
+    def load_tiled_mma_frag(
+        self, mm, src, slice_coord, dst, abc, copy_atom_bits=128, tid=None
+    ):
         assert abc in ["A", "B", "C"]
         if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(src.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(src.dtype, copy_atom_bits)
-        tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc)
+        tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc, tid=tid)
 
         src_slice = src[slice_coord] if slice_coord is not None else src
         if fx.const_expr(abc == "A"):
@@ -521,19 +524,25 @@ class FlyObjCache:
         return frag
 
     def load_tiled_mma_fragA(
-        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128, tid=None
     ):
-        return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "A", copy_atom_bits)
+        return self.load_tiled_mma_frag(
+            mm, src, slice_coord, dst, "A", copy_atom_bits, tid
+        )
 
     def load_tiled_mma_fragB(
-        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128, tid=None
     ):
-        return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "B", copy_atom_bits)
+        return self.load_tiled_mma_frag(
+            mm, src, slice_coord, dst, "B", copy_atom_bits, tid
+        )
 
     def load_tiled_mma_fragC(
-        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128, tid=None
     ):
-        return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "C", copy_atom_bits)
+        return self.load_tiled_mma_frag(
+            mm, src, slice_coord, dst, "C", copy_atom_bits, tid
+        )
 
     def store_tiled_mma_fragC(self, mm, frag, dst, copy_atom_bits=128):
         if fx.const_expr(dst.address_space == TargetAddressSpace.BufferDesc):
@@ -582,11 +591,18 @@ class FlyObjCache:
 
 
 def cvt_f32_to_bf16(c_frag):
-    """f32 -> bf16:add 0x8000 舍入 + 截断(round-half-up),比 .to(fx.BFloat16) 的 RNE + NaN 处理少指令。
-    移植自 src/contrib/flydsl/moe_gemm_splitk.py::_cvt_f32_to_bf16。"""
+    """Convert an F32 fragment to BF16 with the target's shortest path.
+
+    gfx950 lowers the vector cast to native packed RNE conversion. Older
+    targets retain the explicit round-half-up packing sequence.
+    """
     from flydsl._mlir.ir import IntegerType
 
     c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
+    if fx.const_expr(get_rocm_arch().startswith("gfx950")):
+        c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
+        return c_frag_bf16
+
     round_bit = fx.Uint32(0x8000)
     rounded = c_frag.load().bitcast(fx.Uint32) + round_bit
 

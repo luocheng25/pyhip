@@ -96,11 +96,13 @@ def _pack_f32x4_to_fp8(values):
     return fx.Int32(rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, values[2], values[3], packed, True))
 
 
-def _pack_probability_fp8(probability, start):
+def _pack_probability_fp8(probability, start, fp8_dtype):
     values = fx.Vector.from_elements(
         [probability[start + offset] for offset in range_constexpr(4)], fx.Float32
     )
-    return fx.Vector.from_elements([_pack_f32x4_to_fp8(values)], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
+    return fx.Vector.from_elements([_pack_f32x4_to_fp8(values)], fx.Int32).bitcast(
+        fp8_dtype
+    )
 
 
 @flyc.jit
@@ -109,12 +111,14 @@ def _rescale_accumulator_if_needed(output_accumulator, correction):
         output_accumulator.store(output_accumulator.load() * correction)
 
 
-def _store_fp8_probability(score_fragment, probability_operand):
+def _store_fp8_probability(score_fragment, probability_operand, fp8_dtype):
     probability = score_fragment.load()
     for k_group in range_constexpr(2):
         start = k_group * 8
-        probability_lo = _pack_probability_fp8(probability, start)
-        probability_hi = _pack_probability_fp8(probability, start + 4)
+        probability_lo = _pack_probability_fp8(probability, start, fp8_dtype)
+        probability_hi = _pack_probability_fp8(
+            probability, start + 4, fp8_dtype
+        )
         probability_operand[None, 0, k_group].store(
             probability_lo.shuffle(probability_hi, list(range(8)))
         )
@@ -212,7 +216,11 @@ def _prepare_paged_v_tile(v_tile, permute_bf16_tokens: fx.Constexpr[bool]):
 
 
 def _compile_hints_for_dtype(dtype):
-    return {"fast_fp_math": True} if dtype == torch.float8_e4m3fnuz else {}
+    return (
+        {"fast_fp_math": True}
+        if dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        else {}
+    )
 
 
 @flyc.jit
@@ -231,15 +239,35 @@ def _online_softmax(
     split_score_scaling: fx.Constexpr[bool],
     defer_output_rescale: fx.Constexpr[bool],
     interleaved_score_columns: fx.Constexpr[bool],
+    window_left: fx.Constexpr[int] = -1,
 ):
     if const_expr(not all_kv_valid):
-        lane_id = fx.thread_idx.x & 63
+        if const_expr(window_left >= 0):
+            # Rematerialize the SWA lane coordinate at its mask consumer. If it
+            # is derived from the kernel-entry tid, LLVM keeps it live across
+            # every persistent work item and spills the final VGPR.
+            mask_tid = fx.Int32(
+                llvm.inline_asm(
+                    fx.Int32.ir_type,
+                    [as_ir_value(fx.thread_idx.x)],
+                    "v_mov_b32 $0, $1",
+                    "=v,v",
+                    has_side_effects=True,
+                )
+            )
+            lane_id = mask_tid & 63
+        else:
+            lane_id = fx.thread_idx.x & 63
         column_base = (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
         lane_column_group = (lane_id < 32).select(fx.Int32(0), fx.Int32(8))
         block_base = fx.Int32(kv_block_index * 32)
         if const_expr(is_causal):
-            wave_id = fx.thread_idx.x // 64
-            query_row = fx.thread_idx.x & 31
+            if const_expr(window_left >= 0):
+                wave_id = mask_tid // 64
+                query_row = mask_tid & 31
+            else:
+                wave_id = fx.thread_idx.x // 64
+                query_row = fx.thread_idx.x & 31
             query_position = query_tile_start + wave_id * 32 + query_row
             causal_limit = kv_len - query_sequence_length + query_position
             for index in range_constexpr(16):
@@ -247,7 +275,13 @@ def _online_softmax(
                     column = lane_column_group + fx.Int32((index // 8) * 16 + index % 8)
                 else:
                     column = column_base + fx.Int32(index)
-                if block_base + column > causal_limit:
+                kv_position = block_base + column
+                outside_window = kv_position > causal_limit
+                if const_expr(window_left >= 0):
+                    outside_window = outside_window | (
+                        kv_position < causal_limit - fx.Int32(window_left)
+                    )
+                if outside_window:
                     score_fragment[index, 0, 0] = float("-inf")
         else:
             for index in range_constexpr(16):
@@ -315,15 +349,26 @@ def MHA(
     page_size,
     is_causal,
     key_layout="vectorized",
+    window_left=-1,
+    has_sink=False,
+    force_dynamic_schedule=False,
 ):
     assert head_dim_qk in (128, 192)
     assert head_dim_v == 128
     assert page_size in (32, 64, 128)
     assert num_qo_heads % num_kv_heads == 0
     assert key_layout in ("vectorized", "linear")
+    assert window_left == -1 or window_left >= 0
     if key_layout == "linear":
         assert page_size == 32
         assert head_dim_qk == head_dim_v == 128
+    if window_left >= 0:
+        assert is_causal
+        assert key_layout == "vectorized"
+        assert has_sink
+        assert page_size == 64
+    else:
+        assert not has_sink
 
     block_m = 128
     block_n = 32
@@ -332,6 +377,7 @@ def MHA(
     causal_tile_step = 251
     causal_tile_offset = 251
     qk_scale_log2_base = float(LOG2E / (head_dim_qk**0.5))
+    is_gfx950 = "gfx950" in torch.cuda.get_device_properties().gcnArchName
 
     @flyc.jit
     def attention_pipeline(
@@ -345,18 +391,32 @@ def MHA(
         full_qo_len,
         kv_page_table,
         num_kv_pages,
+        first_page,
         kv_sequence_start,
         kv_head,
         qk_scale_log2,
         v_scale,
-        requires_epilogue_reentry_barrier: fx.Constexpr[bool],
+        sink_logit,
+        shared_allocator,
     ):
         tid = fx.thread_idx.x
         dtype = q_tile.dtype
-        is_fp8 = dtype == fx.Float8E4M3FNUZ
+        is_fp8 = dtype in (fx.Float8E4M3FN, fx.Float8E4M3FNUZ)
         is_bf16 = dtype == fx.BFloat16
-        mma_k = 8 if is_bf16 else 16
-        num_kv_blocks = (kv_len + block_n - 1) // block_n
+        pv_mfma_k = 8 if is_bf16 else 16
+        # gfx950 can consume 64 FP8 reduction elements per QK instruction.
+        # PV still reduces over block_n=32, so it retains the K16 atom.
+        use_fp8_qk_k64 = (
+            is_gfx950
+            and dtype == fx.Float8E4M3FN
+            and head_dim_qk % 64 == 0
+        )
+        qk_mfma_k = 64 if use_fp8_qk_k64 else pv_mfma_k
+        if const_expr(window_left >= 0):
+            num_kv_blocks = num_kv_pages * num_blocks_per_page
+        else:
+            num_kv_blocks = (kv_len + block_n - 1) // block_n
+        first_kv_block = first_page * num_blocks_per_page
         use_hw_slot_priority = is_bf16 and head_dim_qk == 128
         interleave_exp_ds_write = (
             is_bf16 and head_dim_qk == 128 and num_qo_heads >= 4
@@ -379,14 +439,49 @@ def MHA(
                 rocdl.s_setprio(2)
             _schedule_fence()
 
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, mma_k, dtype))
-        atom_values = mma_k // 2
+        if const_expr(use_fp8_qk_k64):
+            qk_mma_atom = fx.make_mma_atom(
+                fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, dtype)
+            )
+            qk_mma_atom = fx.atom_set_value(
+                qk_mma_atom, "scale_a", fx.Int32(0)
+            )
+            qk_mma_atom = fx.atom_set_value(
+                qk_mma_atom, "scale_b", fx.Int32(0)
+            )
+        else:
+            qk_mma_atom = fx.make_mma_atom(
+                fx.rocdl.MFMA(32, 32, qk_mfma_k, dtype)
+            )
+        pv_mma_atom = fx.make_mma_atom(
+            fx.rocdl.MFMA(32, 32, pv_mfma_k, dtype)
+        )
+        atom_values = pv_mfma_k // 2
         vector_values = 128 // dtype.width
-        k_permutation = fx.make_layout((atom_values, 2, 2), (1, vector_values, atom_values))
         wave_layout = fx.make_layout((1, 4, 1), (1, 1, 0))
-        mma_tile = fx.make_tile(None, None, k_permutation)
-        qk_tiled_mma = fx.make_tiled_mma(mma_atom, wave_layout, mma_tile)
-        pv_tiled_mma = fx.make_tiled_mma(mma_atom, wave_layout, mma_tile)
+        if const_expr(use_fp8_qk_k64):
+            qk_tiled_mma = fx.make_tiled_mma(
+                qk_mma_atom,
+                wave_layout,
+                (None, None, fx.make_layout((32, 2), (1, 32))),
+            )
+        else:
+            qk_permutation = fx.make_layout(
+                (atom_values, 2, 2), (1, vector_values, atom_values)
+            )
+            qk_tiled_mma = fx.make_tiled_mma(
+                qk_mma_atom,
+                wave_layout,
+                fx.make_tile(None, None, qk_permutation),
+            )
+        pv_permutation = fx.make_layout(
+            (atom_values, 2, 2), (1, vector_values, atom_values)
+        )
+        pv_tiled_mma = fx.make_tiled_mma(
+            pv_mma_atom,
+            wave_layout,
+            fx.make_tile(None, None, pv_permutation),
+        )
         qk_thread_mma = qk_tiled_mma.thr_slice(tid)
         pv_thread_mma = pv_tiled_mma.thr_slice(tid)
 
@@ -429,7 +524,7 @@ def MHA(
             k_lds: fx.Array[dtype, 2 * block_n * k_lds_stride, 16]
             o_lds: fx.Array[fx.BFloat16, block_m * (head_dim_v // 2), 16]
 
-        shared = fx.SharedAllocator().allocate(SharedStorage)
+        shared = shared_allocator.allocate(SharedStorage)
         k_lds_layout = fx.make_layout(
             (block_n, head_dim_qk, 2), (k_lds_stride, 1, block_n * k_lds_stride)
         )
@@ -560,17 +655,31 @@ def MHA(
         output_accumulator.fill(0.0)
 
         def compute_qk():
-            for k_group in range_constexpr(head_dim_qk // (2 * mma_k)):
-                for k_atom in range_constexpr(2):
-                    accumulator = score_fragment[None, 0, 0]
-                    fx.mma_atom_call(
-                        mma_atom, accumulator, k_fragment[None, 0, (k_atom, k_group)],
-                        q_fragment[None, 0, (k_atom, k_group)], accumulator,
-                    )
+            if const_expr(use_fp8_qk_k64):
+                fx.gemm(
+                    qk_thread_mma,
+                    score_fragment,
+                    k_fragment,
+                    q_fragment,
+                    score_fragment,
+                )
+            else:
+                for k_group in range_constexpr(head_dim_qk // (2 * qk_mfma_k)):
+                    for k_atom in range_constexpr(2):
+                        accumulator = score_fragment[None, 0, 0]
+                        fx.mma_atom_call(
+                            qk_mma_atom,
+                            accumulator,
+                            k_fragment[None, 0, (k_atom, k_group)],
+                            q_fragment[None, 0, (k_atom, k_group)],
+                            accumulator,
+                        )
 
         def schedule_qk_and_v_loads():
             if const_expr(is_bf16 and head_dim_qk == 128):
-                _schedule_qk_bf16_d128(num_v_loads, head_dim_qk, mma_k)
+                _schedule_qk_bf16_d128(
+                    num_v_loads, head_dim_qk, qk_mfma_k
+                )
             elif const_expr(is_fp8):
                 _schedule_qk_fp8(num_v_loads)
             else:
@@ -581,7 +690,9 @@ def MHA(
         def schedule_pv_and_next_k():
             num_k_reads = num_k_fragment_bits // 128
             if const_expr(is_bf16):
-                _schedule_pv_bf16(num_k_copies, num_k_reads, head_dim_v, mma_k)
+                _schedule_pv_bf16(
+                    num_k_copies, num_k_reads, head_dim_v, pv_mfma_k
+                )
             else:
                 _schedule_pv_fp8(num_k_reads)
             _schedule_fence()
@@ -624,10 +735,12 @@ def MHA(
 
             running_max, running_sum, correction = _online_softmax(
                 score_fragment, output_accumulator, qk_scale_log2, running_max, running_sum,
-                query_pos0, kv_block_index, kv_len, full_qo_len, is_all_kv_valid, is_causal,
+                query_pos0, first_kv_block + kv_block_index, kv_len, full_qo_len,
+                is_all_kv_valid, is_causal,
                 is_fp8,
                 interleave_exp_ds_write,
                 False,
+                window_left,
             )
 
             store_k_to_lds(k_pipeline_slot, k_pipeline_slot ^ 1)
@@ -640,14 +753,16 @@ def MHA(
             if const_expr(interleave_exp_ds_write):
                 _rescale_accumulator_if_needed(output_accumulator, correction)
             if const_expr(is_fp8):
-                _store_fp8_probability(score_fragment, probability_operand)
+                _store_fp8_probability(
+                    score_fragment, probability_operand, dtype
+                )
             else:
                 _store_bf16_probability(score_fragment, probability_storage)
 
             enter_mma_stage()
 
             fx.gemm(
-                mma_atom, output_accumulator, v_fragment,
+                pv_mma_atom, output_accumulator, v_fragment,
                 probability_operand, output_accumulator,
             )
 
@@ -662,6 +777,9 @@ def MHA(
 
         current_max = fx.Float32(float("-inf"))
         running_sum = fx.Float32(0.0)
+        if const_expr(has_sink):
+            current_max = sink_logit * fx.Float32(LOG2E)
+            running_sum = fx.Float32(0.5)
         current_page_id = kv_page_table[0]
         next_page_id = kv_page_table[1 // num_blocks_per_page]
         prefetch_page_id = kv_page_table[2 // num_blocks_per_page]
@@ -673,7 +791,10 @@ def MHA(
         fx.copy(k_lds_copy_atom, partition_k_lds(0), k_lds_copy.retile(k_fragment))
         enter_mma_stage()
 
-        if const_expr(is_causal):
+        if const_expr(window_left >= 0):
+            num_fast_path_blocks = fx.Int32(0)
+            num_blocks_to_process = num_kv_blocks
+        elif const_expr(is_causal):
             causal_base = kv_len - full_qo_len + query_pos0
             num_fully_valid_blocks = (causal_base + 1) // block_n
             num_fast_path_blocks = (num_fully_valid_blocks // 2) * 2
@@ -735,37 +856,112 @@ def MHA(
         denominator = running_sum + running_sum.shuffle_xor(32, 64)
         output_accumulator.store(output_accumulator.load() * (v_scale / denominator))
         output_fragment_bf16 = _cvt_f32_to_bf16(output_accumulator)
-        epilogue_tid = tid
         if const_expr(is_fp8):
             epilogue_tid = _make_fp8_epilogue_tid(tid, running_sum)
-        cshuffle_store_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-        cshuffle_store = fx.make_tiled_copy_C(cshuffle_store_atom, pv_tiled_mma).get_slice(epilogue_tid)
-        cshuffle_read_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-        cshuffle_read = fx.make_tiled_copy_tv(
-            cshuffle_read_atom, fx.make_layout((32, 8), (8, 1)), fx.make_layout((4, 8), (8, 1))
-        ).get_slice(epilogue_tid)
-        store_source_halves = fx.logical_divide(
-            cshuffle_store.retile(output_fragment_bf16), (None, 2, None)
-        )
-        store_destination = cshuffle_store.partition_D(o_lds_store)
-        read_source = cshuffle_read.partition_S(o_lds_read)
-        output_halves = fx.logical_divide(o_tile, (None, head_dim_v // 2))
-        output_fragment = fx.make_fragment_like(read_source)
-        output_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            cshuffle_store_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+            cshuffle_store = fx.make_tiled_copy_C(
+                cshuffle_store_atom, pv_tiled_mma
+            ).get_slice(epilogue_tid)
+            cshuffle_read_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            cshuffle_read = fx.make_tiled_copy_tv(
+                cshuffle_read_atom,
+                fx.make_layout((32, 8), (8, 1)),
+                fx.make_layout((4, 8), (8, 1)),
+            ).get_slice(epilogue_tid)
+            store_source_halves = fx.logical_divide(
+                cshuffle_store.retile(output_fragment_bf16), (None, 2, None)
+            )
+            store_destination = cshuffle_store.partition_D(o_lds_store)
+            read_source = cshuffle_read.partition_S(o_lds_read)
+            output_halves = fx.logical_divide(o_tile, (None, head_dim_v // 2))
+            output_fragment = fx.make_fragment_like(read_source)
+            output_copy_atom = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(), fx.BFloat16
+            )
 
-        gpu.barrier()
-        for half in range_constexpr(2):
-            fx.copy(
-                cshuffle_store_atom, store_source_halves[None, (None, half), None], store_destination
-            )
             gpu.barrier()
-            fx.copy(cshuffle_read_atom, read_source, output_fragment)
-            if const_expr(half == 0 or requires_epilogue_reentry_barrier):
+            for half in range_constexpr(2):
+                fx.copy(
+                    cshuffle_store_atom,
+                    store_source_halves[None, (None, half), None],
+                    store_destination,
+                )
                 gpu.barrier()
-            fx.copy(
-                output_copy_atom, output_fragment,
-                cshuffle_read.partition_D(output_halves[None, (None, half)]),
+                fx.copy(cshuffle_read_atom, read_source, output_fragment)
+                # Half 0 must drain before LDS is overwritten. After half 1,
+                # static exits and dynamic reaches the ticket barrier.
+                if const_expr(half == 0):
+                    gpu.barrier()
+                fx.copy(
+                    output_copy_atom,
+                    output_fragment,
+                    cshuffle_read.partition_D(
+                        output_halves[None, (None, half)]
+                    ),
+                )
+        else:
+            # Rebuild the C-shuffle partitions from an opaque, epilogue-local
+            # tid. High-level get_slice() captured the entry tid and kept eight
+            # LDS address VGPRs live across the persistent loop.
+            epilogue_tid = fx.Int32(
+                llvm.inline_asm(
+                    fx.Int32.ir_type,
+                    [as_ir_value(fx.thread_idx.x)],
+                    "v_mov_b32 $0, $1",
+                    "=v,v",
+                    has_side_effects=True,
+                )
             )
+            cshuffle_store_atom = fx.make_copy_atom(
+                fx.UniversalCopy64b(), fx.BFloat16
+            )
+            cshuffle_store_tiled = fx.make_tiled_copy_C(
+                cshuffle_store_atom, pv_tiled_mma
+            )
+            cshuffle_read_atom = fx.make_copy_atom(
+                fx.UniversalCopy128b(), fx.BFloat16
+            )
+            cshuffle_read_tiled = fx.make_tiled_copy_tv(
+                cshuffle_read_atom,
+                fx.make_layout((32, 8), (8, 1)),
+                fx.make_layout((4, 8), (8, 1)),
+            )
+            epilogue_thread_coord = fx.make_int_tuple(epilogue_tid)
+            store_source_halves = fx.logical_divide(
+                fx.tiled_copy_retile(cshuffle_store_tiled, output_fragment_bf16),
+                (None, 2, None),
+            )
+            store_destination = fx.tiled_copy_partition_dst(
+                cshuffle_store_tiled, o_lds_store, epilogue_thread_coord
+            )
+            read_source = fx.tiled_copy_partition_src(
+                cshuffle_read_tiled, o_lds_read, epilogue_thread_coord
+            )
+            output_halves = fx.logical_divide(o_tile, (None, head_dim_v // 2))
+            output_fragment = fx.make_fragment_like(read_source)
+            output_copy_atom = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(), fx.BFloat16
+            )
+
+            gpu.barrier()
+            for half in range_constexpr(2):
+                fx.copy(
+                    cshuffle_store_atom,
+                    store_source_halves[None, (None, half), None],
+                    store_destination,
+                )
+                gpu.barrier()
+                fx.copy(cshuffle_read_atom, read_source, output_fragment)
+                # Half 0 must drain before LDS is overwritten. After half 1,
+                # static exits and dynamic reaches the ticket barrier.
+                if const_expr(half == 0):
+                    gpu.barrier()
+                output_destination = fx.tiled_copy_partition_dst(
+                    cshuffle_read_tiled,
+                    output_halves[None, (None, half)],
+                    epilogue_thread_coord,
+                )
+                fx.copy(output_copy_atom, output_fragment, output_destination)
 
     @flyc.jit
     def process_work_item(
@@ -778,6 +974,7 @@ def MHA(
         kv_page_indices,
         q_descale,
         kv_last_page_lens,
+        sink_ptr,
         output,
         batch_index,
         head_index,
@@ -785,7 +982,7 @@ def MHA(
         tid,
         k_scale,
         v_scale,
-        requires_epilogue_reentry_barrier: fx.Constexpr[bool],
+        shared_allocator,
     ):
         query_pos0 = query_tile_index * block_m
         query_start = cu_seqlens_q[batch_index] + query_pos0
@@ -800,6 +997,24 @@ def MHA(
             kv_len = cu_seqlens_k[batch_index + 1] - cu_seqlens_k[batch_index]
         else:
             kv_len = (num_kv_pages - 1) * page_size + kv_last_page_lens[batch_index]
+
+        first_page = fx.Int32(0)
+        pages_to_process = num_kv_pages
+        if const_expr(window_left >= 0):
+            absolute_first_q = kv_len - full_qo_len + query_pos0
+            first_key = absolute_first_q - fx.Int32(window_left)
+            first_key = (first_key > fx.Int32(0)).select(
+                first_key, fx.Int32(0)
+            )
+            first_page = first_key // page_size
+            absolute_last_q_exclusive = absolute_first_q + query_len
+            last_page = (
+                absolute_last_q_exclusive + (page_size - 1)
+            ) // page_size
+            last_page = (last_page < num_kv_pages).select(
+                last_page, num_kv_pages
+            )
+            pages_to_process = last_page - first_page
 
         qo_head = head_index
         kv_head = (qo_head * num_kv_heads) // num_qo_heads
@@ -837,17 +1052,20 @@ def MHA(
         v_tile = _prepare_paged_v_tile(v_tile, True)
 
         kv_page_table = fx.make_view(
-            fx.get_iter(kv_page_indices) + kv_start,
-            fx.make_layout(num_kv_pages, 1),
+            fx.get_iter(kv_page_indices) + kv_start + first_page,
+            fx.make_layout(pages_to_process, 1),
         )
         kv_page_table = fx.rocdl.make_buffer_tensor(
             kv_page_table, max_size=False
         )
+        sink_logit = fx.Float32(0.0)
+        if const_expr(has_sink):
+            sink_logit = sink_ptr[qo_head]
         attention_pipeline(
             q_tile, k_tile, v_tile, o_tile, query_pos0, query_len, kv_len, full_qo_len,
-            kv_page_table, num_kv_pages,
-            cu_seqlens_k[batch_index], kv_head, qk_scale_log2, v_scale,
-            requires_epilogue_reentry_barrier,
+            kv_page_table, pages_to_process, first_page,
+            cu_seqlens_k[batch_index], kv_head, qk_scale_log2, v_scale, sink_logit,
+            shared_allocator,
         )
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -863,9 +1081,11 @@ def MHA(
         k_descale: fx.Tensor,
         v_descale: fx.Tensor,
         kv_last_page_lens: fx.Tensor,
+        sink_ptr: fx.Tensor,
         output: fx.Tensor,
     ):
         tid = fx.thread_idx.x
+        shared_allocator = fx.SharedAllocator()
         work_ticket = fx.Int32(fx.block_idx.x)
         works_per_head = (cu_seqlens_q[1] - cu_seqlens_q[0] + block_m - 1) // block_m
         if const_expr(is_causal):
@@ -880,8 +1100,9 @@ def MHA(
             query_tile_index = work_ticket - head_index * works_per_head
         process_work_item(
             q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
-            q_descale, kv_last_page_lens, output,
-            fx.Int32(0), head_index, query_tile_index, tid, k_descale[0], v_descale[0], False,
+            q_descale, kv_last_page_lens, sink_ptr, output,
+            fx.Int32(0), head_index, query_tile_index, tid, k_descale[0], v_descale[0],
+            shared_allocator,
         )
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -897,14 +1118,21 @@ def MHA(
         k_descale: fx.Tensor,
         v_descale: fx.Tensor,
         kv_last_page_lens: fx.Tensor,
+        sink_ptr: fx.Tensor,
         output: fx.Tensor,
         work_counter: fx.Tensor,
     ):
         tid = fx.thread_idx.x
         batch_size = fx.size(cu_seqlens_q.shape).to_py_value() - 1
+        shared_allocator = fx.SharedAllocator()
+        # The dedicated four-byte LDS mailbox is independently aligned from
+        # the 16-byte K/O union allocated later by attention_pipeline.
+        ticket_mailbox = shared_allocator.allocate(
+            fx.Array[fx.Int32, 1, 4]
+        ).peek()
 
         @flyc.jit
-        def fetch_work(work_counter, tid):
+        def fetch_work(work_counter, ticket_mailbox, tid):
             if tid == 0:
                 address = fx.ptrtoint(fx.get_iter(work_counter))
                 llvm_pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(address))
@@ -912,13 +1140,36 @@ def MHA(
                     llvm.AtomicBinOp.add, llvm_pointer, as_ir_value(fx.Int32(1)), llvm.AtomicOrdering.monotonic,
                     syncscope="agent", alignment=4,
                 )
-                work_counter[fx.block_idx.x + 1] = fx.Int32(old.result)
-                _s_waitcnt(vmcnt=0)
+                ticket = fx.Int32(old.result)
+                ticket_mailbox[0] = ticket
+                _s_waitcnt(lgkmcnt=0)
+            # One barrier broadcasts the ticket and also closes the previous
+            # work item's C-shuffle lifetime before K reuses the union.
             gpu.barrier()
-            ticket = work_counter[fx.block_idx.x + 1]
-            _s_waitcnt(vmcnt=0)
-            gpu.barrier()
+            ticket = ticket_mailbox[0]
+            _s_waitcnt(lgkmcnt=0)
             return ticket
+
+        @flyc.jit
+        def finish_work(work_counter, tid):
+            # Every workgroup exits exactly once. The final completion resets
+            # the cached ticket/completion header for the next stream launch.
+            if tid == 0:
+                address = fx.ptrtoint(fx.get_iter(work_counter) + 1)
+                llvm_pointer = llvm.inttoptr(
+                    ir.Type.parse("!llvm.ptr<1>"), as_ir_value(address)
+                )
+                old = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    llvm_pointer,
+                    as_ir_value(fx.Int32(1)),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+                if fx.Int32(old.result) == fx.Int32(fx.grid_dim.x - 1):
+                    work_counter[0] = fx.Int32(fx.grid_dim.x)
+                    work_counter[1] = fx.Int32(0)
 
         @flyc.jit
         def advance_work_ticket(ticket_delta, query_tile_index, head_index, batch_index, works_per_head):
@@ -948,17 +1199,18 @@ def MHA(
         while batch_index < batch_size:
             process_work_item(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
-                q_descale, kv_last_page_lens, output,
+                q_descale, kv_last_page_lens, sink_ptr, output,
                 batch_index, head_index, query_tile_index, tid, k_scale, v_scale,
-                True,
+                shared_allocator,
             )
 
-            next_ticket = fetch_work(work_counter, tid)
+            next_ticket = fetch_work(work_counter, ticket_mailbox, tid)
             ticket_delta = next_ticket - work_ticket
             work_ticket = next_ticket
             query_tile_index, head_index, batch_index, works_per_head = advance_work_ticket(
                 ticket_delta, query_tile_index, head_index, batch_index, works_per_head
             )
+        finish_work(work_counter, tid)
 
     @flyc.jit
     def launch(
@@ -973,6 +1225,7 @@ def MHA(
         k_descale: fx.Tensor,
         v_descale: fx.Tensor,
         kv_last_page_lens: fx.Tensor,
+        sink_ptr: fx.Tensor,
         output: fx.Tensor,
         work_counter: fx.Tensor,
         num_workgroups: fx.Int32,
@@ -1046,14 +1299,14 @@ def MHA(
             attention_kernel_static(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                 kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, output,
+                kv_last_page_lens, sink_ptr, output,
                 value_attrs=value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
         else:
             attention_kernel(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                 kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, output, work_counter,
+                kv_last_page_lens, sink_ptr, output, work_counter,
                 value_attrs=persistent_value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
@@ -1074,6 +1327,7 @@ def MHA(
         kv_last_page_lens,
         out,
         stream=None,
+        sink_ptr=None,
     ):
         stream = torch.cuda.current_stream() if stream is None else stream
         assert causal == is_causal
@@ -1084,7 +1338,13 @@ def MHA(
                     "cu_seqlens_k=None requires key_layout='vectorized'"
                 )
             cu_seqlens_k = cu_seqlens_q
-        assert q.dtype in (torch.float8_e4m3fnuz, torch.bfloat16)
+        arch = torch.cuda.get_device_properties().gcnArchName
+        native_fp8_dtype = (
+            torch.float8_e4m3fn
+            if "gfx950" in arch
+            else torch.float8_e4m3fnuz
+        )
+        assert q.dtype in (native_fp8_dtype, torch.bfloat16)
         if key_layout == "linear":
             assert q.dtype == torch.bfloat16
             assert head_dim_qk == head_dim_v == 128
@@ -1127,15 +1387,26 @@ def MHA(
         assert kv_last_page_lens.ndim == 1
         assert cu_seqlens_q.shape == cu_seqlens_k.shape == kv_indptr.shape
         assert kv_last_page_lens.shape[0] == cu_seqlens_q.shape[0] - 1
+        if has_sink:
+            assert sink_ptr is not None
+            assert sink_ptr.shape == (num_qo_heads,)
+            assert sink_ptr.dtype == torch.float32
+            assert sink_ptr.device == q.device
+            assert sink_ptr.is_contiguous()
+        elif sink_ptr is None:
+            sink_ptr = q_descale
         assert k.numel() * k.element_size() <= 2**31 - 1
-        assert "gfx942" in torch.cuda.get_device_properties().gcnArchName
+        assert any(supported_arch in arch for supported_arch in ("gfx942", "gfx950"))
         batch_size = cu_seqlens_q.shape[0] - 1
-        static_schedule = batch_size == 1
+        static_schedule = batch_size == 1 and not force_dynamic_schedule
         if static_schedule:
             works_per_head = (num_query_tokens + block_m - 1) // block_m
             num_workgroups = num_qo_heads * works_per_head
         else:
             multiprocessor_count = torch.cuda.get_device_properties().multi_processor_count
+            # A 1/2/3/4 WG-per-CU sweep selected two for both B=1 and B=4:
+            # one under-fills latency hiding, while three or four add agents
+            # without increasing residency at this LDS/VGPR footprint.
             num_workgroups = multiprocessor_count * 2
         if static_schedule:
             work_counter = getattr(launch, "_static_work_counter", None)
@@ -1143,9 +1414,24 @@ def MHA(
                 work_counter = torch.empty(1, device="cuda", dtype=torch.int32)
                 launch._static_work_counter = work_counter
         else:
-            with torch.cuda.stream(stream):
-                work_counter = torch.zeros(num_workgroups + 1, device="cuda", dtype=torch.int32)
-                work_counter[0] = num_workgroups
+            # Counter state is stream-local because launches on different
+            # streams may overlap. The device-side finalizer makes reuse free
+            # of per-call allocation, fill, and seed-copy dispatches.
+            work_counter_cache = getattr(launch, "_work_counter_cache", {})
+            work_counter_key = (
+                torch.cuda.current_device(),
+                stream.cuda_stream,
+                num_workgroups,
+            )
+            work_counter = work_counter_cache.get(work_counter_key)
+            if work_counter is None:
+                with torch.cuda.stream(stream):
+                    work_counter = torch.zeros(
+                        2, device="cuda", dtype=torch.int32
+                    )
+                    work_counter[0] = num_workgroups
+                work_counter_cache[work_counter_key] = work_counter
+                launch._work_counter_cache = work_counter_cache
 
         compiled_cache = getattr(launch, "_compiled", {})
         cache_key = (
@@ -1155,7 +1441,7 @@ def MHA(
             torch.cuda.get_device_properties().gcnArchName,
             *(_tensor_signature(tensor) for tensor in (
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
-                q_descale, k_descale, v_descale, kv_last_page_lens, out,
+                q_descale, k_descale, v_descale, kv_last_page_lens, sink_ptr, out,
                 work_counter,
             )),
         )
@@ -1168,7 +1454,7 @@ def MHA(
                 compiled = flyc.compile(
                     launch, q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                     kv_page_indices, q_descale, k_descale, v_descale,
-                    kv_last_page_lens, out, work_counter, num_workgroups,
+                    kv_last_page_lens, sink_ptr, out, work_counter, num_workgroups,
                     static_schedule, stream,
                 )
             finally:
@@ -1179,8 +1465,9 @@ def MHA(
             compiled(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                 kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, out, work_counter, num_workgroups,
+                kv_last_page_lens, sink_ptr, out, work_counter, num_workgroups,
                 static_schedule, stream,
             )
+        return out
 
     return callable
