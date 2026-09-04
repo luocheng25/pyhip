@@ -9,6 +9,7 @@ from .common import get_device_cache_key
 from .gemm2_1x4 import _build_moe_gemm2_1x4
 from .gemm2_1x8 import _build_moe_gemm2_1x8
 from .gemm2_2x4 import _build_moe_gemm2_2x4
+from .gemm2_8x1 import _build_moe_gemm2_8x1
 from .gemm2_default import _build_moe_gemm2_default
 
 _BUILDERS = {
@@ -16,6 +17,7 @@ _BUILDERS = {
     "1x4_64x256": _build_moe_gemm2_1x4,
     "1x8": _build_moe_gemm2_1x8,
     "2x4": _build_moe_gemm2_2x4,
+    "8x1": _build_moe_gemm2_8x1,
 }
 
 
