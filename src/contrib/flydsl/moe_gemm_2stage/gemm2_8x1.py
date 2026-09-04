@@ -565,6 +565,18 @@ def _build_moe_gemm2_8x1(
                         fx.rocdl.sched_barrier(0)
 
             # ---- 8. 主循环 ----
+            def enter_read_write_stage():
+                fx.rocdl.sched_barrier(0)
+                fx.rocdl.s_barrier()
+                fx.rocdl.s_setprio(0)
+                fx.rocdl.sched_barrier(0)
+
+            def enter_compute_stage():
+                fx.rocdl.sched_barrier(0x40)
+                fx.rocdl.s_barrier()
+                fx.rocdl.s_setprio(1)
+                fx.rocdl.sched_barrier(0x40)
+
             load_weight_tile(0, 0, stage_regs[0])
             load_w_scale(0)
             fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
@@ -587,7 +599,10 @@ def _build_moe_gemm2_8x1(
                     frag_weight = down_ops.load_tiled_mma_fragA(
                         mm, lds_b[cur], copy_atom_bits=128
                     )
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    # 只等本步要用的 2 条 weight load。gfx9 的 vmcnt 按发射序退休，
+                    # 上一块 epilogue 的 8 条 store 发射在它们之后，可以继续在飞。
+                    keep_vmcnt = 8 if (k == 0 and block_n > 0) else 0
+                    fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=keep_vmcnt))
                     commit_weight_tile(nxt, stage_regs[nxt])
                     nk = step + 2
                     nj, nkk = nk // nBK, nk % nBK

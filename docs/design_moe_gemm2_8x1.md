@@ -118,6 +118,41 @@ H3 是唯一不受带宽约束的 case，其收益来源不同（见 §9）。
 2. ✅ 最终 ISA：`VGPR+AGPR = 240 ≤ 256`、`scratch = 0`；
 3. ❌ 相对基准的提升率（v1 为负，待 v2 反相改造）。
 
+### 0.5 优化尝试记录（`[实测]`，Qwen3.5 35B K=256）
+
+> ⚠️ **测量协议缺陷（2026-09-04 发现，已修正）**：下表 #1–#4 是在**未锁频、且每个配置只测一次**
+> 的条件下取得的。事后对**同一份未改动的代码**连测 4 次得到
+> `1.3896 / 1.5117 / 1.5077 / 1.5134 ms`——**run-to-run 漂移 8.9%**，而单次运行内
+> P25–P75 仅 ±0.3%。设 `perf_determinism` 后仍呈双峰 `1.5150 / 1.3899 / 1.3930 / 1.3884`：
+> **每个进程的第一次运行偏慢约 8%**，因为一次 bench 只有 ~0.14 s GPU 负载，不足以让时钟从
+> idle 爬满。
+> **因此 #1–#3 的差异全部落在噪声带内，结论不成立；只有 #4 的两次测量（1.58/1.60）
+> 高于观测到的噪声上界（1.5150），可判定为真实回退。**
+
+| # | 改动 | ms（单次，含噪声） | VGPR+AGPR | 判定 |
+| --- | --- | ---: | ---: | --- |
+| 0 | v1 初版 | 1.5591 | — | 基线 |
+| 1 | 删 CShuffle 内多余 workgroup barrier + 每 K step 2 barrier 降为 1 | 1.3890 | 240 | ⚠️ 噪声内，**不确定** |
+| 2 | MFMA 提到 prefetch 之前 | 1.4112 | — | ⚠️ 噪声内，不确定 |
+| 3 | `frag_sorted_weight` 由 fragC 形状（64）压为 2 个标量 | 1.5056 | **248** | ⚠️ 时间不确定；但**寄存器 240→248 是确定的**，故仍回退 |
+| 4 | **两段反相**（条件错位 barrier + `s_setprio`） | 1.6037 / 1.5832 | — | ❌ 高于噪声上界，**真实回退** |
+
+**当前稳态基准**：连测 3 次 `1.3899 / 1.3930 / 1.3884 ms`（弃首次），即 **≈1.389 ms / 197.9 useful TFLOPS**。
+
+需要记录的结论：
+
+- **测量协议**：后续所有对比必须（a）弃掉每轮首次运行，（b）每个配置重复 ≥3 次，
+  （c）用 ABBA 配对而非独立测量。这与 `MAIN_MERGE_PERFORMANCE_REPORT.md` 的协议一致——
+  之前偷懒省掉这些步骤，导致 3 个结论作废。
+- **尝试 3 的寄存器发现仍然有效**（编译期属性，与时钟无关）：把 `frag_sorted_weight`
+  从 fragC 形状压成标量后，**AGPR 仍为 132 不变、VGPR 反而 108→116**。说明这 64 个值本来
+  就分配在 AGPR（MFMA 专用池，不与 VGPR 争抢），是"免费存储"。
+  → **§4.1 的寄存器预算应区分 VGPR/AGPR 两个池，不能只看总数。**
+- **尝试 4（反相）是真实回退**，与 §5.1 的周期账预测相反。周期账假设 mem stage ≈ 600–700 clk
+  < compute stage 1024 clk；实测反相后变慢，说明 **mem stage 实际远长于 compute stage**。
+  最可能的原因是 §3.5 声称"免 swizzle、零 bank conflict"的 `ds_read` 布局并不成立。
+  → **下一步必须用 ATT 实测 mem stage 时长与 LDS conflict，而不是继续盲调。**
+
 ---
 
 ## 1. 为什么是 8x1 而不是继续调 1x4
@@ -520,3 +555,81 @@ ATT 重点观察项（对应 §5 的三条论证）：
 | 2026-09-04 | 建档。完成 roofline 诊断（§0.2，确认 K=256 三个 case 卡在 HBM ~82%）、几何/寄存器/LDS 预算、两段反相遮盖论证（含 co-issue 实测依据）、伪代码。实现与实测未开始。 |
 | 2026-09-04 | 落地 `gemm2_8x1.py` v1（正确性优先版：完整 8x1 拓扑 + LDS ping-pong + A 常驻 VGPR + CShuffle 写出；两段反相 barrier 留到 v2），并在 `gemm2.py` 注册 `down_path="8x1"`。推导出 preshuffle 权重的等价闭式 `addr(c,k)=(c/16)*16K+(k/16)*256+(c%16)*16+(k%16)`，据此确定 LDS 排布与免 swizzle 的 128-bit `ds_read`。 |
 | 2026-09-04 | 因 §9.1-B1，将所有 `fx.buffer_ops.*` 改写为 v0.3.2 原生的 `fx.rocdl.make_buffer_tensor` + copy atom。修复两个 bug：（1）`load_w_scale` 缺双缓冲，预取 N+1 时覆盖了 N 的 epilogue 所需 scale；（2）weight 预取边界条件写错，最后一个 N 块的末尾 K chunk 被跳过（仅 nBK≥3 暴露）。删除 CShuffle 里多余的 workgroup barrier（该区 wave 私有），并将每个 K step 的 barrier 从 2 个减为 1 个（1.559 -> 1.389 ms）。首轮实测写入 §0.4。 |
+| 2026-09-04 | 尝试两段反相（含滚动 `vmcnt` 版本）与 `frag_sorted_weight` 标量化，均回退。随后发现**测量协议缺陷**：同一份代码 run-to-run 漂移 8.9%，导致此前 3 个结论作废，详见 §0.5。补齐交接材料：把 harness 从 `/tmp` 落进仓库（`tests/contrib/moe/test_down_8x1.py` + `_env_workaround.py`），新增 §11。 |
+
+---
+
+## 11. 交接（换机器继续）
+
+### 11.1 当前状态一句话
+
+`gemm2_8x1` v1 **功能正确、资源达标、性能未达标**：稳态 1.389 ms / 197.9 useful TFLOPS
+（Qwen3.5 35B K=256 @32K），约为 §0.1 历史基线的 0.55x。瓶颈定位尚未完成——
+下一步必须用 ATT 实测，不要继续盲调（理由见 §0.5）。
+
+### 11.2 代码位置
+
+| 内容 | 路径 |
+| --- | --- |
+| kernel | `src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py` |
+| path 注册 | `src/contrib/flydsl/moe_gemm_2stage/gemm2.py`（`_BUILDERS["8x1"]`） |
+| 正确性 + bench harness | `tests/contrib/moe/test_down_8x1.py` |
+| 环境修补（可选） | `tests/contrib/moe/_env_workaround.py` |
+| 本文档 | `docs/design_moe_gemm2_8x1.md` |
+
+分支 `luocheng/moe-down-8wave`。改动只在 `pyhip`，未动 `aiter` 源码与 `FlyDSL`。
+
+### 11.3 环境要求与已知坑
+
+| 项 | 要求 / 现象 |
+| --- | --- |
+| GPU | gfx942。本轮用 MI308X（80 CU）；§0 的 peak 常数 589.8 TFLOPS 与 5.3 TB/s 按此机型推导，换机型需重算 |
+| FlyDSL | **v0.3.2**。`gemm2_8x1.py` 已按该版本 API 编写。注意现有 `gemm2_1x4/2x4/1x8` 仍在用**不存在**的 `fx.buffer_ops`，在 v0.3.2 上无法编译——想做同机 A/B 对比必须先同样改写它们 |
+| aiter | 若 `import aiter` 报 `module_aiter_core has no attribute ...`，删掉 `aiter/jit/module_aiter_core.so` 让 JIT 重建。本轮重建后又遇 `gluon kernels require triton>=3.6.0`（实测 3.5.1），故 `test_moe.py` 全链路仍不可用 |
+| pyhip | 若 editable 装在别的 checkout 上，`sys.path`/`PYTHONPATH` 盖不住（MetaPathFinder 优先）。`_env_workaround.py` 会改写 `__editable___pyhip_1_0_0_finder.MAPPING` |
+| 时钟 | **必须锁频**，且**弃掉每轮首次运行**，见 §0.5 |
+
+### 11.4 复现命令
+
+```bash
+# 正确性（单配置）
+python3 tests/contrib/moe/test_down_8x1.py test --k 256 --n 256
+
+# 正确性（全矩阵，pytest）
+pytest tests/contrib/moe/test_down_8x1.py -k correctness
+
+# 性能：repeat>=3 且丢弃首次
+python3 tests/contrib/moe/test_down_8x1.py bench --case qwen35b_k256 --repeat 3
+
+# 资源（LDS / scratch / VGPR / AGPR）
+rocprofv3 --kernel-trace -f csv -o /tmp/k8x1 -- \
+  python3 tests/contrib/moe/test_down_8x1.py bench --case qwen35b_k256
+# 读 /tmp/k8x1_kernel_trace.csv 的 LDS_Block_Size / Scratch_Size / VGPR_Count / Accum_VGPR_Count
+```
+
+已验证基线：`K x N` ∈ {128,256,384} x {128,256,384,512} 全部 PASS，相对误差 0.37%–0.68%；
+LDS 50176 B、scratch 0、VGPR 108 + AGPR 132 = 240。
+
+### 11.5 下一步（按优先级）
+
+1. **ATT 抓取**（`FlyDSL/.claude/skills/capture-kernel-trace`）。要回答两个问题：
+   - mem stage（16 条 `ds_read_b128` + waitcnt）实际占多少 cycle？§5.1 假设 600–700 clk、
+     compute stage 1024 clk，但反相实测变慢，说明这个假设错了；
+   - §3.5 声称的「免 swizzle、零 bank conflict」`ds_read` 布局是否成立？该结论是纸上推导、
+     从未验证，是当前最可疑的一环。
+2. 依 ATT 结果决定：若确为 LDS conflict，改 LDS 排布（加 XOR swizzle）；
+   若为延迟未隐藏，才考虑 `frag_weight` 双缓冲（需先腾出 64 VGPR）。
+3. 反相改造（§5/§6）——**必须在 1、2 之后**，且要与 epilogue 摊入 mem stage 同时上线。
+4. `raw_ptr_buffer_load/store` + `readfirstlane` soffset（§3.4），ISA 复查核心循环无地址 VALU。
+5. host 侧 selector 按 `rows_per_expert` 门控（§9.2 的 M padding 风险）。
+
+### 11.6 需要重新验证的结论
+
+| 结论 | 状态 |
+| --- | --- |
+| §0.2 roofline 诊断（K=256 卡在 HBM ~82%） | 由 §0.1 历史实测推导，可信 |
+| §0.3 8x1 目标预测 | 仍是**未验证的解析预测** |
+| §4.1 寄存器预算 | 总数对（预测 222 / 实测 240），但**未区分 VGPR/AGPR 两池**，需按 §0.5 修正 |
+| §5.1 每 stage 周期账 | **与反相实测矛盾，很可能是错的**，待 ATT |
+| §3.5 免 swizzle 零 conflict | **纸上推导，从未验证**，待 ATT |
+| §5.3 VALU co-issue 核算 | 依据是实测 co-issue 表，但本 kernel 内未验证 |
