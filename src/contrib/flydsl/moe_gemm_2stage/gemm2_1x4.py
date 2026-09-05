@@ -946,4 +946,5 @@ def _build_moe_gemm2_1x4(
         )
         kernel.launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
 
+    launch_prefill_1x4.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_1x4
