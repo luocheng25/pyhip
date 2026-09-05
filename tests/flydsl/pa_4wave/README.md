@@ -1,6 +1,28 @@
 # Paged Prefill 4-wave/8-wave 优化与性能报告
 
-## 最新：8-wave 可选 persistent（2026-09-05）
+## 最新：SWA+sink 原因与局部修正（2026-09-05）
+
+已完成第3阶段分析：Q4K→64K扫描后8-wave仍慢约17%～21%，不是单纯任务数不足。
+BM256的窗口并集导致MFMA总量为4-wave的1.5倍；短窗口仍有53个barrier/wave，
+4-wave为13。只在 `B=1`、至少1024个最大Q-block/head任务、D128窗口≤64或D192窗口≤128
+时跳过wave完全不可见的QK/PV；不改任务划分，所有memory/NaN-tail/barrier保留。
+小grid和宽窗口全启用曾回退，已由编译期门限排除。
+
+最终完整8-wave回归 **272 passed / 6 skipped**，4-wave **51 passed / 2 skipped**。
+本轮D192/W128同进程A/B（µs）：
+
+| KV | 8static前 | 8static后 | 8persistent前 | 8persistent后 | 4static |
+|---:|---:|---:|---:|---:|---:|
+| 32K | 116.148 | 113.629 | 113.697 | 112.604 | 95.896 |
+| 64K | 116.239 | 114.028 | 113.873 | 113.078 | 95.240 |
+| 128K | 116.549 | 114.888 | 114.151 | 112.884 | 95.082 |
+
+static改善1.43%～2.17%，persistent改善0.70%～1.11%，**仍慢于4-wave**；D128/W128未启用。
+full路径mnemonic数量/资源不变。MFMA动态数减半，但memory/softmax/同步成本未减少，
+不是2×加速。全部根因、实测门限、拒绝的退化实验、布局/计时口径、ATT前后不一致性说明见
+[SWA分析](../pa_8wave/swa_analysis.md)。以下旧矩阵和阶段记录保留，不混为最终重测。
+
+## 8-wave 可选 persistent（2026-09-05，SWA优化前验收）
 
 当前8-wave工厂支持 `persistent=True`，默认仍static。设备端工作队列、每stream独立
 8-byte header、CTA结束自动重置；热路径仍单kernel/零KV workspace。

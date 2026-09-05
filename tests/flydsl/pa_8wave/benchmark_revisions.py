@@ -76,8 +76,8 @@ def make_call(factory, case, causal, options):
 
 
 @benchmark()
-def compare(scenario, dq, q_len, kv_len, heads, candidates, baseline, dump_root, records):
-    causal, window = scenario in ("causal", "swa"), 128 if scenario == "swa" else -1
+def compare(scenario, dq, q_len, kv_len, heads, window_left, candidates, baseline, dump_root, records):
+    causal, window = scenario in ("causal", "swa"), window_left if scenario == "swa" else -1
     q_lens, kv_lens, kv_heads = (q_len,), (kv_len,), 1
     if scenario == "batch4":
         q_lens, kv_lens = (q_len,) * 4, (kv_len,) * 4
@@ -94,6 +94,7 @@ def compare(scenario, dq, q_len, kv_len, heads, candidates, baseline, dump_root,
     if baseline:
         module, baseline_hash = load_revision(baseline)
         factories["baseline"] = (module.PagedAttention, {})
+        factories["baseline_persistent"] = (module.PagedAttention, {"persistent": True})
     calls, isa, errors, dispatch = {}, {}, {}, {}
     for name in candidates:
         if name == "4static" and len(q_lens) != 1:
@@ -101,7 +102,7 @@ def compare(scenario, dq, q_len, kv_len, heads, candidates, baseline, dump_root,
         factory, options = factories[name]
         call = make_call(factory, case, causal, options)
         if dump_root:
-            directory = Path(dump_root) / f"{scenario}_{dq}_{q_len}_{kv_len}_{heads}_{name}"
+            directory = Path(dump_root) / f"{scenario}_{dq}_{q_len}_{kv_len}_{heads}_w{window}_{name}"
             env.debug.dump_ir, env.debug.dump_dir = True, str(directory)
         output = call()
         torch.cuda.synchronize()
@@ -157,14 +158,15 @@ def main():
     parser.add_argument("--q", type=int, nargs="+")
     parser.add_argument("--kv", type=int, nargs="+")
     parser.add_argument("--heads", type=int, nargs="+", default=[16])
-    parser.add_argument("--candidate", nargs="+", choices=("baseline", "static", "persistent", "4static", "4dynamic"), default=["static"])
+    parser.add_argument("--window", type=int, nargs="+", default=[128])
+    parser.add_argument("--candidate", nargs="+", choices=("baseline", "baseline_persistent", "static", "persistent", "4static", "4dynamic"), default=["static"])
     parser.add_argument("--baseline", help="Git blob or revision:path for a same-process baseline")
     parser.add_argument("--dump-root", help="fresh compiler-dump directory; disable disk cache for ISA capture")
     parser.add_argument("--output", type=Path, help="write all raw samples and resource metadata as JSON")
     args = parser.parse_args()
     if not torch.cuda.is_available() or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
         raise SystemExit("requires gfx950")
-    if "baseline" in args.candidate and not args.baseline:
+    if any(name.startswith("baseline") for name in args.candidate) and not args.baseline:
         parser.error("baseline candidate requires --baseline")
     shapes = {"nc": (10240, 2583), "causal": (32768, 32768), "swa": (16384, 131072),
               "batch4": (10240, 2560), "h3": (63225, 63225)}
@@ -175,13 +177,14 @@ def main():
             for q_len in args.q or [q]:
                 for kv_len in args.kv or [kv]:
                     for heads in args.heads:
-                        row = compare(scenario, dq, q_len, kv_len, heads, args.candidate, args.baseline, args.dump_root, records)
-                        for key in ("records", "candidates", "baseline", "dump_root"):
-                            row.pop(key, None)
-                        rows.append(row)
-                        if args.output:
-                            args.output.parent.mkdir(parents=True, exist_ok=True)
-                            args.output.write_text(json.dumps(records, indent=2) + "\n")
+                        for window in args.window if scenario == "swa" else [-1]:
+                            row = compare(scenario, dq, q_len, kv_len, heads, window, args.candidate, args.baseline, args.dump_root, records)
+                            for key in ("records", "candidates", "baseline", "dump_root"):
+                                row.pop(key, None)
+                            rows.append(row)
+                            if args.output:
+                                args.output.parent.mkdir(parents=True, exist_ok=True)
+                                args.output.write_text(json.dumps(records, indent=2) + "\n")
     aiter.logger.info("Revision/scheduler comparison (GPU microseconds):\n%s", pd.DataFrame(rows).to_markdown(index=False))
 
 

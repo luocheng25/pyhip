@@ -229,15 +229,22 @@ def _tiled_mma():
     return fx.make_tiled_mma(atom, fx.make_layout((1, 8, 1), (1, 1, 0)))
 
 
-def _qk(q, k):
+def _qk(q, k, active=None):
     mma = _tiled_mma()
     acc = mma.make_fragment_C(fx.make_rmem_tensor((BN // 2, BM), fx.Float32))
     acc.fill(0.0)
-    fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
+    if active is None:
+        fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
+    else:
+        @flyc.jit
+        def compute_visible():
+            if active:
+                fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
+        compute_visible()
     return acc.load()
 
 
-def _pv(p, v, o0, o1):
+def _pv(p, v, o0, o1, active=None):
     mma = _tiled_mma()
     probs = mma.make_fragment_B(fx.make_rmem_tensor((BM, BN), fx.BFloat16))
     probs.store(p)
@@ -246,7 +253,14 @@ def _pv(p, v, o0, o1):
     # View packed V as (atom values, output columns, reduction). No register
     # transpose. Traversal is fastest-axis first: M,N,K gives an outer K loop
     # alternating the two independent M accumulators, as in the OPUS schedule.
-    fx.gemm(mma, acc, fx.select(v, [0, 2, 1]), probs, acc, traversal_order="mnk")
+    if active is None:
+        fx.gemm(mma, acc, fx.select(v, [0, 2, 1]), probs, acc, traversal_order="mnk")
+    else:
+        @flyc.jit
+        def compute_visible():
+            if active:
+                fx.gemm(mma, acc, fx.select(v, [0, 2, 1]), probs, acc, traversal_order="mnk")
+        compute_visible()
     return acc[None, 0, 0].load(), acc[None, 1, 0].load()
 
 
@@ -315,6 +329,7 @@ def _attention_body(
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool],
     REVERSE: fx.Constexpr[bool] = False, MERGED: fx.Constexpr[bool] = False,
+    PRUNE_SWA: fx.Constexpr[bool] = False,
 ):
     K_CHUNKS = DQ // 64
     K_TILE = 8 * K_CHUNKS * 520
@@ -387,6 +402,10 @@ def _attention_body(
     def data_tile(position):
         return first + (last - position if REVERSE else position)
 
+    def visible_wave_tile(position):
+        return ((data_tile(position) * BN < wave_row + kv_len - q_len + 32)
+                & (data_tile(position) * BN + BN > wave_row + kv_len - q_len - WINDOW)) if PRUNE_SWA else None
+
     def load_k(physical, slot, begin=0, end=K_CHUNKS):
         offset = physical * (BN * HK * DQ * 2)
         for d in fx.range_constexpr(begin, end):
@@ -424,7 +443,7 @@ def _attention_body(
     load_v(page0, 0)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
-    s0 = _qk(q_frag, k_frag)
+    s0 = _qk(q_frag, k_frag, visible_wave_tile(fx.Int32(0)))
     o0 = fx.Vector.filled(16, 0.0, fx.Float32)
     o1 = fx.Vector.filled(16, 0.0, fx.Float32)
     o2 = fx.Vector.filled(16, 0.0, fx.Float32)
@@ -435,7 +454,7 @@ def _attention_body(
     k_frag = _read_qk(storage, rk + 256, DQ)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
-    s1 = _qk(q_frag, k_frag)
+    s1 = _qk(q_frag, k_frag, visible_wave_tile(fx.Int32(0)))
     scores = _mask(_join(s0, s1), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL, WINDOW)
     maximum = (_row_max(scores) * scale).maximumf(fx.Float32(-1.0e30))
     row_sum = fx.Float32(0.0)
@@ -463,7 +482,7 @@ def _attention_body(
         rocdl.s_waitcnt(lgkmcnt=0)
         _stage_end()
         future_page = _prefetch_page(TABLE, data_tile(_min(t + 2, last)))
-        lo = _qk(q_frag, k)
+        lo = _qk(q_frag, k, visible_wave_tile(t))
         previous = _pin(_exp_slice(previous, 0, 24), 32)
         if fx.const_expr(DQ == 128):
             _schedule(8, 3, 1, True)
@@ -484,7 +503,7 @@ def _attention_body(
         # One instruction retains both the rolling DMA and page/LDS waits.
         future_page = _page_ready(future_page, KEEP_VMCNT)
         _stage_end()
-        hi = _qk(q_frag, k)
+        hi = _qk(q_frag, k, visible_wave_tile(t))
         previous = _exp_slice(previous, 24, 32)
         row_sum = _pin_f32(row_sum + _row_sum(previous))
         p = _pin(previous.to(fx.BFloat16), 16)
@@ -512,7 +531,7 @@ def _attention_body(
             rocdl.sched_barrier(0)
             v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
-        o0, o1 = _pv(p, v, o0, o1)
+        o0, o1 = _pv(p, v, o0, o1, visible_wave_tile(t - 1))
         candidate = _row_max(current) * scale
         mask = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - maximum > 8.0).ir_value()))
         new_max = _pin_f32((mask != fx.Int64(0)).select(maximum.maximumf(candidate), maximum))
@@ -530,7 +549,7 @@ def _attention_body(
             rocdl.sched_barrier(0)
             v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
-        o2, o3 = _pv(p, v, o2, o3)
+        o2, o3 = _pv(p, v, o2, o3, visible_wave_tile(t - 1))
         current = _center_slice(current, scale, new_max, split, 32)
         if fx.const_expr(STAGGER):
             for count in (3, 2, 2, 2, 3, 3, 4, 4):
@@ -565,14 +584,14 @@ def _attention_body(
     rocdl.sched_barrier(0)
     v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
     _stage_end()
-    o0, o1 = _pv(p, v, o0, o1)
+    o0, o1 = _pv(p, v, o0, o1, visible_wave_tile(last))
     _stage_end()
     v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + 520 + rv)
     rocdl.s_waitcnt(lgkmcnt=0)
     rocdl.sched_barrier(0)
     v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
     _stage_end()
-    o2, o3 = _pv(p, v, o2, o3)
+    o2, o3 = _pv(p, v, o2, o3, visible_wave_tile(last))
     rocdl.sched_barrier(0)
     if fx.const_expr(not STAGGER):
         rocdl.s_barrier()
@@ -614,10 +633,11 @@ def _attention_sequence(
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool], MERGE: fx.Constexpr[bool],
+    PRUNE_SWA: fx.Constexpr[bool] = False,
 ):
     _attention_body(Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, qb,
                    H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
-                   False, MERGE)
+                   False, MERGE, PRUNE_SWA)
     if fx.const_expr(MERGE):
         mirror = (q_len + BM - 1) // BM - 1 - qb
         if mirror > qb:
@@ -625,7 +645,7 @@ def _attention_sequence(
             # mirror scans backward so both passes balance work and reuse L2.
             _attention_body(Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, mirror,
                            H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
-                           True, MERGE)
+                           True, MERGE, PRUNE_SWA)
 
 
 @flyc.jit
@@ -663,7 +683,7 @@ def _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, stor
     DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
+    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool], PRUNE_SWA: fx.Constexpr[bool] = False):
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
     page_start = _uniform(KI[batch])
@@ -676,9 +696,9 @@ def _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, stor
         if kv_len > 0:
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
             if group != 0:
-                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, True, MERGE)
+                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, True, MERGE, PRUNE_SWA)
             else:
-                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, False, MERGE)
+                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, False, MERGE, PRUNE_SWA)
         else:
             _zero_tile(O, LSE, SINK, q0, q_len, head, qb, H, OROW, OHEAD, WITH_LSE, HAS_SINK)
             if fx.const_expr(MERGE):
@@ -694,11 +714,11 @@ def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
+    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool], PRUNE_SWA: fx.Constexpr[bool]):
     storage = _attention_storage(fx.SharedAllocator(), DQ)
     _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, storage,
         fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z")),
-        H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE)
+        H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE, PRUNE_SWA)
 
 
 def _atomic_increment(counter, index):
@@ -741,7 +761,7 @@ def _attention_persistent_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx
     DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
+    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool], PRUNE_SWA: fx.Constexpr[bool]):
     allocator = fx.SharedAllocator()
     storage = _attention_storage(allocator, DQ)
     mailbox = allocator.allocate(fx.Array[fx.Int32, 1, 4]).peek()
@@ -769,7 +789,7 @@ def _attention_persistent_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx
         local = ticket - begin
         _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, storage,
             local % H, batch, local // H,
-            H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE)
+            H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE, PRUNE_SWA)
         ticket = _next_ticket(COUNTER, mailbox, tid)
         batch, begin, end = locate(ticket, batch, begin, end)
     _finish_scheduler(COUNTER, tid)
@@ -784,8 +804,11 @@ def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], stream: fx.Stream):
     query_blocks = (MAX_Q + BM - 1) // BM
     merge = CAUSAL and WINDOW < 0 and query_blocks * H * B >= 512
+    # Gating regresses small grids / wide windows. Keep their original ISA;
+    # enable only the large, narrow-window regimes validated by paired sweeps.
+    prune = B == 1 and query_blocks * H >= 1024 and 0 <= WINDOW <= (128 if DQ == 192 else 64)
     _attention_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD,
-        PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge,
+        PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge, prune,
         value_attrs={"rocdl.waves_per_eu": 2},
     ).launch(grid=(H, B, (query_blocks + 1) // 2 if merge else query_blocks), block=(THREADS, 1, 1), stream=stream)
 
@@ -800,8 +823,9 @@ def _launch_persistent(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, L
     COUNTER: fx.Tensor, GRID: fx.Constexpr[int], stream: fx.Stream):
     query_blocks = (MAX_Q + BM - 1) // BM
     merge = CAUSAL and WINDOW < 0 and query_blocks * H * B >= 512
+    prune = B == 1 and query_blocks * H >= 1024 and 0 <= WINDOW <= (128 if DQ == 192 else 64)
     _attention_persistent_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, COUNTER,
-        H, HK, NP, B, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge,
+        H, HK, NP, B, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge, prune,
         value_attrs={"rocdl.waves_per_eu": 2},
     ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 

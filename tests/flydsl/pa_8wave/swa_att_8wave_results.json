@@ -1,0 +1,1265 @@
+{
+  "method": "Complete waves only. Per-wave stalls overlap and are not additive. MFMA 32-cycle union is a model, not a hardware utilization counter.",
+  "traces": [
+    {
+      "directory": "/tmp/pa950_swa_att/static/ui_output_agent_58610_dispatch_37",
+      "complete_waves": 32,
+      "mean_wave_span_cycles": 42464.375,
+      "instructions_per_wave": 2928.0,
+      "opcode_per_wave": {
+        "buffer_load_dword": {
+          "count": 1.0,
+          "stall_cycles": 0.5
+        },
+        "buffer_load_dwordx4": {
+          "count": 48.0,
+          "stall_cycles": 3874.125
+        },
+        "buffer_store_dwordx4": {
+          "count": 8.0,
+          "stall_cycles": 2077.875
+        },
+        "ds_read_b128": {
+          "count": 252.0,
+          "stall_cycles": 2072.5
+        },
+        "global_load_dword": {
+          "count": 3.0,
+          "stall_cycles": 50.0
+        },
+        "s_add_i32": {
+          "count": 58.0,
+          "stall_cycles": 35.875
+        },
+        "s_add_u32": {
+          "count": 21.0,
+          "stall_cycles": 23.0
+        },
+        "s_addc_u32": {
+          "count": 21.0,
+          "stall_cycles": 1.625
+        },
+        "s_addk_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_and_b32": {
+          "count": 9.0,
+          "stall_cycles": 2.0
+        },
+        "s_and_b64": {
+          "count": 9.0,
+          "stall_cycles": 3.625
+        },
+        "s_andn2_b32": {
+          "count": 3.0,
+          "stall_cycles": 0.375
+        },
+        "s_ashr_i32": {
+          "count": 26.0,
+          "stall_cycles": 11.25
+        },
+        "s_barrier": {
+          "count": 53.0,
+          "stall_cycles": 9011.5
+        },
+        "s_bitcmp0_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_bitcmp1_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_branch": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc0": {
+          "count": 3.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc1": {
+          "count": 8.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_vccz": {
+          "count": 6.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_eq_u64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_ge_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_gt_i32": {
+          "count": 2.0,
+          "stall_cycles": 1.125
+        },
+        "s_cmp_lg_u32": {
+          "count": 8.0,
+          "stall_cycles": 2.0
+        },
+        "s_cmp_lt_i32": {
+          "count": 10.0,
+          "stall_cycles": 9.875
+        },
+        "s_cmpk_lt_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cselect_b32": {
+          "count": 5.0,
+          "stall_cycles": 1.75
+        },
+        "s_cselect_b64": {
+          "count": 16.0,
+          "stall_cycles": 3.5
+        },
+        "s_endpgm": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_load_dword": {
+          "count": 14.0,
+          "stall_cycles": 0.25
+        },
+        "s_load_dwordx2": {
+          "count": 12.0,
+          "stall_cycles": 24.25
+        },
+        "s_lshl_b32": {
+          "count": 20.0,
+          "stall_cycles": 98.625
+        },
+        "s_lshl_b64": {
+          "count": 16.0,
+          "stall_cycles": 0.875
+        },
+        "s_lshr_b32": {
+          "count": 6.0,
+          "stall_cycles": 2.5
+        },
+        "s_max_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.125
+        },
+        "s_min_i32": {
+          "count": 9.0,
+          "stall_cycles": 1.0
+        },
+        "s_mov_b32": {
+          "count": 62.5,
+          "stall_cycles": 1.25
+        },
+        "s_mov_b64": {
+          "count": 3.5,
+          "stall_cycles": 0.375
+        },
+        "s_movk_i32": {
+          "count": 5.5,
+          "stall_cycles": 0.0
+        },
+        "s_mul_hi_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_mul_i32": {
+          "count": 15.0,
+          "stall_cycles": 2.125
+        },
+        "s_mulk_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_nop": {
+          "count": 197.5,
+          "stall_cycles": 1220.875
+        },
+        "s_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 0.125
+        },
+        "s_sub_i32": {
+          "count": 13.0,
+          "stall_cycles": 100.125
+        },
+        "s_subb_u32": {
+          "count": 5.0,
+          "stall_cycles": 0.5
+        },
+        "s_waitcnt": {
+          "count": 40.0,
+          "stall_cycles": 5419.625
+        },
+        "v_add3_u32": {
+          "count": 4.0,
+          "stall_cycles": 25.75
+        },
+        "v_add_f32_e32": {
+          "count": 203.0,
+          "stall_cycles": 289.75
+        },
+        "v_add_u32_e32": {
+          "count": 79.0,
+          "stall_cycles": 383.125
+        },
+        "v_and_b32_e32": {
+          "count": 21.5,
+          "stall_cycles": 116.25
+        },
+        "v_and_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 5.25
+        },
+        "v_cmp_gt_u32_e32": {
+          "count": 192.0,
+          "stall_cycles": 104.625
+        },
+        "v_cmp_lt_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 1.25
+        },
+        "v_cndmask_b32_e32": {
+          "count": 193.0,
+          "stall_cycles": 155.75
+        },
+        "v_cndmask_b32_e64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "v_cvt_pk_bf16_f32": {
+          "count": 128.0,
+          "stall_cycles": 229.5
+        },
+        "v_div_fixup_f32": {
+          "count": 1.0,
+          "stall_cycles": 0.125
+        },
+        "v_div_fmas_f32": {
+          "count": 1.0,
+          "stall_cycles": 9.5
+        },
+        "v_div_scale_f32": {
+          "count": 2.0,
+          "stall_cycles": 2.5
+        },
+        "v_exp_f32_e32": {
+          "count": 193.0,
+          "stall_cycles": 348.25
+        },
+        "v_fma_f32": {
+          "count": 195.0,
+          "stall_cycles": 329.75
+        },
+        "v_fmac_f32_e32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "v_lshl_add_u32": {
+          "count": 2.0,
+          "stall_cycles": 0.25
+        },
+        "v_lshl_or_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_lshlrev_b32_e32": {
+          "count": 9.0,
+          "stall_cycles": 49.75
+        },
+        "v_lshrrev_b32_e32": {
+          "count": 9.5,
+          "stall_cycles": 51.0
+        },
+        "v_mad_u32_u24": {
+          "count": 3.0,
+          "stall_cycles": 24.875
+        },
+        "v_maximum3_f32": {
+          "count": 108.0,
+          "stall_cycles": 525.875
+        },
+        "v_mfma_f32_32x32x16_bf16": {
+          "count": 240.0,
+          "stall_cycles": 1345.625
+        },
+        "v_mov_b32_e32": {
+          "count": 24.0,
+          "stall_cycles": 264.625
+        },
+        "v_mov_b64_e32": {
+          "count": 32.0,
+          "stall_cycles": 23.125
+        },
+        "v_mul_f32_e32": {
+          "count": 75.0,
+          "stall_cycles": 39.125
+        },
+        "v_mul_lo_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.875
+        },
+        "v_or3_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_or_b32_e32": {
+          "count": 6.0,
+          "stall_cycles": 42.375
+        },
+        "v_permlane32_swap_b32_e64": {
+          "count": 28.0,
+          "stall_cycles": 268.875
+        },
+        "v_rcp_f32_e32": {
+          "count": 1.0,
+          "stall_cycles": 14.875
+        },
+        "v_readfirstlane_b32": {
+          "count": 2.0,
+          "stall_cycles": 2.75
+        },
+        "v_sub_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 20.0
+        },
+        "v_sub_u32_e32": {
+          "count": 6.0,
+          "stall_cycles": 27.25
+        },
+        "v_subrev_u32_e32": {
+          "count": 138.0,
+          "stall_cycles": 68.25
+        }
+      },
+      "cta_samples": [
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 0,
+          "begin": 53904,
+          "end": 98648,
+          "span_cycles": 44744,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 16808,
+          "main_cycles": 19976,
+          "epilogue_cycles": 7960
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 1,
+          "begin": 98684,
+          "end": 143212,
+          "span_cycles": 44528,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 16556,
+          "main_cycles": 19988,
+          "epilogue_cycles": 7984
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 2,
+          "begin": 143356,
+          "end": 187360,
+          "span_cycles": 44004,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 16032,
+          "main_cycles": 19988,
+          "epilogue_cycles": 7984
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 3,
+          "begin": 187400,
+          "end": 230080,
+          "span_cycles": 42680,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 14892,
+          "main_cycles": 19884,
+          "epilogue_cycles": 7904
+        }
+      ],
+      "coverage": [
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 0,
+          "span_cycles": 175980,
+          "resident_union_cycles": 175364,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 1,
+          "span_cycles": 175892,
+          "resident_union_cycles": 175388,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 2,
+          "span_cycles": 176044,
+          "resident_union_cycles": 175484,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 3,
+          "span_cycles": 176168,
+          "resident_union_cycles": 175440,
+          "mfma_32cycle_union_model": 61440
+        }
+      ]
+    },
+    {
+      "directory": "/tmp/pa950_swa_att/static/ui_output_agent_58610_dispatch_38",
+      "complete_waves": 32,
+      "mean_wave_span_cycles": 44190.375,
+      "instructions_per_wave": 2928.0,
+      "opcode_per_wave": {
+        "buffer_load_dword": {
+          "count": 1.0,
+          "stall_cycles": 0.75
+        },
+        "buffer_load_dwordx4": {
+          "count": 48.0,
+          "stall_cycles": 4032.75
+        },
+        "buffer_store_dwordx4": {
+          "count": 8.0,
+          "stall_cycles": 2039.875
+        },
+        "ds_read_b128": {
+          "count": 252.0,
+          "stall_cycles": 2071.875
+        },
+        "global_load_dword": {
+          "count": 3.0,
+          "stall_cycles": 47.75
+        },
+        "s_add_i32": {
+          "count": 58.0,
+          "stall_cycles": 49.875
+        },
+        "s_add_u32": {
+          "count": 21.0,
+          "stall_cycles": 23.625
+        },
+        "s_addc_u32": {
+          "count": 21.0,
+          "stall_cycles": 1.375
+        },
+        "s_addk_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_and_b32": {
+          "count": 9.0,
+          "stall_cycles": 2.75
+        },
+        "s_and_b64": {
+          "count": 9.0,
+          "stall_cycles": 1.75
+        },
+        "s_andn2_b32": {
+          "count": 3.0,
+          "stall_cycles": 0.0
+        },
+        "s_ashr_i32": {
+          "count": 26.0,
+          "stall_cycles": 10.625
+        },
+        "s_barrier": {
+          "count": 53.0,
+          "stall_cycles": 9752.625
+        },
+        "s_bitcmp0_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_bitcmp1_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_branch": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc0": {
+          "count": 3.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc1": {
+          "count": 8.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_vccz": {
+          "count": 6.0,
+          "stall_cycles": 0.125
+        },
+        "s_cmp_eq_u64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_ge_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_gt_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_lg_u32": {
+          "count": 8.0,
+          "stall_cycles": 1.625
+        },
+        "s_cmp_lt_i32": {
+          "count": 10.0,
+          "stall_cycles": 9.0
+        },
+        "s_cmpk_lt_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cselect_b32": {
+          "count": 5.0,
+          "stall_cycles": 2.5
+        },
+        "s_cselect_b64": {
+          "count": 16.0,
+          "stall_cycles": 2.375
+        },
+        "s_endpgm": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_load_dword": {
+          "count": 14.0,
+          "stall_cycles": 0.125
+        },
+        "s_load_dwordx2": {
+          "count": 12.0,
+          "stall_cycles": 35.125
+        },
+        "s_lshl_b32": {
+          "count": 20.0,
+          "stall_cycles": 85.25
+        },
+        "s_lshl_b64": {
+          "count": 16.0,
+          "stall_cycles": 0.625
+        },
+        "s_lshr_b32": {
+          "count": 6.0,
+          "stall_cycles": 4.875
+        },
+        "s_max_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_min_i32": {
+          "count": 9.0,
+          "stall_cycles": 0.375
+        },
+        "s_mov_b32": {
+          "count": 62.5,
+          "stall_cycles": 4.375
+        },
+        "s_mov_b64": {
+          "count": 3.5,
+          "stall_cycles": 1.5
+        },
+        "s_movk_i32": {
+          "count": 5.5,
+          "stall_cycles": 0.0
+        },
+        "s_mul_hi_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.125
+        },
+        "s_mul_i32": {
+          "count": 15.0,
+          "stall_cycles": 2.875
+        },
+        "s_mulk_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_nop": {
+          "count": 197.5,
+          "stall_cycles": 1221.375
+        },
+        "s_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 0.25
+        },
+        "s_sub_i32": {
+          "count": 13.0,
+          "stall_cycles": 94.875
+        },
+        "s_subb_u32": {
+          "count": 5.0,
+          "stall_cycles": 0.625
+        },
+        "s_waitcnt": {
+          "count": 40.0,
+          "stall_cycles": 5679.75
+        },
+        "v_add3_u32": {
+          "count": 4.0,
+          "stall_cycles": 13.75
+        },
+        "v_add_f32_e32": {
+          "count": 203.0,
+          "stall_cycles": 290.5
+        },
+        "v_add_u32_e32": {
+          "count": 79.0,
+          "stall_cycles": 372.25
+        },
+        "v_and_b32_e32": {
+          "count": 21.5,
+          "stall_cycles": 109.25
+        },
+        "v_and_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 4.25
+        },
+        "v_cmp_gt_u32_e32": {
+          "count": 192.0,
+          "stall_cycles": 106.625
+        },
+        "v_cmp_lt_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 1.5
+        },
+        "v_cndmask_b32_e32": {
+          "count": 193.0,
+          "stall_cycles": 159.625
+        },
+        "v_cndmask_b32_e64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "v_cvt_pk_bf16_f32": {
+          "count": 128.0,
+          "stall_cycles": 262.0
+        },
+        "v_div_fixup_f32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_div_fmas_f32": {
+          "count": 1.0,
+          "stall_cycles": 6.75
+        },
+        "v_div_scale_f32": {
+          "count": 2.0,
+          "stall_cycles": 2.5
+        },
+        "v_exp_f32_e32": {
+          "count": 193.0,
+          "stall_cycles": 346.875
+        },
+        "v_fma_f32": {
+          "count": 195.0,
+          "stall_cycles": 326.5
+        },
+        "v_fmac_f32_e32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "v_lshl_add_u32": {
+          "count": 2.0,
+          "stall_cycles": 0.625
+        },
+        "v_lshl_or_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_lshlrev_b32_e32": {
+          "count": 9.0,
+          "stall_cycles": 52.125
+        },
+        "v_lshrrev_b32_e32": {
+          "count": 9.5,
+          "stall_cycles": 39.875
+        },
+        "v_mad_u32_u24": {
+          "count": 3.0,
+          "stall_cycles": 39.625
+        },
+        "v_maximum3_f32": {
+          "count": 108.0,
+          "stall_cycles": 515.25
+        },
+        "v_mfma_f32_32x32x16_bf16": {
+          "count": 240.0,
+          "stall_cycles": 1333.875
+        },
+        "v_mov_b32_e32": {
+          "count": 24.0,
+          "stall_cycles": 252.875
+        },
+        "v_mov_b64_e32": {
+          "count": 32.0,
+          "stall_cycles": 23.875
+        },
+        "v_mul_f32_e32": {
+          "count": 75.0,
+          "stall_cycles": 71.375
+        },
+        "v_mul_lo_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.125
+        },
+        "v_or3_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_or_b32_e32": {
+          "count": 6.0,
+          "stall_cycles": 44.375
+        },
+        "v_permlane32_swap_b32_e64": {
+          "count": 28.0,
+          "stall_cycles": 255.625
+        },
+        "v_rcp_f32_e32": {
+          "count": 1.0,
+          "stall_cycles": 10.25
+        },
+        "v_readfirstlane_b32": {
+          "count": 2.0,
+          "stall_cycles": 7.25
+        },
+        "v_sub_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 20.0
+        },
+        "v_sub_u32_e32": {
+          "count": 6.0,
+          "stall_cycles": 30.875
+        },
+        "v_subrev_u32_e32": {
+          "count": 138.0,
+          "stall_cycles": 67.375
+        }
+      },
+      "cta_samples": [
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 0,
+          "begin": 46112,
+          "end": 94512,
+          "span_cycles": 48400,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 19100,
+          "main_cycles": 20268,
+          "epilogue_cycles": 9032
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 1,
+          "begin": 94556,
+          "end": 140960,
+          "span_cycles": 46404,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 18148,
+          "main_cycles": 19912,
+          "epilogue_cycles": 8344
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 2,
+          "begin": 141200,
+          "end": 185908,
+          "span_cycles": 44708,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 16912,
+          "main_cycles": 20020,
+          "epilogue_cycles": 7776
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 3,
+          "begin": 186132,
+          "end": 229464,
+          "span_cycles": 43332,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 15556,
+          "main_cycles": 19972,
+          "epilogue_cycles": 7804
+        }
+      ],
+      "coverage": [
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 0,
+          "span_cycles": 183176,
+          "resident_union_cycles": 182080,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 1,
+          "span_cycles": 183352,
+          "resident_union_cycles": 182156,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 2,
+          "span_cycles": 183184,
+          "resident_union_cycles": 182192,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 3,
+          "span_cycles": 183084,
+          "resident_union_cycles": 182364,
+          "mfma_32cycle_union_model": 61440
+        }
+      ]
+    },
+    {
+      "directory": "/tmp/pa950_swa_att/static/ui_output_agent_58610_dispatch_39",
+      "complete_waves": 32,
+      "mean_wave_span_cycles": 43337.125,
+      "instructions_per_wave": 2928.0,
+      "opcode_per_wave": {
+        "buffer_load_dword": {
+          "count": 1.0,
+          "stall_cycles": 1.375
+        },
+        "buffer_load_dwordx4": {
+          "count": 48.0,
+          "stall_cycles": 4410.875
+        },
+        "buffer_store_dwordx4": {
+          "count": 8.0,
+          "stall_cycles": 2104.0
+        },
+        "ds_read_b128": {
+          "count": 252.0,
+          "stall_cycles": 2092.625
+        },
+        "global_load_dword": {
+          "count": 3.0,
+          "stall_cycles": 37.375
+        },
+        "s_add_i32": {
+          "count": 58.0,
+          "stall_cycles": 49.125
+        },
+        "s_add_u32": {
+          "count": 21.0,
+          "stall_cycles": 26.25
+        },
+        "s_addc_u32": {
+          "count": 21.0,
+          "stall_cycles": 1.5
+        },
+        "s_addk_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_and_b32": {
+          "count": 9.0,
+          "stall_cycles": 2.625
+        },
+        "s_and_b64": {
+          "count": 9.0,
+          "stall_cycles": 1.625
+        },
+        "s_andn2_b32": {
+          "count": 3.0,
+          "stall_cycles": 3.0
+        },
+        "s_ashr_i32": {
+          "count": 26.0,
+          "stall_cycles": 9.625
+        },
+        "s_barrier": {
+          "count": 53.0,
+          "stall_cycles": 8922.75
+        },
+        "s_bitcmp0_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_bitcmp1_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_branch": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc0": {
+          "count": 3.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_scc1": {
+          "count": 8.0,
+          "stall_cycles": 0.0
+        },
+        "s_cbranch_vccz": {
+          "count": 6.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_eq_u64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_ge_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_gt_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_cmp_lg_u32": {
+          "count": 8.0,
+          "stall_cycles": 1.5
+        },
+        "s_cmp_lt_i32": {
+          "count": 10.0,
+          "stall_cycles": 11.25
+        },
+        "s_cmpk_lt_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.25
+        },
+        "s_cselect_b32": {
+          "count": 5.0,
+          "stall_cycles": 1.125
+        },
+        "s_cselect_b64": {
+          "count": 16.0,
+          "stall_cycles": 1.5
+        },
+        "s_endpgm": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_load_dword": {
+          "count": 14.0,
+          "stall_cycles": 0.625
+        },
+        "s_load_dwordx2": {
+          "count": 12.0,
+          "stall_cycles": 36.5
+        },
+        "s_lshl_b32": {
+          "count": 20.0,
+          "stall_cycles": 86.125
+        },
+        "s_lshl_b64": {
+          "count": 16.0,
+          "stall_cycles": 0.625
+        },
+        "s_lshr_b32": {
+          "count": 6.0,
+          "stall_cycles": 1.25
+        },
+        "s_max_i32": {
+          "count": 2.0,
+          "stall_cycles": 0.0
+        },
+        "s_min_i32": {
+          "count": 9.0,
+          "stall_cycles": 0.75
+        },
+        "s_mov_b32": {
+          "count": 62.5,
+          "stall_cycles": 1.625
+        },
+        "s_mov_b64": {
+          "count": 3.5,
+          "stall_cycles": 0.625
+        },
+        "s_movk_i32": {
+          "count": 5.5,
+          "stall_cycles": 0.0
+        },
+        "s_mul_hi_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.125
+        },
+        "s_mul_i32": {
+          "count": 15.0,
+          "stall_cycles": 2.125
+        },
+        "s_mulk_i32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "s_nop": {
+          "count": 197.5,
+          "stall_cycles": 1220.625
+        },
+        "s_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 0.25
+        },
+        "s_sub_i32": {
+          "count": 13.0,
+          "stall_cycles": 92.75
+        },
+        "s_subb_u32": {
+          "count": 5.0,
+          "stall_cycles": 1.625
+        },
+        "s_waitcnt": {
+          "count": 40.0,
+          "stall_cycles": 5367.5
+        },
+        "v_add3_u32": {
+          "count": 4.0,
+          "stall_cycles": 25.75
+        },
+        "v_add_f32_e32": {
+          "count": 203.0,
+          "stall_cycles": 289.375
+        },
+        "v_add_u32_e32": {
+          "count": 79.0,
+          "stall_cycles": 394.0
+        },
+        "v_and_b32_e32": {
+          "count": 21.5,
+          "stall_cycles": 114.5
+        },
+        "v_and_or_b32": {
+          "count": 2.0,
+          "stall_cycles": 3.5
+        },
+        "v_cmp_gt_u32_e32": {
+          "count": 192.0,
+          "stall_cycles": 101.75
+        },
+        "v_cmp_lt_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 1.5
+        },
+        "v_cndmask_b32_e32": {
+          "count": 193.0,
+          "stall_cycles": 136.0
+        },
+        "v_cndmask_b32_e64": {
+          "count": 5.0,
+          "stall_cycles": 0.0
+        },
+        "v_cvt_pk_bf16_f32": {
+          "count": 128.0,
+          "stall_cycles": 239.75
+        },
+        "v_div_fixup_f32": {
+          "count": 1.0,
+          "stall_cycles": 6.0
+        },
+        "v_div_fmas_f32": {
+          "count": 1.0,
+          "stall_cycles": 14.25
+        },
+        "v_div_scale_f32": {
+          "count": 2.0,
+          "stall_cycles": 2.5
+        },
+        "v_exp_f32_e32": {
+          "count": 193.0,
+          "stall_cycles": 346.375
+        },
+        "v_fma_f32": {
+          "count": 195.0,
+          "stall_cycles": 328.5
+        },
+        "v_fmac_f32_e32": {
+          "count": 2.0,
+          "stall_cycles": 1.875
+        },
+        "v_lshl_add_u32": {
+          "count": 2.0,
+          "stall_cycles": 1.625
+        },
+        "v_lshl_or_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_lshlrev_b32_e32": {
+          "count": 9.0,
+          "stall_cycles": 47.375
+        },
+        "v_lshrrev_b32_e32": {
+          "count": 9.5,
+          "stall_cycles": 42.5
+        },
+        "v_mad_u32_u24": {
+          "count": 3.0,
+          "stall_cycles": 30.5
+        },
+        "v_maximum3_f32": {
+          "count": 108.0,
+          "stall_cycles": 524.25
+        },
+        "v_mfma_f32_32x32x16_bf16": {
+          "count": 240.0,
+          "stall_cycles": 1339.0
+        },
+        "v_mov_b32_e32": {
+          "count": 24.0,
+          "stall_cycles": 245.0
+        },
+        "v_mov_b64_e32": {
+          "count": 32.0,
+          "stall_cycles": 23.625
+        },
+        "v_mul_f32_e32": {
+          "count": 75.0,
+          "stall_cycles": 63.0
+        },
+        "v_mul_lo_u32": {
+          "count": 1.0,
+          "stall_cycles": 0.375
+        },
+        "v_or3_b32": {
+          "count": 1.0,
+          "stall_cycles": 0.0
+        },
+        "v_or_b32_e32": {
+          "count": 6.0,
+          "stall_cycles": 51.875
+        },
+        "v_permlane32_swap_b32_e64": {
+          "count": 28.0,
+          "stall_cycles": 262.625
+        },
+        "v_rcp_f32_e32": {
+          "count": 1.0,
+          "stall_cycles": 9.25
+        },
+        "v_readfirstlane_b32": {
+          "count": 2.0,
+          "stall_cycles": 8.875
+        },
+        "v_sub_f32_e32": {
+          "count": 6.0,
+          "stall_cycles": 20.0
+        },
+        "v_sub_u32_e32": {
+          "count": 6.0,
+          "stall_cycles": 31.75
+        },
+        "v_subrev_u32_e32": {
+          "count": 138.0,
+          "stall_cycles": 54.625
+        }
+      },
+      "cta_samples": [
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 0,
+          "begin": 46948,
+          "end": 94860,
+          "span_cycles": 47912,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 18852,
+          "main_cycles": 20012,
+          "epilogue_cycles": 9048
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 1,
+          "begin": 94908,
+          "end": 140024,
+          "span_cycles": 45116,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 16928,
+          "main_cycles": 20004,
+          "epilogue_cycles": 8184
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 2,
+          "begin": 140064,
+          "end": 183296,
+          "span_cycles": 43232,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 15328,
+          "main_cycles": 19960,
+          "epilogue_cycles": 7944
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "generation": 3,
+          "begin": 183356,
+          "end": 226500,
+          "span_cycles": 43144,
+          "barriers": 53,
+          "prologue_through_barrier6_cycles": 15424,
+          "main_cycles": 19964,
+          "epilogue_cycles": 7756
+        }
+      ],
+      "coverage": [
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 0,
+          "span_cycles": 179532,
+          "resident_union_cycles": 179044,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 1,
+          "span_cycles": 179548,
+          "resident_union_cycles": 178820,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 2,
+          "span_cycles": 179468,
+          "resident_union_cycles": 179248,
+          "mfma_32cycle_union_model": 61440
+        },
+        {
+          "se": 0,
+          "cu": 1,
+          "simd": 3,
+          "span_cycles": 179180,
+          "resident_union_cycles": 179024,
+          "mfma_32cycle_union_model": 61440
+        }
+      ]
+    }
+  ]
+}

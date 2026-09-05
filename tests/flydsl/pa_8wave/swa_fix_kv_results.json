@@ -1,0 +1,269 @@
+[
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      32768
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        105.79824210526316,
+        116.89255555555565,
+        116.15758585858592,
+        115.21789795918362,
+        114.96706451612903
+      ],
+      "static": [
+        114.02827272727265,
+        114.13367676767683,
+        113.18534343434347,
+        113.8871919191919,
+        113.29912631578947
+      ],
+      "baseline_persistent": [
+        112.20523655913976,
+        113.58980808080813,
+        113.69729292929297,
+        113.65532608695655,
+        113.51444565217389
+      ],
+      "persistent": [
+        112.22437234042565,
+        111.85357575757578,
+        113.12109183673475,
+        111.14730851063825,
+        112.21844444444446
+      ],
+      "4static": [
+        95.4291414141414,
+        95.2004545454545,
+        95.75678571428578,
+        94.46204081632654,
+        95.7952121212121
+      ]
+    },
+    "median_us": {
+      "baseline": 115.21789795918362,
+      "static": 113.8871919191919,
+      "baseline_persistent": 113.58980808080813,
+      "persistent": 112.21844444444446,
+      "4static": 95.4291414141414
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 21642608640,
+    "logical_bytes": 178339840,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      65536
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        103.41465934065928,
+        115.1199696969697,
+        116.3326063829787,
+        116.29293939393942,
+        115.32672527472528
+      ],
+      "static": [
+        114.26987878787878,
+        113.66495959595966,
+        112.99451612903223,
+        113.68113131313143,
+        113.84436363636368
+      ],
+      "baseline_persistent": [
+        114.52074747474745,
+        114.06215151515148,
+        113.52879797979803,
+        113.45122222222228,
+        114.27532989690725
+      ],
+      "persistent": [
+        113.14858585858592,
+        112.09329787234041,
+        113.22414141414141,
+        112.14208080808079,
+        113.28030303030307
+      ],
+      "4static": [
+        95.18410204081636,
+        94.9172121212121,
+        96.90920202020199,
+        95.73623232323231,
+        96.53302020202021
+      ]
+    },
+    "median_us": {
+      "baseline": 115.32672527472528,
+      "static": 113.68113131313143,
+      "baseline_persistent": 114.06215151515148,
+      "persistent": 113.14858585858592,
+      "4static": 95.73623232323231
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 21642608640,
+    "logical_bytes": 178339840,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        105.25860638297864,
+        116.43152525252529,
+        116.74830303030303,
+        116.05373737373739,
+        116.54789898989907
+      ],
+      "static": [
+        114.49333333333331,
+        114.30417171717167,
+        113.81688888888893,
+        113.70901010101008,
+        114.30701010101004
+      ],
+      "baseline_persistent": [
+        113.75224242424244,
+        113.93245454545459,
+        113.89245454545454,
+        112.87867676767682,
+        112.90355434782603
+      ],
+      "persistent": [
+        112.87603125000004,
+        112.09844444444447,
+        113.22292929292932,
+        112.0806565656566,
+        113.06736363636367
+      ],
+      "4static": [
+        95.3988484848484,
+        95.35723232323232,
+        97.72538383838386,
+        95.97744444444446,
+        97.22760606060608
+      ]
+    },
+    "median_us": {
+      "baseline": 116.43152525252529,
+      "static": 114.30417171717167,
+      "baseline_persistent": 113.75224242424244,
+      "persistent": 112.87603125000004,
+      "4static": 95.97744444444446
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 21642608640,
+    "logical_bytes": 178339840,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  }
+]

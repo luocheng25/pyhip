@@ -1,0 +1,236 @@
+{
+  "before_revision": "36334413f5094b7b8e1234f33cf3ce1486d93624",
+  "before_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+  "after_source_sha256": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+  "4wave_source_sha256": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+  "case": {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "dv": 128,
+    "hq": 16,
+    "hkv": 1,
+    "page": 64,
+    "window_left": 128,
+    "sink": true
+  },
+  "protocol": "Three full-grid warmed captures, iterations21-23. Do not use instrumented duration as benchmark latency.",
+  "pmc": {
+    "before_static": {
+      "csv": "/tmp/pa950_scheduler_pmc/static/counters_counter_collection.csv",
+      "sha256": "d5b6b27f27ba725a2796f16a1411020ce9386582da0c0746c6941165c8cdd4f7",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2064384.0,
+          2064384.0,
+          2064384.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1966080.0,
+          1966080.0,
+          1966080.0
+        ],
+        "SQ_INSTS_VALU": [
+          15729025.0,
+          15729025.0,
+          15729025.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          425984.0,
+          425984.0,
+          425984.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      }
+    },
+    "before_persistent": {
+      "csv": "/tmp/pa950_scheduler_pmc/persistent/counters_counter_collection.csv",
+      "sha256": "5728c1ce66413d8ad15c0166940b166c7443fbc997f3032c5ab7d41101639037",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2073600.0,
+          2073600.0,
+          2073600.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1966080.0,
+          1966080.0,
+          1966080.0
+        ],
+        "SQ_INSTS_VALU": [
+          15577475.0,
+          15577475.0,
+          15577475.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          466944.0,
+          466944.0,
+          466944.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          2048.0,
+          2048.0,
+          2048.0
+        ]
+      }
+    },
+    "4static": {
+      "csv": "/tmp/pa950_scheduler_pmc/4static/counters_counter_collection.csv",
+      "sha256": "cd5d2169933da0fdb1019736f7051079095361dfe10a9f0adfd7b5388f3f2198",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          1081344.0,
+          1081344.0,
+          1081344.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1310720.0,
+          1310720.0,
+          1310720.0
+        ],
+        "SQ_INSTS_VALU": [
+          14926304.0,
+          14926304.0,
+          14926304.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          917504.0,
+          917504.0,
+          917504.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          786432.0,
+          786432.0,
+          786432.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      }
+    },
+    "4dynamic": {
+      "csv": "/tmp/pa950_scheduler_pmc/4dynamic/counters_counter_collection.csv",
+      "sha256": "1a7ec171aed2408dbf952398aff27e9168aca554e5a97d5a9434630328e8ab87",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          1091584.0,
+          1091584.0,
+          1091584.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1310720.0,
+          1310720.0,
+          1310720.0
+        ],
+        "SQ_INSTS_VALU": [
+          14711266.0,
+          14711266.0,
+          14711266.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          950272.0,
+          950272.0,
+          950272.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          786432.0,
+          786432.0,
+          786432.0
+        ],
+        "SQ_WAVES": [
+          2048.0,
+          2048.0,
+          2048.0
+        ]
+      }
+    },
+    "after_static": {
+      "csv": "/tmp/pa950_swa_final_pmc/static/counters_counter_collection.csv",
+      "sha256": "39cbef5903d98dbc2a78c0a737f0e0ace1907a6845f6a79c07feb95e890e1c0b",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2064384.0,
+          2064384.0,
+          2064384.0
+        ],
+        "SQ_INSTS_MFMA": [
+          983040.0,
+          983040.0,
+          983040.0
+        ],
+        "SQ_INSTS_VALU": [
+          15520129.0,
+          15520129.0,
+          15520129.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          425984.0,
+          425984.0,
+          425984.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      }
+    },
+    "after_persistent": {
+      "csv": "/tmp/pa950_swa_final_pmc/persistent/counters_counter_collection.csv",
+      "sha256": "a3106fe8221398d78afb94806cc706d00b3ae9a0d00a8c3d65c53dfe032d1a4c",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2073600.0,
+          2073600.0,
+          2073600.0
+        ],
+        "SQ_INSTS_MFMA": [
+          983040.0,
+          983040.0,
+          983040.0
+        ],
+        "SQ_INSTS_VALU": [
+          16132483.0,
+          16132483.0,
+          16132483.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          450560.0,
+          450560.0,
+          450560.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          2048.0,
+          2048.0,
+          2048.0
+        ]
+      }
+    }
+  }
+}

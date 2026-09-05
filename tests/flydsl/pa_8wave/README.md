@@ -9,7 +9,20 @@
 `prepare_kv`、`attend_linear`、gather kernel 和线性 KV 缓冲均已删除。
 最新同输入对照见 [4-wave/8-wave 主报告](../pa_4wave/README.md)。
 
-### 最新：可选 persistent（2026-09-05）
+### 最新：SWA+sink 分析与窄窗口优化（2026-09-05）
+
+任务规模扫描和PMC/ATT表明，差距不是单纯任务数不足：BM256窗口并集使8-wave的MFMA
+比4-wave多50%，短流水仍有53个barrier/wave（4-wave为13）。因此仅对实测有收益的
+大grid窄窗口，跳过wave完全不可见的QK/PV；保留所有内存读取、NaN-tail保护与barrier。
+小grid、宽窗口和D128/W128不启用，避免已测出的回退。
+
+最终 **272 passed / 6 skipped**，4-wave **51 passed / 2 skipped**。D192/W128/KV32K–128K
+static改善 **1.43%～2.17%**，persistent改善 **0.70%～1.11%**；KV128K最终为
+**114.888 / 112.884 µs**（static/persistent），4static **95.082 µs**，仍未追平。
+MFMA实测减半，但memory/softmax/同步成本仍在；full路径指令类别数量和资源不变。
+完整根因、门限、否决实验、所有采样与ATT caveat见 [swa_analysis.md](swa_analysis.md)。
+
+### 可选 persistent（2026-09-05，SWA优化前验收）
 
 `PagedAttention(..., persistent=True)` 启用设备端任务队列，默认 `False` 不变。
 每 device/stream/grid 首次分配8-byte header，最后一个CTA自动重置；预热后仍一次调用、

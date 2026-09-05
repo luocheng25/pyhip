@@ -1,0 +1,387 @@
+[
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      2048
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        20.84059183673468,
+        22.26607070707069,
+        22.289898989898994,
+        22.280602040816287,
+        22.322646464646482
+      ],
+      "static": [
+        24.714686868686897,
+        24.857727272727324,
+        25.0451515151515,
+        24.839929292929288,
+        24.826826530612276
+      ],
+      "baseline_persistent": [
+        23.47298989898993,
+        23.47827272727272,
+        23.406020618556695,
+        23.421656565656573,
+        23.377105263157883
+      ],
+      "persistent": [
+        26.35190909090909,
+        26.22660606060606,
+        26.35753535353534,
+        26.32239393939398,
+        26.241575757575717
+      ]
+    },
+    "median_us": {
+      "baseline": 22.280602040816287,
+      "static": 24.839929292929288,
+      "baseline_persistent": 23.421656565656573,
+      "persistent": 26.32239393939398
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 2705326080,
+    "logical_bytes": 22364160,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      4096
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        26.75654255319147,
+        29.255828282828247,
+        29.523316326530615,
+        29.22350505050506,
+        29.470663265306104
+      ],
+      "static": [
+        31.115206185567057,
+        30.975000000000016,
+        30.936867346938776,
+        31.043824742268054,
+        30.734142857142835
+      ],
+      "baseline_persistent": [
+        32.110919191919244,
+        32.15411111111111,
+        31.97994949494947,
+        32.19127272727274,
+        32.16615151515152
+      ],
+      "persistent": [
+        34.37945833333334,
+        34.30205154639177,
+        34.291275510204095,
+        34.131855670103064,
+        34.45856250000003
+      ]
+    },
+    "median_us": {
+      "baseline": 29.255828282828247,
+      "static": 30.975000000000016,
+      "baseline_persistent": 32.15411111111111,
+      "persistent": 34.30205154639177
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 5410652160,
+    "logical_bytes": 44646400,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      8192
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        52.19241414141416,
+        59.83633333333332,
+        59.84763636363635,
+        58.490818181818156,
+        59.651262626262614
+      ],
+      "static": [
+        59.83672727272727,
+        59.19428282828278,
+        59.104575757575816,
+        60.068814432989676,
+        59.212464646464696
+      ],
+      "baseline_persistent": [
+        59.7882424242424,
+        61.2169898989899,
+        61.06223232323231,
+        60.620595959596,
+        60.4710909090909
+      ],
+      "persistent": [
+        60.66347727272728,
+        60.70747474747473,
+        60.92121212121211,
+        60.93575757575759,
+        60.49413131313132
+      ]
+    },
+    "median_us": {
+      "baseline": 59.651262626262614,
+      "static": 59.212464646464696,
+      "baseline_persistent": 60.620595959596,
+      "persistent": 60.70747474747473
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 10821304320,
+    "logical_bytes": 89210880,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      32768
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        221.90426744186033,
+        232.62972164948445,
+        232.056,
+        233.28455208333335,
+        233.3419175257732
+      ],
+      "static": [
+        227.39110101010098,
+        227.10220202020204,
+        225.47942857142866,
+        227.10503030303042,
+        227.12644444444436
+      ],
+      "baseline_persistent": [
+        227.31560416666676,
+        227.85061458333334,
+        227.68074489795913,
+        227.49601041666673,
+        227.1590918367347
+      ],
+      "persistent": [
+        225.36759595959592,
+        225.1889999999999,
+        225.1178787878788,
+        225.53527272727268,
+        225.30172727272722
+      ]
+    },
+    "median_us": {
+      "baseline": 232.62972164948445,
+      "static": 227.10503030303042,
+      "baseline_persistent": 227.49601041666673,
+      "persistent": 225.30172727272722
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 43285217280,
+    "logical_bytes": 356597760,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      65536
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "baseline": [
+        436.1017934782611,
+        444.42981111111123,
+        443.66147727272784,
+        443.19646590909105,
+        443.1235977011494
+      ],
+      "static": [
+        428.057855670103,
+        428.272242105263,
+        429.26223595505627,
+        426.67885869565197,
+        428.56884693877555
+      ],
+      "baseline_persistent": [
+        426.9943010752688,
+        428.7090425531916,
+        428.7733298969073,
+        428.41920000000033,
+        428.4087938144333
+      ],
+      "persistent": [
+        420.0681739130438,
+        421.2203225806451,
+        420.2633913043479,
+        421.6683617021276,
+        420.89993478260857
+      ]
+    },
+    "median_us": {
+      "baseline": 443.19646590909105,
+      "static": 428.272242105263,
+      "baseline_persistent": 428.41920000000033,
+      "persistent": 420.89993478260857
+    },
+    "errors": {
+      "baseline": 0.0,
+      "static": 0.0,
+      "baseline_persistent": 0.0,
+      "persistent": 0.0
+    },
+    "dispatch": {
+      "baseline": [
+        "_attention_kernel_0"
+      ],
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline_persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 86570434560,
+    "logical_bytes": 713113600,
+    "baseline": "3633441:tests/flydsl/pa_8wave/pa_8wave_950.py",
+    "baseline_source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+    "source_sha256": "a7e02442784106a1a67cb462549a9b38b15f0244e854e0d98c97e58ae32fc485"
+  }
+]

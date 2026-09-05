@@ -439,7 +439,7 @@ def test_causal_merge_ragged_empty_and_all_masked(persistent):
 
 @requires_gfx950
 @pytest.mark.parametrize("dq", [128, 192])
-@pytest.mark.parametrize("window_left", [0, 1, 63, 64, 128, 129, 512])
+@pytest.mark.parametrize("window_left", [0, 1, 63, 64, 65, 127, 128, 129, 512])
 @pytest.mark.parametrize("has_sink", [False, True])
 def test_sliding_window_boundaries(dq, window_left, has_sink):
     case = make_case((257,), (777,), heads=4, dq=dq, window_left=window_left, has_sink=has_sink)
@@ -679,6 +679,38 @@ def test_persistent_stream_isolation_and_repeated_graphs(dq, window):
     assert len(active) == 2 and active[0].data_ptr() != active[1].data_ptr()
     for (_, _, grid), counter in kernel._scheduler_counters.items():
         assert counter.tolist() == [grid, 0]
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dq,window", [(128, 64), (128, 65), (192, 128), (192, 129)])
+@pytest.mark.parametrize("q_len", [16128, 16129, 16385])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_swa_pruning_dispatch_thresholds(dq, window, q_len, persistent):
+    # 63/64/65 Q blocks straddle the 1024-task gate. KV<Q exercises fully
+    # masked waves, non-page-aligned diagonals, partial V and actual Q tails.
+    case = make_case((q_len,), (901,), dq=dq, window_left=window,
+                     has_sink=True, nonunit_scales=True, magnitude=4.0)
+    assert_case(case, True, persistent=persistent, softmax_scale=0.0625)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dq,window", [(128, 1), (192, 128)])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_swa_pruned_large_visible_prefix_and_exact_zero_logits(dq, window, has_sink):
+    case = make_case((16384,), (32769,), dq=dq, window_left=window, has_sink=has_sink)
+    case.q.zero_()
+    case.k_pages.zero_()
+    case.v_pages.fill_(1.0)
+    case.k, case.v = vectorize_kv_cache(case.k_pages, case.v_pages, 1, dq, DV, PAGE)
+    first_page = (32769 - 16384 - window) // PAGE
+    case.indices[:first_page] = 2**30
+    if has_sink:
+        case.sinks.zero_()
+    for persistent in (False, True):
+        out, lse = assert_case(case, True, persistent=persistent)
+        expected = (window + 1) / (window + 2) if has_sink else 1.0
+        torch.testing.assert_close(out, torch.full_like(out, expected), rtol=0, atol=0)
+        torch.testing.assert_close(lse, torch.full_like(lse, math.log(window + 1 + int(has_sink))), rtol=1e-6, atol=1e-6)
 
 
 def test_supported_scope_is_explicit():

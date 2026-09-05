@@ -1,0 +1,464 @@
+[
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      2048
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        20.43523469387756,
+        22.036010526315778,
+        22.004636363636372,
+        21.984040404040368,
+        22.076191919191906
+      ],
+      "persistent": [
+        23.4782857142857,
+        23.447131313131287,
+        23.434636363636386,
+        23.380444444444457,
+        23.480663265306138
+      ],
+      "4static": [
+        17.49097979797979,
+        17.45375757575759,
+        17.514645833333358,
+        17.54306060606061,
+        17.50226262626262
+      ],
+      "4dynamic": [
+        21.876595959595985,
+        21.86447872340424,
+        21.830000000000016,
+        21.856373737373726,
+        21.892846938775513
+      ]
+    },
+    "median_us": {
+      "static": 22.004636363636372,
+      "persistent": 23.447131313131287,
+      "4static": 17.50226262626262,
+      "4dynamic": 21.86447872340424
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 2705326080,
+    "logical_bytes": 22364160,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      4096
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        26.27752040816328,
+        28.848999999999965,
+        28.933897959183664,
+        28.99761224489794,
+        29.07139175257732
+      ],
+      "persistent": [
+        31.984818181818202,
+        31.951666666666622,
+        32.03940404040404,
+        31.889797979797994,
+        31.986484848484842
+      ],
+      "4static": [
+        24.44474747474748,
+        24.495312499999994,
+        24.81764646464646,
+        24.60652083333333,
+        24.696434343434344
+      ],
+      "4dynamic": [
+        31.34725252525255,
+        31.25376288659794,
+        31.595618556701027,
+        31.32861616161615,
+        31.270868686868717
+      ]
+    },
+    "median_us": {
+      "static": 28.933897959183664,
+      "persistent": 31.984818181818202,
+      "4static": 24.60652083333333,
+      "4dynamic": 31.32861616161615
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 5410652160,
+    "logical_bytes": 44646400,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      8192
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        53.16740404040405,
+        60.1741313131313,
+        60.18058585858586,
+        59.681181818181834,
+        58.73043434343435
+      ],
+      "persistent": [
+        61.00687878787881,
+        60.00563636363636,
+        61.24608080808077,
+        60.574118279569895,
+        60.22988888888888
+      ],
+      "4static": [
+        48.70339393939396,
+        49.72767676767678,
+        49.50626262626262,
+        49.100989898989916,
+        49.81091919191921
+      ],
+      "4dynamic": [
+        53.16379591836734,
+        52.804969696969735,
+        52.65465656565652,
+        52.43848484848485,
+        53.10760606060602
+      ]
+    },
+    "median_us": {
+      "static": 59.681181818181834,
+      "persistent": 60.574118279569895,
+      "4static": 49.50626262626262,
+      "4dynamic": 52.804969696969735
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 10821304320,
+    "logical_bytes": 89210880,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        107.54839393939388,
+        116.75598989898992,
+        116.04454347826086,
+        116.33051515151512,
+        115.24792473118278
+      ],
+      "persistent": [
+        113.78375757575758,
+        112.63050000000003,
+        113.66941414141414,
+        112.38654545454551,
+        113.63829292929292
+      ],
+      "4static": [
+        95.31602020202023,
+        96.400898989899,
+        96.9564747474747,
+        95.58995959595966,
+        94.76366666666662
+      ],
+      "4dynamic": [
+        102.35989898989898,
+        102.87144444444448,
+        102.82941414141426,
+        101.44553535353539,
+        101.89323232323227
+      ]
+    },
+    "median_us": {
+      "static": 116.04454347826086,
+      "persistent": 113.63829292929292,
+      "4static": 95.58995959595966,
+      "4dynamic": 102.35989898989898
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 21642608640,
+    "logical_bytes": 178339840,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      32768
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        225.5408749999999,
+        233.19802061855677,
+        232.73375000000001,
+        232.72040625000008,
+        233.66360824742267
+      ],
+      "persistent": [
+        229.1734897959183,
+        228.1653030303031,
+        227.58010309278347,
+        227.27759595959597,
+        227.81939583333337
+      ],
+      "4static": [
+        199.37822680412364,
+        198.85292708333338,
+        200.03338541666662,
+        198.50225263157887,
+        199.5102842105263
+      ],
+      "4dynamic": [
+        208.12041237113402,
+        208.07753608247424,
+        207.58866666666668,
+        207.44904123711342,
+        207.22207142857147
+      ]
+    },
+    "median_us": {
+      "static": 232.73375000000001,
+      "persistent": 227.81939583333337,
+      "4static": 199.37822680412364,
+      "4dynamic": 207.58866666666668
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 43285217280,
+    "logical_bytes": 356597760,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      65536
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        444.06896774193535,
+        444.29965555555594,
+        444.5165217391304,
+        446.363846153846,
+        445.6761555555553
+      ],
+      "persistent": [
+        430.08053125,
+        428.26010526315804,
+        428.4222210526315,
+        428.2489673913045,
+        427.8080219780219
+      ],
+      "4static": [
+        369.1094347826088,
+        368.9036344086022,
+        368.1955444444443,
+        368.8958924731185,
+        368.96002222222234
+      ],
+      "4dynamic": [
+        390.07603225806446,
+        389.78829032258074,
+        389.24365217391295,
+        388.9463846153844,
+        390.2890315789469
+      ]
+    },
+    "median_us": {
+      "static": 444.5165217391304,
+      "persistent": 428.26010526315804,
+      "4static": 368.9036344086022,
+      "4dynamic": 389.78829032258074
+    },
+    "errors": {
+      "static": 0.0,
+      "persistent": 0.0,
+      "4static": 0.0,
+      "4dynamic": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "persistent": [
+        "_attention_persistent_kernel_0"
+      ],
+      "4static": [
+        "attention_kernel_static_0"
+      ],
+      "4dynamic": [
+        "attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 86570434560,
+    "logical_bytes": 713113600,
+    "baseline": null,
+    "baseline_source_sha256": null,
+    "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+  }
+]

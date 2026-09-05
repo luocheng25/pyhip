@@ -1,0 +1,366 @@
+{
+  "before_revision": "36334413f5094b7b8e1234f33cf3ce1486d93624",
+  "source_sha256": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+  "pytest": {
+    "passed": 272,
+    "skipped": 6,
+    "log": "/tmp/pa950_swa_final_pytest.log",
+    "skip_reason": "AITER has no matching page64 instances"
+  },
+  "guard": "B==1 and ceil(MAX_Q/256)*H>=1024 and 0<=WINDOW<=(128 if DQ==192 else64)",
+  "final_files": [
+    "swa_fix_final_results.json",
+    "swa_fix_primary_results.json",
+    "swa_fix_window_results.json",
+    "swa_fix_small_grid_results.json"
+  ],
+  "isa": [
+    {
+      "scenario": "nc",
+      "dq": 128,
+      "schedule": "static",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 226,
+        "sgpr_count": 55,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 226,
+        "sgpr_count": 55,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "nc",
+      "dq": 128,
+      "schedule": "persistent",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 232,
+        "sgpr_count": 81,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 232,
+        "sgpr_count": 81,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "nc",
+      "dq": 192,
+      "schedule": "static",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 59,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 59,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "nc",
+      "dq": 192,
+      "schedule": "persistent",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 86,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 12,
+        "vgpr_spill_count": 2,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 86,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 12,
+        "vgpr_spill_count": 2,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "causal",
+      "dq": 128,
+      "schedule": "static",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 221,
+        "sgpr_count": 83,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 221,
+        "sgpr_count": 83,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "causal",
+      "dq": 128,
+      "schedule": "persistent",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 232,
+        "sgpr_count": 104,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 232,
+        "sgpr_count": 104,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "causal",
+      "dq": 192,
+      "schedule": "static",
+      "instruction_equal": true,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 254,
+        "sgpr_count": 89,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 254,
+        "sgpr_count": 89,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "causal",
+      "dq": 192,
+      "schedule": "persistent",
+      "instruction_equal": false,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 106,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 106,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "swa",
+      "dq": 128,
+      "schedule": "static",
+      "instruction_equal": false,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 228,
+        "sgpr_count": 69,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 228,
+        "sgpr_count": 69,
+        "group_segment_fixed_size": 99840,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "swa",
+      "dq": 128,
+      "schedule": "persistent",
+      "instruction_equal": false,
+      "mnemonics_equal": true,
+      "resources_equal": true,
+      "before_resources": {
+        "vgpr_count": 240,
+        "sgpr_count": 90,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 240,
+        "sgpr_count": 90,
+        "group_segment_fixed_size": 99844,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "swa",
+      "dq": 192,
+      "schedule": "static",
+      "instruction_equal": false,
+      "mnemonics_equal": false,
+      "resources_equal": false,
+      "before_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 71,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 76,
+        "group_segment_fixed_size": 149760,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    },
+    {
+      "scenario": "swa",
+      "dq": 192,
+      "schedule": "persistent",
+      "instruction_equal": false,
+      "mnemonics_equal": false,
+      "resources_equal": false,
+      "before_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 94,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 20,
+        "vgpr_spill_count": 4,
+        "sgpr_spill_count": 0
+      },
+      "after_resources": {
+        "vgpr_count": 256,
+        "sgpr_count": 100,
+        "group_segment_fixed_size": 149764,
+        "private_segment_fixed_size": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0
+      }
+    }
+  ],
+  "att": {
+    "8wave": {
+      "complete_waves": 96,
+      "mean_wave_spans": [
+        42464.375,
+        44190.375,
+        43337.125
+      ],
+      "mfma_per_wave": [
+        240.0,
+        240.0,
+        240.0
+      ],
+      "barriers_per_wave": [
+        53.0,
+        53.0,
+        53.0
+      ],
+      "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568"
+    },
+    "4wave": {
+      "complete_waves": 96,
+      "mean_wave_spans": [
+        31976.25,
+        32234.5,
+        32345.25
+      ],
+      "mfma_per_wave": [
+        160.0,
+        160.0,
+        160.0
+      ],
+      "barriers_per_wave": [
+        13.0,
+        13.0,
+        13.0
+      ],
+      "source_sha256": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375"
+    },
+    "final": {
+      "complete_waves": 96,
+      "mean_wave_spans": [
+        50205.375,
+        51121.5,
+        50606.25
+      ],
+      "mfma_per_wave": [
+        120.0,
+        120.0,
+        120.0
+      ],
+      "barriers_per_wave": [
+        53.0,
+        53.0,
+        53.0
+      ],
+      "source_sha256": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69"
+    }
+  }
+}

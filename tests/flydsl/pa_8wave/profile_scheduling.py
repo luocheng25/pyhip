@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from benchmark_revisions import current, make_call, MHA
+from benchmark_revisions import current, load_revision, make_call, MHA
 from test_pa_prefill import make_case, run_torch
 
 
@@ -19,17 +19,24 @@ def main():
     parser.add_argument("--kv", type=int, default=131072)
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--window", type=int, default=128)
+    parser.add_argument("--revision", help="optional Git revision:path for a before-change capture")
     args = parser.parse_args()
     case = make_case((args.q,), (args.kv,), dq=args.dq, heads=args.heads,
                      window_left=args.window, has_sink=args.window >= 0, poison_tail=False)
-    factories = {"static": (current.PagedAttention, {}),
-                 "persistent": (current.PagedAttention, {"persistent": True}),
+    module = current
+    source_hash = hashlib.sha256(Path(current.__file__).read_bytes()).hexdigest()
+    if args.revision:
+        module, source_hash = load_revision(args.revision)
+    factories = {"static": (module.PagedAttention, {}),
+                 "persistent": (module.PagedAttention, {"persistent": True}),
                  "4static": (MHA, {"force_dynamic_schedule": False}),
                  "4dynamic": (MHA, {"force_dynamic_schedule": True})}
     factory, options = factories[args.candidate]
     call = make_call(factory, case, args.window >= 0, options)
-    source = Path(current.__file__) if not args.candidate.startswith("4") else Path(__file__).parent.parent / "pa_4wave/pa_prefill_4wave.py"
-    print("SCHEDULER_PROFILE", json.dumps({**vars(args), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    if args.candidate.startswith("4"):
+        source = Path(__file__).parent.parent / "pa_4wave/pa_prefill_4wave.py"
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    print("SCHEDULER_PROFILE", json.dumps({**vars(args), "source_sha256": source_hash,
           "launches": 23, "selected_iterations": [21, 22, 23]}), flush=True)
     for _ in range(23):
         actual = call()
