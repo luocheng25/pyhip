@@ -1,6 +1,6 @@
 # Paged Prefill 4-wave/8-wave 优化与性能报告
 
-更新时间：2026-09-02。当前实现已完成gfx942/gfx950 BF16、架构原生FP8、
+更新时间：2026-09-03。当前实现已完成gfx942/gfx950 BF16、架构原生FP8、
 non-SWA及gfx950 SWA支持。本文件以gfx950当前结果为主；2026-08的gfx942数据统一
 归档在“历史结果”中，不与当前表直接横向比较。
 
@@ -10,13 +10,13 @@ non-SWA及gfx950 SWA支持。本文件以gfx950当前结果为主；2026-08的gf
 `B=1,Hq=16,Hkv=1,Dqk=192,Dv=128,page=64`。除特别说明外，协议均为同进程、
 同逻辑输入、20次预热、100个CUDA event样本、5轮中位数；TFLOPS为算法有效FLOPs。
 
-| 场景 | dtype | AITER | 4-wave | 8-wave | 结论 |
-|---|---|---:|---:|---:|---|
-| non-causal `Q10240,KV2583` | BF16 | **259.93 us / 1042.00T** | 514.22 us / 526.72T | 425.36 us / 636.75T | AITER varlen最快；4/8-wave分别为0.505x/0.611x |
-| causal `Q=KV=32768` | BF16 | 15454.06 us / 355.74T | 8917.36 us / 616.50T | **8283.14 us / 663.70T** | 8-wave最快，较AITER快1.866x |
-| causal `Q=KV=32768` | OCP FP8 K64 | N/A | **4651.73 us / 1181.83T** | 5101.77 us / 1077.58T | 4-wave较8-wave快1.097x |
-| SWA `Q16K,KV128K,window=128` | BF16 | 121.74 us varlen-only / 266.53 us含gather | **94.44 us static** | 139.28 us | 4-wave较两种AITER口径快1.289x/2.822x；8-wave较含gather快1.914x |
-| SWA `Q16K,KV128K,window=128` | OCP FP8 K64 | N/A | **67.05 us / 322.78T有效** | 112.35 us / 192.64T有效 | 4-wave较8-wave快1.676x |
+| 场景 | dtype | AITER | 4-wave static | 4-wave dynamic | 8-wave | 结论 |
+|---|---|---:|---:|---:|---:|---|
+| non-causal `Q10240,KV2583` | BF16 | **282.27 us / 959.53T** | 304.07 us / 890.74T | 314.05 us / 862.43T（独立轮次） | 350.43 us / 772.89T native | 8-wave API已删除4-wave回退；native 8-wave同轮仍比4-wave慢15.24% |
+| causal `Q=KV=32768` | BF16 | 15561.18 us / 353.29T | **5748.63 us / 956.32T** | 7032.47 us / 781.74T | 8462.96 us native（历史） | 8-wave不再自适应到4-wave；本行native数据为历史测量 |
+| causal `Q=KV=32768` | OCP FP8 K64 | N/A | **4230.13 us / 1299.62T** | 4815.89 us / 1141.54T | 5163.99 us / 1064.60T | static最快；dynamic为static的0.878x且快于8-wave |
+| SWA `Q16K,KV128K,window=128` | BF16 | 123.39 us varlen-only / 269.03 us含gather | **77.94 us / 277.68T有效** | 84.44 us / 256.31T有效 | 142.20 us native（历史） | 8-wave不再自适应到4-wave；本行native数据为历史测量 |
+| SWA `Q16K,KV128K,window=128` | OCP FP8 K64 | N/A | **61.00 us / 354.78T有效** | 66.56 us / 325.14T有效 | 113.72 us / 190.31T有效 | static/dynamic分别较8-wave快1.864x/1.708x |
 
 口径说明：
 
@@ -25,7 +25,10 @@ non-SWA及gfx950 SWA支持。本文件以gfx950当前结果为主；2026-08的gf
   TFLOPS另计被mask但仍进入MFMA的tile工作，详见
   [gfx950_swa_performance.md](../pa_8wave/gfx950_swa_performance.md)；
 - 每张明细表内的数据可以直接比较；不同架构、dtype、shape或计时协议的数据不混算提升；
-- AITER等长D192/V128使用linear/page-size-1 batch-prefill ABI，非等长使用linear THD；
+- dynamic为同一4-wave kernel的persistent ticket分支；总览中的BF16行来自包含全部候选
+  的同轮次测试，FP8的static/dynamic来自同轮次配对测试；
+- 8-wave API始终执行原生512线程kernel，不再导入或调用4-wave后端。AITER等长
+  D192/V128使用linear/page-size-1 batch-prefill ABI，非等长使用linear THD；
   FlyDSL使用page64 vectorized cache。三者共享逻辑Q/K/V，计时不包含布局转换。
 
 ## 当前功能范围
@@ -54,6 +57,189 @@ page 32/64/128、per-token/per-tensor Q scale及ragged tail。
 `3 passed`。生产性能分别由`PYHIP_RUN_PA_AITER_PERF=1`和
 `PYHIP_RUN_PA_AITER_SWA_PERF=1`显式开启。
 
+### Non-causal BF16 native 8-wave瓶颈分析（`Q10240,KV2583`）
+
+AITER在该shape命中gfx950专用OPUS
+`gqa_d192_v128_kernel<32,64,8,non-causal,group>`，不是通用CK fallback。下面的PMC
+来自同一逻辑输入上的单kernel dispatch；profile延迟与顶部5轮中位数略有差异，但
+相对关系一致。
+
+| 指标 | 4-wave | native 8-wave | AITER OPUS |
+|---|---:|---:|---:|
+| Q tile / KV tile | 128 / 32 | 256 / 32 | 256 / 64 |
+| 物理WG / 逻辑任务 | 1280 / 1280 | 256 / 640 | 640 / 640 |
+| 物理wave启动数 | 5120 | 2048 | 5120 |
+| BF16 MFMA | K16 | K16 | K16 |
+| `SQ_INSTS_MFMA` | 8.294M | 8.397M | 8.397M |
+| `SQ_INSTS_VALU` | 45.107M | 89.095M | 40.092M |
+| `SQ_INSTS_VMEM_RD` | 4.869M | 1.395M | 1.152M |
+| `SQ_INSTS_LDS` | 6.420M | 9.675M | 11.817M |
+| LDS bank conflict | 0.492M / 1.60% | 14.418M / 33.50% | 0 / 0% |
+| L2 miss | 1.180M | 1.139M | 1.124M |
+| `MfmaUtil` | 53.64% | 31.90%-32.56% | 56.4%-56.6% |
+| `MeanOccupancyPerActiveCU` | 1.72 | 2.00 | 1.98 |
+| ISA VGPR / SGPR / LDS | 212 / 91 / 24960 B | 237 / 100 / 49940 B | 250 / 70 / 149760 B |
+| 当前延迟 | 304.07 us | 350.43 us | 282.27 us |
+
+设置`AITER_DISABLE_FMHA_OPUS=1`后，同一输入会落到AITER
+`fmha_fwd_hd192_hd128_bf16_group` ASM，独立100-event中位为296.15 us。当前4-wave
+以本轮数值作参考，4-wave相对该历史独立值慢1.18%，native 8-wave约为其1.37x。差距
+不是Python dispatch，
+剩余重点是KV64 softmax频率、barrier锁步和跨tile流水。
+
+结论按影响排序：
+
+1. **4-wave gfx950 BF16 K16已完成。** 动态MFMA从16.589M降到8.294M；输出与
+  AITER保持`2e-2`容差内一致。K预取现使用buffer-to-LDS direct DMA，目标ISA为
+  212 VGPR、24960 B LDS、0 scratch，最终同轮三次为299.29/299.65/300.59 us。
+2. **gfx950 BF16 D192改用HW-slot互补priority。** 保持计算、访存、barrier和调度
+  fence不变的三路A/B中，统一`p2/p0`、全程`p0`和slot-aware分别为316.71、322.13和
+  312.87 us；slot-aware较统一`p2/p0`快1.23%，较全程`p0`快2.96%。wave slot 0的
+  MFMA/softmax使用`p3/p1`，其他驻留wave使用`p2/p0`，避免所有wave同时以相同高
+  priority竞争。fresh ATT中`p3/p1` wave的高/低阶段累计周期比中位数为2.04，统一
+  `p2/p0`基线为2.54；资源仍为212 VGPR、24960 B LDS、0 scratch。
+3. **BN32不会使概率EXP翻倍。** 每个wave在4-wave的一个BN32 tile持有16个score，
+  AITER的一个BN64 tile持有32个score；按64 keys归一化，两者都是32个概率EXP。
+  4-wave每个BN32还无条件执行1个在线max校正EXP，因此每64 keys比AITER约多2个
+  TRANS。目标shape的PMC为4-wave 7.060M、AITER 6.733M，只差4.9%，EXP不是主要
+  性能差距。每wave可以精确写成4-wave `81*16 + 81 + 2 = 1379`，AITER
+  `41*32 + 3 = 1315`；其中前一项是概率EXP，其余为校正和epilogue TRANS。
+  4-wave的逐lane条件被LLVM if-convert为无条件`v_exp + v_cndmask`；AITER先用
+  wave ballot形成uniform分支，只在max真正推进时执行校正EXP。BN32真正重复的是
+  row-max、在线max/sum更新、条件判断和布局控制。
+4. **row-max和lazy-max的冗余VALU已压缩。** 16项row-max由LLVM通用归约改为5条
+  `v_max3`初级归约、2条`v_max3`二级归约和1条`v_max`，cross-lane交换直接使用
+  gfx950 `v_permlane32_swap`。二者组合A/B提速1.51%，并将VGPR从237降到230。
+  在线状态改为AITER式阈值8的无偏lazy-max，直接选择`row_max/running_max`，再从
+  选中的max计算correction；同时复用`max_advances`控制O重标定。每个展开块因此少
+  1条ADD、1条compare和1条`cndmask`，correction改写单项提速0.31%-0.42%。
+5. **page64 lookahead复用已删除重复页表工作。** pair内第一块的
+  `table[(block+3)/2]`恒等于循环状态中的`prefetch_k_page_id`，只在第二块读取下一页。
+  静态页表`buffer_load_dword`站点从5降到3，VMEM read从5.079M降到4.869M，INT32
+  降到1.649M；同进程A/B提速0.82%-0.94%。
+6. **8-wave V跨wave LDS复用已验证但未保留为目标默认路径。** D192/V128 BF16由
+  512线程协作加载V到三槽LDS ring，VMEM read从4.319M降到1.395M，已接近AITER的
+  1.152M；代价是LDS指令从5.881M增至9.675M、VALU增至89.095M。独立同进程A/B中，
+  K-only为397.71 us，K+V LDS为410.95 us（回退3.33%）。其他head维度继续走原
+  global-to-register V路径。
+  当前native 8-wave为每个错相4-wave组使用独立两槽K LDS + direct-V，P@V位于
+  MFMA stage。K通过buffer-to-LDS direct DMA写入pair-padded LDS，目标资源为
+  233 VGPR / 49940 B LDS / 0 scratch。目标epilogue以direct
+  store替代C-shuffle，静态barrier为31；公开API始终运行该512线程实现。
+7. **K预取已改为direct LDS且保持低冲突。** 4-wave与8-wave均使用
+  `raw_ptr_buffer_load_lds`，每条64-lane DMA搬两个32-row D-group，并在每个pair后留
+  16 B padding；ISA中K侧`ds_write_b128`为0。4-wave在KV32和KV2583上的
+  `SQ_LDS_BANK_CONFLICT`均固定为49152，说明新增80个K block带来0个K-LDS冲突，
+  残余来自固定C-shuffle；8-wave KV2583整体为0冲突。8-wave必须为两个错相4-wave组
+  分配独立双槽ring，否则KV96开始出现非确定性覆盖。
+8. **AITER流水仍更完整。** 它保留两份score fragment，使`QK(t)`与
+  `softmax/P@V(t-1)`跨KV64 tile重叠，并将8个wave拆成两组错开一个stage。8-wave
+  当前在每个BN32的QK、softmax和P@V阶段间用全workgroup barrier锁步；结果是相同
+  MFMA数量下利用率只有约32%，AITER约56.5%。persistent ticket不是主要差异：
+  8-wave虽只启动256个物理WG并循环处理640个逻辑任务，GPU利用率仍为100%，
+  `MeanOccupancyPerActiveCU`也与AITER同为约2。
+  原生8-wave的BN32双score一barrier原型已做到目标ragged shape逐bit一致，但三轮
+  为547.20/546.10/549.66 us，对照native 390.53/389.99/391.89 us，回退约40%。
+  它没有KV64带来的softmax频率减半，因此不能验证或替代真正的KV64设计。
+
+#### 4-wave与AITER的VALU分类
+
+同一`Q10240,KV2583,non-causal`单dispatch，二者均启动5120个wave。按每wave和每64
+keys归一化后：
+
+| PMC类别 | 4-wave / wave | AITER / wave | 4-wave / 64 keys | AITER / 64 keys | 差额 / 64 keys |
+|---|---:|---:|---:|---:|---:|
+| 全部VALU | 8810.0 | 7830.5 | 217.53 | 190.99 | +26.54 |
+| TRANS F32 | 1379.0 | 1315.0 | 34.05 | 32.07 | +1.98 |
+| FMA F32 | 1464.0 | 1352.0 | 36.15 | 32.98 | +3.17 |
+| ADD F32 | 1378.0 | 1353.0 | 34.02 | 33.00 | +1.02 |
+| MUL F32 | 68.0 | 84.0 | 1.68 | 2.05 | -0.37 |
+| INT32 | 322.0 | 139.0 | 7.95 | 3.39 | +4.56 |
+| INT64 | 41.0 | 4.0 | 1.01 | 0.10 | +0.91 |
+| CVT | 682.0 | 700.0 | 16.84 | 17.07 | -0.23 |
+| SALU（不计入VALU） | 548.0 | 948.5 | 13.53 | 23.13 | -9.60 |
+
+差额来源按影响排序：
+
+1. **gfx950 BF16转换已对齐native指令。** `_cvt_f32_to_bf16`在函数内部检查平台：
+  gfx950使用vector cast并发射`v_cvt_pk_bf16_f32`，gfx942继续使用原有round-half-up
+  的`+0x8000`、右移和`v_perm`。相对手写路径，gfx950每wave少1360条INT32、增加
+  680条CVT，总VALU从59.407M降到52.444M（-11.7%），VGPR从237降到226。
+  当前4-wave的CVT已与AITER基本相同；最终仍有322对139条INT32/wave，来自地址与控制。
+2. **核心循环的`v_pk_add_f32`已消除。** 生成源有两处：BF16的vector
+  `scaled_score - updated_max`被后端配成8条packed add/BN32；FP8的
+  `llvm.vector.reduce.fadd.v16f32`被配成7条packed add/展开块。BF16现在直接使用
+  16条`v_fma_f32(score, scale, -updated_max)`融合scale-sub；FP8使用逐元素
+  `v_sub_f32`和15条标量add归约树。最终BF16/FP8静态ISA的`v_pk_add_f32`均为0。
+  BF16同进程旧/新A-B为343.97/313.27 us（提速9.8%），总VALU从52.444M降到
+  49.126M，ADD差额从+19.02降到+3.02条/64 keys；最大输出差0.000488。
+3. **D192 K写已与EXP交织。** 原稳态每轮三条`ds_write_b128`连续发射，最后一条后
+  仅约8条BF16 CVT便进入`lgkmcnt(0)+barrier`。单纯把K写整体移到softmax前会因提前
+  等VMEM回退3.3%-3.8%；仅靠跨basic-block scheduler hint也不生效。最终方案延后
+  output rescale，使17条EXP和3条K写进入同一调度区，并按
+  `4 EXP -> write -> 4 EXP -> write -> 4 EXP -> write -> 5 EXP`交织。ATT确认稳态
+  三条write两侧均有EXP，最后write到barrier约58条记录；同进程A/B提速0.92%，
+  输出逐bit一致。
+4. **显式max树、无偏lazy-max和谓词复用继续消除重复工作。** 最终总VALU进一步降到
+  45.107M，ADD差额降到+1.02条/64 keys；静态ISA相对上一版每个展开块少1条ADD、
+  1条compare和1条`cndmask`，仍为零`v_pk_add_f32`。
+5. **BN32仍重复其他非EXP softmax工作。** 4-wave每64 keys做两次16项sum、row max、
+  running max/sum更新和阈值选择；AITER对32项一次完成。sum reduction本身是
+  `2*15`对`31`次add，数量近似相同；剩余差距来自row-max和在线状态更新等控制。
+6. **未分类VALU主要是重复控制与布局操作。** 扣除转换净开销和细分浮点counter后，
+  仍包含两次row-max后的`max/compare/cndmask`、两次在线状态选择、额外cross-lane
+  交换、概率布局move/permute及地址计算。gfx950现有counter不能再将这些类别分开，
+  因此不把该余量强行归到单一源码操作。AITER的SALU反而多9.60条/64 keys，说明
+  它把更多统一控制留在scalar侧，而4-wave有更多逐lane vector控制。
+7. **per-wave direct V主要造成VMEM差距。** 4-wave每个wave为自己的32行Q读取V，
+  AITER由workgroup协作将BN64 K/V各搬入一次LDS。lookahead复用后4-wave的VMEM read为
+  4.869M，AITER为1.152M（4.23倍）；这是issue/流水压力，不是上述INT32差额的主要来源。
+8. **流水而非指令总量。** 即使移除上述冗余，4-wave仍是单score fragment，阶段间
+  barrier锁步；AITER用双score、两组4-wave错相，将EXP/VALU隐藏在MFMA之后。
+  本轮缩短非MFMA stage后4-wave `MfmaUtil`已从约46%升到53.64%，仍低于AITER约56.5%。
+
+`-packed-fp32-ops`不是VALU差额原因。诊断A/B分别给转换前的同一BF16 specialization传入
+`-packed-fp32-ops`和`+packed-fp32-ops`，MLIR属性确认相反，但最终ISA SHA256完全
+一致：两者都是68个静态`v_exp`、192个静态`v_pk_*_f32`、237 VGPR、0 scratch。
+也就是说当前编译器仍选择了packed add/mul；该target feature在这条ISA上没有产生
+任何变化。
+
+转换A/B中manual/native延迟为347.37/339.03 us（native快2.46%），两者对AITER最大
+绝对误差均为0.0009766。首次组合测试的异步GPU fault来自前一个candidate尚未同步时
+开始JIT/加载下一code object；在各候选首次launch后加入同步后，non-SWA与SWA两项
+完整生产组合均通过。当前按8-wave相同方式保留平台门控。
+
+当前优化状态与TODO：
+
+1. [x] 4-wave gfx950 BF16 QK/P@V切换K16，并同步probability/K-row layout。
+2. [x] 8-wave重做K-LDS padding/read permutation，将K-only冲突率降到3.76%。
+3. [x] 8-wave V由workgroup协作加载到三槽LDS并跨8个wave复用；功能完成，当前性能
+  取舍如上，后续优化不能只以冲突率作为验收指标。
+4. [ ] 将8-wave内部KV tile提升到64并保留两个score fragment，使`QK(t)`与
+  `softmax/P@V(t-1)`重叠，同时把softmax频率减半；不再尝试已回退约40%的BN32
+  双score版本。
+5. [ ] 将8个wave拆成两组4-wave并错开一个pipeline stage；验收要求`MfmaUtil > 50%`、
+  0 scratch，且不能恢复K-LDS冲突。除已保留的等价lookahead复用外，不再优先优化
+  page-table或L2：剩余计数不支持该方向。
+
+### 4-wave static/dynamic当前数据
+
+同一输入、20次预热、100个CUDA event样本、5轮中位数；static与dynamic在每个case
+按对应行注明的容差一致。`dynamic/static`为static延迟除以dynamic延迟，小于1表示dynamic较慢。
+
+| 场景 | dtype | 4-wave static | 4-wave dynamic | dynamic/static |
+|---|---|---:|---:|---:|
+| non-causal `Q10240,KV2583` | BF16 K16 direct-LDS | 312.73-314.21 us | 321.07-322.73 us | 0.974x |
+| causal `Q=KV=32768` | BF16 K16 | 5748.63 us / 956.32T | 7032.47 us / 781.74T | 0.817x |
+| SWA `Q16K,KV128K,window=128` | BF16 K16 | 77.94 us / 277.68T有效 | 84.44 us / 256.31T有效 | 0.923x |
+| causal `Q=KV=32768` | OCP FP8 K64 | 4230.13 us / 1299.62T | 4815.89 us / 1141.54T | 0.878x |
+| SWA `Q16K,KV128K,window=128` | OCP FP8 K64 | 61.00 us / 354.78T有效 | 66.56 us / 325.14T有效 | 0.916x |
+
+slot-aware priority的最终同轮结果中，non-causal目标shape的dynamic比static慢
+2.6%-2.7%；本轮dynamic相对static通过`rtol=atol=2e-2`。其他表项为此前同轮历史
+数据，不据此外推。dynamic仍用于batch>1负载均衡，短non-causal/causal与SWA回归
+均验证dynamic和static逐bit一致。
+
 ### Non-SWA FP8 K16/K64 A/B
 
 生产shape为`Q=KV=32768,causal`，算法工作量为`5.497558 TFLOP`。相同量化输入下
@@ -74,7 +260,7 @@ gfx950 OCP FP8 QK使用`v_mfma_f32_32x32x64_f8f6f4`，并通过
 sink。4-wave按query tile裁剪page table，窗口外page不会被读取；batch=1默认走
 static，`force_dynamic_schedule=True`时走persistent。
 
-BF16 scheduler sweep结果：
+BF16 scheduler sweep结果（K16/V-LDS前历史A/B）：
 
 | Total KV | 4-wave static | 4-wave dynamic | 8-wave persistent | Dynamic vs 8-wave |
 |---:|---:|---:|---:|---:|
@@ -82,7 +268,7 @@ BF16 scheduler sweep结果：
 | 64K | 103.89 us | 110.34 us | 141.99 us | 1.287x |
 | 128K | **103.94 us** | 110.26 us | 142.15 us | 1.289x |
 
-128K final-source dtype与K64结果：
+128K历史dtype与K64 A/B结果（均早于本轮softmax/lookahead优化，仅用于记录K64收益）：
 
 | dtype | 4-wave static | 8-wave persistent | 4-wave vs 8-wave |
 |---|---:|---:|---:|
@@ -95,13 +281,13 @@ SWA AITER有两种计时口径：
 1. **含gather端到端**：从5D cache gather到linear K/V，再调用AITER；
 2. **attention-only**：K/V已是linear布局，只计AITER attention kernel。
 
-同进程、同输入、20次预热、100样本、5轮中位数：
+同进程、同输入、20次预热、100样本、5轮中位数；三行BF16均来自本轮最终实现：
 
 | KV | gather + `mha_batch_prefill_func` | `mha_batch_prefill_func` only | gather + `flash_attn_varlen_func` | `flash_attn_varlen_func` only | 4-wave static | 8-wave persistent |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32K | 275.37 us / 78.59T | 248.67 us / 87.03T | 145.51 us / 148.74T | 115.32 us / 187.67T | **92.08 us / 235.04T** | 138.43 us / 156.34T |
-| 64K | 316.81 us / 68.31T | 248.39 us / 87.13T | 181.83 us / 119.03T | 117.52 us / 184.16T | **93.34 us / 231.87T** | 139.57 us / 155.07T |
-| 128K | fault，未计时 | fault，未计时 | 266.53 us / 81.20T | 121.74 us / 177.78T | **94.44 us / 229.17T** | 139.28 us / 155.39T |
+| 32K | 281.37 us / 76.92T | 259.55 us / 83.39T | 146.72 us / 147.51T | 116.86 us / 185.20T | **78.32 us / 276.34T** | 143.45 us / 150.87T |
+| 64K | 323.29 us / 66.94T | 260.41 us / 83.11T | 180.15 us / 120.14T | 118.20 us / 183.10T | **78.10 us / 277.11T** | 143.53 us / 150.79T |
+| 128K | fault，未计时 | fault，未计时 | 269.03 us / 80.45T | 123.39 us / 175.40T | **77.94 us / 277.68T** | 142.20 us / 152.20T |
 
 两种线性AITER API都正确支持SWA：`mha_batch_prefill_func`实际命中
 `aiter::mha_batch_prefill`，`flash_attn_varlen_func`命中`aiter::mha_varlen_fwd`；
@@ -112,31 +298,31 @@ specialization；`flash_attn_varlen_func`是linear THD接口，不是direct-page
 
 ### 当前资源
 
-gfx950 OCP FP8 D192 fresh ISA：
-
-| Kernel | QK / P@V静态站点 | VGPR | SGPR | LDS | Private | Spill | Scratch |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 4-wave K16 | 24 K16 / 16 K16 | 180 | 37 | 16384 B | 0 B | 0 | 0 |
-| 4-wave K64 | 6 K64 / 16 K16 | 180 | 37 | 16384 B | 0 B | 0 | 0 |
-| 8-wave K16 | 48 K16 / 32 K16 | 174 | 72 | 12292 B | 0 B | 0 | 0 |
-| 8-wave K64 | 12 K64 / 32 K16 | 176 | 72 | 12292 B | 0 B | 0 | 0 |
-
-K64把QK静态MFMA站点减少4倍；4-wave资源不变，8-wave仅增加2个VGPR。
-
-gfx950 BF16 SWA specialization：
+gfx950 OCP FP8 D192当前可分发的K64 specialization：
 
 | Kernel | 调度 | VGPR | SGPR | LDS | Private | Spill | Scratch |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 4-wave | static | 249 | 91 | 25600 B | 0 B | 0 | 0 |
-| 4-wave | dynamic | 254 | 91 | 25604 B | 0 B | 0 | 0 |
-| 8-wave | persistent | 228 | 88 | 36868 B | 0 B | 0 | 0 |
+| 4-wave K64 | static | 174 | 68 | 16384 B | 0 B | 0 | 0 |
+| 4-wave K64 | dynamic | 178 | 93 | 16388 B | 0 B | 0 | 0 |
+| 8-wave K64 | persistent | 176 | 72 | 12292 B | 0 B | 0 | 0 |
+
+K64相对K16把QK静态MFMA站点减少4倍；P@V仍使用K16。
+
+gfx950 BF16 D192/V128当前目标specialization：
+
+| Kernel | 调度 | VGPR | SGPR | LDS | Private | Spill | Scratch |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 4-wave direct K-LDS | static | 212 | 91 | 24960 B | 0 B | 0 | 0 |
+| 4-wave direct K-LDS | dynamic | 218 | 93 | 24964 B | 0 B | 0 | 0 |
+| 8-wave direct K-LDS + direct-V/direct-store | persistent | 233 | 100 | 49940 B | 0 B | 2 SGPR / 0 VGPR | 0 |
 
 ### 当前验证
 
 | 范围 | 结果 |
 |---|---|
-| 4-wave合并测试文件 | `49 passed, 2 skipped`；skip为两项可选生产性能测试 |
-| 8-wave gfx950完整矩阵 | 原矩阵`65 passed, 1 skipped` |
+| 4-wave合并测试文件 | `51 passed, 2 skipped`；skip为两项可选生产性能测试 |
+| 4-wave dynamic生产输出 | non-SWA与SWA两项opt-in测试各`1 passed`，均包含static/dynamic逐bit检查 |
+| 8-wave gfx950完整矩阵 | `67 passed, 1 skipped` |
 | AITER non-SWA路由 + SWA双入口 + 三方正确性 | `3 passed` |
 | non-SWA K16/K64 | 各kernel内逐bit一致 |
 | SWA K16/K64 | 各kernel内逐bit一致；4/8-wave relative-L2 `6.3745e-5` |
@@ -148,8 +334,18 @@ gfx950 BF16 SWA specialization：
 - 4-wave为`BM128 x BN32 x 256 threads`；batch=1走static grid，batch>1走
   atomic-ticket persistent grid；
 - 8-wave为`BM256 x BN32 x 512 threads`，使用1 WG/CU persistent调度；
-- K使用LDS ping-pong，V从global直接进入register，output使用半块C-shuffle；
-- online softmax使用raw-max、lazy rebase和loop-carried max/sum；
+- 4-wave使用独立`k_lds0/k_lds1`字段构成pair-padded direct-DMA K LDS ping-pong，
+  V保持global-to-register。稳态先以`vmcnt(8)`等待上一轮K DMA，同时保留当前V请求；
+  gfx950 BF16 D192按HW wave slot为MFMA/softmax阶段选择`p3/p1`或`p2/p0`；进入MFMA
+  阶段后以两条MFMA起步，再将K `ds_read_b128`与P@V MFMA逐条交织，读取完成后才向
+  已消费槽发起下一次K DMA。prologue和epilogue的`vmcnt(0)`分别保护首次读取和
+  K/output union复用；稳态剩余的机器级`vmcnt(0)`只保护最终V fragment消费；
+- 8-wave native D192/V128 BF16为两个错相4-wave组分别使用direct-DMA双槽K LDS ring，
+  并使用direct-V和direct output store；K的每两个D-group后padding 16 B，再由K16
+  置换视图读取。P@V位于MFMA stage；公开8-wave API始终运行该原生路径；
+- online softmax使用显式8指令max树、direct permlane32、阈值8的无偏lazy rebase和
+  loop-carried max/sum，并复用推进谓词控制O重标定；
+- page64的pair首块复用已携带的lookahead page id，只在pair第二块读取下一页；
 - 32x32 MFMA减少row max/sum cross-lane开销，`v_permlane`避免经LDS交换；
 - FP8采用gfx950 K64 QK、K16 P@V、score MUL split11和FP8-only fast-math；
 - BF16/FP8共享pipeline骨架，dtype专属K搬运、scheduler、probability、V布局和epilogue
@@ -164,8 +360,8 @@ Dynamic scheduler工作已全部完成：
 - 4-wave的1/2/3/4 WG-per-CU sweep选择2 WG/CU；8-wave选择1 WG/CU；
 - 最终trace中static/dynamic kernel为97.34/105.52 us，稳态dynamic没有额外初始化dispatch。
 
-版本：4-wave `a1b7e861c9373103994e295412aa9cf6b09da2758515070fafb14bf4ec4a0b69`；
-8-wave `f9e68913a906d6b4c20935f920bc528d3ec6341f085a642b1e7be7e6f2a2f815`。
+版本：4-wave `7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375`；
+8-wave `160b38fcc74696fd05115d6ebfbe757b34592f53fde56c713b2e64b201bada7b`。
 
 ## 复现当前结果
 
@@ -392,9 +588,22 @@ FP8 D192 dynamic persistent kernel的执行ISA同样逐条一致。
 | 映射/priority | tile-major回退0.5%；反向priority约回退3% | head-major、`0/2` |
 | 数值调度 | sum多链/非均匀gap无收益；显式rcp仅397.112T | 单链sum、gap2、fast-math |
 | BF16实验 | split8中性；D192 shape峰值约210.7T | 原BF16 softmax、独立D192优化 |
+| V自然padding | 冲突率降到0.37%，但`ds_read_b128`串行化使延迟升到749.39 us | 128-bit swizzled V LDS |
+| V预分区/专属hint | 256 VGPR且411.86 us；精确DS/MFMA分组为413.57 us | 消费点重物化V地址、原调度hint |
+| BF16平衡sum树 | ADD仍为15条且VGPR不变，但目标case稳定回退0.65%-0.73% | 保留LLVM线性归约及现有EXP/DS-write交织 |
+| page id `readfirstlane` | 少10条整数VALU、VGPR 230降到226，但VMEM地址依赖串行化并回退10.9%-11.2% | 仅复用等价lookahead，不强制页号进SGPR |
+| 完整V预分区 | 输出逐bit一致，但静态地址指令净增1条 | 循环内按page/block分区 |
+| 单结果permlane32 | 未初始化old-dst导致NaN；该指令需要双结果/旧目标语义 | 保留ROCDL双结果intrinsic |
 
 ## ATT证据
 
+- 当前gfx950 BF16 K16、slot-aware priority、native CVT、显式max树、page64
+  lookahead复用、零`v_pk_add_f32`：
+  `tests/flydsl/pa_4wave/ui_output_agent_54855_dispatch_22`；源码快照与当前文件SHA256
+  一致，trace含20个完整wave并同时覆盖`p3/p1`和`p2/p0`路径；
+- 统一`p2/p0`基线：`tests/flydsl/pa_4wave/ui_output_agent_44323_dispatch_22`。其
+  高/低阶段累计周期比中位数为2.54；slot-aware的`p3/p1` wave降至2.04。两份trace
+  均保持MFMA起步、K DS-read/MFMA交织及读取完成后发射K DMA；
 - FP8 D192：`tests/flydsl/pa_4wave/att_fp8_d192_3wave/ui_output_agent_28524_dispatch_66`；
 - BF16 D192：`tests/flydsl/pa_4wave/att_bf16_d192/ui_output_agent_32152_dispatch_13`；
 - FP8主要stall/MFMA：MFMA 36.674、VALU 12.619、barrier 7.413、VMEM-load 6.397、

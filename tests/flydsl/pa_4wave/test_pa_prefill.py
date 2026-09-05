@@ -1037,6 +1037,7 @@ def test_swa_aiter_production_performance():
         varlen_out = torch.empty_like(batch_out)
         direct_out = torch.empty_like(batch_out)
         four_wave_out = torch.empty_like(batch_out)
+        four_wave_dynamic_out = torch.empty_like(batch_out)
         eight_wave_out = torch.empty_like(batch_out)
 
         def gather():
@@ -1059,24 +1060,40 @@ def test_swa_aiter_production_performance():
         def four_wave():
             return run_swa_4wave(case, out=four_wave_out)
 
+        def four_wave_dynamic():
+            return run_swa_4wave(
+                case,
+                out=four_wave_dynamic_out,
+                force_dynamic_schedule=True,
+            )
+
         def eight_wave():
             return run_swa_8wave(case, out=eight_wave_out)
 
         gather()
         varlen_result = varlen()
+        torch.cuda.synchronize()
         four_wave_result = four_wave()
+        torch.cuda.synchronize()
+        four_wave_dynamic_result = four_wave_dynamic()
+        torch.cuda.synchronize()
         eight_wave_result = eight_wave()
+        torch.cuda.synchronize()
         torch.testing.assert_close(
             four_wave_result, varlen_result, rtol=2e-2, atol=2e-2
         )
         torch.testing.assert_close(
             eight_wave_result, varlen_result, rtol=2e-2, atol=2e-2
         )
+        torch.testing.assert_close(
+            four_wave_dynamic_result, four_wave_result, rtol=0, atol=0
+        )
         candidates = {
             "gather": gather,
             "flash_varlen": varlen,
             "gather_flash_varlen": gather_varlen,
             "4-wave": four_wave,
+            "4-wave-dynamic": four_wave_dynamic,
             "8-wave": eight_wave,
         }
         if total_kv < 131072:
@@ -1114,6 +1131,7 @@ def test_swa_aiter_production_performance():
                 "direct_paged": timings.get("direct_paged"),
                 "direct_status": direct_status,
                 "4-wave": timings["4-wave"],
+                "4-wave-dynamic": timings["4-wave-dynamic"],
                 "8-wave": timings["8-wave"],
             }
         )
@@ -1122,8 +1140,8 @@ def test_swa_aiter_production_performance():
         "\n| KV | gather | mha_batch_prefill_func only "
         "| gather + mha_batch_prefill_func | flash_attn_varlen_func only "
         "| gather + flash_attn_varlen_func | mha_batch_prefill_func direct-5D "
-        "| 4-wave static | 8-wave persistent |\n"
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "| 4-wave static | 4-wave dynamic | dynamic/static | 8-wave persistent |\n"
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
     for row in rows:
         batch_display = (
@@ -1146,7 +1164,9 @@ def test_swa_aiter_production_performance():
             f"| {batch_display} | {total_display} "
             f"| {row['flash_varlen']:.2f} us "
             f"| {row['gather_flash_varlen']:.2f} us | {direct_display} "
-            f"| {row['4-wave']:.2f} us | {row['8-wave']:.2f} us |"
+            f"| {row['4-wave']:.2f} us | {row['4-wave-dynamic']:.2f} us "
+            f"| {row['4-wave'] / row['4-wave-dynamic']:.3f}x "
+            f"| {row['8-wave']:.2f} us |"
         )
 
 
@@ -1295,7 +1315,7 @@ def run_dispatched_aiter(case, out=None):
     return result, "flash_attn_varlen_func"
 
 
-def run_comparison_4wave(case, out=None):
+def run_comparison_4wave(case, out=None, force_dynamic_schedule=False):
     if out is None:
         out = torch.empty(
             case["qo_len"],
@@ -1311,6 +1331,7 @@ def run_comparison_4wave(case, out=None):
         MIMO_BF16.head_dim_v,
         case["page_size"],
         case["causal"],
+        force_dynamic_schedule=force_dynamic_schedule,
     )
     return kernel(
         case["q"],
@@ -1457,6 +1478,20 @@ def test_pa_matches_dispatched_aiter(qo_len, kv_len, causal, expected_route):
 
 
 @requires_gfx950
+@pytest.mark.parametrize(
+    ("qo_len", "kv_len", "causal"),
+    [(257, 259, False), (257, 259, True)],
+)
+def test_pa_4wave_forced_dynamic_matches_static(qo_len, kv_len, causal):
+    case = make_aiter_comparison_case(qo_len, kv_len, causal)
+    static = run_comparison_4wave(case)
+    dynamic = run_comparison_4wave(case, force_dynamic_schedule=True)
+    assert torch.isfinite(dynamic).all()
+    torch.testing.assert_close(dynamic, static, rtol=0, atol=0)
+    torch.cuda.synchronize()
+
+
+@requires_gfx950
 @pytest.mark.skipif(
     os.environ.get("PYHIP_RUN_PA_AITER_PERF") != "1",
     reason="set PYHIP_RUN_PA_AITER_PERF=1 to run production AITER comparisons",
@@ -1476,18 +1511,35 @@ def test_pa_aiter_production_performance():
                 dtype=torch.bfloat16,
                 device="cuda",
             )
-            for name in ("aiter", "4-wave", "8-wave")
+            for name in ("aiter", "4-wave", "4-wave-dynamic", "8-wave")
         }
         expected, route = run_dispatched_aiter(case, outputs["aiter"])
+        torch.cuda.synchronize()
         actual_4wave = run_comparison_4wave(case, outputs["4-wave"])
+        torch.cuda.synchronize()
+        actual_4wave_dynamic = run_comparison_4wave(
+            case,
+            outputs["4-wave-dynamic"],
+            force_dynamic_schedule=True,
+        )
+        torch.cuda.synchronize()
         actual_8wave = run_comparison_8wave(case, outputs["8-wave"])
+        torch.cuda.synchronize()
         torch.testing.assert_close(actual_4wave, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            actual_4wave_dynamic, actual_4wave, rtol=0, atol=0
+        )
         torch.testing.assert_close(actual_8wave, expected, rtol=2e-2, atol=2e-2)
 
         timings = benchmark_comparison_candidates(
             {
                 "aiter": lambda: run_dispatched_aiter(case, outputs["aiter"])[0],
                 "4-wave": lambda: run_comparison_4wave(case, outputs["4-wave"]),
+                "4-wave-dynamic": lambda: run_comparison_4wave(
+                    case,
+                    outputs["4-wave-dynamic"],
+                    force_dynamic_schedule=True,
+                ),
                 "8-wave": lambda: run_comparison_8wave(case, outputs["8-wave"]),
             }
         )
@@ -1498,21 +1550,25 @@ def test_pa_aiter_production_performance():
                 "route": route,
                 **{
                     f"{name}_us": timings[name]
-                    for name in ("aiter", "4-wave", "8-wave")
+                    for name in ("aiter", "4-wave", "4-wave-dynamic", "8-wave")
                 },
                 **{
                     f"{name}_tflops": flops / (timings[name] * 1e6)
-                    for name in ("aiter", "4-wave", "8-wave")
+                    for name in ("aiter", "4-wave", "4-wave-dynamic", "8-wave")
                 },
                 "4-wave_speedup": timings["aiter"] / timings["4-wave"],
+                "dynamic_vs_static": (
+                    timings["4-wave"] / timings["4-wave-dynamic"]
+                ),
                 "8-wave_speedup": timings["aiter"] / timings["8-wave"],
             }
         )
 
     print(
-        "\n| shape | AITER route | AITER us / TFLOPS | 4-wave us / TFLOPS "
-        "| 4-wave vs AITER | 8-wave us / TFLOPS | 8-wave vs AITER |\n"
-        "|---|---|---:|---:|---:|---:|---:|"
+        "\n| shape | AITER route | AITER us / TFLOPS | 4-wave static us / TFLOPS "
+        "| static vs AITER | 4-wave dynamic us / TFLOPS | dynamic/static "
+        "| 8-wave us / TFLOPS | 8-wave vs AITER |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|"
     )
     for row in rows:
         print(
@@ -1520,6 +1576,9 @@ def test_pa_aiter_production_performance():
             f"| {row['aiter_us']:.2f} / {row['aiter_tflops']:.2f}T "
             f"| {row['4-wave_us']:.2f} / {row['4-wave_tflops']:.2f}T "
             f"| {row['4-wave_speedup']:.3f}x "
+            f"| {row['4-wave-dynamic_us']:.2f} / "
+            f"{row['4-wave-dynamic_tflops']:.2f}T "
+            f"| {row['dynamic_vs_static']:.3f}x "
             f"| {row['8-wave_us']:.2f} / {row['8-wave_tflops']:.2f}T "
             f"| {row['8-wave_speedup']:.3f}x |"
         )

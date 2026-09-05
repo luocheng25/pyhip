@@ -10,6 +10,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr.typing import Vector as Vec
 
@@ -21,6 +22,121 @@ def _maxnumf(a, b):
     """Non-NaN-propagating f32 max used by the wave softmax reduction."""
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
 
+
+def _exp2_f32(value):
+    return fx.Float32(llvm.call_intrinsic(
+        fx.Float32.ir_type,
+        "llvm.amdgcn.exp2.f32",
+        [arith.unwrap(value)],
+        [],
+        [],
+    ))
+
+
+def _exp2_vec_f32(values):
+    raw = arith.unwrap(values)
+    result = [
+        llvm.call_intrinsic(
+            fx.Float32.ir_type,
+            "llvm.amdgcn.exp2.f32",
+            [
+                vector.extract(
+                    raw, static_position=[index], dynamic_position=[]
+                )
+            ],
+            [],
+            [],
+        )
+        for index in range_constexpr(raw.type.shape[0])
+    ]
+    return fx.Vector(
+        vector.from_elements(
+            ir.VectorType.get([len(result)], fx.Float32.ir_type), result
+        )
+    )
+
+
+def _fma_f32(lhs, rhs, acc, negate_acc=False):
+    instruction = (
+        "v_fma_f32 $0, $1, $2, -$3"
+        if negate_acc
+        else "v_fma_f32 $0, $1, $2, $3"
+    )
+    return fx.Float32(llvm.inline_asm(
+        fx.Float32.ir_type,
+        [arith.unwrap(lhs), arith.unwrap(rhs), arith.unwrap(acc)],
+        instruction,
+        "=v,v,v,v",
+        has_side_effects=False,
+    ))
+
+
+def _cvt_f32_to_bf16_pinned(fragment):
+    values = fragment.load()
+    packed = [
+        fx.Int32(llvm.inline_asm(
+            fx.Int32.ir_type,
+            [arith.unwrap(values[index]), arith.unwrap(values[index + 1])],
+            "v_cvt_pk_bf16_f32 $0, $1, $2",
+            "=v,v,0",
+            has_side_effects=True,
+        ))
+        for index in range_constexpr(0, values.numel, 2)
+    ]
+    probability = fx.make_fragment_like(fragment, dtype=fx.BFloat16)
+    probability.store(
+        fx.Vector.from_elements(packed, fx.Int32).bitcast(fx.BFloat16)
+    )
+    return probability
+
+
+def _max_f32(lhs, rhs):
+    return fx.Float32(llvm.inline_asm(
+        fx.Float32.ir_type,
+        [arith.unwrap(lhs), arith.unwrap(rhs)],
+        "v_max_f32 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    ))
+
+
+def _max3_f32(lhs, middle, rhs):
+    return fx.Float32(llvm.inline_asm(
+        fx.Float32.ir_type,
+        [arith.unwrap(lhs), arith.unwrap(middle), arith.unwrap(rhs)],
+        "v_max3_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        has_side_effects=False,
+    ))
+
+
+def _reduce_max_f32(values):
+    partials = [
+        _max3_f32(
+            values[3 * index], values[3 * index + 1], values[3 * index + 2]
+        )
+        for index in range_constexpr(5)
+    ]
+    lower = _max3_f32(partials[0], partials[1], partials[2])
+    upper = _max3_f32(partials[3], partials[4], values[15])
+    return _max_f32(lower, upper)
+
+
+def _cross_lane_max32(value):
+    pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    value_bits = as_ir_value(value).bitcast(fx.Int32.ir_type)
+    swapped = rocdl.permlane32_swap(
+        pair_type, value_bits, value_bits, False, True
+    )
+    lower = llvm.extractvalue(fx.Int32.ir_type, swapped, [0]).bitcast(
+        fx.Float32.ir_type
+    )
+    upper = llvm.extractvalue(fx.Int32.ir_type, swapped, [1]).bitcast(
+        fx.Float32.ir_type
+    )
+    return _max_f32(fx.Float32(lower), fx.Float32(upper))
+
+
 @flyc.jit
 def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                    q_pos0, kv_block_n, kv_len, qo_len,
@@ -29,7 +145,8 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                    is_causal: fx.Constexpr[bool],
                    return_bf16_probability: fx.Constexpr[bool] = False,
                    window_left: fx.Constexpr[int] = -1,
-                   probability_mfma_k: fx.Constexpr[int] = 8):
+                   probability_mfma_k: fx.Constexpr[int] = 8,
+                   align_4wave_valu: fx.Constexpr[bool] = False):
     """
     old_max/l_in是会被更新的，使用SSA方式return更新后值，不要使用mutable container例如list来修改
 
@@ -82,28 +199,44 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                     )
                 if outside_window:
                     fragS[i,0,0] = float("-inf")
+    score = fragS.load()
+    if fx.const_expr(align_4wave_valu):
+        row_max = _reduce_max_f32(score)
+        row_max = _cross_lane_max32(row_max)
+        row_max = _fma_f32(row_max, sm_scale_log2, fx.Float32(0.0))
+        max_advances = row_max > old_max + fx.Float32(8.0)
+        new_max = max_advances.select(row_max, old_max)
+        corr = _exp2_f32(old_max - new_max)
+        centered_scores = fx.Vector.from_elements(
+            [
+                _fma_f32(
+                    score[index], sm_scale_log2, new_max, negate_acc=True
+                )
+                for index in range_constexpr(score.numel)
+            ],
+            fx.Float32,
+        )
+        probs = _exp2_vec_f32(centered_scores)
+        row_sum = probs.reduce("add")
+        l_out = _fma_f32(l_in, corr, row_sum)
+        rescale_predicate = max_advances
+    else:
+        scores = fxh.eltwise_op("v_mul_f32", score, sm_scale_log2)
+        row_max = scores.reduce("max")
+        row_max = _maxnumf(row_max, row_max.shuffle_xor(32, 64))
 
+        new_max = old_max
+        corr = fx.Float32(1.0)
+        threshold = fxh.eltwise_op("v_add_f32", old_max, fx.Float32(7.0))
+        if row_max > threshold:
+            new_max = fxh.eltwise_op("v_add_f32", row_max, fx.Float32(1.0))
+            corr = fxh.eltwise_op("llvm.amdgcn.exp2.f32", old_max - new_max)
 
-    scores = fxh.eltwise_op("v_mul_f32", fragS.load(), sm_scale_log2)
-
-    row_max = scores.reduce("max")
-    row_max = _maxnumf(row_max, row_max.shuffle_xor(32, 64))
-
-    new_max = old_max
-    corr = fx.Float32(1.0)
-    threshold = fxh.eltwise_op("v_add_f32", old_max, fx.Float32(7.0))
-    if row_max > threshold:
-        new_max = fxh.eltwise_op("v_add_f32", row_max, fx.Float32(1.0))
-        # do not use inline asm inside scf.If, use intrinsic instead
-        corr = fxh.eltwise_op("llvm.amdgcn.exp2.f32", old_max - new_max)
-
-    centered_scores = fxh.eltwise_op("v_sub_f32", scores, new_max)
-    probs = fxh.eltwise_op("v_exp_f32", centered_scores)
-    row_sum = probs.reduce("add")
-
-    # this fake instruction avoids spills for some reason, but seems to be not required anymore
-    # row_sum = fxh.eltwise_op("; fake inst", row_sum, 0.0)
-    l_out = fxh.eltwise_op("v_fma_f32", l_in, corr, row_sum)
+        centered_scores = fxh.eltwise_op("v_sub_f32", scores, new_max)
+        probs = fxh.eltwise_op("v_exp_f32", centered_scores)
+        row_sum = probs.reduce("add")
+        l_out = fxh.eltwise_op("v_fma_f32", l_in, corr, row_sum)
+        rescale_predicate = corr < fx.Float32(1.0)
     fragS.store(probs)
 
     # Rebase the accumulated numerator only when the lazy max advances.
@@ -112,12 +245,15 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
 
     @flyc.jit
     def rescale_if_needed():
-        if corr < fx.Float32(1.0):
+        if rescale_predicate:
             rescale_output()
 
     rescale_if_needed()
     if fx.const_expr(return_bf16_probability):
-        probability = fxh.cvt_f32_to_bf16(fragS)
+        if fx.const_expr(align_4wave_valu):
+            probability = _cvt_f32_to_bf16_pinned(fragS)
+        else:
+            probability = fxh.cvt_f32_to_bf16(fragS)
         if fx.const_expr(probability_mfma_k == 16):
             probability_layout = fx.make_layout((8, 1, 2), (1, 0, 8))
         else:
@@ -187,7 +323,9 @@ def PagedAttention(
     @flyc.jit
     def attn_pipeline(q_tile, # [BM, head_dim_qk]
                       k_tile, # [BN, (k_vector_size, head_dim_qk // k_vector_size), num_physical_pages, num_BN_per_page]
+                      k_dma_resource,
                       v_tile, # [head_dim_v, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
+                      v_dma_resource,
                       o_tile, # [BM, head_dim_v]
                       q_pos0, query_len, kv_len, full_qo_len,
                       ptr_kv_page_table,
@@ -201,6 +339,15 @@ def PagedAttention(
 
         flyobj = fxh.FlyObjCache()
         dtype = k_tile.dtype
+        use_split_bf16_pv = (
+            is_gfx950
+            and dtype == fx.BFloat16
+            and head_dim_qk == 192
+            and head_dim_v == 128
+            and page_size == 64
+        )
+        use_direct_output_store = use_split_bf16_pv
+        use_4wave_stage_boundary = use_split_bf16_pv
         pv_mfma_k = 16
         if fx.const_expr(dtype == fx.BFloat16 and not is_gfx950):
             pv_mfma_k = 8
@@ -282,14 +429,17 @@ def PagedAttention(
             对K的layout中n维度进行remap, 用这个layout进行compose (4, 2, 4):(1, 16, 4) 使得P的lane[0]/[32]跟V一致
             对P的寄存器排布，按照 fx.gemm 对 A/B 输入的要求重新解释
         """
-        if fx.const_expr(k_tile.dtype == fx.BFloat16):
-            k_row_layout = fx.make_layout((4, 2, 2, 2), (1, 8, 4, 16))
-        else:
-            k_row_layout = fx.make_layout((4, 2, 4), (1, 16, 4))
-        k_tile = fx.composition(
-            k_tile,
-            fx.make_tile(k_row_layout, None, None, None),
+        k_row_layout = (
+            fx.make_layout((4, 2, 2, 2), (1, 8, 4, 16))
+            if k_tile.dtype == fx.BFloat16
+            else fx.make_layout((4, 2, 4), (1, 16, 4))
         )
+        use_padded_k_lds = is_gfx950 and k_tile.dtype == fx.BFloat16
+        if not use_padded_k_lds:
+            k_tile = fx.composition(
+                k_tile,
+                fx.make_tile(k_row_layout, None, None, None),
+            )
 
         fragQ = flyobj.load_tiled_mma_fragB(tmma1, q_tile)
 
@@ -323,30 +473,70 @@ def PagedAttention(
             v_tile.dtype,
         )
 
-        # gfx950 BF16 register-pressure change (Dqk=192 production case):
-        #
-        # Before:
-        #   prefetch[ping] = global_load(K[i + 3])  # 8 VGPR/thread
-        #   prefetch[pong] = global_load(K[i + 4])  # 8 VGPR/thread
-        #   ... QK -> softmax -> PV -> loop backedge ...
-        #   LDS[ping_or_pong] = prefetch[ping_or_pong]
-        #
-        # Both fragments stayed live across several stages and the loop
-        # backedge. Together with Q/K/V/O fragments this exceeded 256 VGPRs,
-        # so LLVM repeatedly spilled K data in the steady loop.
-        #
-        # After:
-        #   tmp = global_load(K[i + 3])             # one transient fragment
-        #   ... overlap the load with QK/softmax ...
-        #   wait(tmp); LDS[(i + 3) % 3] = tmp
-        #   fragK = LDS[(i + 1) % 3]
-        #
-        # The three-stage LDS ring carries the lookahead across iterations.
-        # Only one 8-VGPR temporary lives from global load to LDS store, and it
-        # dies before the backedge. This trades 12 KiB LDS for zero scratch in
-        # the steady KV loop.
+        def compute_pv(probability_operand):
+            if fx.const_expr(use_split_bf16_pv and pv_mfma_k == 16):
+                for k_group in fx.range_constexpr(2):
+                    for n_group in fx.range_constexpr(head_dim_v // 32):
+                        accumulator = fragO[None, n_group, 0]
+                        fx.mma_atom_call(
+                            pv_mma_atom,
+                            accumulator,
+                            fragV[None, n_group, k_group],
+                            probability_operand[None, 0, k_group],
+                            accumulator,
+                        )
+            else:
+                fx.gemm(
+                    tmma2,
+                    fragO,
+                    fragV,
+                    probability_operand,
+                    fragO,
+                )
+
+        def compute_qk():
+            fragS.fill(0.0)
+            fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
+
+        # TODO(gfx950): widen the internal KV tile to BN64 and keep two score
+        # fragments so QK(t) can overlap softmax/PV(t - 1).  The external
+        # paged-cache ABI can remain BN32; only the internal reduction stage
+        # and online-softmax cadence need to consume two adjacent blocks.
+        # TODO(gfx950): split the eight waves into two four-wave groups staggered
+        # by one pipeline stage.  Revisit this after BN64 lands and require
+        # MfmaUtil above 50% without reintroducing scratch or LDS conflicts.
+
+        # gfx950 BF16 writes K directly from its buffer descriptor into a
+        # two-stage LDS ring. The two staggered four-wave groups require
+        # independent rings: they reach full-workgroup barriers in adjacent
+        # pipeline generations and cannot safely share an asynchronously
+        # written slot. V remains per-wave in registers.
         use_k_ring = is_gfx950 and k_tile.dtype == fx.BFloat16
-        k_lds_stages = 3 if use_k_ring else 2
+        use_direct_k_lds = use_k_ring
+        use_grouped_direct_k_lds = use_direct_k_lds and key_layout == "vectorized"
+        k_lds_stages = (
+            2 if use_direct_k_lds
+            else 3 if use_k_ring
+            else 2
+        )
+        k_lds_stride = head_dim_qk + (8 if use_padded_k_lds else 0)
+        # Each 64-lane DMA copies a pair of 32-row vector groups. A 16-byte
+        # gap after the pair preserves source coalescing and rotates the next
+        # pair's LDS read banks.
+        k_lds_group_stride = BN * vector_values
+        num_k_group_pairs = head_dim_qk // (2 * vector_values)
+        k_lds_group_pair_stride = 2 * k_lds_group_stride + vector_values
+        k_lds_stage_elements = (
+            num_k_group_pairs * k_lds_group_pair_stride
+            if use_grouped_direct_k_lds
+            else BN * k_lds_stride
+        )
+        k_lds_group_elements = k_lds_stages * k_lds_stage_elements
+        k_lds_elements = (
+            2 * k_lds_group_elements
+            if use_direct_k_lds
+            else k_lds_group_elements
+        )
 
         # let all 512 threads participate in the copy so no extra if condition involved
         # 512*16/32 = 256, so all head_dim <= 256 can be padded to 256
@@ -356,24 +546,96 @@ def PagedAttention(
             else 128
         )
 
+        # The former V-LDS gate covered only this target specialization; its
+        # measured regression makes direct V the final path for every shape.
+        use_v_lds = False
+        v_lds_elements = (
+            k_lds_stages * BN * head_dim_v if use_v_lds else 1
+        )
+        @fx.struct
+        class KVStorage:
+            k_lds: fx.Array[
+                k_tile.dtype, k_lds_elements, 16
+            ]
+            v_lds: fx.Array[v_tile.dtype, v_lds_elements, 16]
+
         @fx.union
         class SharedStorage:
-            k_lds: fx.Array[
-                k_tile.dtype, k_lds_stages * BN * head_dim_qk, 16
-            ]
+            kv: KVStorage
             o_lds: fx.Array[o_tile.dtype, (BM//8) * head_dim_v, 16]
 
         # mask,base,shift, swizzle always in unit of 128b,
         swz_base = ((128 // k_tile.dtype.width) - 1).bit_length()
         swz = fx.SwizzleType.get(3, swz_base, 3)
         lds = shared_allocator.allocate(SharedStorage)
-        layout_k_lds = fx.make_composed_layout(
-            fx.static(swz),
-            fx.make_ordered_layout(
-                (BN, head_dim_qk, k_lds_stages), (1, 0, 2)
-            ),
+        k_lds_array = lds.kv.k_lds
+        k_lds_storage = (
+            k_lds_array.peek().view(
+                fx.make_layout(
+                    (
+                        BN,
+                        (vector_values, (2, num_k_group_pairs)),
+                        k_lds_stages,
+                        2,
+                    ),
+                    (
+                        vector_values,
+                        (1, (k_lds_group_stride, k_lds_group_pair_stride)),
+                        k_lds_stage_elements,
+                        k_lds_group_elements,
+                    ),
+                )
+            )
+            if use_grouped_direct_k_lds
+            else k_lds_array.peek().view(
+                fx.make_layout(
+                    (BN, head_dim_qk, k_lds_stages, 2),
+                    (
+                        k_lds_stride,
+                        1,
+                        k_lds_stage_elements,
+                        k_lds_group_elements,
+                    ),
+                )
+            )
+            if use_direct_k_lds
+            else k_lds_array.peek().view(
+                fx.make_layout(
+                    (BN, head_dim_qk, k_lds_stages),
+                    (k_lds_stride, 1, k_lds_stage_elements),
+                )
+            )
         )
-        lds_k = lds.k_lds.peek().view(layout_k_lds)
+        lds_k = (
+            fx.composition(
+                k_lds_storage,
+                fx.make_tile(
+                    k_row_layout,
+                    None,
+                    None,
+                    None,
+                )
+                if use_direct_k_lds
+                else fx.make_tile(k_row_layout, None, None),
+            )
+            if use_padded_k_lds
+            else k_lds_array.peek().view(
+                fx.make_composed_layout(
+                    fx.static(swz),
+                    fx.make_ordered_layout(
+                        (BN, head_dim_qk, k_lds_stages), (1, 0, 2)
+                    ),
+                )
+            )
+        )
+        v_lds_storage = lds.kv.v_lds.peek().view(
+            fx.make_composed_layout(
+                fx.static(swz),
+                fx.make_ordered_layout(
+                    (head_dim_v, BN, k_lds_stages), (1, 0, 2)
+                ),
+            )
+        )
 
         # assert 0, f"{lds_ku32} {lds_k}"
 
@@ -403,83 +665,368 @@ def PagedAttention(
             new_layout = fx.recast_layout(src.layout, src.dtype.width, new_dtype.width)
             return fx.make_view(new_iter, new_layout)
 
-        lds_k_u32 = recast_tensor(lds_k, fx.Uint32)
-        k_tile_u32 = recast_tensor(k_tile, fx.Uint32)
+        v_lds_u32 = recast_tensor(v_lds_storage, fx.Uint32)
+        v_tile_u32 = recast_tensor(v_tile, fx.Uint32)
 
-        glk_thrcopy, glk_load_atom = flyobj.get_tiled_copy_coalesced_mn(
-            k_tile_u32[None, None, 0, 0],
-            copy_atom_bits=copy_atom_bits,
-            num_threads=num_copy_threads,
-        )
-        glk_srck = glk_thrcopy.partition_S(k_tile_u32)
-        glk_dstk = glk_thrcopy.partition_D(lds_k_u32)
+        if fx.const_expr(use_direct_k_lds):
+            dma_lane_id = fx.Int32(tid & 63)
+            dma_wave_id = fx.Int32(tid // 64)
+            dma_wave_group = dma_wave_id // 4
+            dma_wave_in_group = dma_wave_id % 4
 
-        glk_store_atom = flyobj.get_universal_copy_atom(
-            fx.Uint32, copy_atom_bits
-        )
-        glk_frag = fx.make_fragment_like(glk_dstk[None, None, None, 0])
-        num_vm_cnt_load_k = (fx.size(glk_frag.shape).get_static_leaf_int * glk_frag.dtype.width)//copy_atom_bits
-        if fx.const_expr(use_k_ring):
-            prefetch_fragk = fx.make_fragment_like(
-                glk_srck[None, None, None, 0, 0]
-            )
+            if fx.const_expr(
+                use_grouped_direct_k_lds and use_split_bf16_pv
+            ):
+                pair_rounds = (num_k_group_pairs + 3) // 4
+                source_row = dma_lane_id & (BN - 1)
+                k_source_voffsets = [[], []]
+                k_lds_destinations = [[], []]
+                for bn_part in fx.range_constexpr(2):
+                    for pair_round in fx.range_constexpr(pair_rounds):
+                        group_pair = fx.Int32(
+                            dma_wave_in_group + pair_round * 4
+                        )
+                        d_group = fx.Int32(
+                            group_pair * 2 + dma_lane_id // BN
+                        )
+                        source_offset = fx.Int32(
+                            d_group * page_size * vector_values
+                            + (bn_part * BN + source_row) * vector_values
+                        )
+                        k_source_voffsets[bn_part].append(
+                            source_offset * (k_tile.dtype.width // 8)
+                        )
+
+                        destination_offset = fx.Int32(
+                            dma_wave_group * k_lds_group_elements
+                            + bn_part * k_lds_stage_elements
+                            + group_pair * k_lds_group_pair_stride
+                        )
+                        destination_view = fx.make_view(
+                            fx.get_iter(k_lds_storage) + destination_offset,
+                            fx.make_layout(1, 1),
+                        )
+                        k_lds_destinations[bn_part].append(
+                            fly_dialect.extract_aligned_pointer_as_index(
+                                ir.Type.parse("!llvm.ptr<3>"),
+                                arith._to_raw(destination_view),
+                            )
+                        )
+
+            def global_load_k(block_n, page_id, bn_id, frag_id, lds_buff_id):
+                if fx.const_expr(is_valid_block_n(block_n)):
+                    if fx.const_expr(use_grouped_direct_k_lds):
+                        pair_rounds = (
+                            num_k_group_pairs + 3
+                        ) // 4
+                        if fx.const_expr(use_split_bf16_pv):
+                            page_soffset = fx.Int32(
+                                rocdl.readfirstlane(
+                                    fx.Int32.ir_type,
+                                    arith.unwrap(fx.Int32(page_id)),
+                                )
+                            ) * fx.Int32(
+                                page_size
+                                * num_kv_heads
+                                * head_dim_qk
+                                * (k_tile.dtype.width // 8)
+                            )
+                            for pair_round in fx.range_constexpr(pair_rounds):
+                                rocdl.raw_ptr_buffer_load_lds(
+                                    k_dma_resource,
+                                    k_lds_destinations[lds_buff_id][pair_round],
+                                    fx.Int32(16),
+                                    k_source_voffsets[bn_id][pair_round],
+                                    page_soffset,
+                                    fx.Int32(0),
+                                    fx.Int32(0),
+                                )
+                        else:
+                            source_row = dma_lane_id & (BN - 1)
+                            dma_lds_slot = fx.Int32(lds_buff_id)
+                            for pair_round in fx.range_constexpr(pair_rounds):
+                                group_pair = fx.Int32(
+                                    dma_wave_in_group + pair_round * 4
+                                )
+                                if group_pair < num_k_group_pairs:
+                                    d_group = fx.Int32(
+                                        group_pair * 2 + dma_lane_id // BN
+                                    )
+                                    source_offset = fx.Int32(
+                                        page_id
+                                        * page_size
+                                        * num_kv_heads
+                                        * head_dim_qk
+                                        + d_group
+                                        * page_size
+                                        * vector_values
+                                        + (
+                                            fx.Int32(bn_id) * BN
+                                            + source_row
+                                        )
+                                        * vector_values
+                                    )
+                                    destination_offset = fx.Int32(
+                                        dma_wave_group * k_lds_group_elements
+                                        + dma_lds_slot * k_lds_stage_elements
+                                        + group_pair
+                                        * k_lds_group_pair_stride
+                                    )
+                                    destination_view = fx.make_view(
+                                        fx.get_iter(k_lds_storage)
+                                        + destination_offset,
+                                        fx.make_layout(1, 1),
+                                    )
+                                    destination = fly_dialect.extract_aligned_pointer_as_index(
+                                        ir.Type.parse("!llvm.ptr<3>"),
+                                        arith._to_raw(destination_view),
+                                    )
+                                    rocdl.raw_ptr_buffer_load_lds(
+                                        k_dma_resource,
+                                        destination,
+                                        fx.Int32(16),
+                                        fx.Int32(
+                                            source_offset
+                                            * (k_tile.dtype.width // 8)
+                                        ),
+                                        fx.Int32(0),
+                                        fx.Int32(0),
+                                        fx.Int32(0),
+                                    )
+                        return pair_rounds
+
+                    dma_lds_slot = fx.Int32(lds_buff_id)
+                    vectors_per_row = head_dim_qk // vector_values
+                    padded_vectors_per_row = vectors_per_row + 1
+                    rows_per_dma = 64 // padded_vectors_per_row
+                    dma_calls_per_wave = (8 + rows_per_dma - 1) // rows_per_dma
+                    row_in_dma = dma_lane_id // padded_vectors_per_row
+                    vector_in_row = dma_lane_id % padded_vectors_per_row
+                    last_block = num_kv_pages * num_BN_per_page - 1
+                    source_block = fx.Int32(arith.minsi(
+                        arith.unwrap(fx.Int32(block_n)), arith.unwrap(last_block)
+                    ))
+                    for dma_index in fx.range_constexpr(dma_calls_per_wave):
+                        first_wave_row = dma_index * rows_per_dma
+                        rows_this_dma = min(rows_per_dma, 8 - first_wave_row)
+                        if (row_in_dma < rows_this_dma) & (vector_in_row < vectors_per_row):
+                            source_row = dma_wave_in_group * 8 + first_wave_row + row_in_dma
+                            source_offset = fx.Int32(
+                                (source_block * BN + source_row)
+                                * num_kv_heads * head_dim_qk
+                                + vector_in_row * vector_values
+                            )
+                            destination_offset = fx.Int32(
+                                dma_wave_group * k_lds_group_elements
+                                + dma_lds_slot * k_lds_stage_elements
+                                + (dma_wave_in_group * 8 + first_wave_row) * k_lds_stride
+                            )
+                            destination_view = fx.make_view(
+                                fx.get_iter(k_lds_storage) + destination_offset,
+                                fx.make_layout(1, 1),
+                            )
+                            destination = fly_dialect.extract_aligned_pointer_as_index(
+                                ir.Type.parse("!llvm.ptr<3>"),
+                                arith._to_raw(destination_view),
+                            )
+                            rocdl.raw_ptr_buffer_load_lds(
+                                k_dma_resource,
+                                destination,
+                                fx.Int32(16),
+                                fx.Int32(source_offset * (k_tile.dtype.width // 8)),
+                                fx.Int32(0),
+                                fx.Int32(0),
+                                fx.Int32(0),
+                            )
+                    return dma_calls_per_wave
+                return 0
+
+            def ds_store_k(block_n, frag_id, lds_buff_id):
+                return
         else:
+            lds_k_u32 = recast_tensor(
+                k_lds_storage if use_padded_k_lds else lds_k,
+                fx.Uint32,
+            )
+            k_tile_u32 = recast_tensor(k_tile, fx.Uint32)
+            glk_thrcopy, glk_load_atom = flyobj.get_tiled_copy_coalesced_mn(
+                k_tile_u32[None, None, 0, 0],
+                copy_atom_bits=copy_atom_bits,
+                num_threads=num_copy_threads,
+            )
+            glk_srck = glk_thrcopy.partition_S(k_tile_u32)
+            glk_dstk = glk_thrcopy.partition_D(lds_k_u32)
+            glk_store_atom = flyobj.get_universal_copy_atom(
+                fx.Uint32, copy_atom_bits
+            )
+            glk_frag = fx.make_fragment_like(glk_dstk[None, None, None, 0])
+            num_vm_cnt_load_k = (
+                fx.size(glk_frag.shape).get_static_leaf_int
+                * glk_frag.dtype.width
+            ) // copy_atom_bits
             prefetch_fragk_list = [
                 fx.make_fragment_like(glk_srck[None, None, None, 0, 0]),
                 fx.make_fragment_like(glk_srck[None, None, None, 0, 0]),
             ]
 
-        def global_load_k(block_n, page_id, bn_id, frag_id):
-            if fx.const_expr(is_valid_block_n(block_n)):
-                if fx.const_expr(key_layout == "linear"):
-                    last_block = num_kv_pages * num_BN_per_page - 1
-                    source_block = fx.Int32(arith.minsi(
-                        arith.unwrap(fx.Int32(block_n)), arith.unwrap(last_block)
-                    ))
-                    source = glk_srck[None, None, None, source_block, 0]
-                else:
-                    source = glk_srck[None, None, None, page_id, bn_id]
-                if fx.const_expr(use_k_ring):
-                    if fx.const_expr(num_copy_threads == num_threads):
-                        fx.copy(glk_load_atom, source, prefetch_fragk)
+            def global_load_k(block_n, page_id, bn_id, frag_id, lds_buff_id):
+                if fx.const_expr(is_valid_block_n(block_n)):
+                    if fx.const_expr(key_layout == "linear"):
+                        last_block = num_kv_pages * num_BN_per_page - 1
+                        source_block = fx.Int32(arith.minsi(
+                            arith.unwrap(fx.Int32(block_n)), arith.unwrap(last_block)
+                        ))
+                        source = glk_srck[None, None, None, source_block, 0]
                     else:
-                        if tid < num_copy_threads:
-                            fx.copy(glk_load_atom, source, prefetch_fragk)
-                else:
+                        source = glk_srck[None, None, None, page_id, bn_id]
                     if fx.const_expr(num_copy_threads == num_threads):
                         fx.copy(glk_load_atom, source, prefetch_fragk_list[frag_id])
                     else:
                         if tid < num_copy_threads:
                             fx.copy(glk_load_atom, source, prefetch_fragk_list[frag_id])
-                return num_vm_cnt_load_k
-            else:
+                    return num_vm_cnt_load_k
                 return 0
 
-        def ds_store_k(block_n, frag_id, lds_buff_id):
-            if fx.const_expr(is_valid_block_n(block_n)):
-                if fx.const_expr(use_k_ring):
-                    source = prefetch_fragk
-                else:
+            def ds_store_k(block_n, frag_id, lds_buff_id):
+                if fx.const_expr(is_valid_block_n(block_n)):
                     source = prefetch_fragk_list[frag_id]
-                if fx.const_expr(num_copy_threads == num_threads):
-                    fx.copy(
-                        glk_store_atom,
-                        source,
-                        glk_dstk[None, None, None, lds_buff_id],
-                    )
-                else:
-                    if tid < num_copy_threads:
+                    if fx.const_expr(num_copy_threads == num_threads):
                         fx.copy(
                             glk_store_atom,
                             source,
                             glk_dstk[None, None, None, lds_buff_id],
                         )
+                    else:
+                        if tid < num_copy_threads:
+                            fx.copy(
+                                glk_store_atom,
+                                source,
+                                glk_dstk[None, None, None, lds_buff_id],
+                            )
+
+        glv_thrcopy, glv_load_atom = flyobj.get_tiled_copy_coalesced_mn(
+            v_tile_u32[None, None, 0, 0],
+            copy_atom_bits=128,
+            num_threads=num_threads if use_v_lds else 128,
+        )
+        glv_srcv = glv_thrcopy.partition_S(v_tile_u32)
+        glv_dstv = glv_thrcopy.partition_D(v_lds_u32)
+        glv_store_atom = flyobj.get_universal_copy_atom(fx.Uint32, 128)
+        prefetch_fragv = fx.make_fragment_like(
+            glv_srcv[None, None, None, 0, 0]
+        )
+        num_vm_cnt_load_v_lds = (
+            fx.size(prefetch_fragv.shape).get_static_leaf_int
+            * prefetch_fragv.dtype.width
+        ) // 128
+
+        def global_load_v(block_n, page_id, bn_id):
+            if fx.const_expr(is_valid_block_n(block_n)):
+                fx.copy(
+                    glv_load_atom,
+                    glv_srcv[None, None, None, page_id, bn_id],
+                    prefetch_fragv,
+                )
+                return num_vm_cnt_load_v_lds
+            return 0
+
+        def ds_store_v(block_n, lds_buff_id):
+            if fx.const_expr(is_valid_block_n(block_n)):
+                fx.copy(
+                    glv_store_atom,
+                    prefetch_fragv,
+                    glv_dstv[None, None, None, lds_buff_id],
+                )
     
         fragO.fill(0.0)
 
         v_copy_atom = flyobj.get_universal_copy_atom(v_tile.dtype, 128)
         v_tcopy = flyobj.get_tiled_mma_copy(v_copy_atom, tmma2, "A")
         v_thrcopy = v_tcopy.get_slice(tid)
+        v_global_partition = v_thrcopy.partition_S(v_tile)
+        v_frag_partition = v_thrcopy.retile(fragV)
+        if fx.const_expr(use_split_bf16_pv):
+            v_lane_id = fx.Int32(tid & 63)
+            v_lane_voffset = fx.Int32(
+                (v_lane_id & 31) * 16
+                + (v_lane_id // 32) * 2048
+            )
+            v_load_voffsets = [
+                [
+                    v_lane_voffset
+                    + n_group * 512
+                    + k_group * 4096
+                    for n_group in range_constexpr(head_dim_v // 32)
+                ]
+                for k_group in range_constexpr(2)
+            ]
+            v_vec4_i32 = ir.VectorType.get([4], fx.Int32.ir_type)
+
+        def load_v_fragment(page_id, bn_part):
+            if fx.const_expr(use_split_bf16_pv):
+                page_soffset = fx.Int32(
+                    rocdl.readfirstlane(
+                        fx.Int32.ir_type,
+                        arith.unwrap(fx.Int32(page_id)),
+                    )
+                ) * fx.Int32(
+                    page_size
+                    * num_kv_heads
+                    * head_dim_v
+                    * (v_tile.dtype.width // 8)
+                ) + fx.Int32(
+                    bn_part
+                    * BN
+                    * num_kv_heads
+                    * head_dim_v
+                    * (v_tile.dtype.width // 8)
+                )
+                for k_group in range_constexpr(2):
+                    for n_group in range_constexpr(head_dim_v // 32):
+                        loaded = rocdl.raw_ptr_buffer_load(
+                            v_vec4_i32,
+                            v_dma_resource,
+                            v_load_voffsets[k_group][n_group],
+                            page_soffset,
+                            fx.Int32(0),
+                        )
+                        v_frag_partition[
+                            None, n_group, k_group
+                        ].store(
+                            fx.Vector(loaded).bitcast(fx.BFloat16)
+                        )
+            else:
+                fx.copy(
+                    v_copy_atom,
+                    v_global_partition[
+                        None,
+                        None,
+                        None,
+                        page_id,
+                        bn_part,
+                    ],
+                    v_frag_partition,
+                )
+
+        k_copy_atom = flyobj.get_universal_copy_atom(k_tile.dtype, 128)
+        k_tcopy = flyobj.get_tiled_mma_copy(k_copy_atom, tmma1, "A", tid=tid)
+        k_lds_partition = k_tcopy.partition_S(lds_k)
+        k_frag_partition = k_tcopy.retile(fragK)
+
+        def load_k_fragment_range(lds_slot, begin, end):
+            source = k_lds_partition[
+                None,
+                None,
+                None,
+                lds_slot,
+                wave_m,
+            ]
+            for k_group in fx.range_constexpr(begin, end):
+                fx.copy(
+                    k_copy_atom,
+                    source[None, None, k_group],
+                    k_frag_partition[None, None, k_group],
+                )
 
         def kv_step(page_n, lds_buff_id, cur_max, l_in,
                     kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3,
@@ -492,8 +1039,13 @@ def PagedAttention(
             for bn_i in fx.range_constexpr(num_BN_per_page):
                 bn0_page = kv_page_0123[(bn_i + 0)//num_BN_per_page]
                 bn0_part = (bn_i + 0) % num_BN_per_page
-                bn3_page = kv_page_0123[(bn_i + 3)//num_BN_per_page]
-                bn3_part = (bn_i + 3) % num_BN_per_page
+                prefetch_distance = k_lds_stages if use_k_ring else 3
+                prefetch_page = kv_page_0123[
+                    (bn_i + prefetch_distance) // num_BN_per_page
+                ]
+                prefetch_part = (
+                    bn_i + prefetch_distance
+                ) % num_BN_per_page
 
                 pipeline_block_n = page_n * num_BN_per_page + bn_i
                 logical_block_n = (
@@ -510,42 +1062,125 @@ def PagedAttention(
                         prefetch_frag_id,
                         lds_buff_id ^ 1,
                     )
-                vm_cnt += global_load_k(
-                    pipeline_block_n + 3,
-                    bn3_page,
-                    bn3_part,
-                    prefetch_frag_id,
-                )
+                if fx.const_expr(
+                    not use_direct_k_lds
+                    or not is_valid_block_n(pipeline_block_n)
+                ):
+                    vm_cnt += global_load_k(
+                        pipeline_block_n + prefetch_distance,
+                        prefetch_page,
+                        prefetch_part,
+                        prefetch_frag_id,
+                        (
+                            bn_i
+                            if use_split_bf16_pv
+                            else (
+                                (
+                                    pipeline_block_n
+                                    + prefetch_distance
+                                )
+                                % k_lds_stages
+                                if use_direct_k_lds
+                                else lds_buff_id
+                            )
+                        ),
+                    )
+                if fx.const_expr(use_v_lds):
+                    vm_cnt += global_load_v(
+                        pipeline_block_n + prefetch_distance,
+                        prefetch_page,
+                        prefetch_part,
+                    )
                 
                 if fx.const_expr(is_valid_block_n(pipeline_block_n)):
-                    fragS.fill(0.0)
-                    #s_waitcnt(lgkmcnt=0)
-                    fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
-                    fx.copy(
-                        v_copy_atom,
-                        v_thrcopy.partition_S(v_tile[None, None, bn0_page, bn0_part]),
-                        v_thrcopy.retile(fragV),
-                    )
-
-                    vm_cnt += num_vm_cnt_load_v
+                    if fx.const_expr(use_v_lds):
+                        v_load_tid = fx.Int32(
+                            llvm.inline_asm(
+                                fx.Int32.ir_type,
+                                [as_ir_value(tid)],
+                                "v_mov_b32 $0, $1",
+                                "=v,v",
+                                has_side_effects=True,
+                            )
+                        )
+                        flyobj.load_tiled_mma_fragA(
+                            tmma2,
+                            v_lds_storage,
+                            [None, None, pipeline_block_n % k_lds_stages],
+                            dst=fragV,
+                            tid=v_load_tid,
+                        )
+                    else:
+                        load_v_fragment(bn0_page, bn0_part)
+                        vm_cnt += num_vm_cnt_load_v
+                    compute_qk()
                     #assert 0, f"{vm_cnt} {num_vm_cnt_load_v}"
 
-                    # Interleave all eight V loads with QK MFMA groups. The
-                    # trailing catch-all handles the remaining K8/K16/K64 ops.
-                    fx.rocdl.sched_group_barrier(0x200, 1, 0)
-                    fx.rocdl.sched_mfma(2)
-                    fx.rocdl.sched_vmem(1)
-                    for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
-                        fx.rocdl.sched_mfma(3)
-                        fx.rocdl.sched_vmem(2)
-                    fx.rocdl.sched_vmem(100)
-                    fx.rocdl.sched_mfma(100)
+                    # Interleave direct V loads with QK MFMA groups.  The same
+                    # grouping is retained for V-LDS because an explicit
+                    # DS-read/MFMA schedule regressed the target shape.  The
+                    # catch-all handles remaining K8/K16/K64 operations.
+                    if fx.const_expr(use_split_bf16_pv):
+                        # Keep an optional page-table read in this MFMA stage,
+                        # ahead of the eight V-load/MFMA pairs.
+                        if fx.const_expr(bn_i == 0):
+                            fx.rocdl.sched_vmem(1)
+                        for _ in fx.range_constexpr(num_vm_cnt_load_v):
+                            fx.rocdl.sched_vmem(1)
+                            fx.rocdl.sched_mfma(1)
+                        fx.rocdl.sched_vmem(100)
+                        fx.rocdl.sched_mfma(100)
+                    else:
+                        if fx.const_expr(not use_direct_k_lds):
+                            fx.rocdl.sched_group_barrier(0x200, 1, 0)
+                        fx.rocdl.sched_mfma(2)
+                        fx.rocdl.sched_vmem(1)
+                        for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
+                            fx.rocdl.sched_mfma(3)
+                            fx.rocdl.sched_vmem(2)
+                        fx.rocdl.sched_vmem(100)
+                        fx.rocdl.sched_mfma(100)
 
                 rocdl.sched_barrier(0)
                 fxh.s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
-                rocdl.s_barrier() # ::::::::: wave-group barrier ::::::::: 切换调度
-                rocdl.s_setprio(0)
-                rocdl.sched_barrier(0)
+                rocdl.s_barrier()
+
+                if fx.const_expr(not use_4wave_stage_boundary):
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+
+                if fx.const_expr(
+                    use_direct_k_lds
+                    and not use_split_bf16_pv
+                    and is_valid_block_n(pipeline_block_n)
+                ):
+                    global_load_k(
+                        pipeline_block_n + prefetch_distance,
+                        prefetch_page,
+                        prefetch_part,
+                        prefetch_frag_id,
+                        (pipeline_block_n + prefetch_distance)
+                        % k_lds_stages,
+                    )
+
+                if fx.const_expr(use_4wave_stage_boundary):
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+
+                if fx.const_expr(
+                    use_split_bf16_pv
+                    and is_valid_block_n(pipeline_block_n + 1)
+                ):
+                    load_k_fragment_range(
+                        bn_i ^ 1,
+                        0,
+                        head_dim_qk // 16,
+                    )
+                    for _ in fx.range_constexpr(head_dim_qk // 16):
+                        fx.rocdl.sched_dsrd(1)
+                        fx.rocdl.sched_group_barrier(0x402, 5, 0)
+                    fx.rocdl.sched_dsrd(100)
+                    fx.rocdl.sched_group_barrier(0x402, 100, 0)
 
                 if fx.const_expr(is_valid_block_n(pipeline_block_n)):
                     # q_pos0, kv_len
@@ -555,6 +1190,7 @@ def PagedAttention(
                             q_pos0, logical_block_n, kv_len, full_qo_len,
                             is_all_kv_valid, BN, is_causal, True, window_left,
                             pv_mfma_k,
+                            use_split_bf16_pv,
                         )
                     else:
                         cur_max, l_in = online_softmax(
@@ -564,21 +1200,58 @@ def PagedAttention(
                         )
 
                 rocdl.sched_barrier(0)
+                if fx.const_expr(use_direct_k_lds):
+                    fxh.s_waitcnt(vmcnt=0)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 rocdl.sched_barrier(0)
+
+                if fx.const_expr(
+                    use_direct_k_lds
+                    and use_split_bf16_pv
+                    and is_valid_block_n(pipeline_block_n)
+                ):
+                    global_load_k(
+                        pipeline_block_n + prefetch_distance,
+                        prefetch_page,
+                        prefetch_part,
+                        prefetch_frag_id,
+                        (
+                            bn_i
+                            if use_split_bf16_pv
+                            else (
+                                pipeline_block_n + prefetch_distance
+                            )
+                            % k_lds_stages
+                        ),
+                    )
 
                 # MFMA-stage :
                 #   1st half: P@V part for block_n
                 #   2nd half: Q@K part for block_n+1
 
-                if fx.const_expr(use_k_ring and is_valid_block_n(pipeline_block_n + 3)):
+                if fx.const_expr(
+                    use_k_ring
+                    and not use_direct_k_lds
+                    and is_valid_block_n(
+                        pipeline_block_n + prefetch_distance
+                    )
+                ):
                     fxh.s_waitcnt(vmcnt=0)
                     ds_store_k(
-                        pipeline_block_n + 3,
+                        pipeline_block_n + prefetch_distance,
                         prefetch_frag_id,
-                        (pipeline_block_n + 3) % k_lds_stages,
+                        (
+                            pipeline_block_n + prefetch_distance
+                        ) % k_lds_stages,
                     )
+                    if fx.const_expr(use_v_lds):
+                        ds_store_v(
+                            pipeline_block_n + prefetch_distance,
+                            (
+                                pipeline_block_n + prefetch_distance
+                            ) % k_lds_stages,
+                        )
                 
                 if fx.const_expr(is_valid_block_n(pipeline_block_n)):
                     if fx.const_expr(k_tile.dtype != fx.BFloat16):
@@ -594,55 +1267,50 @@ def PagedAttention(
                         probability_operand = prob_operand
                     if fx.const_expr(not use_k_ring):
                         fxh.s_waitcnt(vmcnt=0)
-                    fx.gemm(tmma2, fragO, fragV, probability_operand, fragO)
+                    compute_pv(probability_operand)
 
-                if fx.const_expr(is_valid_block_n(pipeline_block_n + 1)):
-                    # Before, partitioning with the outer `tid` let LLVM hoist
-                    # all Dqk=192 LDS addresses before the KV loop:
-                    #
-                    #   k_addr[0:12] = partition(outer_tid, LDS)
-                    #   for each KV block: fragK = ds_read(k_addr[0:12])
-                    #
-                    # Those address VGPRs then stayed live for the whole loop.
-                    # The side-effecting move creates a local SSA root instead:
-                    #
-                    #   local_tid = opaque_move(outer_tid)
-                    #   fragK = ds_read(partition(local_tid, current_LDS_slot))
-                    #
-                    # Recomputing cheap address ALU at the consumer avoids
-                    # keeping twelve address values live or spilling them.
-                    k_load_tid = fx.Int32(
-                        llvm.inline_asm(
-                            fx.Int32.ir_type,
-                            [as_ir_value(tid)],
-                            "v_mov_b32 $0, $1",
-                            "=v,v",
-                            has_side_effects=True,
-                        )
-                    )
-                    flyobj.load_tiled_mma_fragA(
-                        tmma1,
-                        lds_k,
-                        [
-                            None,
-                            None,
+                if fx.const_expr(
+                    not use_split_bf16_pv
+                    and is_valid_block_n(pipeline_block_n + 1)
+                ):
+                        flyobj.load_tiled_mma_fragA(
+                            tmma1,
+                            lds_k,
                             (
-                                (pipeline_block_n + 1) % k_lds_stages
-                                if use_k_ring
-                                else lds_buff_id ^ 1
+                                [
+                                    None,
+                                    None,
+                                    (pipeline_block_n + 1) % k_lds_stages,
+                                    wave_m,
+                                ]
+                                if use_direct_k_lds
+                                else [
+                                    None,
+                                    None,
+                                    (
+                                        (pipeline_block_n + 1) % k_lds_stages
+                                        if use_k_ring
+                                        else lds_buff_id ^ 1
+                                    ),
+                                ]
                             ),
-                        ],
-                        dst=fragK,
-                        tid=k_load_tid,
-                    )
+                            dst=fragK,
+                            tid=tid,
+                        )
 
-
-                # leave some LDS bandwidth in head of MFMA-stage
-                # because head of online-softmax-stage needs LDS
-                for _ in fx.range_constexpr(num_bits_fragK//128//2):
-                    fx.rocdl.sched_group_barrier(0x100, 2, 0)
-                    fx.rocdl.sched_mfma(3)
-                fx.rocdl.sched_mfma(100)
+                if fx.const_expr(use_split_bf16_pv):
+                    for _ in fx.range_constexpr(pair_rounds):
+                        fx.rocdl.sched_group_barrier(0x800, 1, 0)
+                        fx.rocdl.sched_mfma(1)
+                    fx.rocdl.sched_group_barrier(0x800, 100, 0)
+                    fx.rocdl.sched_mfma(100)
+                else:
+                    # Leave some LDS bandwidth at the head of the MFMA stage
+                    # because the softmax stage starts with LDS traffic.
+                    for _ in fx.range_constexpr(num_bits_fragK//128//2):
+                        fx.rocdl.sched_group_barrier(0x100, 2, 0)
+                        fx.rocdl.sched_mfma(3)
+                    fx.rocdl.sched_mfma(100)
                 #fx.rocdl.sched_group_barrier(0x200, 1, 0)
                 fx.rocdl.sched_barrier(0)
                 lds_buff_id = lds_buff_id^1
@@ -737,11 +1405,10 @@ def PagedAttention(
 
         fragO_bf16 = fxh.cvt_f32_to_bf16(fragO)
 
-        if fx.const_expr(0):
+        if fx.const_expr(use_direct_output_store):
             # direct store to vmem
             if wave_m == 0:
                 gpu.barrier()
-
             flyobj.store_tiled_mma_fragC(tmma2, fragO_bf16, fx.select(o_tile, [1,0]), copy_atom_bits=64)
         else:
             # 128-bit C-shuffle epilogue:
@@ -1035,11 +1702,25 @@ def PagedAttention(
                 k_tile = K[None, None, head_kv, None, None, None]
                 k_tile = fx.select(k_tile, (3, 4, 2, 0, 1))
                 k_tile = fx.group(k_tile, 1, 3)
+            k_dma_tensor = (
+                k_tile
+                if key_layout == "linear"
+                else fx.rocdl.make_buffer_tensor(k_tile, max_size=True)
+            )
+            k_dma_resource = rocdl.get_buffer_rsrc(
+                fx.get_iter(k_dma_tensor)
+            )
             # V has a public [page, head, page/vector, D, vector] layout. The
             # launch view splits page/vector into BN pages without moving data.
             v_tile = V[None, None, head_kv, None, None, None] # [num_physical_pages, num_BN_per_page, BN // k_vector_size, head_dim, k_vector_size]
             v_tile = fx.select(v_tile, (3, 4, 2, 0, 1))    # [head_dim, k_vector_size, BN // k_vector_size, num_physical_pages, num_BN_per_page]
             v_tile = fx.group(v_tile, 1, 3)                # [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
+            v_dma_tensor = fx.rocdl.make_buffer_tensor(
+                v_tile, max_size=True
+            )
+            v_dma_resource = rocdl.get_buffer_rsrc(
+                fx.get_iter(v_dma_tensor)
+            )
 
             first_page = fx.Int32(0)
             pages_to_process = num_kv_pages
@@ -1073,7 +1754,8 @@ def PagedAttention(
             sink_logit = fx.Float32(0.0)
             if fx.const_expr(has_sink):
                 sink_logit = sink_ptr[head_qo]
-            attn_pipeline(q_tile, k_tile, v_tile, o_tile,
+            attn_pipeline(q_tile, k_tile, k_dma_resource,
+                          v_tile, v_dma_resource, o_tile,
                           query_pos0, query_len, kv_len, full_qo_len,
                           buf_kv_page_table,
                           first_page, pages_to_process, last_page_len,
@@ -1246,9 +1928,6 @@ def PagedAttention(
         # assert K.numel()*K.element_size() <= 2**31 - 1, f"KV cache size ={K.numel()*K.element_size()} > 2**31 - 1"
 
         multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
-        # One 8-wave workgroup already consumes 36 KiB LDS. A 1/2/3/4
-        # WG-per-CU sweep found one best for B=4 (295.49/298.49/300.95/
-        # 302.72 us); B=1's 0.4% preference for two was measurement-sized.
         num_workgroups = multi_processor_count
         # Cache the two-word ticket/completion header per device and stream.
         # The last exiting workgroup resets it, so steady calls launch no fill
@@ -1388,4 +2067,5 @@ def PagedAttention(
             )
         return out
 
+    callable.bf16_backend = "native-8wave"
     return callable
