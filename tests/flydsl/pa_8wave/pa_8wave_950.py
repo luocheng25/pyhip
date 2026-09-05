@@ -652,25 +652,24 @@ def _zero_tile(O, LSE, SINK, q0, q_len, head, qb,
             LSE[(q0 + qb * BM + tid) * H + head] = SINK[head] if HAS_SINK else fx.Float32(float("-inf"))
 
 
-@flyc.kernel(known_block_size=[THREADS, 1, 1])
-def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+def _attention_storage(allocator, dq):
+    elements = 2 * (8 * (dq // 64) * 520) + max(32 * (dq // 64) * 520, 2 * V_TILE)
+    return allocator.allocate(fx.Array[fx.BFloat16, elements, 16]).peek().view(fx.make_layout(elements, 1))
+
+
+@flyc.jit
+def _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, storage, head, batch, qb,
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int],
     DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
-    head = fx.Int32(gpu.block_id("x"))
-    batch = fx.Int32(gpu.block_id("y"))
-    qb = fx.Int32(gpu.block_id("z"))
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
     page_start = _uniform(KI[batch])
     pages = _uniform(KI[batch + 1]) - page_start
     table = fx.make_view(fx.get_iter(PAGES) + page_start, fx.make_layout(pages, 1))
     kv_len = (pages > 0).select((pages - 1) * 64 + _uniform(LAST[batch]), fx.Int32(0))
-    lds_elements = 2 * (8 * (DQ // 64) * 520) + max(32 * (DQ // 64) * 520, 2 * V_TILE)
-    storage = fx.SharedAllocator().allocate(fx.Array[fx.BFloat16, lds_elements, 16]).peek().view(fx.make_layout(lds_elements, 1))
     q_blocks = (q_len + BM - 1) // BM
     work_blocks = (q_blocks + 1) // 2 if MERGE else q_blocks
     if qb < work_blocks:
@@ -688,6 +687,94 @@ def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
                     _zero_tile(O, LSE, SINK, q0, q_len, head, mirror, H, OROW, OHEAD, WITH_LSE, HAS_SINK)
 
 
+@flyc.kernel(known_block_size=[THREADS, 1, 1])
+def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
+    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
+    QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
+    PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
+    storage = _attention_storage(fx.SharedAllocator(), DQ)
+    _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, storage,
+        fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z")),
+        H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE)
+
+
+def _atomic_increment(counter, index):
+    # Agent-scoped atomic ticket; the stream orders complete kernel launches.
+    pointer = fx.to_llvm_ptr(fx.get_iter(counter) + index)
+    return fx.Int32(llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add, pointer, fx.Int32(1).ir_value(),
+        llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4,
+    ).result)
+
+
+@flyc.jit
+def _next_ticket(counter, mailbox, tid):
+    if tid == 0:
+        mailbox[0] = _atomic_increment(counter, 0)
+        rocdl.s_waitcnt(lgkmcnt=0)
+    # The pipeline may leave speculative K DMA outstanding at its epilogue.
+    # Drain every wave before a new task reuses the same Q/K/V LDS addresses.
+    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+    # Broadcast the ticket AND close all waves' previous Q/V LDS lifetimes.
+    _stage_end()
+    ticket = mailbox[0]
+    rocdl.s_waitcnt(lgkmcnt=0)
+    return _uniform(ticket)
+
+
+@flyc.jit
+def _finish_scheduler(counter, tid):
+    if tid == 0:
+        finished = _atomic_increment(counter, 1)
+        if finished == fx.Int32(gpu.grid_dim.x) - 1:
+            counter[0] = fx.Int32(gpu.grid_dim.x)
+            counter[1] = fx.Int32(0)
+
+
+@flyc.kernel(known_block_size=[THREADS, 1, 1])
+def _attention_persistent_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
+    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+    COUNTER: fx.Tensor, H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
+    QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
+    PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
+    allocator = fx.SharedAllocator()
+    storage = _attention_storage(allocator, DQ)
+    mailbox = allocator.allocate(fx.Array[fx.Int32, 1, 4]).peek()
+    tid = fx.Int32(gpu.thread_id("x"))
+
+    def batch_tasks(batch):
+        q_len = _uniform(CQ[batch + 1]) - _uniform(CQ[batch])
+        blocks = (q_len + BM - 1) // BM
+        return ((blocks + 1) // 2 if MERGE else blocks) * H
+
+    @flyc.jit
+    def locate(ticket, batch, begin, end):
+        # Tickets only increase per CTA. Skip complete/empty batches, not
+        # individual heads or max-Q padding, and read current device metadata.
+        while (batch < B) & (ticket >= end):
+            begin = end
+            batch += 1
+            if batch < B:
+                end += batch_tasks(batch)
+        return batch, begin, end
+
+    ticket = fx.Int32(gpu.block_id("x"))
+    batch, begin, end = locate(ticket, fx.Int32(0), fx.Int32(0), batch_tasks(fx.Int32(0)))
+    while batch < B:
+        local = ticket - begin
+        _attention_task(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, storage,
+            local % H, batch, local // H,
+            H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, MERGE)
+        ticket = _next_ticket(COUNTER, mailbox, tid)
+        batch, begin, end = locate(ticket, batch, begin, end)
+    _finish_scheduler(COUNTER, tid)
+
+
 @flyc.jit
 def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
     CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
@@ -703,6 +790,22 @@ def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     ).launch(grid=(H, B, (query_blocks + 1) // 2 if merge else query_blocks), block=(THREADS, 1, 1), stream=stream)
 
 
+@flyc.jit
+def _launch_persistent(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
+    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int], MAX_Q: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
+    QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
+    PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
+    COUNTER: fx.Tensor, GRID: fx.Constexpr[int], stream: fx.Stream):
+    query_blocks = (MAX_Q + BM - 1) // BM
+    merge = CAUSAL and WINDOW < 0 and query_blocks * H * B >= 512
+    _attention_persistent_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, COUNTER,
+        H, HK, NP, B, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge,
+        value_attrs={"rocdl.waves_per_eu": 2},
+    ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
 def _flat(tensor):
     """View storage, preserving the real Q/O row and head strides separately."""
     if tensor.numel() == 0:
@@ -714,11 +817,30 @@ def _flat(tensor):
 class _PagedAttention:
     bf16_backend = "native-8wave"
 
-    def __init__(self, heads, kv_heads, dq, causal, quant_query_mode, window_left, has_sink):
+    def __init__(self, heads, kv_heads, dq, causal, quant_query_mode, window_left, has_sink, persistent):
         self.heads, self.kv_heads, self.causal = heads, kv_heads, causal
         self.dq, self.window_left, self.has_sink = dq, window_left, has_sink
         self.quant_query_mode = quant_query_mode
+        self.persistent = persistent
+        self._scheduler_counters = {}
         self._compiled = {}
+
+    def _scheduler(self, device, stream, batch, max_q):
+        blocks = (max_q + BM - 1) // BM
+        merge = self.causal and self.window_left < 0 and blocks * self.heads * batch >= 512
+        tasks = ((blocks + 1) // 2 if merge else blocks) * self.heads * batch
+        grid = min(torch.cuda.get_device_properties(device).multi_processor_count, tasks)
+        if tasks + grid >= 2**31:
+            raise ValueError("persistent work tickets must fit signed int32")
+        key = (device, stream.cuda_stream, grid)
+        counter = self._scheduler_counters.get(key)
+        if counter is None:
+            with torch.cuda.stream(stream):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("warm persistent attention on this stream before graph capture")
+                counter = torch.tensor([grid, 0], device=device, dtype=torch.int32)
+            self._scheduler_counters[key] = counter
+        return counter, grid
 
     def _validate_sink(self, sink_ptr, device):
         if self.has_sink:
@@ -750,6 +872,10 @@ class _PagedAttention:
         GPU metadata values (page IDs, prefix sums, last-page lengths and the
         supplied maximum lengths) must be consistent. They are not copied to
         the CPU, so the hot path remains asynchronous and graph-capturable.
+        Persistent mode caches an 8-byte scheduler header per device/stream/grid;
+        warm each specialization on its capture stream before recording a graph.
+        Graphs retain that header: overlapping replays must originate from
+        independently warmed capture streams, not a single shared header.
         """
         if not Q.is_cuda or K.device != Q.device or V.device != Q.device:
             raise ValueError("Q/K/V must be on the same GPU")
@@ -798,8 +924,8 @@ class _PagedAttention:
             raise ValueError("invalid output buffer")
         if lse is not None and (lse.shape != (Q.shape[0], self.heads) or lse.dtype != torch.float32 or lse.device != Q.device or not lse.is_contiguous()):
             raise ValueError("LSE must be contiguous FP32 [tokens, heads]")
-        if Q.shape[0] > 0:
-            self._run(_launch_attention, (
+        if Q.shape[0] > 0 and max_seqlen_q > 0:
+            args = (
                 _flat(Q), _flat(K), _flat(V), _flat(out), _flat(lse) if lse is not None else k_descale.reshape(-1),
                 cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
                 _flat(q_descale), k_descale.reshape(-1), v_descale.reshape(-1),
@@ -808,15 +934,20 @@ class _PagedAttention:
                 self.dq, self.window_left, self.has_sink,
                 Q.stride(0), Q.stride(1), out.stride(0), out.stride(1),
                 q_descale.numel() != 1, self.causal, lse is not None,
-                float(1 / math.sqrt(self.dq) if softmax_scale is None else softmax_scale), stream,
-            ))
+                float(1 / math.sqrt(self.dq) if softmax_scale is None else softmax_scale),
+            )
+            if self.persistent:
+                counter, grid = self._scheduler(Q.device, stream, batch, max_seqlen_q)
+                self._run(_launch_persistent, (*args, counter, grid, stream))
+            else:
+                self._run(_launch_attention, (*args, stream))
         return (out, lse) if return_lse else out
 
 
 @functools.cache
 def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
                    is_causal, quant_query_mode="per-token", key_layout="vectorized",
-                   window_left=-1, has_sink=False):
+                   window_left=-1, has_sink=False, *, persistent=False):
     if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (DV, BN, "vectorized"):
         raise NotImplementedError("only gfx950 BF16 D128/D192, V128 page64 attention is supported")
     if not isinstance(window_left, int) or window_left < -1 or window_left >= 2**31:
@@ -827,4 +958,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         raise ValueError("query heads must be a positive multiple of KV heads")
     if quant_query_mode not in ("per-token", "per-tensor"):
         raise ValueError("unsupported query scale mode")
-    return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, is_causal, quant_query_mode, window_left, has_sink)
+    if not isinstance(persistent, bool):
+        raise ValueError("persistent must be a bool")
+    return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, is_causal, quant_query_mode, window_left, has_sink, persistent)

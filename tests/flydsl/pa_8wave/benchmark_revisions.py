@@ -143,7 +143,7 @@ def compare(scenario, dq, q_len, kv_len, heads, candidates, baseline, dump_root,
               "source_sha256": hashlib.sha256(Path(current.__file__).read_bytes()).hexdigest()}
     records.append(record)
     print("REVISION_RESULT", json.dumps(record), flush=True)
-    ret = {}
+    ret = {"heads": heads, "batch": len(q_lens)}
     for name, us in medians.items():
         ret.update({f"{name} us": us, f"{name} TFLOPS": flops / us / 1e6,
                     f"{name} TB/s": nbytes / us / 1e6, f"{name} err": errors[name]})

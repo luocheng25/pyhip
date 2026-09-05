@@ -1,6 +1,18 @@
 # Paged Prefill 4-wave/8-wave 优化与性能报告
 
-## 最新：8-wave tile API 重构（2026-09-05）
+## 最新：8-wave 可选 persistent（2026-09-05）
+
+当前8-wave工厂支持 `persistent=True`，默认仍static。设备端工作队列、每stream独立
+8-byte header、CTA结束自动重置；热路径仍单kernel/零KV workspace。
+最终 **236 passed / 6 skipped**，默认static六种汇编与第1阶段逐条一致。
+
+同输入本轮 H3 BF16 page64：static **34648.100 µs**、persistent **31564.267 µs**、
+4dynamic **31562.353 µs**；8-wave开启persistent降低8.90%，接近4dynamic。
+SWA D128/D192分别 **101.649→98.352 / 116.698→113.855 µs**；full基本持平。
+完整采样、真实PMC任务数、少量D192persistent spill与graph并发限制见
+[persistent验收](../pa_8wave/persistent.md)。以下全矩阵保留原来static数据，不混入新结果。
+
+## 8-wave tile API 重构（2026-09-05）
 
 当前 direct-paged 8-wave 的 QK/PV 已改用 tiled-MMA fragment + `fx.gemm`，
 保留 OPUS 八阶段流水。D128/D192 × full/causal/SWA 六种 specialization 的

@@ -9,7 +9,19 @@
 `prepare_kv`、`attend_linear`、gather kernel 和线性 KV 缓冲均已删除。
 最新同输入对照见 [4-wave/8-wave 主报告](../pa_4wave/README.md)。
 
-### 最新：tile API 重构（2026-09-05）
+### 最新：可选 persistent（2026-09-05）
+
+`PagedAttention(..., persistent=True)` 启用设备端任务队列，默认 `False` 不变。
+每 device/stream/grid 首次分配8-byte header，最后一个CTA自动重置；预热后仍一次调用、
+一个 attention kernel、零KV workspace。支持ragged、空请求、causal配对、SWA/sink、LSE、
+独立stream捕获图的并发replay。共享同一个capture/header的图必须串行。
+
+最终回归 **236 passed / 6 skipped**；默认static六种汇编逐条不变。
+H3：static **34648.100 µs** → persistent **31564.267 µs**，4dynamic **31562.353 µs**；
+SWA D192：**116.698→113.855 µs**，full路径基本持平。D192 persistent NC/SWA存在少量spill，
+不宣称通用加速。完整接口、并发契约、资源、PMC及采样见 [persistent.md](persistent.md)。
+
+### tile API 重构（2026-09-05）
 
 Q/K/P、score/output 改用 tiled-MMA fragment API，QK/PV 改用 `fx.gemm`，
 V 使用 layout-only `fx.select`；保留原八阶段流水与显式 LDS/wait 边界。
@@ -164,8 +176,8 @@ MFMA1640 不变，稳定 phase **2913.6→2787.5 cycles**。动态指令 **13502
   调用点的 `lgkmcnt(0)` / barrier，保留 OPUS rolling VMEM waits。
 
 **分页适配完全在 attention 内核内完成。** 输入 K/V 不重排、不预处理、不缓存内容；
-只复用编译结果。SWA 直接裁剪每个 query block 的 KV 页范围，不访问更早的页表项。
-传入 `out=`/`lse=` 后热路径不分配 GPU tensor。删除了原 Q16K/KV128K 下 D128
+只复用编译结果与可选scheduler header，不缓存KV内容。SWA 直接裁剪每个 query block 的
+KV页范围，不访问更早的页表项。预热且传入 `out=`/`lse=` 后热路径不分配 GPU tensor。删除了原 Q16K/KV128K 下 D128
 64 MiB / D192 80 MiB 的线性 KV workspace；LDS 用量保持不变。
 
 ### 优化前对旧 gather 分支纯 core 的验收（历史数据）

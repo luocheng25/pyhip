@@ -92,13 +92,14 @@ class Case:
     def dq(self):
         return self.q.shape[-1]
 
-    def factory(self, causal):
+    def factory(self, causal, persistent=False):
         return PagedAttention(self.heads, self.kv_heads, self.dq, DV, PAGE, causal, self.mode,
-                              window_left=self.window_left, has_sink=self.sinks is not None)
+                              window_left=self.window_left, has_sink=self.sinks is not None,
+                              persistent=persistent)
 
-    def run(self, causal, out=None, **kwargs):
+    def run(self, causal, out=None, *, persistent=False, **kwargs):
         kwargs.setdefault("sink_ptr", self.sinks)
-        return self.factory(causal)(
+        return self.factory(causal, persistent)(
             self.q, self.k, self.v, self.cq, self.ck, self.indptr, self.indices,
             max(self.q_lens, default=0), max(self.kv_lens, default=0), causal,
             self.qs, self.ks, self.vs, self.last, out=out, **kwargs,
@@ -203,7 +204,7 @@ def run_torch(case, causal, softmax_scale=None):
     return output, lse
 
 
-def assert_case(case, causal, *, repeats=3, layout="contiguous", softmax_scale=None):
+def assert_case(case, causal, *, repeats=3, layout="contiguous", softmax_scale=None, persistent=False):
     shape = (case.q.shape[0], case.heads, DV)
     if layout == "padded":
         backing = torch.full((shape[0], shape[1] + 1, DV + 16), -123.0, device="cuda", dtype=torch.bfloat16)
@@ -216,7 +217,8 @@ def assert_case(case, causal, *, repeats=3, layout="contiguous", softmax_scale=N
     lse = torch.full(shape[:2], -123.0, device="cuda", dtype=torch.float32)
     first = None
     for _ in range(repeats):
-        result, result_lse = case.run(causal, out, return_lse=True, lse=lse, softmax_scale=softmax_scale)
+        result, result_lse = case.run(causal, out, return_lse=True, lse=lse, softmax_scale=softmax_scale,
+                        persistent=persistent)
         assert result is out and result_lse is lse
         if first is None:
             first = (out.clone(), lse.clone())
@@ -296,18 +298,20 @@ def test_direct_attention_reads_current_pages():
 
 
 @requires_gfx950
-def test_page_table_changes_between_calls():
+@pytest.mark.parametrize("persistent", [False, True])
+def test_page_table_changes_between_calls(persistent):
     case = make_case((129,), (320,), heads=4, table_offset=2)
-    assert_case(case, False)
+    assert_case(case, False, persistent=persistent)
     case.page_order[2:] = list(reversed(case.page_order[2:]))
     case.indices.copy_(_i32(case.page_order))
-    assert_case(case, False)
+    assert_case(case, False, persistent=persistent)
 
 
 @requires_gfx950
 @pytest.mark.parametrize("dq", [128, 192])
 @pytest.mark.parametrize("causal", [False, True])
-def test_shared_physical_pages_across_sequences(dq, causal):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_shared_physical_pages_across_sequences(dq, causal, persistent):
     case = make_case((9, 33), (129, 257), heads=6, kv_heads=2, dq=dq,
                      table_offset=2, q_offset=3, nonunit_scales=True, poison_tail=False)
     # Eight logical pages reuse just three physical pages, including aliases
@@ -317,7 +321,7 @@ def test_shared_physical_pages_across_sequences(dq, causal):
     case.page_order[2:] = [2, 0, 2, 1, 2, 0, 1, 0]
     case.indices.copy_(_i32(case.page_order))
     case.k, case.v = vectorize_kv_cache(case.k_pages, case.v_pages, 2, dq, DV, PAGE)
-    assert_case(case, causal)
+    assert_case(case, causal, persistent=persistent)
 
 
 @requires_gfx950
@@ -339,12 +343,13 @@ def test_runtime_lengths_change_without_recompilation():
 @pytest.mark.parametrize("dq", [128, 192])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("with_lse", [False, True])
-def test_packed_v_runtime_poisoned_tails_forward_and_reverse(dq, causal, with_lse):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_packed_v_runtime_poisoned_tails_forward_and_reverse(dq, causal, with_lse, persistent):
     # Causal chooses MERGE (32 Q blocks * 16 heads == 512). Its mirror
     # consumes the physical tail in the first phase, not in the epilogue.
     q_len = 7937 if causal else 257
     case = make_case((q_len,), (321,), dq=dq, poison_tail=False)
-    kernel = case.factory(causal)
+    kernel = case.factory(causal, persistent)
     source_k, source_v = case.k_pages.clone(), case.v_pages.clone()
     out = torch.empty(q_len, 16, DV, device="cuda", dtype=torch.bfloat16)
     lse = torch.empty(q_len, 16, device="cuda") if with_lse else None
@@ -384,11 +389,12 @@ def test_packed_v_runtime_poisoned_tails_forward_and_reverse(dq, causal, with_ls
 
 
 @requires_gfx950
-def test_empty_queries_and_empty_keys():
+@pytest.mark.parametrize("persistent", [False, True])
+def test_empty_queries_and_empty_keys(persistent):
     case = make_case((0,), (0,), heads=2)
-    out, lse = case.run(False, return_lse=True)
+    out, lse = case.run(False, return_lse=True, persistent=persistent)
     assert out.shape == (0, 2, DV) and lse.shape == (0, 2)
-    assert_case(make_case((65,), (0,), heads=2), False)
+    assert_case(make_case((65,), (0,), heads=2), False, persistent=persistent)
 
 
 @requires_gfx950
@@ -417,16 +423,18 @@ def test_target_shape_accuracy():
 @requires_gfx950
 @pytest.mark.parametrize("q_len", [7937, 8193])
 @pytest.mark.parametrize("dq,has_sink", [(192, False), (128, False), (128, True), (192, True)])
-def test_causal_head_tail_merge(q_len, dq, has_sink):
-    assert_case(make_case((q_len,), (q_len + 7,), dq=dq, has_sink=has_sink), True)
+@pytest.mark.parametrize("persistent", [False, True])
+def test_causal_head_tail_merge(q_len, dq, has_sink, persistent):
+    assert_case(make_case((q_len,), (q_len + 7,), dq=dq, has_sink=has_sink), True, persistent=persistent)
 
 
 @requires_gfx950
-def test_causal_merge_ragged_empty_and_all_masked():
+@pytest.mark.parametrize("persistent", [False, True])
+def test_causal_merge_ragged_empty_and_all_masked(persistent):
     # Max grid is large enough to select paired blocks, while each sequence
     # still has its own odd/even query-block count and KV extent.
     case = make_case((33, 4097, 65), (0, 193, 129), q_offset=3, table_offset=2)
-    assert_case(case, True)
+    assert_case(case, True, persistent=persistent)
 
 
 @requires_gfx950
@@ -469,20 +477,22 @@ def test_swa_ragged_strides_and_nonunit_scales(dq, layout):
 
 @requires_gfx950
 @pytest.mark.parametrize("dq", [128, 192])
-def test_direct_swa_does_not_read_excluded_prefix(dq):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_direct_swa_does_not_read_excluded_prefix(dq, persistent):
     case = make_case((257,), (8193,), heads=4, dq=dq, window_left=128, has_sink=True)
     first_page = (8193 - 257 - 128) // PAGE
     # Excluded page-table entries are intentionally invalid, not just zeros.
     case.indices[:first_page] = 2**30
-    assert_case(case, True, repeats=10)
+    assert_case(case, True, repeats=10, persistent=persistent)
 
 
 @requires_gfx950
 @pytest.mark.parametrize("dq", [128, 192])
-def test_swa_runtime_lengths_and_sinks_are_not_cached(dq):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_swa_runtime_lengths_and_sinks_are_not_cached(dq, persistent):
     case = make_case((65,), (2049,), heads=4, dq=dq, mode="per-tensor", window_left=128, has_sink=True,
                      nonunit_scales=True)
-    kernel = case.factory(True)
+    kernel = case.factory(True, persistent)
     out = torch.empty(65, 4, DV, dtype=torch.bfloat16, device="cuda")
     lse = torch.empty(65, 4, device="cuda")
     for length, sink in ((2049, 0.0), (257, -80.0), (128, 80.0), (0, -float("inf")), (193, 1.0)):
@@ -500,19 +510,20 @@ def test_swa_runtime_lengths_and_sinks_are_not_cached(dq):
 
 @requires_gfx950
 @pytest.mark.parametrize("dq", [128, 192])
-def test_swa_zero_logits_has_exact_inclusive_window_and_sink(dq):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_swa_zero_logits_has_exact_inclusive_window_and_sink(dq, persistent):
     case = make_case((129,), (257,), heads=2, dq=dq, window_left=128, has_sink=True)
     case.q.zero_()
     case.k_pages.zero_()
     case.v_pages.fill_(1.0)
     case.sinks.zero_()
     case.k, case.v = vectorize_kv_cache(case.k_pages, case.v_pages, 1, dq, DV, PAGE)
-    out, lse = assert_case(case, True)
+    out, lse = assert_case(case, True, persistent=persistent)
     # 129 visible keys plus one zero-value sink: no off-by-one or double sink.
     torch.testing.assert_close(out, torch.full_like(out, 129 / 130), rtol=0, atol=0)
     torch.testing.assert_close(lse, torch.full_like(lse, math.log(130)), rtol=1e-6, atol=1e-6)
     case.sinks.fill_(-float("inf"))
-    out, _ = assert_case(case, True)
+    out, _ = assert_case(case, True, persistent=persistent)
     torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
 
 
@@ -561,9 +572,122 @@ def test_direct_only_no_workspace_single_launch(dq, monkeypatch):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
+@requires_gfx950
+@pytest.mark.parametrize("dq", [128, 192])
+@pytest.mark.parametrize("causal,window,has_sink", [(False, -1, False), (True, -1, True),
+                                                  (True, 0, False), (True, 128, True)])
+@pytest.mark.parametrize("layout", ["padded", "head-major"])
+def test_persistent_ragged_gqa_strides_and_empty_requests(dq, causal, window, has_sink, layout):
+    case = make_case((0, 7, 1025, 0, 513), (63, 0, 129, 0, 901), heads=6, kv_heads=2,
+                     dq=dq, q_offset=5, table_offset=3, layout=layout, nonunit_scales=True,
+                     window_left=window, has_sink=has_sink)
+    assert_case(case, causal, persistent=True, layout=layout, repeats=5, softmax_scale=0.0625)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dq", [128, 192])
+@pytest.mark.parametrize("causal,window", [(False, -1), (True, -1), (True, 128)])
+def test_persistent_more_tasks_than_cus_and_counter_reuse(dq, causal, window, monkeypatch):
+    # 48 query blocks * 16 heads is three times the persistent grid; causal
+    # pairing still leaves 384 tasks. Every CTA must fetch work after task 0.
+    case = make_case((12289,), (901,), dq=dq, window_left=window, has_sink=window >= 0)
+    kernel = case.factory(causal, True)
+    out = torch.empty(12289, 16, DV, device="cuda", dtype=torch.bfloat16)
+    expected = case.run(causal).clone()
+    first = case.run(causal, out, persistent=True).clone()
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    for _ in range(12):
+        case.run(causal, out, persistent=True)
+        torch.testing.assert_close(out, first, rtol=0, atol=0)
+    counters = list(kernel._scheduler_counters.items())
+    for (_, _, grid), counter in counters:
+        assert counter.tolist() == [grid, 0]
+    before = torch.cuda.memory_allocated()
+    def no_allocation(*args, **kwargs):
+        pytest.fail("warmed persistent call must not allocate or reset a tensor")
+    with monkeypatch.context() as patch:
+        for name in ("empty", "empty_like", "zeros", "tensor"):
+            patch.setattr(torch, name, no_allocation)
+        case.run(causal, out, persistent=True)
+        torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before
+    assert _gpu_dispatch(lambda: case.run(causal, out, persistent=True)) == ["_attention_persistent_kernel_0"]
+    ref, _ = run_torch(case, causal)
+    torch.testing.assert_close(out.float(), ref, rtol=0.02, atol=0.02)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dq", [128, 192])
+def test_persistent_runtime_query_mapping_changes_and_empty_grid(dq):
+    case = make_case((257, 513, 257), (129, 321, 193), heads=6, kv_heads=2, dq=dq,
+                     q_offset=3, table_offset=2, poison_tail=False)
+    kernel = case.factory(False, True)
+    out = torch.empty(case.q.shape[0], 6, DV, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(case.q.shape[:2], device="cuda")
+    compiled_count = None
+    for lengths in ((257, 513, 257), (0, 1, 1026), (1027, 0, 0), (0, 0, 0), (513, 257, 257)):
+        case.q_lens = lengths
+        case.cq.copy_(_i32(list(accumulate(lengths, initial=3))))
+        out.fill_(-123)
+        lse.fill_(-123)
+        # Keep host bounds/storage fixed while device metadata changes.
+        kernel(case.q, case.k, case.v, case.cq, None, case.indptr, case.indices,
+               1027, 321, False, case.qs, case.ks, case.vs, case.last, out=out, lse=lse)
+        begin, end = 3, 3 + sum(lengths)
+        ref, ref_lse = run_torch(case, False)
+        torch.testing.assert_close(out[begin:end].float(), ref[begin:end], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(lse[begin:end], ref_lse[begin:end], rtol=2e-4, atol=5e-4)
+        assert (out[:begin] == -123).all() and (out[end:] == -123).all()
+        for (_, _, grid), counter in kernel._scheduler_counters.items():
+            assert counter.tolist() == [grid, 0]
+        if compiled_count is None:
+            compiled_count = len(kernel._compiled)
+        assert len(kernel._compiled) == compiled_count
+
+
+@requires_gfx950
+@pytest.mark.parametrize("dq,window", [(128, -1), (192, 128)])
+def test_persistent_stream_isolation_and_repeated_graphs(dq, window):
+    case = make_case((4097,), (777,), dq=dq, window_left=window, has_sink=window >= 0)
+    kernel = case.factory(True, True)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    outputs = [torch.empty(4097, 16, DV, device="cuda", dtype=torch.bfloat16) for _ in streams]
+    lses = [torch.empty(4097, 16, device="cuda") for _ in streams]
+    graphs = []
+    for stream, out, lse in zip(streams, outputs, lses):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            case.run(True, out, persistent=True, lse=lse, stream=stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                case.run(True, out, persistent=True, lse=lse, stream=stream)
+                case.run(True, out, persistent=True, lse=lse, stream=stream)
+            graphs.append(graph)
+    # Distinct stream-local counters permit overlapping launches/replays.
+    for _ in range(8):
+        for graph, stream in zip(graphs, streams):
+            with torch.cuda.stream(stream):
+                graph.replay()
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    ref, ref_lse = run_torch(case, True)
+    for out, lse in zip(outputs, lses):
+        torch.testing.assert_close(out.float(), ref, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(lse, ref_lse, rtol=2e-4, atol=5e-4)
+    active = [counter for (_, sid, _), counter in kernel._scheduler_counters.items()
+              if sid in {stream.cuda_stream for stream in streams}]
+    assert len(active) == 2 and active[0].data_ptr() != active[1].data_ptr()
+    for (_, _, grid), counter in kernel._scheduler_counters.items():
+        assert counter.tolist() == [grid, 0]
+
+
 def test_supported_scope_is_explicit():
     assert PagedAttention(16, 1, DQ, DV, PAGE, False).bf16_backend == "native-8wave"
     assert PagedAttention(16, 1, 128, DV, PAGE, False).bf16_backend == "native-8wave"
+    assert not PagedAttention(16, 1, DQ, DV, PAGE, False).persistent
+    assert PagedAttention(16, 1, DQ, DV, PAGE, False, persistent=True).persistent
+    with pytest.raises(ValueError, match="persistent"):
+        PagedAttention(16, 1, DQ, DV, PAGE, False, persistent="yes")
     with pytest.raises(NotImplementedError):
         PagedAttention(16, 1, 64, DV, PAGE, False)
     with pytest.raises(NotImplementedError):

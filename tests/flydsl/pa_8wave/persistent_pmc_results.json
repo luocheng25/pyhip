@@ -1,0 +1,82 @@
+{
+  "source_sha256": "134eacc14a2096504bdf265cd03de21fe9ff22d9f739c661e743d7f09cd00568",
+  "q": 16384,
+  "kv": 131072,
+  "dq": 192,
+  "heads": 16,
+  "window_left": 128,
+  "sink": true,
+  "note": "Three warmed full-grid captures. Counter collection duration is not benchmark latency.",
+  "counters": {
+    "static": {
+      "csv": "/tmp/pa950_scheduler_pmc/static/counters_counter_collection.csv",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2064384.0,
+          2064384.0,
+          2064384.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1966080.0,
+          1966080.0,
+          1966080.0
+        ],
+        "SQ_INSTS_VALU": [
+          15729025.0,
+          15729025.0,
+          15729025.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          425984.0,
+          425984.0,
+          425984.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      }
+    },
+    "persistent": {
+      "csv": "/tmp/pa950_scheduler_pmc/persistent/counters_counter_collection.csv",
+      "samples": {
+        "SQ_INSTS_LDS": [
+          2073600.0,
+          2073600.0,
+          2073600.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1966080.0,
+          1966080.0,
+          1966080.0
+        ],
+        "SQ_INSTS_VALU": [
+          15577475.0,
+          15577475.0,
+          15577475.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          466944.0,
+          466944.0,
+          466944.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          2048.0,
+          2048.0,
+          2048.0
+        ]
+      }
+    }
+  }
+}
