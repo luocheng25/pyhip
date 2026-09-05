@@ -1,0 +1,214 @@
+[
+  {
+    "scenario": "nc",
+    "dq": 128,
+    "q_lens": [
+      10240
+    ],
+    "kv_lens": [
+      2583
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": false,
+    "window_left": -1,
+    "sink": false,
+    "timing_us": {
+      "static": [
+        250.88981111111113,
+        256.246393258427,
+        256.6628117647061,
+        258.14434782608697,
+        258.5291368421053
+      ],
+      "baseline": [
+        257.3295777777777,
+        257.9023296703297,
+        259.0215,
+        258.14494791666664,
+        258.79906593406605
+      ]
+    },
+    "median_us": {
+      "static": 256.6628117647061,
+      "baseline": 258.14494791666664
+    },
+    "errors": {
+      "static": 0.0,
+      "baseline": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline": [
+        "_attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 216677744640,
+    "logical_bytes": 85208576,
+    "baseline": "40e83659b4f752ce1424ca598dd75a1827141c07",
+    "baseline_source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29"
+  },
+  {
+    "scenario": "nc",
+    "dq": 192,
+    "q_lens": [
+      10240
+    ],
+    "kv_lens": [
+      2583
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": false,
+    "window_left": -1,
+    "sink": false,
+    "timing_us": {
+      "static": [
+        292.0760112359551,
+        296.80710638297876,
+        295.2496022727273,
+        296.7482674418605,
+        296.9383181818182
+      ],
+      "baseline": [
+        296.7309673913043,
+        295.63907692307674,
+        295.07029213483145,
+        297.23013636363635,
+        297.0308470588235
+      ]
+    },
+    "median_us": {
+      "static": 296.7482674418605,
+      "baseline": 296.7309673913043
+    },
+    "errors": {
+      "static": 0.0,
+      "baseline": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline": [
+        "_attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 270847180800,
+    "logical_bytes": 106510720,
+    "baseline": "40e83659b4f752ce1424ca598dd75a1827141c07",
+    "baseline_source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29"
+  },
+  {
+    "scenario": "swa",
+    "dq": 128,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        91.21439393939393,
+        101.04730851063837,
+        100.48544444444443,
+        100.84871739130448,
+        101.06526262626268
+      ],
+      "baseline": [
+        99.69430303030302,
+        101.0264646464646,
+        102.036202020202,
+        100.29311111111112,
+        100.84262626262628
+      ]
+    },
+    "median_us": {
+      "static": 100.84871739130448,
+      "baseline": 100.84262626262628
+    },
+    "errors": {
+      "static": 0.0,
+      "baseline": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline": [
+        "_attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 17314086912,
+    "logical_bytes": 142671872,
+    "baseline": "40e83659b4f752ce1424ca598dd75a1827141c07",
+    "baseline_source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29"
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "q_lens": [
+      16384
+    ],
+    "kv_lens": [
+      131072
+    ],
+    "heads": 16,
+    "kv_heads": 1,
+    "causal": true,
+    "window_left": 128,
+    "sink": true,
+    "timing_us": {
+      "static": [
+        105.82688172043007,
+        116.35053061224491,
+        116.1255959595959,
+        116.57796739130436,
+        116.78542424242421
+      ],
+      "baseline": [
+        116.54592631578947,
+        115.52619565217385,
+        116.37934343434353,
+        116.52021276595748,
+        115.85867346938775
+      ]
+    },
+    "median_us": {
+      "static": 116.35053061224491,
+      "baseline": 116.37934343434353
+    },
+    "errors": {
+      "static": 0.0,
+      "baseline": 0.0
+    },
+    "dispatch": {
+      "static": [
+        "_attention_kernel_0"
+      ],
+      "baseline": [
+        "_attention_kernel_0"
+      ]
+    },
+    "isa": {},
+    "effective_flops": 21642608640,
+    "logical_bytes": 178339840,
+    "baseline": "40e83659b4f752ce1424ca598dd75a1827141c07",
+    "baseline_source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29"
+  }
+]

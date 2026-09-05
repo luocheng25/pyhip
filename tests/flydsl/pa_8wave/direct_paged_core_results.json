@@ -1,0 +1,77 @@
+{
+  "date": "2026-09-05",
+  "gpu": "AMD Instinct MI350X gfx950",
+  "dtype": "bfloat16",
+  "batch": 1,
+  "query_heads": 16,
+  "kv_heads": 1,
+  "value_dim": 128,
+  "page_size": 64,
+  "direct_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428",
+  "prechange_source_sha256": "612f941eb9e434e445a498f754b2b5da33439a8f9cbc217c1762716b3760788f",
+  "snapshot_sha256": "949730571a8af0e5f01632341295ce75adc7e0e55d7cb5929fc3ca24790f5370",
+  "snapshot_note": "Pre-change source plus one trailing newline; used only as an external benchmark reference, not a runtime branch.",
+  "protocol": {
+    "same_process_same_inputs": true,
+    "preallocated_outputs": true,
+    "initial_paired_warmups": 100,
+    "warmups_per_measurement": 20,
+    "iterations_per_measurement": 100,
+    "rounds": 5,
+    "candidate_order": "alternates each round",
+    "timing": "aiter.test_common.run_perftest GPU profiler, microseconds",
+    "baseline": "pre-change attention-only linear core; gather excluded",
+    "direct": "public direct-paged call; no preprocessing kernel or KV workspace",
+    "correctness": "independent FP32 reference, rtol=atol=0.02; repeatability bit-exact"
+  },
+  "cases": [
+    {
+      "dq": 128, "q": 10240, "kv": 2583, "causal": false, "window": -1, "sink": false,
+      "direct_us": [269.71030107526883, 264.64339130434803, 264.68410112359544, 266.1626559139784, 268.04832631578944],
+      "linear_core_us": [259.81233695652173, 259.73930434782625, 261.2493586956521, 261.7814375000001, 260.1829670329671],
+      "direct_median_us": 266.1626559139784, "core_median_us": 260.1829670329671,
+      "direct_over_core": 1.0229826300668392, "max_abs_diff_vs_core": 0.00048828125,
+      "vgpr": 228, "sgpr": 74, "lds_bytes": 99840, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    },
+    {
+      "dq": 192, "q": 10240, "kv": 2583, "causal": false, "window": -1, "sink": false,
+      "direct_us": [302.6095340909091, 303.1970937500001, 303.21689247311855, 302.4005268817205, 301.6417113402062],
+      "linear_core_us": [295.5773707865169, 295.9323225806451, 294.40233333333344, 294.5546, 295.2974623655913],
+      "direct_median_us": 302.6095340909091, "core_median_us": 295.2974623655913,
+      "direct_over_core": 1.0247617154131354, "max_abs_diff_vs_core": 0.00048828125,
+      "vgpr": 256, "sgpr": 77, "lds_bytes": 149760, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    },
+    {
+      "dq": 128, "q": 32768, "kv": 32768, "causal": true, "window": -1, "sink": false,
+      "direct_us": [4514.690030927836, 4532.2319595959625, 4558.573898989896, 4570.6789393939425, 4574.17197979798],
+      "linear_core_us": [4416.621676767678, 4426.076959595958, 4436.377969696969, 4437.069313131314, 4442.028242424238],
+      "direct_median_us": 4558.573898989896, "core_median_us": 4436.377969696969,
+      "direct_over_core": 1.0275440753983536, "max_abs_diff_vs_core": 0.0009765625,
+      "vgpr": 221, "sgpr": 83, "lds_bytes": 99840, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    },
+    {
+      "dq": 192, "q": 32768, "kv": 32768, "causal": true, "window": -1, "sink": false,
+      "direct_us": [5317.553535353533, 5381.10374074074, 5309.785696969697, 5401.2155185185175, 5406.2224625],
+      "linear_core_us": [5284.740448717944, 5286.951797468357, 5292.772949999998, 5296.495050000002, 5305.109329268295],
+      "direct_median_us": 5381.10374074074, "core_median_us": 5292.772949999998,
+      "direct_over_core": 1.016688943881627, "max_abs_diff_vs_core": 0.0009765625,
+      "vgpr": 254, "sgpr": 89, "lds_bytes": 149760, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    },
+    {
+      "dq": 128, "q": 16384, "kv": 131072, "causal": true, "window": 128, "sink": true,
+      "direct_us": [104.62015151515146, 103.15990909090907, 101.96027272727275, 102.69080808080804, 102.33159595959602],
+      "linear_core_us": [102.1804848484849, 101.3077171717171, 101.65479797979802, 101.92137362637366, 101.89845454545451],
+      "direct_median_us": 102.69080808080804, "core_median_us": 101.89845454545451,
+      "direct_over_core": 1.0077759131763875, "max_abs_diff_vs_core": 0.001953125,
+      "vgpr": 230, "sgpr": 71, "lds_bytes": 99840, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    },
+    {
+      "dq": 192, "q": 16384, "kv": 131072, "causal": true, "window": 128, "sink": true,
+      "direct_us": [111.7567368421053, 117.63316161616163, 118.57947872340429, 116.81212121212118, 118.22483516483516],
+      "linear_core_us": [117.04528571428571, 116.90708080808083, 116.8347474747475, 117.09098924731184, 117.29577777777773],
+      "direct_median_us": 117.63316161616163, "core_median_us": 117.04528571428571,
+      "direct_over_core": 1.0050226363094277, "max_abs_diff_vs_core": 0.001953125,
+      "vgpr": 256, "sgpr": 75, "lds_bytes": 149760, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0
+    }
+  ]
+}

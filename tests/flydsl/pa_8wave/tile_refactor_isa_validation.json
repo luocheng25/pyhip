@@ -1,0 +1,62 @@
+[
+  {
+    "scenario": "nc",
+    "dq": 128,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 4517,
+    "instruction_sha256": "268bd920c8c5dedb996b73e9d28a73a98878ed95f66a6d582a5ed4b9470a5080",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  },
+  {
+    "scenario": "nc",
+    "dq": 192,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 4749,
+    "instruction_sha256": "5459da19f49d902993c25058e7e35c1b13433513c78eb3813f578dd125151a17",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  },
+  {
+    "scenario": "causal",
+    "dq": 128,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 10781,
+    "instruction_sha256": "cc650bcbb180c57f7ba4010f69243dd17680fae5f08737da1f8cb315ebe31f6b",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  },
+  {
+    "scenario": "causal",
+    "dq": 192,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 11226,
+    "instruction_sha256": "8bcfa9ca9a7f8ca06f26b615bb6576072679ddf1ffcdf09720101d1d74c5e355",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  },
+  {
+    "scenario": "swa",
+    "dq": 128,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 4698,
+    "instruction_sha256": "f25b838dac5cae789189ff28737e8a6653f5817c64ab2333a128ad9811819e47",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  },
+  {
+    "scenario": "swa",
+    "dq": 192,
+    "instructions_equal": true,
+    "mnemonics_equal": true,
+    "instruction_count": 4910,
+    "instruction_sha256": "40d600974b466c7905bb7dab6fe9feea5601ee47f2ef2f48be0a227ab4870dbe",
+    "source_sha256": "3c340d9c36f8b54f6ed473730e20e6759dc273aaf3ac25165b6fc066edfa5b29",
+    "resources_equal": true
+  }
+]

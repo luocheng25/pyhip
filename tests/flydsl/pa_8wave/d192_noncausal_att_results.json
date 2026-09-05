@@ -1,0 +1,125 @@
+{
+  "date": "2026-09-05",
+  "production_kernel_modified": false,
+  "shape": {"batch": 1, "q": 10240, "kv": 2583, "heads": 16, "kv_heads": 1, "dq": 192, "dv": 128, "page_size": 64, "causal": false, "sink": false, "window_left": -1, "return_lse": false, "dtype": "bfloat16", "seed": 20260905},
+  "environment": {
+    "gpu": "AMD Instinct MI350X", "arch": "gfx950:sramecc+:xnack-", "gpu_index": 0,
+    "cus": 256, "simds_per_cu": 4, "lds_bytes_per_cu": 163840,
+    "python": "/opt/venv/bin/python", "rocm": "7.2.0", "rocprofv3": "1.1.0",
+    "rocprofv3_revision": "fc0010cf6a5a972d42b276df946510f30343d493",
+    "decoder": "rocprof-trace-decoder 0.1.6",
+    "decoder_directory": "/host_lc/pyhip/tests/gluon/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux/opt/rocm/lib"
+  },
+  "sha256": {
+    "pa_8wave_950.py": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428",
+    "profile_noncausal_att.py": "b037ab533d07cc41cefba5400dc2e9d9c294519850f57af449f3b22b065d4d89",
+    "analyze_noncausal_att.py": "1dd71dc0c6adf5edce79b9bef00671a3ec0419e3669abe277d14928c41976a9f",
+    "/tmp/pa950_att_ablation.py": "a19f42d4924c63b0209a8f180e374af1bd4208ae5482599bb24e53b4398c0508",
+    "/tmp/pa950_att_validate_packed_v.py": "92e72c317df1611d69cbb9503acb3c77a0c62b3e6019edd99f6bfa7128899c58",
+    "/sgl-workspace/aiter/aiter/jit/module_fmha_fwd_bf16_opus.so": "ff6864b877db0df323e0242de69bbf6558dfca0c3a2e372b127f421adc030b19"
+  },
+  "capture": {
+    "raw_root": "/tmp/pa950_att_d192_nc_20260905",
+    "full_analysis": "/tmp/pa950_att_d192_final_analysis.json",
+    "target_launches": [21, 22, 23], "total_launches": 23,
+    "simd_mask": "0xf", "buffer_size": "0x10000000",
+    "cu1_requested_se_mask": "0x3", "cu2_requested_se_mask": "0x1",
+    "decoded_instruction_coverage": [[0, 1], [0, 2]],
+    "coverage_note": "CU1 request produced raw ATT and occupancy for SE0/SE1 but instruction-wave JSON only for SE0. CU2 was captured separately. Do not describe this as whole-GPU or two-SE instruction coverage.",
+    "flydsl_filter": "_attention_kernel", "opus_filter": "gqa_d192_v128_kernel",
+    "flydsl_input": "original SHUFFLE-5D paged KV, random valid page table, zero-padded tail",
+    "opus_input": "equivalent logical linear KV constructed before launches, explicit packed group-mode OPUS",
+    "reference": "independent FP32 reference; rtol=atol=0.02; max absolute output error 0.0009247958660125732 for both original kernels and both diagnostic variants",
+    "warnings": "No incomplete wave used; every wave num_stitched equals num_insts. ATT dispatch durations are not used as ordinary benchmark times."
+  },
+  "method": {
+    "cta_grouping": "Eight waves per sequential generation; all four SIMDs and slots0/1, starts within512 cycles, all333 barrier completions within64 cycles. This identifies CTA cohorts for this one-CTA-resident workload, not a general interpretation of wave id.",
+    "steady_region": "Aligned workgroup barrier intervals7+8*t+s with t=1..38,s=0..7, corresponding to logical phases2..39. Excludes first and final logical phase.",
+    "stage_pairing": ["nonstagger S0 / stagger previous S7", "nonstagger S1 / stagger S0", "nonstagger S2 / stagger S1", "nonstagger S3 / stagger S2", "nonstagger S4 / stagger S3", "nonstagger S5 / stagger S4", "nonstagger S6 / stagger S5", "nonstagger S7 / stagger S6"],
+    "reported_means": "Mean over sampled CTAs within each capture, then equal-weight mean across captures.",
+    "stall_semantics": "On gfx9 ATT latency=stall+issue. Per-wave stall totals overlap between waves and must NOT be added as kernel-time attribution.",
+    "mfma_union_model": "Union of [attempt+stall, attempt+stall+32) for each native BF16 32x32x16 MFMA on the two waves of each SIMD. Explicit execution-window model, not a hardware utilization counter.",
+    "scope": "Explains measured code/path differences and sampled CTA stage costs; does not assign every microsecond of global runtime to a specific instruction."
+  },
+  "resources": {
+    "grid_ctas": [16, 1, 40], "total_ctas": 640, "threads_per_cta": 512,
+    "waves_per_cta": 8, "resident_ctas_per_cu": 1, "resident_waves_per_simd": 2,
+    "flydsl": {"lds_bytes": 149760, "vgpr": 256, "sgpr": 77, "private_bytes": 0},
+    "opus": {"lds_bytes": 149760, "vgpr": 250, "sgpr": 70, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0},
+    "note": "Registers and LDS from ELF/ISA metadata. rocprofv3 CSV showed encoded VGPR128/SGPR112 and LDS150016; these are not the source register counts. Both target kernels are nonpersistent."
+  },
+  "baseline_att": {
+    "flydsl": {
+      "captures": 6, "complete_waves": 120, "sampled_ctas": 15,
+      "instructions_per_wave": 13502.5, "mfma_per_wave": 1640, "global_128b_loads_per_wave": 223,
+      "barriers_per_wave": 333, "waitcnt_per_wave": 218,
+      "bfi_equal_sources_per_wave": 656, "bfi_same_destination_per_wave": 336,
+      "s_load_dword_per_wave": 50, "s_nop_per_wave": 652,
+      "steady_phase_mean_cycles": 2913.593567251462,
+      "steady_stage_mean_cycles": [297.0175438596491, 398.5204678362573, 388, 412.0204678362573, 428.77485380116957, 320.7573099415205, 373.85380116959067, 294.64912280701753],
+      "mean_waitcnt_stall_cycles_per_wave": 10455.861111111111,
+      "mean_barrier_stall_cycles_per_wave": 22277.694444444445
+    },
+    "opus": {
+      "captures": 6, "complete_waves": 136, "sampled_ctas": 17,
+      "instructions_per_wave": 12416, "mfma_per_wave": 1640, "global_128b_loads_per_wave": 223,
+      "barriers_per_wave": 333, "waitcnt_per_wave": 175,
+      "bfi_equal_sources_per_wave": 0, "bfi_same_destination_per_wave": 0,
+      "s_load_dword_per_wave": 4, "s_nop_per_wave": 458,
+      "steady_phase_mean_cycles": 2726.1345029239765,
+      "steady_stage_mean_cycles": [273.12865497076024, 376.1812865497076, 372, 412.6666666666667, 404.4795321637427, 288, 324, 275.67836257309943],
+      "mean_waitcnt_stall_cycles_per_wave": 8400.152777777777,
+      "mean_barrier_stall_cycles_per_wave": 19249.51388888889
+    }
+  },
+  "capture_summaries": [
+    {"directory": "flydsl", "ui_prefix": "ui_output_agent_17072_dispatch_", "dispatches": [38, 39, 40], "ctas": [3, 3, 2], "steady_phase_cycles": [2902.1052631578946, 2916.0350877192986, 2921.894736842105], "mfma_union_model_pct": [75.78704149417541, 74.47563363891805, 73.41580020494311]},
+    {"directory": "opus", "ui_prefix": "ui_output_agent_35167_dispatch_", "dispatches": [42, 43, 44], "ctas": [3, 2, 3], "steady_phase_cycles": [2724.8070175438597, 2728.6315789473683, 2725.3333333333335], "mfma_union_model_pct": [81.29900777411434, 78.58140205213056, 79.5087265675501]},
+    {"directory": "flydsl_cu2", "ui_prefix": "ui_output_agent_41824_dispatch_", "dispatches": [38, 39, 40], "ctas": [3, 2, 2], "steady_phase_cycles": [2903.157894736842, 2917.578947368421, 2920.789473684211], "mfma_union_model_pct": [76.02124577498793, 73.20586009562237, 73.28994776973997]},
+    {"directory": "opus_cu2", "ui_prefix": "ui_output_agent_49074_dispatch_", "dispatches": [42, 43, 44], "ctas": [3, 3, 3], "steady_phase_cycles": [2726, 2725.5438596491226, 2726.4912280701756], "mfma_union_model_pct": [81.29334069985387, 79.49005995582202, 79.6569650514173]},
+    {"directory": "flydsl_no_tail_diagnostic", "ui_prefix": "ui_output_agent_57403_dispatch_", "dispatches": [38, 39, 40], "ctas": [2, 2, 3], "steady_phase_cycles": [2789.2631578947367, 2789.8421052631584, 2786.7017543859647], "mfma_union_model_pct": [78.96419677853763, 77.46668585620394, 78.63527049604052]},
+    {"directory": "flydsl_i32_v_diagnostic", "ui_prefix": "ui_output_agent_57813_dispatch_", "dispatches": [38, 39, 40], "ctas": [2, 2, 3], "steady_phase_cycles": [2839.0526315789475, 2832.7368421052633, 2832.9122807017543], "mfma_union_model_pct": [76.73720650540838, 75.06069718629657, 76.47154538676563]}
+  ],
+  "full_grid_pmc": {
+    "launches_per_backend": 3,
+    "all_three_identical": true,
+    "flydsl": {"SQ_WAVES": 5120, "SQ_INSTS_MFMA": 8396800, "SQ_INSTS_LDS": 8458240, "SQ_INSTS_SMEM": 312320, "SQ_LDS_BANK_CONFLICT": 0},
+    "opus": {"SQ_WAVES": 5120, "SQ_INSTS_MFMA": 8396800, "SQ_INSTS_LDS": 11816960, "SQ_INSTS_SMEM": 76800, "SQ_LDS_BANK_CONFLICT": 0}
+  },
+  "diagnostic_ablations": {
+    "production_modified": false,
+    "no_tail": {
+      "change": "Process-local replacement of _mask_v_tail with identity on zero-padded performance data only.",
+      "not_correct_for_supported_api": "This removes NaN-tail protection. It is diagnostic only, not a usable optimization.",
+      "instructions_per_wave": 12100, "bfi_equal_sources_per_wave": 0,
+      "steady_phase_mean_cycles": 2788.6023391812864
+    },
+    "packed_v": {
+      "change": "Process-local _read_v variant: bitcast each 8-BF16 LDS read to 4 i32 words; concatenate all32 i32 words before a single BF16 vector store, instead of repeatedly storing individual BF16 slices. Tail mask, page table, math and barriers are retained.",
+      "instructions_per_wave": 12844.5, "bfi_equal_sources_per_wave": 0,
+      "steady_phase_mean_cycles": 2834.9005847953217,
+      "validation": "24 independent FP32-reference cases: D128/D192 x full-noncausal/full-causal/SWA128+sink x KV64/65/128/777 with Q257 and NaN tails; three bit-exact launches per case. Not a replacement for the complete173-test suite."
+    },
+    "conclusion": "Packed-V representation is an experimentally confirmed contributor. Exact LLVM optimization pass responsible for the extra BFI is not identified. The actual tail branch remains in IR/ISA; it was not converted into unconditional masking."
+  },
+  "uninstrumented_confirmation": {
+    "protocol": "Same process and logical inputs, preallocated outputs; initial100 paired warmups, five alternating rounds,20warmup/100iterations/run_perftest,num_rotate_args1. No ATT/PMC enabled. All three outputs pass independent FP32 reference.",
+    "timing_us": {
+      "original_5d": [308.14884883720924, 302.9304838709677, 301.9009204545455, 304.64269072164944, 302.6848260869566],
+      "packed_v_5d_diagnostic": [298.78426966292136, 298.6490322580645, 297.41545161290315, 298.81693406593416, 299.0956888888889],
+      "opus_linear": [291.50582022471923, 291.80696666666677, 292.05618478260885, 291.4990674157303, 291.7961573033708]
+    },
+    "median_us": {"original_5d": 302.9304838709677, "packed_v_5d_diagnostic": 298.78426966292136, "opus_linear": 291.7961573033708},
+    "original_over_opus_pct": 3.8157893066497417,
+    "packed_over_opus_pct": 2.3948609961594647,
+    "packed_reduction_pct": 1.3687015433588412,
+    "saved_us": 4.146214208046331,
+    "observed_gap_reduction_fraction": 0.37238122870516904
+  },
+  "persistence": {
+    "current_8wave": "No persistent work queue or CTA work loop. Noncausal fixed head/batch/qblock grid. MERGE handles at most two causal head/tail Q blocks, not general persistence.",
+    "current_4wave": "Static path is nonpersistent; dynamic path has an atomic ticket queue and while batch_index<batch_size loop.",
+    "opus_d192_group": "Nonpersistent fixed grid, same640CTAs for the target.",
+    "implication": "Missing persistence cannot explain a scheduling-mode difference between these two baselines. Persistent work assignment may reduce setup/reassignment overhead but does not increase LDS-limited resident waves; benefit has not been measured."
+  }
+}

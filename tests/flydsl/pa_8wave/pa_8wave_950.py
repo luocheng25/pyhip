@@ -1,9 +1,8 @@
-"""OPUS-style gfx950 BF16 D192/V128 attention with the paged-prefill ABI.
+"""Direct-paged gfx950 BF16 D128/D192, V128 attention with SWA/sinks.
 
-SHUFFLE-5D page64 KV is adapted to linear KV by a separate FlyDSL gather. The
-attention kernel uses OPUS's Q/V LDS alias, padded K/V layouts, two compile-time
-wave-group bodies and eight-stage ping/pong loop. Gather runs on every call and
-must be included when timing the public interface; no attention data is cached.
+The attention kernel reads SHUFFLE-5D page64 K/V through the current page table.
+No gather, linear-KV workspace, data cache or auxiliary GPU launch is used.
+OPUS's Q/V LDS alias, compile-time wave groups and ping/pong pipeline are retained.
 """
 
 import functools
@@ -17,11 +16,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 
-BM, BN, DQ, DV, THREADS = 256, 64, 192, 128, 512
-K_TILE = 8 * 3 * 520
-V_TILE = 8 * 2 * 544
-Q_TILE = 32 * 3 * 520
-LDS_ELEMENTS = 2 * K_TILE + max(Q_TILE, 2 * V_TILE)
+BM, BN, DV, THREADS = 256, 64, 128, 512
+V_TILE = 8 * 2 * 520
 LOG2E = math.log2(math.e)
 
 
@@ -35,6 +31,26 @@ def _max(a, b):
 
 def _uniform(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
+
+
+def _prefetch_page(table, index):
+    # Page indices are wave-uniform. SMEM avoids draining the in-flight KV
+    # DMA queue, unlike a global_load + vmcnt(0) + readfirstlane sequence.
+    address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + index))
+    return fx.Int32(llvm.inline_asm(
+        fx.Int32.ir_type, [address.ir_value()],
+        "s_load_dword $0, $1, 0", "=s,s,~{memory}",
+        has_side_effects=True,
+    ))
+
+
+def _page_ready(value, vmcnt=None):
+    # The tied result cannot be used until the scalar/LDS queue is drained.
+    wait = "s_waitcnt lgkmcnt(0)" if vmcnt is None else f"s_waitcnt vmcnt({vmcnt}) lgkmcnt(0)"
+    return fx.Int32(llvm.inline_asm(
+        fx.Int32.ir_type, [fx.Int32(value).ir_value()],
+        wait, "=s,0", has_side_effects=True,
+    ))
 
 
 def _exp(value):
@@ -151,7 +167,7 @@ def _dma(resource, storage, destination, voffset, soffset):
     )
 
 
-def _read_operand(storage, base, immediate=0, transpose=False):
+def _read_operand(storage, base, immediate=0):
     # The copy atoms currently model all direct-LDS DMA as one aliasing store:
     # they insert vmcnt(0) even when the phase reads a different ring buffer.
     # Match OPUS's explicit LDS-read boundary; the caller owns lgkmcnt(0) and
@@ -159,74 +175,116 @@ def _read_operand(storage, base, immediate=0, transpose=False):
     # ds_read has a 16-bit byte immediate; Q's third D chunk exceeds it.
     high = (immediate * 2) & ~0xFFFF
     address = fx.Int32(fx.ptrtoint(fx.get_iter(storage) + base + high // 2))
-    width = 2 if transpose else 4
-    instruction = "ds_read_b64_tr_b16" if transpose else "ds_read_b128"
     return fx.Vector(llvm.inline_asm(
-        ir.VectorType.get([width], fx.Int32.ir_type), [address.ir_value()],
-        f"{instruction} $0, $1 offset:{(immediate * 2) & 0xFFFF}", "=v,v,~{memory}",
+        ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
+        f"ds_read_b128 $0, $1 offset:{(immediate * 2) & 0xFFFF}", "=v,v,~{memory}",
         has_side_effects=True,
     )).bitcast(fx.BFloat16)
 
 
-def _read_qk(storage, base, q=False):
-    result = fx.make_rmem_tensor(fx.make_layout((8, 12), (1, 8)), fx.BFloat16)
-    chunk_stride = 16448 if q else 4160
-    for k in range(12):
-        result[None, k].store(_read_operand(storage, base, (k // 4) * chunk_stride + (k % 4) * 16))
+def _read_qk(storage, base, dq, q=False):
+    mma = _tiled_mma()
+    tile = fx.make_rmem_tensor((BM if q else BN // 2, dq), fx.BFloat16)
+    result = mma.make_fragment_B(tile) if q else mma.make_fragment_A(tile)
+    for k in range(dq // 16):
+        offset = (k // 4) * 16448 + (k % 4) * 16 if q else k * 1040
+        result[None, 0, k].store(_read_operand(storage, base, offset))
     return result
 
 
 def _read_v(storage, base):
-    result = fx.make_rmem_tensor(fx.make_layout((4, 16), (1, 4)), fx.BFloat16)
-    for i in range(16):
-        result[None, i].store(_read_operand(storage, base, (i % 8) * 64 + (i // 8) * 32, True))
-    return fx.make_view(fx.get_iter(result), fx.make_layout((8, 4, 2), (1, 8, 32)))
+    # K permutes token bits 2/3 so consecutive P registers correspond to
+    # eight consecutive tokens. V can then use native b128 reads, no transpose.
+    # Assemble packed words before the BF16 store: repeated BF16 slice stores
+    # followed by the tail-mask bitcast otherwise introduce redundant BFI moves.
+    chunks = [_read_operand(storage, base, n * 256 + k * 2080).bitcast(fx.Int32)
+              for n in range(2) for k in range(4)]
+    words = fx.Vector.from_elements([part[i] for part in chunks for i in range(4)], fx.Int32)
+    result = fx.make_rmem_tensor(fx.make_layout((8, 4, 2), (1, 8, 32)), fx.BFloat16)
+    result.store(words.bitcast(fx.BFloat16))
+    return result
+
+
+@flyc.jit
+def _mask_v_tail(values, remaining):
+    words = fx.Vector(values).bitcast(fx.Int32)
+    if remaining < BN:
+        # 0 * NaN is NaN: masking P alone cannot sanitize poisoned V padding.
+        lane = _pin_i32(fx.Int32(gpu.thread_id("x")))
+        limit = _pin_i32(remaining - ((lane >> 5) & 1) * 8)
+        masks = []
+        for i in fx.range_constexpr(16):
+            token = (i // 4) * 16 + (i % 4) * 2
+            bits = (limit > token).select(fx.Int32(0xFFFF), fx.Int32(0))
+            bits = bits | (limit > token + 1).select(fx.Int32(-65536), fx.Int32(0))
+            masks.append(_pin_i32(bits))
+        words = fx.Vector.from_elements([words[i] & masks[i % 16] for i in range(32)], fx.Int32)
+    return words.bitcast(fx.BFloat16)
+
+
+def _tiled_mma():
+    # Eight waves partition query rows; each pipeline superunit covers 32 K
+    # columns (QK) or 64 output columns (PV), not the entire BN/DV tile.
+    atom = fx.make_mma_atom(rocdl.MFMA(32, 32, 16, fx.BFloat16))
+    return fx.make_tiled_mma(atom, fx.make_layout((1, 8, 1), (1, 1, 0)))
 
 
 def _qk(q, k):
-    atom = fx.make_mma_atom(rocdl.MFMA(32, 32, 16, fx.BFloat16))
-    acc = fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32)
+    mma = _tiled_mma()
+    acc = mma.make_fragment_C(fx.make_rmem_tensor((BN // 2, BM), fx.Float32))
     acc.fill(0.0)
-    for i in range(12):
-        fx.mma_atom_call(atom, acc, k[None, i], q[None, i], acc)
+    fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
     return acc.load()
 
 
 def _pv(p, v, o0, o1):
-    atom = fx.make_mma_atom(rocdl.MFMA(32, 32, 16, fx.BFloat16))
-    probs = fx.make_rmem_tensor(fx.make_layout((8, 4), (1, 8)), fx.BFloat16)
+    mma = _tiled_mma()
+    probs = mma.make_fragment_B(fx.make_rmem_tensor((BM, BN), fx.BFloat16))
     probs.store(p)
-    acc = fx.make_rmem_tensor(fx.make_layout((16, 2), (1, 16)), fx.Float32)
+    acc = mma.make_fragment_C(fx.make_rmem_tensor((DV // 2, BM), fx.Float32))
     acc.store(_join(o0, o1))
-    # OPUS's tiled MMA is K-major: alternate independent output accumulators.
-    for k in range(4):
-        for n in range(2):
-            c = acc[None, n]
-            fx.mma_atom_call(atom, c, v[None, k, n], probs[None, k], c)
-    return acc[None, 0].load(), acc[None, 1].load()
+    # View packed V as (atom values, output columns, reduction). No register
+    # transpose. Traversal is fastest-axis first: M,N,K gives an outer K loop
+    # alternating the two independent M accumulators, as in the OPUS schedule.
+    fx.gemm(mma, acc, fx.select(v, [0, 2, 1]), probs, acc, traversal_order="mnk")
+    return acc[None, 0, 0].load(), acc[None, 1, 0].load()
 
 
 @flyc.jit
-def _mask(scores, tile, wave_row, kv_len, q_len, causal: fx.Constexpr[bool]):
+def _mask(scores, tile, wave_row, kv_len, q_len, causal: fx.Constexpr[bool], window: fx.Constexpr[int]):
     scores, tile = fx.Vector(scores), fx.Int32(tile)
-    lane_half = (fx.Int32(gpu.thread_id("x")) & 32) // 8
-    if fx.const_expr(causal):
+    lane_half = (fx.Int32(gpu.thread_id("x")) & 32) // 4
+    if fx.const_expr(window >= 0):
+        # The inclusive window is [q + KV - Q - window, q + KV - Q].
+        # Unsigned distance tests both bounds, including negative diagonals.
+        window_lane = _pin_i32(fx.Int32(gpu.thread_id("x")))
+        diagonal = _pin_i32(kv_len - q_len + wave_row + (window_lane & 31)
+                    - tile * BN - (window_lane & 32) // 4)
+        scores = fx.Vector.from_elements([
+            (fx.Uint32(diagonal - ((i // 8) * 16 + i % 8))
+             <= fx.Uint32(window)).select(scores[i], fx.Float32(float("-inf")))
+            for i in range(32)
+        ], fx.Float32)
+    elif fx.const_expr(causal):
         if wave_row + kv_len - q_len < (tile + 1) * BN:
             mask_lane = _pin_i32(fx.Int32(gpu.thread_id("x")))
             boundary = _pin_i32(kv_len - q_len + wave_row + (mask_lane & 31)
-                                - tile * 64 - (mask_lane & 32) // 8)
+                                - tile * 64 - (mask_lane & 32) // 4)
             scores = fx.Vector.from_elements([
-                (boundary >= (i // 16) * 32 + ((i % 16) // 4) * 8 + i % 4).select(
+                (boundary >= (i // 8) * 16 + i % 8).select(
                     scores[i], fx.Float32(float("-inf")))
                 for i in range(32)
             ], fx.Float32)
     else:
-        if ((kv_len & 63) != 0) & (tile == (kv_len - 1) // 64):
+        # All callers pass a valid KV tile, so only its remaining length is
+        # needed; avoid a separate modulo, last-tile division and conjunction.
+        remaining = kv_len - tile * BN
+        if remaining < BN:
             # Materialize inside the tail branch. Otherwise LICM keeps 32 wave
             # predicates (64 SGPRs) live throughout the entire main loop.
-            border_limit = _pin_i32(kv_len - 1 - tile * 64 - lane_half)
+            border_limit = _pin_i32(remaining - 1 - lane_half)
             scores = fx.Vector.from_elements([
-                (border_limit >= (i // 16) * 32 + ((i % 16) // 4) * 8 + i % 4).select(
+                (border_limit >= (i // 8) * 16 + i % 8).select(
                     scores[i], fx.Float32(float("-inf")))
                 for i in range(32)
             ], fx.Float32)
@@ -249,14 +307,18 @@ def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask):
 
 @flyc.jit
 def _attention_body(
-    Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, qb,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], CAP: fx.Constexpr[int],
+    Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, qb,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int],
     OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool],
     REVERSE: fx.Constexpr[bool] = False, MERGED: fx.Constexpr[bool] = False,
 ):
+    K_CHUNKS = DQ // 64
+    K_TILE = 8 * K_CHUNKS * 520
+    KEEP_VMCNT = K_CHUNKS + 2
     tid = fx.Int32(gpu.thread_id("x"))
     wave = _uniform(tid >> 6)
     lane = tid & 63
@@ -270,22 +332,25 @@ def _attention_body(
     q_ptr = fx.get_iter(Q) + (fx.Int64(q0) + q_start) * QROW + head * QHEAD
     q_view = fx.make_view(q_ptr, fx.make_layout((BM, DQ), (QROW, 1)))
     q_buf = rocdl.make_buffer_tensor(q_view, num_records_bytes=q_valid * QROW * 2)
-    k_ptr = fx.get_iter(K) + (fx.Int64(batch) * CAP * HK + hkv) * DQ
-    v_ptr = fx.get_iter(V) + (fx.Int64(batch) * CAP * HK + hkv) * DV
+    k_ptr = fx.get_iter(K) + hkv * BN * DQ
+    v_ptr = fx.get_iter(V) + hkv * BN * DV
     k_buf = rocdl.make_buffer_tensor(
-        fx.make_view(k_ptr, fx.make_layout((CAP, DQ), (HK * DQ, 1))),
-        num_records_bytes=kv_len * HK * DQ * 2,
+        fx.make_view(k_ptr, fx.make_layout(NP * HK * BN * DQ, 1)),
+        num_records_bytes=(NP * HK - hkv) * BN * DQ * 2,
     )
     v_buf = rocdl.make_buffer_tensor(
-        fx.make_view(v_ptr, fx.make_layout((CAP, DV), (HK * DV, 1))),
-        num_records_bytes=kv_len * HK * DV * 2,
+        fx.make_view(v_ptr, fx.make_layout(NP * HK * BN * DV, 1)),
+        num_records_bytes=(NP * HK - hkv) * BN * DV * 2,
     )
     gq = rocdl.get_buffer_rsrc(fx.get_iter(q_buf))
     gk = rocdl.get_buffer_rsrc(fx.get_iter(k_buf))
     gv = rocdl.get_buffer_rsrc(fx.get_iter(v_buf))
-    scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
     if fx.const_expr(MERGED):
-        scale = _uniform(scale.bitcast(fx.Int32)).bitcast(fx.Float32)
+        # Keep the shared scalar scale out of VGPRs across both paired passes.
+        scale_bits = _prefetch_page(KS, fx.Int32(0))
+        scale = _page_ready(scale_bits).bitcast(fx.Float32) * fx.Float32(SCALE * LOG2E)
+    else:
+        scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
     if fx.const_expr(PER_TOKEN):
         qs_buf = rocdl.make_buffer_tensor(QS, max_size=False)
         scale = scale * qs_buf[(q0 + row) * H + head]
@@ -300,47 +365,63 @@ def _attention_body(
     tiles = total_tiles
     if fx.const_expr(CAUSAL):
         tiles = _max(_min((q_start + q_valid + kv_len - q_len + 63) // 64, total_tiles), fx.Int32(1))
+    first = fx.Int32(0)
+    if fx.const_expr(WINDOW >= 0):
+        first = _max((q_start + kv_len - q_len - WINDOW) // BN, fx.Int32(0))
+        tiles = tiles - first
     last = tiles - 1
-    local_g = wave + (lane >> 3) * 8
-    gq_off = (local_g * QROW + (lane & 7) * 8) * 2
-    gk_off = (local_g * HK * DQ + (lane & 7) * 8) * 2
-    gv_off = (local_g * HK * DV + (lane & 7) * 8) * 2
-    rk = (lane & 7) * 520 + ((lane >> 3) & 3) * 64 + (lane >> 5) * 8
-    rq = (lane & 7) * 2056 + wave * 256 + ((lane >> 3) & 3) * 64 + (lane >> 5) * 8
-    rv = (lane >> 5) * 2176 + ((lane >> 2) & 3) * 544 + ((lane >> 4) & 1) * 16 + (lane & 3) * 4
+    q_lane = lane
+    if fx.const_expr(MERGED):
+        # Q-only coordinates must die after each prologue, not be hoisted
+        # across both paired passes and spilled throughout the hot loop.
+        q_lane = _pin_i32(lane)
+    local_g = wave + (q_lane >> 3) * 8
+    gq_off = (local_g * QROW + (q_lane & 7) * 8) * 2
+    gk_off = (wave * 512 + lane * 8) * 2
+    gv_off = ((wave >> 1) * 1024 + (wave & 1) * 512 + lane * 8) * 2
+    k_row = (lane & 19) | ((lane & 4) << 1) | ((lane & 8) >> 1)
+    rk = k_row * 8 + (lane >> 5) * 520
+    rq = (q_lane & 7) * 2056 + wave * 256 + ((q_lane >> 3) & 3) * 64 + (q_lane >> 5) * 8
+    rv = (lane & 31) * 8 + (lane >> 5) * 1040
 
     def data_tile(position):
-        return last - position if REVERSE else position
+        return first + (last - position if REVERSE else position)
 
-    def load_k(tile, slot, begin=0, end=3):
-        offset = data_tile(_min(tile, last)) * (64 * HK * DQ * 2)
+    def load_k(physical, slot, begin=0, end=K_CHUNKS):
+        offset = physical * (BN * HK * DQ * 2)
         for d in fx.range_constexpr(begin, end):
             _dma(gk, storage, slot * K_TILE + (d * 8 + wave) * 520,
-                 gk_off + d * 128, offset)
+                 gk_off + d * (64 * BN * 2), offset)
 
-    def load_v(tile, slot):
-        offset = data_tile(_min(tile, last)) * (64 * HK * DV * 2)
+    def load_v(physical, slot):
+        offset = physical * (BN * HK * DV * 2)
         for d in fx.range_constexpr(2):
-            _dma(gv, storage, 2 * K_TILE + slot * V_TILE + (d * 8 + wave) * 544,
-                 gv_off + d * 128, offset)
+            _dma(gv, storage, 2 * K_TILE + slot * V_TILE + (d * 8 + wave) * 520,
+                  gv_off + d * (32 * DV * 2), offset)
 
+    page0 = _prefetch_page(TABLE, data_tile(fx.Int32(0)))
+    page1 = _prefetch_page(TABLE, data_tile(_min(fx.Int32(1), last)))
+    page2 = _prefetch_page(TABLE, data_tile(_min(fx.Int32(2), last)))
     # Q aliases the entire V region until Q has been read into registers.
-    for d in fx.range_constexpr(3):
+    for d in fx.range_constexpr(K_CHUNKS):
         for n in fx.range_constexpr(4):
             _dma(gq, storage, 2 * K_TILE + (d * 8 + wave) * 2056 + n * 512,
                  gq_off + d * 128 + n * 64 * QROW * 2, fx.Int32(0))
-    load_k(fx.Int32(0), 0)
-    rocdl.s_waitcnt(vmcnt=3)
+    page0 = _page_ready(page0)
+    page1 = _page_ready(page1)
+    page2 = _page_ready(page2)
+    load_k(page0, 0)
+    rocdl.s_waitcnt(vmcnt=K_CHUNKS)
     _stage_end()
-    q_frag = _read_qk(storage, 2 * K_TILE + rq, True)
-    load_k(fx.Int32(1), 1)
-    rocdl.s_waitcnt(lgkmcnt=0, vmcnt=3)
+    q_frag = _read_qk(storage, 2 * K_TILE + rq, DQ, True)
+    load_k(page1, 1)
+    rocdl.s_waitcnt(lgkmcnt=0, vmcnt=K_CHUNKS)
     _stage_end()
     if fx.const_expr(STAGGER):
         _stage_end()
 
-    k_frag = _read_qk(storage, rk)
-    load_v(fx.Int32(0), 0)
+    k_frag = _read_qk(storage, rk, DQ)
+    load_v(page0, 0)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     s0 = _qk(q_frag, k_frag)
@@ -348,36 +429,45 @@ def _attention_body(
     o1 = fx.Vector.filled(16, 0.0, fx.Float32)
     o2 = fx.Vector.filled(16, 0.0, fx.Float32)
     o3 = fx.Vector.filled(16, 0.0, fx.Float32)
-    _schedule(12, 3, 5)
+    _schedule(DQ // 16, 3 if DQ == 192 else 5, 5)
     o0, o1, o2, o3 = _pin(o0), _pin(o1), _pin(o2), _pin(o3)
     _stage_end()
-    k_frag = _read_qk(storage, rk + 256)
+    k_frag = _read_qk(storage, rk + 256, DQ)
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     s1 = _qk(q_frag, k_frag)
-    scores = _mask(_join(s0, s1), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL)
+    scores = _mask(_join(s0, s1), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL, WINDOW)
     maximum = (_row_max(scores) * scale).maximumf(fx.Float32(-1.0e30))
-    scores = _center_slice(scores, scale, maximum, 0, 32)
     row_sum = fx.Float32(0.0)
+    if fx.const_expr(HAS_SINK):
+        # One zero-value virtual key per head. row_sum is already reduced
+        # across lane +/-32, so the sink contributes once, not twice.
+        sink_log2 = fx.Float32(SINK[head]) * fx.Float32(LOG2E)
+        maximum = maximum.maximumf(sink_log2)
+        row_sum = _exp(sink_log2 - maximum)
+    scores = _center_slice(scores, scale, maximum, 0, 32)
     rocdl.s_waitcnt(vmcnt=2)
     _stage_end()
-    load_k(fx.Int32(2), 0)
+    load_k(page2, 0)
     _stage_end()
 
     @flyc.jit
-    def phase(previous, maximum, row_sum, o0, o1, o2, o3, t, CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+    def phase(previous, maximum, row_sum, o0, o1, o2, o3, current_page, next_page, t, CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
         previous = fx.Vector(previous)
         o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
         maximum, row_sum, t = fx.Float32(maximum), fx.Float32(row_sum), fx.Int32(t)
         # S0/S1: memory of t, then QK(t) + exp(t-1).
-        k = _read_qk(storage, CUR * K_TILE + rk)
+        k = _read_qk(storage, CUR * K_TILE + rk, DQ)
         if fx.const_expr(STAGGER):
-            load_v(t, CUR)
+            load_v(current_page, CUR)
         rocdl.s_waitcnt(lgkmcnt=0)
         _stage_end()
+        future_page = _prefetch_page(TABLE, data_tile(_min(t + 2, last)))
         lo = _qk(q_frag, k)
         previous = _pin(_exp_slice(previous, 0, 24), 32)
-        if fx.const_expr(STAGGER):
+        if fx.const_expr(DQ == 128):
+            _schedule(8, 3, 1, True)
+        elif fx.const_expr(STAGGER):
             _schedule(1, 3, 1, True)
             rocdl.sched_group_barrier(rocdl.mask_mfma, 3, 1)
             _schedule(8, 3, 1, True)
@@ -388,10 +478,11 @@ def _attention_body(
             _schedule(8, 3, 1, True)
         _stage_end()
         # S2/S3: second QK half + remaining exp, sum, BF16 P.
-        k = _read_qk(storage, CUR * K_TILE + rk + 256)
+        k = _read_qk(storage, CUR * K_TILE + rk + 256, DQ)
         if fx.const_expr(not STAGGER):
-            load_v(t, CUR)
-        rocdl.s_waitcnt(lgkmcnt=0, vmcnt=5)
+            load_v(current_page, CUR)
+        # One instruction retains both the rolling DMA and page/LDS waits.
+        future_page = _page_ready(future_page, KEEP_VMCNT)
         _stage_end()
         hi = _qk(q_frag, k)
         previous = _exp_slice(previous, 24, 32)
@@ -401,17 +492,25 @@ def _attention_body(
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 2)
         rocdl.sched_group_barrier(0x400, 2, 2)
         rocdl.sched_group_barrier(0x002, 2, 2)
-        _schedule(5, 6, 2)
-        _schedule(1, 5, 2)
-        _schedule(2, 6, 2)
-        _schedule(1, 2, 2)
+        if fx.const_expr(DQ == 128):
+            _schedule(5, 10, 2)
+        else:
+            _schedule(5, 6, 2)
+            _schedule(1, 5, 2)
+            _schedule(2, 6, 2)
+            _schedule(1, 2, 2)
         _stage_end()
         current = _join(lo, hi)
         # S4/S5: V(t-1), K(t+2), then PV + current softmax head.
         v = _read_v(storage, 2 * K_TILE + PREV * V_TILE + rv)
-        load_k(t + 2, CUR, 0, 1 if STAGGER else 3)
-        current = _mask(current, data_tile(t), wave_row, kv_len, q_len, CAUSAL)
+        load_k(future_page, CUR, 0, 1 if STAGGER else K_CHUNKS)
+        current = _mask(current, data_tile(t), wave_row, kv_len, q_len, CAUSAL, WINDOW)
         rocdl.s_waitcnt(lgkmcnt=0)
+        if fx.const_expr(REVERSE):
+            # Forward phases consume t-1 <= tiles-2: these V pages are full.
+            # Reverse traversal can consume the partial final page at t=1.
+            rocdl.sched_barrier(0)
+            v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
         o0, o1 = _pv(p, v, o0, o1)
         candidate = _row_max(current) * scale
@@ -423,10 +522,13 @@ def _attention_body(
             _schedule(1, count, 3)
         _stage_end()
         # S6/S7: other V half, then finish PV and conditional rescale.
-        v = _read_v(storage, 2 * K_TILE + PREV * V_TILE + V_TILE // 2 + rv)
+        v = _read_v(storage, 2 * K_TILE + PREV * V_TILE + 520 + rv)
         if fx.const_expr(STAGGER):
-            load_k(t + 2, CUR, 1, 3)
-        rocdl.s_waitcnt(lgkmcnt=0, vmcnt=5)
+            load_k(future_page, CUR, 1, K_CHUNKS)
+        rocdl.s_waitcnt(lgkmcnt=0, vmcnt=KEEP_VMCNT)
+        if fx.const_expr(REVERSE):
+            rocdl.sched_barrier(0)
+            v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
         o2, o3 = _pv(p, v, o2, o3)
         current = _center_slice(current, scale, new_max, split, 32)
@@ -438,20 +540,20 @@ def _attention_body(
             _schedule(5, 4, 4)
         o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, maximum, new_max, row_sum, mask)
         _stage_end()
-        return current, new_max, row_sum, o0, o1, o2, o3
+        return current, new_max, row_sum, o0, o1, o2, o3, next_page, future_page
 
     for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
         rocdl.sched_barrier(0)
-        scores, maximum, row_sum, o0, o1, o2, o3 = phase(scores, maximum, row_sum, o0, o1, o2, o3, t, 1, 0)
+        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, t, 1, 0)
         rocdl.sched_barrier(0)
-        scores, maximum, row_sum, o0, o1, o2, o3 = phase(scores, maximum, row_sum, o0, o1, o2, o3, t + 1, 0, 1)
+        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, t + 1, 0, 1)
         rocdl.sched_barrier(0)
     rocdl.sched_barrier(0)
     if (tiles & 1) == 0:
-        scores, maximum, row_sum, o0, o1, o2, o3 = phase(scores, maximum, row_sum, o0, o1, o2, o3, tiles - 1, 1, 0)
+        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, tiles - 1, 1, 0)
 
     maximum, row_sum = fx.Float32(maximum), fx.Float32(row_sum)
-    rocdl.s_waitcnt(vmcnt=3)
+    rocdl.s_waitcnt(vmcnt=K_CHUNKS)
     _stage_end()
     scores = _exp_slice(scores, 0, 32)
     row_sum = row_sum + _row_sum(scores)
@@ -460,11 +562,15 @@ def _attention_body(
     last_slot = (tiles - 1) & 1
     v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + rv)
     rocdl.s_waitcnt(lgkmcnt=0)
+    rocdl.sched_barrier(0)
+    v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
     _stage_end()
     o0, o1 = _pv(p, v, o0, o1)
     _stage_end()
-    v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + V_TILE // 2 + rv)
+    v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + 520 + rv)
     rocdl.s_waitcnt(lgkmcnt=0)
+    rocdl.sched_barrier(0)
+    v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
     _stage_end()
     o2, o3 = _pv(p, v, o2, o3)
     rocdl.sched_barrier(0)
@@ -502,28 +608,30 @@ def _attention_body(
 
 @flyc.jit
 def _attention_sequence(
-    Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, qb,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], CAP: fx.Constexpr[int],
+    Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, qb,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool], MERGE: fx.Constexpr[bool],
 ):
-    _attention_body(Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, qb,
-                   H, HK, CAP, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
+    _attention_body(Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, qb,
+                   H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
                    False, MERGE)
     if fx.const_expr(MERGE):
         mirror = (q_len + BM - 1) // BM - 1 - qb
         if mirror > qb:
             # OPUS pairs the shortest and longest causal query blocks. The
             # mirror scans backward so both passes balance work and reuse L2.
-            _attention_body(Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, mirror,
-                           H, HK, CAP, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
+            _attention_body(Q, K, V, O, LSE, QS, KS, VS, SINK, TABLE, storage, q0, q_len, kv_len, batch, head, mirror,
+                           H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, STAGGER,
                            True, MERGE)
 
 
 @flyc.jit
-def _zero_tile(O, LSE, q0, q_len, head, qb,
-               H: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int], WITH_LSE: fx.Constexpr[bool]):
+def _zero_tile(O, LSE, SINK, q0, q_len, head, qb,
+               H: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
+               WITH_LSE: fx.Constexpr[bool], HAS_SINK: fx.Constexpr[bool]):
     tid = fx.Int32(gpu.thread_id("x"))
     valid = _min(q_len - qb * BM, fx.Int32(BM))
     ptr = fx.get_iter(O) + (fx.Int64(q0) + qb * BM) * OROW + head * OHEAD
@@ -541,13 +649,14 @@ def _zero_tile(O, LSE, q0, q_len, head, qb,
         fx.copy(atom, zeros, dst)
     if fx.const_expr(WITH_LSE):
         if (tid < BM) & (qb * BM + tid < q_len):
-            LSE[(q0 + qb * BM + tid) * H + head] = fx.Float32(float("-inf"))
+            LSE[(q0 + qb * BM + tid) * H + head] = SINK[head] if HAS_SINK else fx.Float32(float("-inf"))
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
 def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, CK: fx.Tensor, KI: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], CAP: fx.Constexpr[int],
+    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float], MERGE: fx.Constexpr[bool]):
@@ -556,78 +665,39 @@ def _attention_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     qb = fx.Int32(gpu.block_id("z"))
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
-    pages = _uniform(KI[batch + 1]) - _uniform(KI[batch])
+    page_start = _uniform(KI[batch])
+    pages = _uniform(KI[batch + 1]) - page_start
+    table = fx.make_view(fx.get_iter(PAGES) + page_start, fx.make_layout(pages, 1))
     kv_len = (pages > 0).select((pages - 1) * 64 + _uniform(LAST[batch]), fx.Int32(0))
-    storage = fx.SharedAllocator().allocate(fx.Array[fx.BFloat16, LDS_ELEMENTS, 16]).peek().view(fx.make_layout(LDS_ELEMENTS, 1))
+    lds_elements = 2 * (8 * (DQ // 64) * 520) + max(32 * (DQ // 64) * 520, 2 * V_TILE)
+    storage = fx.SharedAllocator().allocate(fx.Array[fx.BFloat16, lds_elements, 16]).peek().view(fx.make_layout(lds_elements, 1))
     q_blocks = (q_len + BM - 1) // BM
     work_blocks = (q_blocks + 1) // 2 if MERGE else q_blocks
     if qb < work_blocks:
         if kv_len > 0:
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
             if group != 0:
-                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, qb, H, HK, CAP, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, True, MERGE)
+                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, True, MERGE)
             else:
-                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, storage, q0, q_len, kv_len, batch, head, qb, H, HK, CAP, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, False, MERGE)
+                _attention_sequence(Q, K, V, O, LSE, QS, KS, VS, SINK, table, storage, q0, q_len, kv_len, batch, head, qb, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD, PER_TOKEN, CAUSAL, WITH_LSE, SCALE, False, MERGE)
         else:
-            _zero_tile(O, LSE, q0, q_len, head, qb, H, OROW, OHEAD, WITH_LSE)
+            _zero_tile(O, LSE, SINK, q0, q_len, head, qb, H, OROW, OHEAD, WITH_LSE, HAS_SINK)
             if fx.const_expr(MERGE):
                 mirror = q_blocks - 1 - qb
                 if mirror > qb:
-                    _zero_tile(O, LSE, q0, q_len, head, mirror, H, OROW, OHEAD, WITH_LSE)
-
-
-@flyc.kernel(known_block_size=[128, 1, 1])
-def _gather_kernel(K: fx.Tensor, V: fx.Tensor, KL: fx.Tensor, VL: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor,
-                   HK: fx.Constexpr[int], CAP: fx.Constexpr[int]):
-    tid = fx.Int32(gpu.thread_id("x"))
-    block = fx.Int32(gpu.block_id("x"))
-    ph, part = block // 4, block % 4
-    batch = fx.Int32(gpu.block_id("y"))
-    logical, head = ph // HK, ph % HK
-    start = KI[batch]
-    if logical < KI[batch + 1] - start:
-        page = _uniform(PAGES[start + logical])
-        kb = (fx.Int64(page) * HK + head) * (64 * DQ)
-        vb = (fx.Int64(page) * HK + head) * (64 * DV)
-        ko = (fx.Int64(batch) * CAP + logical * 64) * HK * DQ + head * DQ
-        vo = (fx.Int64(batch) * CAP + logical * 64) * HK * DV + head * DV
-        copy = fx.make_copy_atom(fx.UniversalCopy(128), fx.BFloat16)
-        # Four 16-token blocks per page expose enough parallelism at short KV.
-        for i in fx.range_constexpr(3):
-            item = tid + i * 128
-            token, d8 = part * 16 + item // 24, item % 24
-            src = fx.make_view(fx.get_iter(K) + kb + d8 * 512 + token * 8, fx.make_layout(8, 1))
-            dst = fx.make_view(fx.get_iter(KL) + ko + token * HK * DQ + d8 * 8, fx.make_layout(8, 1))
-            reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-            fx.copy(copy, src, reg)
-            fx.copy(copy, reg, dst)
-        # Each lane reads eight contiguous tokens for one V dimension, then
-        # scatters to coalesced output rows; two vector reads replace 16 scalars.
-        for group in fx.range_constexpr(2):
-            token = part * 16 + group * 8
-            src = fx.make_view(fx.get_iter(V) + vb + (token // 8) * 1024 + tid * 8, fx.make_layout(8, 1))
-            reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-            fx.copy(copy, src, reg)
-            vals = reg.load()
-            for i in fx.range_constexpr(8):
-                VL[vo + (token + i) * HK * DV + tid] = vals[i]
-
-
-@flyc.jit
-def _launch_gather(K: fx.Tensor, V: fx.Tensor, KL: fx.Tensor, VL: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor,
-                   HK: fx.Constexpr[int], CAP: fx.Constexpr[int], B: fx.Constexpr[int], stream: fx.Stream):
-    _gather_kernel(K, V, KL, VL, KI, PAGES, HK, CAP).launch(grid=(CAP // 16 * HK, B, 1), block=(128, 1, 1), stream=stream)
+                    _zero_tile(O, LSE, SINK, q0, q_len, head, mirror, H, OROW, OHEAD, WITH_LSE, HAS_SINK)
 
 
 @flyc.jit
 def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, CK: fx.Tensor, KI: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], CAP: fx.Constexpr[int], B: fx.Constexpr[int], MAX_Q: fx.Constexpr[int],
+    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int], MAX_Q: fx.Constexpr[int],
+    DQ: fx.Constexpr[int], WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool],
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], stream: fx.Stream):
     query_blocks = (MAX_Q + BM - 1) // BM
-    merge = CAUSAL and query_blocks * H * B >= 512
-    _attention_kernel(Q, K, V, O, LSE, CQ, CK, KI, LAST, QS, KS, VS, H, HK, CAP, QROW, QHEAD, OROW, OHEAD,
+    merge = CAUSAL and WINDOW < 0 and query_blocks * H * B >= 512
+    _attention_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK, H, HK, NP, DQ, WINDOW, HAS_SINK, QROW, QHEAD, OROW, OHEAD,
         PER_TOKEN, CAUSAL, WITH_LSE, SCALE, merge,
         value_attrs={"rocdl.waves_per_eu": 2},
     ).launch(grid=(H, B, (query_blocks + 1) // 2 if merge else query_blocks), block=(THREADS, 1, 1), stream=stream)
@@ -644,10 +714,19 @@ def _flat(tensor):
 class _PagedAttention:
     bf16_backend = "native-8wave"
 
-    def __init__(self, heads, kv_heads, causal, quant_query_mode):
+    def __init__(self, heads, kv_heads, dq, causal, quant_query_mode, window_left, has_sink):
         self.heads, self.kv_heads, self.causal = heads, kv_heads, causal
+        self.dq, self.window_left, self.has_sink = dq, window_left, has_sink
         self.quant_query_mode = quant_query_mode
-        self._compiled, self._workspace = {}, {}
+        self._compiled = {}
+
+    def _validate_sink(self, sink_ptr, device):
+        if self.has_sink:
+            if (sink_ptr is None or sink_ptr.shape != (self.heads,) or sink_ptr.dtype != torch.float32
+                    or sink_ptr.device != device or not sink_ptr.is_contiguous()):
+                raise ValueError("sink_ptr must be contiguous FP32 [query heads] on the input GPU")
+        elif sink_ptr is not None:
+            raise ValueError("sink_ptr requires has_sink=True")
 
     def _run(self, fn, args):
         signature = tuple((x.dtype, tuple(x.shape), tuple(x.stride())) if isinstance(x, torch.Tensor)
@@ -661,41 +740,13 @@ class _PagedAttention:
             else:
                 compiled(*args)
 
-    def prepare_kv(self, K, V, kv_indptr, kv_page_indices, max_seqlen_k, stream=None):
-        stream = torch.cuda.current_stream(K.device) if stream is None else stream
-        batch = kv_indptr.numel() - 1
-        cap = max(64, math.ceil(max_seqlen_k / 64) * 64)
-        key = (K.device, stream.cuda_stream, batch, cap)
-        if key not in self._workspace:
-            with torch.cuda.stream(stream):
-                self._workspace[key] = (
-                    torch.empty((batch, cap, self.kv_heads, DQ), device=K.device, dtype=torch.bfloat16),
-                    torch.empty((batch, cap, self.kv_heads, DV), device=K.device, dtype=torch.bfloat16),
-                )
-        kl, vl = self._workspace[key]
-        self._run(_launch_gather, (_flat(K), _flat(V), _flat(kl), _flat(vl), kv_indptr, kv_page_indices,
-                                  self.kv_heads, cap, batch, stream))
-        return kl, vl
-
-    def attend_linear(self, Q, KL, VL, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_last_page_lens,
-                      q_descale, k_descale, v_descale, max_seqlen_q, out, lse=None, stream=None, softmax_scale=None):
-        stream = torch.cuda.current_stream(Q.device) if stream is None else stream
-        per_token = q_descale.numel() != 1
-        self._run(_launch_attention, (
-            _flat(Q), _flat(KL), _flat(VL), _flat(out), _flat(lse) if lse is not None else k_descale.reshape(-1),
-            cu_seqlens_q, cu_seqlens_k if cu_seqlens_k is not None else cu_seqlens_q,
-            kv_indptr, kv_last_page_lens, _flat(q_descale), k_descale.reshape(-1), v_descale.reshape(-1),
-            self.heads, self.kv_heads, KL.shape[1], KL.shape[0], max_seqlen_q,
-            Q.stride(0), Q.stride(1), out.stride(0), out.stride(1),
-            per_token, self.causal, lse is not None, float(1 / math.sqrt(DQ) if softmax_scale is None else softmax_scale), stream,
-        ))
-        return out
-
     def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
                  max_seqlen_q, max_seqlen_k, causal, q_descale, k_descale, v_descale,
                  kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
         """Run paged attention; descales must be finite and strictly positive.
 
+        A sink is an unscaled natural-logit, per query head, for a virtual key
+        with value zero. Finite sink logits and -inf (disabled) are supported.
         GPU metadata values (page IDs, prefix sums, last-page lengths and the
         supplied maximum lengths) must be consistent. They are not copied to
         the CPU, so the hot path remains asynchronous and graph-capturable.
@@ -706,18 +757,19 @@ class _PagedAttention:
             raise NotImplementedError("this kernel requires gfx950")
         if Q.dtype != torch.bfloat16 or K.dtype != Q.dtype or V.dtype != Q.dtype:
             raise NotImplementedError("only BF16 Q/K/V are supported")
-        if causal != self.causal or sink_ptr is not None:
-            raise ValueError("causal must match the factory; attention sinks are unsupported")
-        if Q.ndim != 3 or Q.shape[1:] != (self.heads, DQ) or Q.stride(-1) != 1:
-            raise ValueError("Q must be [tokens, heads, 192] with contiguous head dimension")
-        if K.ndim != 5 or V.ndim != 5 or K.shape != (V.shape[0], self.kv_heads, 24, 64, 8) or V.shape[1:] != (self.kv_heads, 8, 128, 8):
+        if causal != self.causal:
+            raise ValueError("causal must match the factory")
+        self._validate_sink(sink_ptr, Q.device)
+        if Q.ndim != 3 or Q.shape[1:] != (self.heads, self.dq) or Q.stride(-1) != 1:
+            raise ValueError("Q must be [tokens, heads, head_dim_qk] with contiguous head dimension")
+        if K.ndim != 5 or V.ndim != 5 or K.shape != (V.shape[0], self.kv_heads, self.dq // 8, 64, 8) or V.shape[1:] != (self.kv_heads, 8, 128, 8):
             raise ValueError("K/V must use page64 SHUFFLE-5D layouts")
         if not K.is_contiguous() or not V.is_contiguous():
             raise ValueError("paged K/V storage must be contiguous")
         if max_seqlen_q < 0 or max_seqlen_k < 0:
             raise ValueError("sequence-length bounds must be nonnegative")
-        if max_seqlen_k * self.kv_heads * DQ * 2 >= 2**31:
-            raise NotImplementedError("linear KV spans must fit the signed 32-bit buffer offset")
+        if K.numel() * K.element_size() >= 2**31:
+            raise NotImplementedError("physical KV cache must fit the signed 32-bit buffer offset")
         if softmax_scale is not None and (not math.isfinite(softmax_scale) or softmax_scale <= 0):
             raise ValueError("softmax_scale must be finite and positive")
         batch = cu_seqlens_q.numel() - 1
@@ -747,9 +799,17 @@ class _PagedAttention:
         if lse is not None and (lse.shape != (Q.shape[0], self.heads) or lse.dtype != torch.float32 or lse.device != Q.device or not lse.is_contiguous()):
             raise ValueError("LSE must be contiguous FP32 [tokens, heads]")
         if Q.shape[0] > 0:
-            kl, vl = self.prepare_kv(K, V, kv_indptr, kv_page_indices, max_seqlen_k, stream)
-            self.attend_linear(Q, kl, vl, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_last_page_lens,
-                               q_descale, k_descale, v_descale, max_seqlen_q, out, lse, stream, softmax_scale)
+            self._run(_launch_attention, (
+                _flat(Q), _flat(K), _flat(V), _flat(out), _flat(lse) if lse is not None else k_descale.reshape(-1),
+                cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
+                _flat(q_descale), k_descale.reshape(-1), v_descale.reshape(-1),
+                sink_ptr if sink_ptr is not None else k_descale.reshape(-1),
+                self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q,
+                self.dq, self.window_left, self.has_sink,
+                Q.stride(0), Q.stride(1), out.stride(0), out.stride(1),
+                q_descale.numel() != 1, self.causal, lse is not None,
+                float(1 / math.sqrt(self.dq) if softmax_scale is None else softmax_scale), stream,
+            ))
         return (out, lse) if return_lse else out
 
 
@@ -757,10 +817,14 @@ class _PagedAttention:
 def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
                    is_causal, quant_query_mode="per-token", key_layout="vectorized",
                    window_left=-1, has_sink=False):
-    if (head_dim_qk, head_dim_v, page_size, key_layout, window_left, has_sink) != (DQ, DV, BN, "vectorized", -1, False):
-        raise NotImplementedError("only gfx950 BF16 D192/V128 page64 full attention is supported")
+    if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (DV, BN, "vectorized"):
+        raise NotImplementedError("only gfx950 BF16 D128/D192, V128 page64 attention is supported")
+    if not isinstance(window_left, int) or window_left < -1 or window_left >= 2**31:
+        raise ValueError("window_left must be -1 or a nonnegative signed 32-bit integer")
+    if window_left >= 0 and not is_causal:
+        raise ValueError("SWA requires bottom-right causal attention")
     if num_kv_heads <= 0 or num_qo_heads <= 0 or num_qo_heads % num_kv_heads:
         raise ValueError("query heads must be a positive multiple of KV heads")
     if quant_query_mode not in ("per-token", "per-tensor"):
         raise ValueError("unsupported query scale mode")
-    return _PagedAttention(num_qo_heads, num_kv_heads, is_causal, quant_query_mode)
+    return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, is_causal, quant_query_mode, window_left, has_sink)

@@ -1,0 +1,336 @@
+{
+  "date": "2026-09-05",
+  "scope": "Full current README workload retest; no attention implementation changes",
+  "environment": {"gpu": "AMD Instinct MI350X", "arch": "gfx950:sramecc+:xnack-", "cus": 256, "gpu_index": 0, "python": "/opt/venv/bin/python", "torch": "2.9.1+rocm7.2.0.git7e1940d4", "hip": "7.2.26015-fc0010cf6a", "HIP_VISIBLE_DEVICES": "0", "FLYDSL_RUNTIME_ENABLE_CACHE": "0", "clock_policy": "Existing auto-DPM, no clock/power changes", "available_architectures": ["gfx950"]},
+  "source_sha256": {
+    "../pa_8wave/pa_8wave_950.py": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "../pa_8wave/test_pa_prefill.py": "8747141372fd76a37f825c44c76fb27829c6279b9427e74b705b7ffe46fa62d3",
+    "pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+    "test_pa_prefill.py": "7ea2a7021602580babd669f05a6c6fa78469cee43b95d24070d160ff6fbbecae",
+    "benchmark_readme.py": "fa2b53173673b2f7c2b0e659782399699bd7480a61ee5ac26d90cd07bb88662f",
+    "profile_readme.py": "7c0e933601c8764bf338887cdb5cd39843cc2eed6e92c83316fdc3e1d127cf41"
+  },
+  "opus_binary_sha256": "ff6864b877db0df323e0242de69bbf6558dfca0c3a2e372b127f421adc030b19",
+  "protocol": {
+    "seed": 20260905, "value_dim": 128, "same_process_per_configuration": true,
+    "same_physical_5d_cache_and_page_table_per_configuration": true, "random_page_order": true,
+    "preallocated_output": true, "return_lse": false, "tail_padding": "zero; strict kernel correctness suites retain NaN-tail coverage",
+    "initial_all_candidate_warmups": 100, "warmups_per_round": 20, "iterations_per_round": 100, "rounds": 5, "num_rotate_args": 1,
+    "candidate_order": "forward/reversed on alternating rounds",
+    "timing": "Each sample is aiter.test_common.run_perftest GPU-profiler filtered mean; reported latency is median of five samples. No ATT/PMC enabled during timing.",
+    "excluded": "Compilation, initial allocation, CPU dispatch, reference, layout conversion and OPUS linear-KV preparation",
+    "reference": "Independent chunked FP32 reference on actual BF16 or dequantized FP8 inputs; all output elements, including H3, checked before timing",
+    "tolerances": {"bf16": {"rtol": 0.02, "atol": 0.02}, "fp8": {"rtol": 0.1, "atol": 0.1}},
+    "all_candidate_error_ratios": 0, "bit_exact_repeat_launches": 3,
+    "maximum_absolute_error_by_dtype": {"bf16": 0.00954294204711914, "fp8": 0.08626246452331543},
+    "fp8": "gfx950 OCP float8_e4m3fn, per-token/head Q scale, scalar K/V scales; compare with dequantized FP32 reference, not a different quantization contract",
+    "flops": "2*heads*visible_query_key_pairs*(dq+128); causal includes diagonal; SWA window128 is129 visible keys per row",
+    "logical_bytes": "input_element_bytes*(sum(Q)*heads*dq + page-aligned_visible_KV_union*kv_heads*(dq+128)) + 2*sum(Q)*heads*128; not HBM traffic",
+    "TFLOPS": "effective_flops / median_us / 1e6", "TB_per_second": "logical_bytes / median_us / 1e6"
+  },
+  "coverage": {"workloads": 22, "dtype_configurations": 44, "measured_candidate_results": 127, "timing_samples": 635, "resource_specializations": 30},
+  "workload_columns": ["name", "q_lens", "kv_lens", "dq", "heads", "kv_heads", "page", "causal", "window_left"],
+  "workloads": [
+    ["noncausal_d128", [10240], [2583], 128, 16, 1, 64, false, -1],
+    ["causal_d128", [32768], [32768], 128, 16, 1, 64, true, -1],
+    ["swa32k_d128", [16384], [32768], 128, 16, 1, 64, true, 128],
+    ["swa64k_d128", [16384], [65536], 128, 16, 1, 64, true, 128],
+    ["swa128k_d128", [16384], [131072], 128, 16, 1, 64, true, 128],
+    ["noncausal_d192", [10240], [2583], 192, 16, 1, 64, false, -1],
+    ["causal_d192", [32768], [32768], 192, 16, 1, 64, true, -1],
+    ["swa32k_d192", [16384], [32768], 192, 16, 1, 64, true, 128],
+    ["swa64k_d192", [16384], [65536], 192, 16, 1, 64, true, 128],
+    ["swa128k_d192", [16384], [131072], 192, 16, 1, 64, true, 128],
+    ["page32_noncausal", [10240], [2583], 192, 16, 1, 32, false, -1],
+    ["page32_causal", [32768], [32768], 192, 16, 1, 32, true, -1],
+    ["batch4_d192_p32", [10240,10240,10240,10240], [2560,2560,2560,2560], 192, 16, 1, 32, false, -1],
+    ["batch4_d128_h1_p32", [10240,10240,10240,10240], [2560,2560,2560,2560], 128, 1, 1, 32, false, -1],
+    ["singlehead_full_p32", [40960], [40960], 128, 1, 1, 32, false, -1],
+    ["singlehead_causal_p32", [32768], [32768], 128, 1, 1, 32, true, -1],
+    ["h3_p32", [63225,7], [63225,7], 128, 14, 14, 32, false, -1],
+    ["batch4_d192_p64", [10240,10240,10240,10240], [2560,2560,2560,2560], 192, 16, 1, 64, false, -1],
+    ["batch4_d128_h1_p64", [10240,10240,10240,10240], [2560,2560,2560,2560], 128, 1, 1, 64, false, -1],
+    ["singlehead_full_p64", [40960], [40960], 128, 1, 1, 64, false, -1],
+    ["singlehead_causal_p64", [32768], [32768], 128, 1, 1, 64, true, -1],
+    ["h3_p64", [63225,7], [63225,7], 128, 14, 14, 64, false, -1]
+  ],
+  "candidate_contracts": {
+    "8wave_5d": "Current pa_8wave_950.PagedAttention, BF16 page64 only, one attention kernel and no KV workspace; not legacy8wave",
+    "4wave_static_5d": "Current MHA static path, batch1 only",
+    "4wave_dynamic_5d": "Current MHA forced dynamic atomic-ticket path; batch>1 is labelled dynamic, never static",
+    "aiter_linear": "flash_attn_varlen_func with equivalent prebuilt linear KV; D128 full is ASM, D192 full OPUS, SWA CK",
+    "opus_linear": "Explicit OPUS D192 packed group or D128 dense4D uniform batch; no layout conversion timed"
+  },
+  "unavailable_rules": {
+    "8wave_5d": "All FP8 and page32 configurations: current kernel supports BF16 page64 only",
+    "4wave_static_5d": "Batch4 and H3: static supports batch1 only",
+    "opus_linear": "All FP8, SWA/sink and D128 ragged H3: no matching OPUS semantics/API",
+    "aiter_fp8": "Not configured for the README's per-token Q-scale contract; no claim that every FP8 AITER API is unsupported",
+    "aiter_5d_bf16": "Actually probed in every BF16 configuration, all22 returned no matching kernel found at page32/page64; no linear fallback",
+    "aiter_5d_error_template": "invalid argument for batch_prefill: no matching kernel found. page_size={page}, num_pages={sum(ceil(k/page))}, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required.",
+    "not_recreated": "Deleted gather/old-core paths, historical K16-vs-K64 code edits and rejected optimization variants remain historical, not current measurements",
+    "gfx942": "No gfx942 GPU available; historical MI308X numbers not relabelled or extrapolated",
+    "page128": "Covered by full4wave correctness suite, not a separate historical production timing row"
+  },
+  "dispatch_observations": {
+    "8wave_5d": ["_attention_kernel_0"],
+    "4wave_static_5d": ["attention_kernel_static_0"],
+    "4wave_dynamic_5d": ["attention_kernel_0"],
+    "aiter_D128_full_noncausal": ["aiter::fmha_fwd_hd128_bf16_group"],
+    "aiter_D128_full_causal": ["aiter::fmha_fwd_hd128_bf16_causal_group"],
+    "opus_D128_noncausal": ["void gqa_d128_kernel<opus_gqa_traits<32, 64, 128, 8, false> >(opus_gqa_kargs)"],
+    "opus_D128_causal": ["void gqa_d128_kernel<opus_gqa_traits<32, 64, 128, 8, true> >(opus_gqa_kargs)"],
+    "aiter_or_opus_D192_noncausal": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, false, true, false, false> >(opus_gqa_d192_kargs)"],
+    "aiter_or_opus_D192_causal": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, true, true, false, false> >(opus_gqa_d192_kargs)"],
+    "aiter_SWA_D128_pipeline": "BlockFmhaPipelineQRKSVSAsyncTrload",
+    "aiter_SWA_D192_pipeline": "BlockFmhaPipelineQRKSVSAsync",
+    "note": "Every candidate dispatch profiled before timing; full mangled CK names retained in original log records"
+  },
+  "validation": {
+    "current_8wave": {"passed": 181, "skipped": 6, "log": "/tmp/pa_readme_retest_8wave_suite.log"},
+    "4wave_default": {"passed": 51, "skipped": 2, "log": "/tmp/pa_readme_retest_4wave_suite.log", "note": "Two skips are opt-in performance tests. Some comparisons in this existing suite use historical pa_prefill_8w32x32.py; unified benchmark does not."},
+    "legacy_non_swa_opt_in": {"status": "ABORTED", "exit_code": 134, "location": "test_pa_prefill.py::test_pa_aiter_production_performance, synchronize after run_dispatched_aiter at causal Q=KV32768", "backend": "AITER linear/page1 mha_batch_prefill_func", "error": "Memory access fault by GPU node-2; Reason: Unknown", "log": "/tmp/pa_readme_retest_legacy_api.log", "timing_reported": false},
+    "legacy_swa_opt_in": {"passed": 1, "log": "/tmp/pa_readme_retest_legacy_swa.log", "note": "Fresh independent process; batch-prefill128K remained disabled by existing known-fault guard. Legacy8wave and CUDA-event/gather protocol, not the unified current table."},
+    "gpu_health_after_abort": "Fresh process torch.arange(16).sum()=120, synchronize succeeded"
+  },
+  "raw_logs": ["/tmp/pa_readme_retest_noncausal.log", "/tmp/pa_readme_retest_causal_swa.log", "/tmp/pa_readme_retest_extended.log", "/tmp/pa_readme_retest_h3.log"],
+  "samples_note": "Five per-round microsecond samples for every measured candidate. Median is derived rather than duplicated; omitted candidates follow unavailable_rules.",
+  "measurements": [
+    {"case":"noncausal_d128","dtype":"bf16","timing_us":{
+      "8wave_5d":[250.74794736842108,257.0362282608695,257.86347311827956,257.9018913043478,259.30372164948443],
+      "4wave_static_5d":[269.8346333333333,268.96839560439554,269.3599555555556,269.43896629213504,270.1864615384616],
+      "4wave_dynamic_5d":[274.64130107526887,273.6591052631579,275.4329793814433,276.0425612244898,274.06986170212764],
+      "aiter_linear":[253.2957362637363,253.2413448275863,253.52607692307697,254.12432967032973,254.18782954545458],
+      "opus_linear":[241.52547058823527,241.81041935483873,241.8838333333333,241.61646590909103,241.9224606741573]}},
+    {"case":"noncausal_d192","dtype":"bf16","timing_us":{
+      "8wave_5d":[292.8118,296.1155263157895,295.6975180722892,296.01547826086954,297.19564444444444],
+      "4wave_static_5d":[318.27525274725264,318.5284615384615,317.81062068965525,317.8584367816091,318.1157977528088],
+      "4wave_dynamic_5d":[324.60791358024704,325.20525882352956,324.7520588235294,325.0628888888889,325.40370786516854],
+      "aiter_linear":[292.6986966292136,292.603340909091,291.810619047619,292.09326966292116,292.62993103448275],
+      "opus_linear":[291.97824999999995,292.2230222222222,292.3260454545455,291.9589767441861,292.0129302325582]}},
+    {"case":"noncausal_d128","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[192.48560919540225,201.63628421052633,199.28670408163268,200.0499545454545,200.69047126436794],
+      "4wave_dynamic_5d":[216.69261290322572,215.80073195876295,217.25543434343425,215.06141414141413,217.0570404040405]}},
+    {"case":"noncausal_d192","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[217.75709210526335,222.0625681818182,223.5659042553192,222.8282365591397,222.59571428571437],
+      "4wave_dynamic_5d":[238.81900000000007,239.42839393939397,241.67208080808084,242.06826530612238,240.92619191919192]}},
+    {"case":"causal_d128","dtype":"bf16","timing_us":{
+      "8wave_5d":[4485.942462365593,4499.220350649349,4469.558090909092,4539.31253488372,4504.718505050507],
+      "4wave_static_5d":[4907.638112244896,4929.746242424247,4928.51723469388,4953.333676767676,4958.105193877553],
+      "4wave_dynamic_5d":[5487.470919191917,5497.94402020202,5509.99847474748,5524.423656565652,5541.321979797979],
+      "aiter_linear":[4549.533439024391,4458.3047575757555,4562.585024390241,4569.352240963861,4587.670052631584],
+      "opus_linear":[4681.8147373737365,4687.287717171719,4713.126918367348,4717.71378787879,4733.318515463919]}},
+    {"case":"causal_d192","dtype":"bf16","timing_us":{
+      "8wave_5d":[5341.337715789474,5347.7716590909085,5261.727393939396,5371.390791208791,5371.039871794874],
+      "4wave_static_5d":[6442.362767676769,6452.721173469387,6461.78883673469,6474.235343434347,6475.477886597938],
+      "4wave_dynamic_5d":[7112.91341836735,7132.683489795917,7144.3232626262625,7142.502525252522,7161.17390909091],
+      "aiter_linear":[5291.866714285715,5295.111555555555,5298.061565789471,5299.01142168675,5308.945782051282],
+      "opus_linear":[5293.986761904763,5294.943743902438,5298.312640000001,5299.029228915661,5310.558101265824]}},
+    {"case":"swa32k_d128","dtype":"bf16","timing_us":{
+      "8wave_5d":[90.21616326530616,101.5982626262626,100.55014141414145,101.67624242424233,102.8608865979381],
+      "4wave_static_5d":[84.15843434343444,81.96782291666665,82.88651020408159,82.50451041666669,83.7483131313131],
+      "4wave_dynamic_5d":[88.6022371134021,89.04992929292932,89.44670707070703,90.61765656565656,88.58322222222218],
+      "aiter_linear":[116.26493617021279,118.73776288659798,116.71946315789474,118.59457291666662,115.82862365591401]}},
+    {"case":"swa64k_d128","dtype":"bf16","timing_us":{
+      "8wave_5d":[92.73965909090906,100.23942424242418,101.98453535353525,101.2540000000001,101.84755555555554],
+      "4wave_static_5d":[83.78063636363633,81.7032291666667,83.36995833333332,82.60524242424242,83.64043434343436],
+      "4wave_dynamic_5d":[87.99608163265304,89.01759595959592,88.2490808080808,87.65996969696977,88.19089898989897],
+      "aiter_linear":[115.81669387755099,118.95589534883719,116.39991666666663,118.2564893617022,117.7987525773196]}},
+    {"case":"swa128k_d128","dtype":"bf16","timing_us":{
+      "8wave_5d":[91.92517171717174,101.51381818181815,102.5861616161616,100.43376767676766,101.28107070707068],
+      "4wave_static_5d":[82.89414141414142,82.28825000000002,83.82670707070709,82.00401010101007,81.87673737373733],
+      "4wave_dynamic_5d":[89.31377777777773,89.85803030303026,89.16103030303029,90.03581818181813,89.19255555555549],
+      "aiter_linear":[116.1304,117.754125,116.37613978494623,118.36416129032264,116.18573958333342]}},
+    {"case":"swa32k_d192","dtype":"bf16","timing_us":{
+      "8wave_5d":[105.36878723404254,116.68978260869562,117.105,115.85290909090908,117.61823232323233],
+      "4wave_static_5d":[97.16495959595953,96.66797979797975,95.94956565656561,95.60369696969703,97.78195959595953],
+      "4wave_dynamic_5d":[104.00965656565651,105.289303030303,103.19953535353532,105.060202020202,102.98456565656564],
+      "aiter_linear":[128.1450808080807,127.4532291666667,127.4541414141414,127.39531250000005,125.75358695652167]}},
+    {"case":"swa64k_d192","dtype":"bf16","timing_us":{
+      "8wave_5d":[108.21844999999999,116.77740404040404,117.07558585858591,115.84322580645154,117.37718478260872],
+      "4wave_static_5d":[96.15078787878791,96.57787878787877,97.4453838383839,96.78313131313128,97.52902020202016],
+      "4wave_dynamic_5d":[102.07059595959603,103.3599393939394,102.50777777777775,104.5361414141414,104.12884848484846],
+      "aiter_linear":[125.82184782608698,127.56607070707068,126.48913829787237,127.19635353535354,126.52488297872338]}},
+    {"case":"swa128k_d192","dtype":"bf16","timing_us":{
+      "8wave_5d":[105.27824999999996,115.63676344086026,115.46686021505384,116.38990909090906,116.80368085106382],
+      "4wave_static_5d":[97.2209183673469,96.4053434343435,96.05259595959592,95.7911818181818,96.8683939393939],
+      "4wave_dynamic_5d":[102.46981818181817,103.35993939393936,102.34818181818184,103.0968888888888,102.71465656565657],
+      "aiter_linear":[127.48808080808088,127.98757731958764,126.5211237113402,128.4788282828283,126.4174947368421]}},
+    {"case":"causal_d128","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[3760.3454421052625,3765.339391752577,3763.951298969073,3784.574737373738,3780.3118659793818],
+      "4wave_dynamic_5d":[4202.289551020409,4207.72801041667,4206.477428571429,4190.645567010311,4200.162787878787]}},
+    {"case":"causal_d192","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[4360.29587878788,4339.517707070708,4340.551686868687,4341.749676767678,4348.007583333331],
+      "4wave_dynamic_5d":[4725.140252525252,4730.103666666665,4729.300777777777,4734.493282828283,4738.613383838383]}},
+    {"case":"swa32k_d128","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[53.564181818181815,60.772515151515144,59.65773737373739,59.61611111111109,59.64480808080806],
+      "4wave_dynamic_5d":[71.80691836734691,71.86949494949492,71.41533333333338,70.68723232323231,70.73814141414141]}},
+    {"case":"swa64k_d128","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[52.81547474747473,59.40398989898986,61.307888888888904,59.08074747474752,59.80763636363636],
+      "4wave_dynamic_5d":[72.1721313131313,71.0403402061856,71.69130303030306,70.77692929292937,70.76603030303035]}},
+    {"case":"swa128k_d128","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[53.386797979797976,60.45978787878789,60.81535353535356,61.5877684210526,59.16397979797979],
+      "4wave_dynamic_5d":[72.22507070707071,72.57456565656564,72.18142424242421,71.17895959595965,72.08404040404042]}},
+    {"case":"swa32k_d192","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[60.91595959595963,68.09724242424242,69.71132653061225,68.79864285714285,68.8184673913044],
+      "4wave_dynamic_5d":[79.7736161616162,80.27416326530617,80.76395959595959,80.26575757575755,80.08474747474745]}},
+    {"case":"swa64k_d192","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[60.029464646464625,68.10531313131314,68.77964948453602,69.060101010101,68.7963440860215],
+      "4wave_dynamic_5d":[80.94012121212127,80.6484040404041,80.8932525252526,80.72234343434343,80.29727272727273]}},
+    {"case":"swa128k_d192","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[61.3474949494949,69.2959587628866,68.26249494949496,69.31184210526318,68.70534343434346],
+      "4wave_dynamic_5d":[79.37198947368428,80.05538947368423,80.75708080808079,80.61930303030303,81.14941414141413]}},
+    {"case":"page32_noncausal","dtype":"bf16","timing_us":{
+      "4wave_static_5d":[313.7265131578947,317.3483146067415,316.2080229885057,317.41747777777795,317.03929885057465],
+      "4wave_dynamic_5d":[319.7717362637363,319.8206444444444,319.13317241379315,320.0765217391305,319.5802000000001],
+      "aiter_linear":[291.7779550561799,291.91011235955045,291.79807954545447,292.05998901098906,291.20803448275865],
+      "opus_linear":[291.53586206896546,292.16010000000017,292.15864044943817,292.0663913043479,292.2169999999999]}},
+    {"case":"page32_causal","dtype":"bf16","timing_us":{
+      "4wave_static_5d":[6379.409938775511,6408.885091836735,6416.671499999996,6440.163828282825,6446.568818181819],
+      "4wave_dynamic_5d":[6997.021141414142,6999.979707070709,7001.488438775507,7008.881878787881,7036.944418367349],
+      "aiter_linear":[5209.960313253012,5214.888843373498,5239.548011764708,5248.867864197529,5277.692542168677],
+      "opus_linear":[5211.041036585366,5214.313363636365,5242.7347012987,5246.897875000002,5278.977780487807]}},
+    {"case":"batch4_d192_p32","dtype":"bf16","timing_us":{
+      "4wave_dynamic_5d":[1274.1821855670103,1271.02306185567,1274.1192577319584,1274.5122783505155,1275.7610000000002],
+      "aiter_linear":[1085.646597826087,1085.3916041666669,1086.1720624999998,1085.8168210526312,1086.2878913043485],
+      "opus_linear":[1084.74647368421,1085.393652631579,1084.6999166666662,1086.1718000000003,1085.5953085106378]}},
+    {"case":"batch4_d128_h1_p32","dtype":"bf16","timing_us":{
+      "4wave_dynamic_5d":[80.7741590909091,89.67332323232327,88.96945454545457,89.32505102040818,87.93548484848488],
+      "aiter_linear":[78.06242105263163,78.3007878787879,77.79249494949494,77.24681052631577,77.36056565656567],
+      "opus_linear":[78.21311111111113,76.16297916666666,77.75653535353531,76.92628865979384,76.97074489795922]}},
+    {"case":"singlehead_full_p32","dtype":"bf16","timing_us":{
+      "4wave_static_5d":[1117.694453608248,1119.7565937499996,1119.578452631579,1119.387536082474,1121.0712187499994],
+      "4wave_dynamic_5d":[1112.6220421052633,1111.501515789474,1112.8505104166663,1112.2013125,1113.6651250000002],
+      "aiter_linear":[1023.609557894736,1025.3670631578946,1027.3170760869561,1030.1631170212759,1032.558117021277],
+      "opus_linear":[956.5890421052629,964.2836262626264,961.6637368421052,965.6706562499995,957.0712424242428]}},
+    {"case":"singlehead_causal_p32","dtype":"bf16","timing_us":{
+      "4wave_static_5d":[633.7751530612245,634.2808723404249,633.96628125,634.2011010101013,634.5217083333331],
+      "4wave_dynamic_5d":[620.5711157894734,620.5968865979384,620.0491250000001,620.4461720430108,620.5331276595746],
+      "aiter_linear":[592.6153535353533,593.3204343434345,592.8117474747477,592.7574842105265,592.8767878787879],
+      "opus_linear":[533.1530833333335,531.3940210526312,533.8403703703706,533.1331546391751,533.0913578947367]}},
+    {"case":"batch4_d192_p64","dtype":"bf16","timing_us":{
+      "8wave_5d":[1086.7834270833328,1086.3506382978724,1086.980221052632,1087.5800638297872,1086.4281999999992],
+      "4wave_dynamic_5d":[1274.7311530612249,1275.84956122449,1271.794206185567,1276.195704081633,1275.6960918367347],
+      "aiter_linear":[1087.9170860215054,1088.1126813186818,1087.1924999999999,1087.5226063829791,1089.3860851063837],
+      "opus_linear":[1086.8892736842106,1087.2358229166666,1086.314042553192,1087.376442105263,1088.27247368421]}},
+    {"case":"batch4_d128_h1_p64","dtype":"bf16","timing_us":{
+      "8wave_5d":[67.28584848484842,77.59248484848483,78.10751020408159,77.86037373737376,78.53918181818186],
+      "4wave_dynamic_5d":[90.82890909090902,90.89518181818187,90.2474848484849,89.17470707070706,89.98848484848483],
+      "aiter_linear":[77.91209090909092,77.21660824742268,77.59973469387755,78.08826262626269,77.93310101010104],
+      "opus_linear":[76.96498989898987,77.52703030303032,77.31247474747475,76.35036842105265,76.77265656565658]}},
+    {"case":"singlehead_full_p64","dtype":"bf16","timing_us":{
+      "8wave_5d":[1005.9870714285713,1006.8700416666665,1004.9316250000002,1027.7216145833333,1006.4615368421053],
+      "4wave_static_5d":[1113.3947216494842,1114.9621855670111,1113.613278350515,1116.4331250000005,1111.9211034482753],
+      "4wave_dynamic_5d":[1109.5191413043472,1109.5395760869562,1111.8630425531915,1109.6273263157902,1110.4404315789482],
+      "aiter_linear":[1018.3430476190475,1030.9065,1022.273306818181,1024.1507555555556,1023.7996000000012],
+      "opus_linear":[950.4676777777781,958.0683979591845,952.353500000001,954.9178617021283,954.5991170212762]}},
+    {"case":"singlehead_causal_p64","dtype":"bf16","timing_us":{
+      "8wave_5d":[612.2172727272729,613.1922525252528,612.7405252525255,612.9966868686868,613.3715612244897],
+      "4wave_static_5d":[623.4995913978495,623.7207010309281,623.5984044943814,624.1800537634404,623.5221458333331],
+      "4wave_dynamic_5d":[628.5733118279568,629.2976086956521,628.5929183673468,628.8602421052632,629.276965909091],
+      "aiter_linear":[595.7893917525774,596.3036020408163,597.2167373737375,596.3205353535355,597.2624329896908],
+      "opus_linear":[535.7048333333335,534.0679081632652,535.5444166666666,533.1701562500001,533.4206276595748]}},
+    {"case":"page32_noncausal","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[218.55492207792216,225.5261758241759,225.61587912087913,225.32660227272711,225.67493258426967],
+      "4wave_dynamic_5d":[240.30418085106385,243.5310520833334,242.82667676767667,242.04564646464644,244.30474468085112]}},
+    {"case":"page32_causal","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[4403.572252525252,4406.496214285713,4406.595424242427,4388.502656565657,4380.7243608247445],
+      "4wave_dynamic_5d":[4713.419747474747,4718.784383838387,4726.341010101009,4727.180626262627,4738.349909090911]}},
+    {"case":"batch4_d192_p32","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[917.3589479166675,916.8635773195883,912.1575851063823,910.6143052631585,915.9248105263155]}},
+    {"case":"batch4_d128_h1_p32","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[70.22615151515149,75.03077777777779,74.38655102040816,74.45742424242422,75.06592929292924]}},
+    {"case":"singlehead_full_p32","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[938.92797979798,943.6194166666661,944.3544183673462,943.5232525252529,939.9178686868685],
+      "4wave_dynamic_5d":[940.2293608247423,940.570818181819,944.2275252525258,941.4165151515143,941.4213535353533]}},
+    {"case":"singlehead_causal_p32","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[580.8474835164835,581.05193814433,581.0828080808081,581.3022121212125,581.1576979166667],
+      "4wave_dynamic_5d":[586.9512164948454,586.3872424242425,587.1626262626261,586.9639894736841,586.9917789473681]}},
+    {"case":"batch4_d192_p64","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[908.0618421052627,907.2723191489363,909.4581935483872,905.9174193548387,908.077053763441]}},
+    {"case":"batch4_d128_h1_p64","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[70.73202020202025,75.5269494949495,74.90874747474746,75.37542424242423,74.21267346938774]}},
+    {"case":"singlehead_full_p64","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[941.5688888888889,941.7995454545458,941.8694545454542,941.9377373737375,942.7999898989898],
+      "4wave_dynamic_5d":[944.3635257731958,945.5168585858588,945.2424949494948,945.8548673469382,944.5631030927835]}},
+    {"case":"singlehead_causal_p64","dtype":"fp8","timing_us":{
+      "4wave_static_5d":[567.3538749999999,567.4893814432987,567.3049393939394,567.37201010101,567.4115306122452],
+      "4wave_dynamic_5d":[572.3734949494948,572.3370404040404,572.1402626262625,572.3447070707075,572.6138181818178]}},
+    {"case":"h3_p32","dtype":"bf16","timing_us":{
+      "4wave_dynamic_5d":[30952.239868686876,30994.839252747264,31001.906428571423,31140.88980808083,31238.976444444408],
+      "aiter_linear":[34858.38347916666,34964.34680208337,35201.7085744681,35219.39462499999,35231.31704166666]}},
+    {"case":"h3_p64","dtype":"bf16","timing_us":{
+      "8wave_5d":[34665.58409090909,34752.543530612245,34742.36212121213,34626.90896907216,34647.84097979796],
+      "4wave_dynamic_5d":[31589.78688888889,31576.613707070726,31583.970424242416,31591.504171717155,31578.617414141398],
+      "aiter_linear":[35195.653666666665,35167.791561224505,35173.90338947368,35160.31615151517,35159.593459183685]}},
+    {"case":"h3_p32","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[25498.5958125,25441.80725252525,25426.733474747485,25378.46702020202,25344.607959595975]}},
+    {"case":"h3_p64","dtype":"fp8","timing_us":{
+      "4wave_dynamic_5d":[25054.227247422685,25094.569686868694,25107.299178947345,25132.148212121225,25079.781851063857]}}
+  ],
+  "resource_columns": ["mode", "dq", "dtype", "candidate", "vgpr", "sgpr", "lds_bytes"],
+  "resource_common": {"private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0, "source": "fresh final ISA metadata", "log": "/tmp/pa_readme_retest_resources.log"},
+  "resources": [
+    ["noncausal",128,"bf16","8wave_5d",226,55,99840],
+    ["noncausal",128,"bf16","4wave_static_5d",180,74,16640],
+    ["noncausal",128,"bf16","4wave_dynamic_5d",186,100,16644],
+    ["noncausal",128,"fp8","4wave_static_5d",148,74,16384],
+    ["noncausal",128,"fp8","4wave_dynamic_5d",156,98,16388],
+    ["noncausal",192,"bf16","8wave_5d",256,59,149760],
+    ["noncausal",192,"bf16","4wave_static_5d",212,74,24960],
+    ["noncausal",192,"bf16","4wave_dynamic_5d",218,100,24964],
+    ["noncausal",192,"fp8","4wave_static_5d",166,74,16384],
+    ["noncausal",192,"fp8","4wave_dynamic_5d",176,99,16388],
+    ["causal",128,"bf16","8wave_5d",221,83,99840],
+    ["causal",128,"bf16","4wave_static_5d",182,74,16640],
+    ["causal",128,"bf16","4wave_dynamic_5d",184,96,16644],
+    ["causal",128,"fp8","4wave_static_5d",148,74,16384],
+    ["causal",128,"fp8","4wave_dynamic_5d",153,96,16388],
+    ["causal",192,"bf16","8wave_5d",254,89,149760],
+    ["causal",192,"bf16","4wave_static_5d",214,74,24960],
+    ["causal",192,"bf16","4wave_dynamic_5d",216,96,24964],
+    ["causal",192,"fp8","4wave_static_5d",166,74,16384],
+    ["causal",192,"fp8","4wave_dynamic_5d",172,96,16388],
+    ["swa128k",128,"bf16","8wave_5d",228,69,99840],
+    ["swa128k",128,"bf16","4wave_static_5d",173,48,16640],
+    ["swa128k",128,"bf16","4wave_dynamic_5d",174,68,16644],
+    ["swa128k",128,"fp8","4wave_static_5d",145,46,16384],
+    ["swa128k",128,"fp8","4wave_dynamic_5d",149,66,16388],
+    ["swa128k",192,"bf16","8wave_5d",256,71,149760],
+    ["swa128k",192,"bf16","4wave_static_5d",208,46,24960],
+    ["swa128k",192,"bf16","4wave_dynamic_5d",209,68,24964],
+    ["swa128k",192,"fp8","4wave_static_5d",164,46,16384],
+    ["swa128k",192,"fp8","4wave_dynamic_5d",168,66,16388]
+  ],
+  "pmc": {
+    "case": "noncausal_d192", "dtype": "bf16", "iterations": [21,22,23],
+    "root": "/tmp/pa_readme_retest_pmc",
+    "note": "Two separate matched counter groups per candidate. Each array contains three raw readings. Instrumented durations are not included in timing samples.",
+    "values": {
+      "8wave_5d": {"SQ_INSTS_LDS":[8458240,8458240,8458240],"SQ_INSTS_MFMA":[8396800,8396800,8396800],"SQ_INSTS_VALU":[40509440,40509440,40509440],"SQ_INSTS_VMEM_RD":[1157120,1157120,1157120],"SQ_LDS_BANK_CONFLICT":[0,0,0],"SQ_WAVES":[5120,5120,5120],"MeanOccupancyPerActiveCU":[1.980943,1.982449,1.983482],"MfmaUtil":[57.976906,57.623471,55.180884],"TCC_HIT_sum":[9364779,9402273,9402102],"TCC_MISS_sum":[1153697,1171623,1171638]},
+      "4wave_static_5d": {"SQ_INSTS_LDS":[5160960,5160960,5160960],"SQ_INSTS_MFMA":[8294400,8294400,8294400],"SQ_INSTS_VALU":[47052800,47052800,47052800],"SQ_INSTS_VMEM_RD":[4869120,4869120,4869120],"SQ_LDS_BANK_CONFLICT":[491520,491520,491520],"SQ_WAVES":[5120,5120,5120],"MeanOccupancyPerActiveCU":[1.910956,1.908244,1.907906],"MfmaUtil":[53.880341,53.780508,54.357172],"TCC_HIT_sum":[17049888,17053116,17051885],"TCC_MISS_sum":[1062456,1081012,1081976]},
+      "4wave_dynamic_5d": {"SQ_INSTS_LDS":[5167360,5167360,5167360],"SQ_INSTS_MFMA":[8294400,8294400,8294400],"SQ_INSTS_VALU":[47639042,47639042,47639042],"SQ_INSTS_VMEM_RD":[4884480,4884480,4884480],"SQ_LDS_BANK_CONFLICT":[491520,491520,491520],"SQ_WAVES":[2048,2048,2048],"MeanOccupancyPerActiveCU":[1.880528,1.879297,1.880525],"MfmaUtil":[52.679715,51.999326,52.093382],"TCC_HIT_sum":[17089779,17098448,17095937],"TCC_MISS_sum":[1117048,1133092,1135358]},
+      "opus_linear": {"SQ_INSTS_LDS":[11816960,11816960,11816960],"SQ_INSTS_MFMA":[8396800,8396800,8396800],"SQ_INSTS_VALU":[40092160,40092160,40092160],"SQ_INSTS_VMEM_RD":[1152000,1152000,1152000],"SQ_LDS_BANK_CONFLICT":[0,0,0],"SQ_WAVES":[5120,5120,5120],"MeanOccupancyPerActiveCU":[1.98123,1.981381,1.981487],"MfmaUtil":[61.166642,60.172859,58.756354],"TCC_HIT_sum":[8974848,9012583,9012597],"TCC_MISS_sum":[1095002,1123989,1123975]}
+    }
+  },
+  "att": {
+    "case": "noncausal_d192", "candidate": "8wave_5d", "root": "/tmp/pa_readme_retest_att", "analysis": "/tmp/pa_readme_retest_att_analysis.json",
+    "ui_prefix": "ui_output_agent_44279_dispatch_", "dispatches": [41,42,43], "iterations": [21,22,23], "se": 0, "cu": 1, "simd_mask": "0xf",
+    "complete_waves": [24,24,24], "instructions_per_wave": 12217, "bfi_per_wave": 0, "waitcnt_per_wave": 179, "barriers_per_wave": 333, "mfma_per_wave": 1640,
+    "steady_phase_cycles": [2782.561403508772,2783.8596491228072,2784.7368421052633], "mean_steady_phase_cycles": 2783.719298245614,
+    "mfma_union_model_pct": [78.61151610777128,77.39899269222545,77.34765915739983],
+    "note": "Aligned CTA stage intervals, not global kernel-time attribution. MFMA union is a labelled32-cycle execution-window model, not the hardware MfmaUtil counter."
+  },
+  "legacy_swa_event_protocol": {
+    "current_8wave_included": false, "warmups": 20, "samples": 100, "rounds": 5, "timing": "CUDA-event median, different seed/input construction; do not compare with unified profiler rows",
+    "columns": ["kv", "gather_us", "batch_prefill_only_us", "gather_batch_prefill_us", "varlen_only_us", "gather_varlen_us", "4wave_static_us", "4wave_dynamic_us", "historical_8wave_us"],
+    "printed_results_rounded_to_2_decimals": [
+      [32768,33.28,259.57,280.69,117.20,148.09,77.48,88.02,123.22],
+      [65536,62.26,259.87,323.35,118.02,180.29,78.08,85.48,123.56],
+      [131072,153.45,null,null,122.12,269.03,79.34,85.04,124.12]
+    ],
+    "null_reason": "Existing known128K batch-prefill GPU-fault guard; not run",
+    "direct_5d": "All3 unsupported: no matching kernel found",
+    "status": "1 passed"
+  }
+}

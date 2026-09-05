@@ -1,0 +1,169 @@
+{
+  "date": "2026-09-05",
+  "status": "packed-V and control/wait changes integrated in pa_8wave_950.py",
+  "gpu": "AMD Instinct MI350X gfx950",
+  "python": "/opt/venv/bin/python",
+  "dtype": "bfloat16",
+  "batch": 1,
+  "query_heads": 16,
+  "kv_heads": 1,
+  "value_dim": 128,
+  "page_size": 64,
+  "source": {
+    "baseline_git_blob": "d9d34e3",
+    "baseline_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428",
+    "packed_only_merged_sha256": "7d3a128dcb482b75772c052e2431fad83e55a407e1fdfab8a21029309efbeca2",
+    "final_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+    "final_test_sha256": "8747141372fd76a37f825c44c76fb27829c6279b9427e74b705b7ffe46fa62d3",
+    "comparison_driver": "/tmp/pa950_compare_control.py",
+    "packed_helper": "/tmp/pa950_att_ablation.py:read_v_i32",
+    "baseline_loading": "git show d9d34e3, checked against baseline SHA256; two independent modules loaded via in-memory linecache, one overriding only _read_v with the verified packed implementation. No baseline runtime branch added to production.",
+    "scope": "Only the FlyDSL attention source, its tests and reports changed. AITER and 4-wave kernels unchanged; no persistent scheduler, gather or workspace added."
+  },
+  "changes": [
+    "Assemble V LDS fragments as32 packed i32 words followed by one BF16 store instead of repeated BF16 slice stores.",
+    "Fuse simultaneous rolling VM and page/LDS waits into one tied-result s_waitcnt vmcnt(KEEP_VMCNT) lgkmcnt(0); preserve wait thresholds.",
+    "Use remaining=kv_len-tile*64 and remaining<64 for noncausal boundary masking; callers provide valid tiles.",
+    "Compile out V tail-mask calls in forward main-loop phases: consumed data tile t-1 is strictly before the final processed tile. Retain reverse-phase and epilogue V tail clearing and their scheduler fences."
+  ],
+  "validation": {
+    "packed_only_before_controls": {"passed": 173, "skipped": 6, "log": "/tmp/pa950_packed_v_merged_full_suite.log"},
+    "control_focused": {"passed": 83, "deselected": 96, "log": "/tmp/pa950_control_wait_focused.log"},
+    "final_full": {"passed": 181, "skipped": 6, "log": "/tmp/pa950_packed_control_full_suite.log"},
+    "skip_reason": "AITER 5D page64 specialization unavailable; no numerical failures skipped.",
+    "new_tests": "Eight cases: D128/D192 x forward/noncausal or paired causal reverse x with/without LSE; runtime KV lengths1,64,65,128,193,321,320 with actual physical NaN-poisoned tails, three bit-exact repeats, FP32 reference, no recompilation."
+  },
+  "protocol": {
+    "same_process_per_shape": true,
+    "same_original_5d_cache_and_page_table": true,
+    "preallocated_outputs": true,
+    "return_lse": false,
+    "initial_all_candidate_warmups": 100,
+    "warmups_per_measurement": 20,
+    "iterations_per_measurement": 100,
+    "num_rotate_args": 1,
+    "rounds": 5,
+    "candidate_order": "forward/reversed on alternating rounds",
+    "timing": "median of five aiter.test_common.run_perftest GPU-profiler filtered averages, microseconds; no ATT/PMC enabled during timing",
+    "excluded": "compilation, first allocation, CPU dispatch, independent torch reference, construction of equivalent logical linear KV for OPUS",
+    "accuracy": "FP32 reference rtol=atol0.02, checkAllclose ratio0 required; three bit-exact repeats per candidate",
+    "tail_padding": "zero for timing; NaN poisoning retained in correctness regressions",
+    "opus": "explicit D128 dense4D or D192 packed3D group OPUS on equivalent prebuilt linear KV; not a 5D end-to-end comparison; SWA/sink unsupported",
+    "flops": "2*heads*visible_query_key_pairs*(dq+128)",
+    "logical_bytes": "2*(q*heads*(dq+128)+visible_page_aligned_KV_union*kv_heads*(dq+128)); not HBM counter",
+    "env": {"FLYDSL_RUNTIME_ENABLE_CACHE": "0"},
+    "logs": ["/tmp/pa950_control_wait_nc.log", "/tmp/pa950_control_wait_causal_swa.log"]
+  },
+  "cases": [
+    {
+      "q": 10240, "kv": 2583, "dq": 128, "causal": false, "window_left": -1, "sink": false,
+      "timing_us": {
+        "original_5d": [270.75220689655157, 266.3949893617022, 268.0611458333334, 265.48637362637373, 265.14506521739133],
+        "packed_only_5d": [259.0596413043478, 259.34484782608706, 259.8092150537634, 260.05363736263735, 259.01981609195394],
+        "current_5d": [257.53373684210516, 258.56565934065947, 259.9868842105263, 256.8344666666667, 258.49496666666676],
+        "opus_linear": [241.2441333333333, 241.11159770114932, 242.47232291666668, 241.34368888888895, 241.27233720930218]
+      },
+      "median_us": {"original_5d": 266.3949893617022, "packed_only_5d": 259.34484782608706, "current_5d": 258.49496666666676, "opus_linear": 241.27233720930218},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0, "opus_linear": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    },
+    {
+      "q": 10240, "kv": 2583, "dq": 192, "causal": false, "window_left": -1, "sink": false,
+      "timing_us": {
+        "original_5d": [297.3587578947369, 304.0589677419354, 303.37689130434785, 304.1822637362638, 303.6890652173912],
+        "packed_only_5d": [299.0902183908046, 299.1262826086956, 301.1140370370369, 298.63235869565216, 298.6732282608696],
+        "current_5d": [296.68793478260864, 296.1823977272727, 294.81679775280907, 296.9133409090909, 297.3572365591398],
+        "opus_linear": [292.41402247191, 292.4525652173913, 291.1518023255813, 291.94973033707873, 291.5471309523808]
+      },
+      "median_us": {"original_5d": 303.6890652173912, "packed_only_5d": 299.0902183908046, "current_5d": 296.68793478260864, "opus_linear": 291.94973033707873},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0, "opus_linear": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    },
+    {
+      "q": 32768, "kv": 32768, "dq": 128, "causal": true, "window_left": -1, "sink": false,
+      "timing_us": {
+        "original_5d": [4522.610340206188, 4578.457030303034, 4580.60380808081, 4601.696292929292, 4572.885131313133],
+        "packed_only_5d": [4419.919555555556, 4462.103323232325, 4471.396636363637, 4487.086111111112, 4494.72192929293],
+        "current_5d": [4449.523090909091, 4493.739613333336, 4475.263030303031, 4522.026415584419, 4501.501585858585],
+        "opus_linear": [4672.624484848482, 4678.861494949493, 4697.384606060606, 4703.129868686868, 4724.015101010101]
+      },
+      "median_us": {"original_5d": 4578.457030303034, "packed_only_5d": 4471.396636363637, "current_5d": 4493.739613333336, "opus_linear": 4697.384606060606},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0, "opus_linear": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    },
+    {
+      "q": 32768, "kv": 32768, "dq": 192, "causal": true, "window_left": -1, "sink": false,
+      "timing_us": {
+        "original_5d": [5414.600714285716, 5443.131787500005, 5439.9547037037055, 5452.7180875, 5451.448901234572],
+        "packed_only_5d": [5313.3471125, 5327.330621951219, 5335.192819277107, 5351.112439024388, 5357.399487804878],
+        "current_5d": [5309.5799375, 5317.538522727275, 5244.258090909092, 5340.318700000001, 5353.156925925926],
+        "opus_linear": [5278.623512195124, 5278.156193181821, 5284.699282051278, 5285.5566705882375, 5291.8624805194795]
+      },
+      "median_us": {"original_5d": 5443.131787500005, "packed_only_5d": 5335.192819277107, "current_5d": 5317.538522727275, "opus_linear": 5284.699282051278},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0, "opus_linear": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    },
+    {
+      "q": 16384, "kv": 131072, "dq": 128, "causal": true, "window_left": 128, "sink": true,
+      "timing_us": {
+        "original_5d": [91.75706060606053, 103.45243434343439, 102.88433333333327, 103.96032323232319, 103.89851515151517],
+        "packed_only_5d": [102.15623232323233, 100.63940404040402, 102.50250505050506, 102.86396875000003, 102.12108080808089],
+        "current_5d": [101.89723232323234, 101.47377777777781, 101.57842424242419, 101.76915151515156, 102.27502020202017]
+      },
+      "median_us": {"original_5d": 103.45243434343439, "packed_only_5d": 102.15623232323233, "current_5d": 101.76915151515156},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    },
+    {
+      "q": 16384, "kv": 131072, "dq": 192, "causal": true, "window_left": 128, "sink": true,
+      "timing_us": {
+        "original_5d": [107.16922727272727, 119.0978484848485, 119.1977204301075, 118.86329347826081, 119.05582828282832],
+        "packed_only_5d": [116.56195833333334, 117.50948387096771, 117.12932608695654, 116.84452173913041, 117.4452626262626],
+        "current_5d": [116.52077777777772, 116.98221212121211, 116.55890322580647, 116.25567741935484, 115.63671717171714]
+      },
+      "median_us": {"original_5d": 119.05582828282832, "packed_only_5d": 117.12932608695654, "current_5d": 116.52077777777772},
+      "errors": {"original_5d": 0.0, "packed_only_5d": 0.0, "current_5d": 0.0},
+      "source_sha256": "d75b971423b763b6968d143b008845ad4d100e64b69f10ba0c6e2671cd4ff79c",
+      "baseline_source_sha256": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428"
+    }
+  ],
+  "resources": [
+    {"mode": "noncausal", "dq": 128, "vgpr_count": 226, "sgpr_count": 55, "group_segment_fixed_size": 99840, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0},
+    {"mode": "noncausal", "dq": 192, "vgpr_count": 256, "sgpr_count": 59, "group_segment_fixed_size": 149760, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0},
+    {"mode": "causal", "dq": 128, "vgpr_count": 221, "sgpr_count": 83, "group_segment_fixed_size": 99840, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0},
+    {"mode": "causal", "dq": 192, "vgpr_count": 254, "sgpr_count": 89, "group_segment_fixed_size": 149760, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0},
+    {"mode": "swa", "dq": 128, "vgpr_count": 228, "sgpr_count": 69, "group_segment_fixed_size": 99840, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0},
+    {"mode": "swa", "dq": 192, "vgpr_count": 256, "sgpr_count": 71, "group_segment_fixed_size": 149760, "private_segment_fixed_size": 0, "vgpr_spill_count": 0, "sgpr_spill_count": 0}
+  ],
+  "att_final_d192_noncausal": {
+    "raw_directory": "/tmp/pa950_packed_control_att_final",
+    "analysis": "/tmp/pa950_packed_control_att_analysis.json",
+    "ui_prefix": "ui_output_agent_51323_dispatch_",
+    "dispatches": [38, 39, 40],
+    "target_iterations": [21, 22, 23],
+    "decoded_se": 0, "target_cu": 1, "simd_mask": "0xf",
+    "complete_waves": [24, 24, 16],
+    "instructions_per_wave": 12217,
+    "bfi_per_wave": 0,
+    "waitcnt_per_wave": 179,
+    "barriers_per_wave": 333,
+    "mfma_per_wave": 1640,
+    "lds_reads_per_wave": 1652,
+    "s_load_dword_per_wave": 49,
+    "s_nop_per_wave": 752,
+    "steady_phase_cycles": [2787.964912280702, 2785.052631578947, 2789.4736842105262],
+    "steady_phase_mean_cycles": 2787.497076023392,
+    "before": {"instructions_per_wave": 13502.5, "bfi_per_wave": 656, "waitcnt_per_wave": 218, "barriers_per_wave": 333, "mfma_per_wave": 1640, "s_nop_per_wave": 652, "steady_phase_mean_cycles": 2913.593567251462},
+    "note": "Same analyzer and41-tile workload; observed aligned CTA stage cycles, not a global kernel speedup. All333 barriers and1640 MFMA retained. Some hazard padding increased; no claim that all instruction categories improved. Historical baseline captures are in d192_noncausal_att_results.json."
+  },
+  "caveats": [
+    "All six final medians improve over original, but D128 causal is0.50% slower than packed-only in this round. No universal control-only speedup is claimed.",
+    "OPUS timings exclude input conversion and are not native5D performance. Current AITER5D page64 remains unavailable.",
+    "No persistent scheduler implemented; the public implementation remains a single direct-paged kernel with no KV workspace."
+  ]
+}

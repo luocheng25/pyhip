@@ -1,5 +1,626 @@
 # Paged Prefill 4-wave/8-wave 优化与性能报告
 
+## 最新：8-wave tile API 重构（2026-09-05）
+
+当前 direct-paged 8-wave 的 QK/PV 已改用 tiled-MMA fragment + `fx.gemm`，
+保留 OPUS 八阶段流水。D128/D192 × full/causal/SWA 六种 specialization 的
+**每条汇编指令及操作数、寄存器/LDS/spill 都与重构前一致**。
+完整回归 **181 passed / 6 skipped**。首轮同进程延迟差 -0.16%～+1.09%，反序复测
+短路径 -0.57%～+0.01%，未观察到可重复下降；不宣称 refactor 本身加速。
+原始样本、逐指令核对及复现见 [tile 重构验收](../pa_8wave/tile_refactor.md)。
+
+## 统一全矩阵重测（tile 重构前，2026-09-05）
+
+本轮按本文的可运行 workload 矩阵重新测量：**22 种 workload × BF16/FP8 = 44 组配置，
+127 个候选结果、635 个轮次样本**，并复核 **30 个 specialization 资源、4 个后端 PMC、
+当前 8-wave ATT**。本轮**没有修改 attention 内核**。
+
+- 当前 8-wave：[pa_8wave_950.py](../pa_8wave/pa_8wave_950.py)，已含 packed-V/控制等待优化，
+  BF16 page64 direct-only，非 persistent；不能替换成旧 FP8/persistent 8-wave。
+- 当前 4-wave：[pa_prefill_4wave.py](pa_prefill_4wave.py)，BF16/架构原生 FP8；batch1
+  static 与强制 dynamic 分开测量，batch>1 只有 dynamic，不能将默认路径误标为 static。
+- 统一入口：[benchmark_readme.py](benchmark_readme.py)。全部精确五轮采样、shape 定义、
+  source hash、N/A 原因、回归与 profiler 记录见 [readme_retest_results.json](readme_retest_results.json)。
+- **以下“当前”表均为本轮新测数据**；此前的版本 A/B、gather、gfx942 以及否决实验统一
+  折叠在文末历史记录，不替换其历史样本、不混入当前速度结论。
+
+### 计时、正确性和布局口径
+
+MI350X gfx950、GPU0、256 CU，PyTorch 2.9.1 / ROCm 7.2，现有 auto-DPM，未改时钟或功耗。
+本机可见的 8 张卡均为 gfx950，**没有 gfx942 硬件**。主配置为
+`B1/Hq16/Hkv1/Dv128/page64`；额外配置在对应表中注明。
+
+每个配置内同进程、相同逻辑 Q/K/V、同一原始 5D cache/随机物理页表、预分配输出，
+无 LSE。100 轮共同预热，随后 **5 轮交替候选顺序，每候选每轮 20 warmup / 100 次迭代**，
+`num_rotate_args=1`；`run_perftest` GPU profiler 每轮过滤均值的中位数。计时期间无
+ATT/PMC，不含编译、首次分配、CPU dispatch、reference 或 linear KV 准备。
+
+**每个已计时候选先对独立、分块 FP32 reference 检查全部输出**，包括 H3 长序列，
+`checkAllclose` 错误比例必须为 0，并检查三次 bit-exact 重复。BF16 容差 `2e-2`，
+FP8 容差 `1e-1`；FP8 reference 来自实际量化后输入的反量化值。性能输入尾页统一补零，
+内核完整回归仍包含 NaN poison。未使用 `PA_SKIP_REFERENCE` 来获取当前表数据。
+
+- `AITER linear` 使用 `flash_attn_varlen_func`：D128 full 是 ASM，D192 full 是 OPUS，
+  SWA 是 CK。**不把整列称为 OPUS**。
+- `OPUS linear` 显式调用专用入口：D128 dense4D、D192 packed3D group，profiling 已确认
+  `gqa_d128_kernel` / `gqa_d192_v128_kernel`。它不支持对应 5D ABI，转换不计时，
+  **不能称为 OPUS 分页端到端性能**。
+- `AITER 5D` 在全部 22 组 BF16 配置中实际调用，page32/page64 均返回
+  `no matching kernel found`，所以以下表不重复一整列 N/A；没有退回 linear。
+- 当前 8-wave 的 FP8/page32 为不支持；D128 ragged H3、SWA/sink、FP8 无可比 OPUS。
+  FP8 AITER 未配置与本轮 per-token Q scale 完全一致的 baseline，标 N/A，不推断其他
+  AITER FP8 API 都不可用。FP8 4-wave 为 QK K64 / PV K16 当前分支。
+- TFLOPS 按有效 QK/PV 计算；causal 精确计入对角线，SWA128 为最多 **129** 个可见 key。
+  TB/s 按 Q/O 与页对齐可见 KV 并集的最小逻辑字节计算，**不是 HBM counter**。
+
+### BF16 full attention：同轮 5D / linear 对照
+
+时间单位 **µs**。所有 `5D` 列均含页表 lookup 和 attention，未扣除分页开销。
+
+| 场景 | Dqk | 8-wave 5D | 4-wave static 5D | 4-wave dynamic 5D | AITER linear | 显式 OPUS linear |
+|---|---:|---:|---:|---:|---:|---:|
+| noncausal Q10240/KV2583 | 128 | 257.863 | 269.439 | 274.641 | 253.526 | 241.810 |
+| noncausal Q10240/KV2583 | 192 | 296.015 | 318.116 | 325.063 | 292.603 | 292.013 |
+| causal Q=KV32768 | 128 | 4499.220 | 4929.746 | 5509.998 | 4562.585 | 4713.127 |
+| causal Q=KV32768 | 192 | 5347.772 | 6461.789 | 7142.503 | 5298.062 | 5298.313 |
+
+D192 noncausal 当前 8-wave 比 4-wave static 延迟低 **6.95%**，比 OPUS linear 高
+**1.37%**；causal32K 分别低 **17.24%**、高 **0.93%**。这些是本轮对应形状结果，
+不是所有 head/序列长度的保证。
+
+### BF16 SWA+sink：Q16K / window_left128
+
+逐 head FP32 sink logit 从 -1 到 1。OPUS 不支持该语义，N/A。
+
+| Dqk | Total KV | 8-wave 5D | 4-wave static 5D | 4-wave dynamic 5D | AITER linear |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 32K | 101.598 | 82.887 | 89.050 | 116.719 |
+| 128 | 64K | 101.254 | 83.370 | 88.191 | 117.799 |
+| 128 | 128K | 101.281 | 82.288 | 89.314 | 116.376 |
+| 192 | 32K | 116.690 | 96.668 | 104.010 | 127.453 |
+| 192 | 64K | 116.777 | 96.783 | 103.360 | 126.525 |
+| 192 | 128K | 115.637 | 96.405 | 102.715 | 127.488 |
+
+**SWA 仍是 4-wave static 最快**；D192/KV128K 的 8-wave 比 static 慢 **19.95%**。
+总 KV32K→128K 时耗时基本不变，符合可见页范围裁剪。
+
+主 BF16 候选有效吞吐（`TFLOPS / 逻辑 TB/s`）：
+
+| 场景 | Dqk | 8-wave | 4-wave static | 4-wave dynamic | AITER linear | OPUS linear |
+|---|---:|---:|---:|---:|---:|---:|
+| noncausal | 128 | 840.28 / 0.3304 | 804.18 / 0.3162 | 788.95 / 0.3103 | 854.66 / 0.3361 | 896.06 / 0.3524 |
+| noncausal | 192 | 914.98 / 0.3598 | 851.41 / 0.3348 | 833.21 / 0.3277 | 925.65 / 0.3640 | 927.52 / 0.3647 |
+| causal32K | 128 | 977.54 / 0.0634 | 892.17 / 0.0579 | 798.22 / 0.0518 | 963.97 / 0.0625 | 933.18 / 0.0605 |
+| causal32K | 192 | 1028.04 / 0.0667 | 850.81 / 0.0552 | 769.72 / 0.0499 | 1037.69 / 0.0673 | 1037.64 / 0.0673 |
+| SWA KV128K | 128 | 170.95 / 1.4087 | 210.41 / 1.7338 | 193.86 / 1.5974 | 148.78 / 1.2260 | N/A |
+| SWA KV128K | 192 | 187.16 / 1.5422 | 224.50 / 1.8499 | 210.71 / 1.7363 | 169.76 / 1.3989 | N/A |
+
+### FP8：当前 4-wave static/dynamic
+
+OCP `float8_e4m3fn`，Q per-token/head scale、K/V scalar scale，输出 BF16。当前 8-wave
+无 FP8 路径，不使用历史 8-wave 代替。时间 **µs**：
+
+| 场景 | Dqk | KV | static | dynamic | static TFLOPS | static 逻辑 TB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| noncausal Q10240 | 128 | 2583 | 200.050 | 216.693 | 1083.12 | 0.3178 |
+| noncausal Q10240 | 192 | 2583 | 222.596 | 240.926 | 1216.77 | 0.3335 |
+| causal Q32768 | 128 | 32768 | 3765.339 | 4202.290 | 1168.07 | 0.0557 |
+| causal Q32768 | 192 | 32768 | 4341.750 | 4730.104 | 1266.25 | 0.0565 |
+| SWA Q16K/W128 | 128 | 32K | 59.645 | 71.415 | 290.29 | 1.7586 |
+| SWA Q16K/W128 | 128 | 64K | 59.404 | 71.040 | 291.46 | 1.7657 |
+| SWA Q16K/W128 | 128 | 128K | 60.460 | 72.181 | 286.37 | 1.7349 |
+| SWA Q16K/W128 | 192 | 32K | 68.799 | 80.266 | 314.58 | 1.7838 |
+| SWA Q16K/W128 | 192 | 64K | 68.780 | 80.722 | 314.67 | 1.7843 |
+| SWA Q16K/W128 | 192 | 128K | 68.705 | 80.619 | 315.01 | 1.7862 |
+
+其余候选及配置的 TFLOPS/TB/s 在统一入口输出的完整 markdown 表中列出，亦可由原始
+shape 和 latency 精确重算。BF16 与 FP8 的数值/吞吐不当作等精度的横向速度比较。
+
+### page32、batch4、单 head 扩展矩阵
+
+所有扩展场景仍在本轮 gfx950 上重测，**不是将历史 gfx942 数字更名**。D192 使用 Hq16/Hkv1；
+单 head 与 batch4 D128 使用 Hq1/Hkv1。batch4 每序列 Q10240/KV2560；单 head full
+为 Q=KV40960，causal 为 Q=KV32768；page32 的普通 NC/C 分别为 Q10240/KV2583 和 causal32K。
+时间 **µs**，N/A 按上方支持规则解释：
+
+| 场景 | page | dtype | 8-wave 5D | 4-wave static | 4-wave dynamic | AITER linear | OPUS linear |
+|---|---:|---|---:|---:|---:|---:|---:|
+| D192 noncausal | 32 | BF16 | N/A | 317.039 | 319.772 | 291.798 | 292.159 |
+| D192 causal32K | 32 | BF16 | N/A | 6416.671 | 7001.488 | 5239.548 | 5242.735 |
+| batch4 D192 | 32 | BF16 | N/A | N/A | 1274.182 | 1085.817 | 1085.394 |
+| batch4 D128 H1 | 32 | BF16 | N/A | N/A | 88.969 | 77.792 | 76.971 |
+| single-head full | 32 | BF16 | N/A | 1119.578 | 1112.622 | 1027.317 | 961.664 |
+| single-head causal | 32 | BF16 | N/A | 634.201 | 620.533 | 592.812 | 533.133 |
+| batch4 D192 | 64 | BF16 | 1086.783 | N/A | 1275.696 | 1087.917 | 1087.236 |
+| batch4 D128 H1 | 64 | BF16 | 77.860 | N/A | 90.247 | 77.912 | 76.965 |
+| single-head full | 64 | BF16 | 1006.462 | 1113.613 | 1109.627 | 1023.800 | 954.599 |
+| single-head causal | 64 | BF16 | 612.997 | 623.598 | 628.860 | 596.321 | 534.068 |
+| D192 noncausal | 32 | FP8 | N/A | 225.526 | 242.827 | N/A | N/A |
+| D192 causal32K | 32 | FP8 | N/A | 4403.572 | 4726.341 | N/A | N/A |
+| batch4 D192 | 32 | FP8 | N/A | N/A | 915.925 | N/A | N/A |
+| batch4 D128 H1 | 32 | FP8 | N/A | N/A | 74.457 | N/A | N/A |
+| single-head full | 32 | FP8 | N/A | 943.523 | 941.417 | N/A | N/A |
+| single-head causal | 32 | FP8 | N/A | 581.083 | 586.964 | N/A | N/A |
+| batch4 D192 | 64 | FP8 | N/A | N/A | 908.062 | N/A | N/A |
+| batch4 D128 H1 | 64 | FP8 | N/A | N/A | 74.909 | N/A | N/A |
+| single-head full | 64 | FP8 | N/A | 941.869 | 945.242 | N/A | N/A |
+| single-head causal | 64 | FP8 | N/A | 567.372 | 572.345 | N/A | N/A |
+
+### H3 长序列：segments=(63225,7)，Hq=Hkv14，D128
+
+两段均 noncausal，完整 FP32 reference 通过；本轮采用统一 5轮/100迭代 protocol，
+不沿用旧 H3 的 3warmup/10event 数字。时间 **µs**：
+
+| page | dtype | 8-wave 5D | 4-wave dynamic 5D | AITER linear |
+|---:|---|---:|---:|---:|
+| 32 | BF16 | N/A | 31001.906 | 35201.709 |
+| 64 | BF16 | 34665.584 | 31583.970 | 35167.792 |
+| 32 | FP8 | N/A | 25426.733 | N/A |
+| 64 | FP8 | N/A | 25094.570 | N/A |
+
+H3 的 4-wave static 不支持 batch2，显式 OPUS D128 没有 ragged entry。
+**page64 BF16 H3 的 8-wave 比 4-wave dynamic 慢 9.76%**，因此不能把主形状的优势
+推广到 H3。当前 8-wave 无 persistent，batch4/H3 使用静态三维 grid。
+
+### 全部正确性、兼容测试与失败记录
+
+| 检查 | 本轮结果 |
+|---|---|
+| 当前 8-wave 完整 suite | **181 passed、6 skipped**；skip 为缺失 AITER5D page64 |
+| 4-wave 完整默认 suite | **51 passed、2 skipped**；skip 为两个 opt-in 性能测试 |
+| 统一 44组配置/127候选 | **全部 FP32 reference 错误比例0**；三次重复一致 |
+| 旧 non-SWA opt-in | **失败：进程退出134，GPU memory fault**，不是 skip 或通过 |
+| 旧 SWA opt-in（独立进程） | **1 passed**；旧 batch-prefill128K 已知 fault guard 未运行 |
+| page32/64/128、短尾、batch、stream/counter复用 | 由完整 suites 覆盖；page128 未另设历史生产计时行 |
+| gfx942 | 当前机器无此架构，**未重测**，旧记录保留为历史 |
+
+旧 non-SWA opt-in 在 `run_dispatched_aiter` 的 **linear/page1 causal Q=KV32768** 调用后
+同步处出现 GPU memory fault；无新计时可报告，不沿用此前“生产测试通过”的结论。
+它与本轮成功的 `flash_attn_varlen_func` / 显式 OPUS 不同。原日志索引在结果 JSON；
+故障后新进程的 GPU 健康检查成功。此任务未尝试通过改 kernel 或放宽校验来隐藏故障。
+
+现有 [test_pa_prefill.py](test_pa_prefill.py) 的部分比较使用历史
+[pa_prefill_8w32x32.py](../pa_8wave/pa_prefill_8w32x32.py)，因此以下旧 SWA opt-in 新测值
+**单列为兼容记录**，不是当前 8-wave。它采用另一 seed、CUDA-event 20/100/5 与全量
+Triton gather，不能与上方 GPU-profiler 表混算；单位 µs：
+
+| KV | gather | batch-prefill only | gather+batch | varlen only | gather+varlen | 4-wave static | 4-wave dynamic | 历史8-wave |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32K | 33.28 | 259.57 | 280.69 | 117.20 | 148.09 | 77.48 | 88.02 | 123.22 |
+| 64K | 62.26 | 259.87 | 323.35 | 118.02 | 180.29 | 78.08 | 85.48 | 123.56 |
+| 128K | 153.45 | 未运行：已知fault | 未运行：已知fault | 122.12 | 269.03 | 79.34 | 85.04 | 124.12 |
+
+### 新资源：30 个 specialization
+
+均为 page64、无 LSE，重新生成 ISA，表项为 **VGPR / SGPR / LDS bytes**；全部 private=0、
+VGPR/SGPR spill=0。按 full-NC、causal32K、SWA128K 分别列出，不用某一个 shape 的资源
+代表所有实例。
+
+| dtype | 模式 | Dqk | 8-wave | 4-wave static | 4-wave dynamic |
+|---|---|---:|---|---|---|
+| BF16 | noncausal | 128 | 226 / 55 / 99840 | 180 / 74 / 16640 | 186 / 100 / 16644 |
+| BF16 | noncausal | 192 | 256 / 59 / 149760 | 212 / 74 / 24960 | 218 / 100 / 24964 |
+| BF16 | causal | 128 | 221 / 83 / 99840 | 182 / 74 / 16640 | 184 / 96 / 16644 |
+| BF16 | causal | 192 | 254 / 89 / 149760 | 214 / 74 / 24960 | 216 / 96 / 24964 |
+| BF16 | SWA | 128 | 228 / 69 / 99840 | 173 / 48 / 16640 | 174 / 68 / 16644 |
+| BF16 | SWA | 192 | 256 / 71 / 149760 | 208 / 46 / 24960 | 209 / 68 / 24964 |
+| FP8 | noncausal | 128 | N/A | 148 / 74 / 16384 | 156 / 98 / 16388 |
+| FP8 | noncausal | 192 | N/A | 166 / 74 / 16384 | 176 / 99 / 16388 |
+| FP8 | causal | 128 | N/A | 148 / 74 / 16384 | 153 / 96 / 16388 |
+| FP8 | causal | 192 | N/A | 166 / 74 / 16384 | 172 / 96 / 16388 |
+| FP8 | SWA | 128 | N/A | 145 / 46 / 16384 | 149 / 66 / 16388 |
+| FP8 | SWA | 192 | N/A | 164 / 46 / 16384 | 168 / 66 / 16388 |
+
+### 新 PMC / ATT：D192 noncausal Q10240/KV2583
+
+[profile_readme.py](profile_readme.py) 使用同一 workload；每后端采预热后的第21–23次，
+指令组和 utilization/cache 组独立运行。下列为三次中位数，不与性能表混用计时。
+
+| 指标 | 8-wave 5D | 4-wave static | 4-wave dynamic | OPUS linear |
+|---|---:|---:|---:|---:|
+| `SQ_WAVES` | 5120 | 5120 | 2048 | 5120 |
+| `SQ_INSTS_MFMA` | 8396800 | 8294400 | 8294400 | 8396800 |
+| `SQ_INSTS_VALU` | 40509440 | 47052800 | 47639042 | 40092160 |
+| `SQ_INSTS_VMEM_RD` | 1157120 | 4869120 | 4884480 | 1152000 |
+| `SQ_INSTS_LDS` | 8458240 | 5160960 | 5167360 | 11816960 |
+| `SQ_LDS_BANK_CONFLICT` | 0 | 491520 | 491520 | 0 |
+| `MfmaUtil` | 57.62% | 53.88% | 52.09% | 60.17% |
+| `MeanOccupancyPerActiveCU` | 1.9824 | 1.9082 | 1.8805 | 1.9814 |
+| `TCC_MISS_sum` | 1171623 | 1081012 | 1133092 | 1123975 |
+
+当前 8-wave 新 ATT：SE0/CU1、三次 capture 共 **72 个完整 wave**；每 wave 动态指令
+**12217**、BFI **0**、waitcnt **179**、barrier **333**、MFMA **1640**。
+稳定 phase 平均 **2783.72 cycles**。ATT 的 stage 时间/模型覆盖率不是全卡 utilization；
+上表 `MfmaUtil` 是另行采集的硬件 metric。旧 ATT/优化推导见
+[D192分析](../pa_8wave/d192_noncausal_att.md)，当前 capture 索引已存入结果 JSON。
+
+### 复现当前矩阵
+
+从 pyhip 根目录使用现有 GPU 环境，统一 benchmark 默认即为全部44组：
+
+```bash
+HIP_VISIBLE_DEVICES=0 FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python tests/flydsl/pa_4wave/benchmark_readme.py
+HIP_VISIBLE_DEVICES=0 FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python -m pytest -q tests/flydsl/pa_8wave/test_pa_prefill.py
+HIP_VISIBLE_DEVICES=0 FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python -m pytest -q tests/flydsl/pa_4wave/test_pa_prefill.py
+```
+
+`--case` / `--dtype` 可选择真实 workload/dtype 子矩阵；每项输出 `README_RETEST_RESULT`
+JSON（五轮采样、精确 dispatch、错误比例与不可用原因）及完整 TFLOPS/TB/s markdown 表。
+旧 opt-in 故障路径不属于统一 benchmark 的候选，不自动重试故障。
+
+---
+
+<details>
+<summary>历史版本、旧计时协议、优化 A/B 与 gfx942 记录（不是本轮当前结果）</summary>
+
+以下原样保留旧测量和优化过程；文内“当前/最新”均指当时版本。本轮结论只以上方
+统一重测为准，旧 gather/core、旧8-wave FP8、已否决代码分支不重建为生产候选。
+
+## 最新：packed-V 合入与控制/等待精简（2026-09-05）
+
+[pa_8wave_950.py](../pa_8wave/pa_8wave_950.py) 已合入 packed-i32 V 拼接，不再是隔离实验。
+先仅合入 packed-V，完成 **173 passed、6 skipped**，再修改控制/等待；最终
+[完整回归](../pa_8wave/test_pa_prefill.py) **181 passed、6 skipped**。6 个跳过项仍仅为
+AITER 缺少 page64 5D 实例。AITER/4-wave 内核、公开 ABI 和数值容差未修改。
+
+### 已合入的改动与安全边界
+
+- V LDS 结果先按 32 个 i32 word 拼接，再一次性转为 BF16；消除反复 BF16 slice store
+  与 tail bitcast 之间的冗余 BFI。
+- 将 phase S2 同一位置的 VM wait 与 page/LDS wait 合为一条
+  `s_waitcnt vmcnt(KEEP_VMCNT) lgkmcnt(0)`。**未提高 VM 阈值、未删除 LDS 等待**。
+- noncausal border 改为 `remaining=kv_len-tile*64; remaining<64`；合法 tile 的条件等价，
+  不再组合 modulo、最后 tile 除法与布尔条件。mask predicate 仍在分支内物化。
+- 正向 main phase 消费 `t-1 <= tiles-2`，必然不是最后一个实际 KV tile，因此编译期
+  删除这两处 V tail 检查。**reverse main phase 与 epilogue 的 NaN-tail 清零及 fence
+  全部保留**；不是全局禁用 V mask，也没有删减 workgroup barrier。
+- 新增 8 项回归：D128/D192 × 正向/causal 首尾配对反向 × 有/无 LSE，同一编译结果
+  依次使用 KV1/64/65/128/193/321/320，更新物理尾页 NaN poison，严格 FP32 reference
+  与三次 bit-exact 重复，确保不依赖固定 runtime 长度或 padding 内容。
+- 保持 **direct-paged、一个 attention kernel、零 KV workspace**。本轮未加入 persistent。
+
+### 同进程分阶段性能
+
+MI350X gfx950，BF16、B1/Hq16/Hkv1/Dv128/page64、无 LSE、预分配输出。三个 FlyDSL
+候选使用**同一原始 5D cache/随机页表**；旧源码从已核对 SHA 的 Git blob 只读加载到
+独立模块，仅用于本次比较。100 轮共同预热、5 轮交替候选顺序、每轮 20 warmup /
+100 次 `run_perftest`，取五轮 GPU 时间中位数；不启用 ATT/PMC。所有候选 `err=0`。
+单位 **µs**：
+
+| 场景 | Dqk | 改动前 direct | 仅 packed-V | packed-V + 控制/等待（当前） | 显式 OPUS linear core |
+|---|---:|---:|---:|---:|---:|
+| noncausal Q10240/KV2583 | 128 | 266.395 | 259.345 | **258.495** | 241.272 |
+| noncausal Q10240/KV2583 | 192 | 303.689 | 299.090 | **296.688** | 291.950 |
+| causal Q=KV32768 | 128 | 4578.457 | 4471.397 | **4493.740** | 4697.385 |
+| causal Q=KV32768 | 192 | 5443.132 | 5335.193 | **5317.539** | 5284.699 |
+| SWA+sink Q16K/KV128K/W128 | 128 | 103.452 | 102.156 | **101.769** | N/A：不支持 |
+| SWA+sink Q16K/KV128K/W128 | 192 | 119.056 | 117.129 | **116.521** | N/A：不支持 |
+
+D192 noncausal 相比改动前下降 **2.31% / 7.001 µs**，其中控制/等待在 packed-V
+基础上再减少 **2.402 µs**；与本轮 OPUS linear 的差距为 **1.62%**。
+六个最终中位数均优于改动前，但 **D128 causal 比仅 packed-V 慢 0.50%**，不能宣称
+控制改动对所有 shape 都加速；相比改动前该项仍下降 1.85%。D192 causal 比 OPUS 慢
+0.62%，D128 noncausal 仍慢 7.14%。这里不混用不同时轮的中位数。
+
+OPUS 使用同逻辑但预先构建的 linear KV，转换不计时，**不是 OPUS 的 5D 分页端到端
+性能**；AITER 5D page64 仍无匹配实例。本轮未重测 4-wave，不把下方历史 4-wave 时间
+拼成同轮对照。SWA 的小幅改善不构成超过 4-wave 的证据。
+
+| 当前场景 | Dqk | 有效 TFLOPS | 逻辑 TB/s |
+|---|---:|---:|---:|
+| noncausal Q10240/KV2583 | 128 | 838.23 | 0.3296 |
+| noncausal Q10240/KV2583 | 192 | 912.90 | 0.3590 |
+| causal 32K | 128 | 978.74 | 0.0635 |
+| causal 32K | 192 | 1033.89 | 0.0670 |
+| SWA+sink | 128 | 170.13 | 1.4019 |
+| SWA+sink | 192 | 185.74 | 1.5305 |
+
+SWA 仅按每行 129 个可见 key 计算有效 FLOPs；逻辑 TB/s 不是 HBM counter。
+全部五轮样本、source/test SHA、回归与资源记录见
+[packed_v_control_results.json](../pa_8wave/packed_v_control_results.json)。
+
+### 最终 ATT 与资源复核
+
+D192 noncausal，SE0/CU1、三个预热后 launch、64 个完整 wave；同一分析器复核：
+
+| 每 wave 指标 | 改动前 | 当前 |
+|---|---:|---:|
+| 动态指令 | 13502.5 | 12217 |
+| BFI | 656 | **0** |
+| `s_waitcnt` | 218 | **179** |
+| `s_barrier` | 333 | **333** |
+| BF16 MFMA | 1640 | **1640** |
+| `s_nop` | 652 | 752 |
+
+稳定 phase 平均 **2913.6 → 2787.5 cycles**；这是采样 CTA 的 stage 时间，不作为
+整 kernel 加速比例。部分 hazard padding 增加，未声称所有类别都减少。资源均取新生成
+ISA metadata，无 LSE：
+
+| Dqk | 模式 | VGPR | SGPR | LDS bytes | Private bytes | VGPR/SGPR spill |
+|---:|---|---:|---:|---:|---:|---:|
+| 128 | noncausal | 226 | 55 | 99840 | 0 | 0/0 |
+| 192 | noncausal | 256 | 59 | 149760 | 0 | 0/0 |
+| 128 | causal 配对 | 221 | 83 | 99840 | 0 | 0/0 |
+| 192 | causal 配对 | 254 | 89 | 149760 | 0 | 0/0 |
+| 128 | SWA+sink | 228 | 69 | 99840 | 0 | 0/0 |
+| 192 | SWA+sink | 256 | 71 | 149760 | 0 | 0/0 |
+
+复现入口与完整支持范围见 [8-wave README](../pa_8wave/README.md)。下方保留的是
+**本次优化前**的 5D/OPUS、旧 core 和更早实验数据，不能当作当前资源或耗时。
+
+---
+
+## 历史对照：优化前 5D direct-paged 与显式 OPUS（2026-09-05）
+
+[pa_8wave_950.py](../pa_8wave/pa_8wave_950.py) **仅保留 direct-paged attention**。
+`prepare_kv`、`attend_linear`、gather kernel 和线性 KV workspace 均已移除；预分配输出
+时一次公开调用只启动一个 attention kernel，不做任何 KV 预处理或数据缓存。
+D128/D192、V128、BF16 page64、SWA、sink、LSE、ragged、strided Q/O 与 stream/graph
+功能保持。当时只增加比较入口、测试和报告，未修改 attention 内核。
+当时的[完整测试](../pa_8wave/test_pa_prefill.py) **173 passed、6 skipped**：原 165 项 direct
+测试全部通过，另有 8 项比较回归通过；6 项 AITER 5D 测试因缺少 page64 实例跳过。
+
+补充 [D192 noncausal ATT 分析](../pa_8wave/d192_noncausal_att.md)：当前 8-wave 与
+OPUS group 均非 persistent。采样定位 V fragment 表示的 656 条额外 BFI/wave；保持
+尾页保护的隔离改写在正常计时中为 298.784 µs，原始为 302.930 µs、OPUS 291.796 µs。
+当时实验尚未合入；现在已合入并进一步优化，最新结果见本文开头。下表保留旧数据，证据见
+[ATT 原始摘要](../pa_8wave/d192_noncausal_att_results.json)。
+
+### 5D 输入、显式 OPUS 入口与计时口径
+
+- MI350X gfx950，BF16，`B=1,Hq=16,Hkv=1,Dv=128,page_size=64`，不输出 LSE。
+  5D K 为 `[pages,Hkv,Dqk/8,64,8]`，V 为 `[pages,Hkv,8,128,8]`。
+  `flydsl_5d`、两种 `4wave_*_5d` 和 `aiter_5d` 使用**同一份物理 K/V、随机页表、
+  实际尾页长度及 Q**；没有为某个 5D 候选重排或更换页大小。
+- `aiter_5d` 直接调用 `mha_batch_prefill_func`，**不是 OPUS 入口**。当前构建在六个
+  生产形状及六个小型正确性探测上均返回 `no matching kernel found`。
+  已核对当前 CK 生成器：`SUPPORTED_PAGE_SIZE = [1, 16, 1024]`，page1 仅用于 linear，
+  dispatch 按页大小精确匹配，**没有 page64 实例**。5D 输入通过 ABI 检查；错误附带的
+  `>2GB/CDNA3` 通用提示不是本例原因。该列标 N/A，不回退到 linear，也没有改 AITER
+  生成器或重新打包 cache 来制造可运行结果。
+- `opus_linear` **绕过默认路由，显式调用 OPUS**：D128 使用
+  `fmha_fwd_bf16_opus_fwd` 的 dense BSHD 入口，4D view 在计时前创建；D192 使用
+  `fmha_fwd_bf16_opus_varlen_fwd` 的 packed 3D group 入口。Profiler 确认实际 kernel
+  分别为 `gqa_d128_kernel` / `gqa_d192_v128_kernel`。当前 OPUS 没有对应 5D 页表 ABI，
+  也不支持 SWA/sink。它使用由同一物理 cache 重建的相同逻辑 linear KV，**转换不计时**；
+  因而这一列是 attention-only baseline，**不是 OPUS 的 5D / 分页端到端性能**。
+- 每个形状内所有候选同进程、预分配输出，先对独立 FP32 reference 严格验算，`err=0`
+  才测量。所有性能输入统一零填充尾页以兼容旧 4-wave；direct 正确性测试仍用 NaN poison。
+  共同预热 100 轮，再做 **5 轮交替候选顺序、每轮 20 warmup / 100 次迭代**，
+  `num_rotate_args=1`。每轮值是 `run_perftest` GPU profiler 的过滤均值（去首轮与 IQR
+  异常点），下表取五轮中位数；不含编译、首次分配、CPU dispatch 或 reference 时间。
+
+### 优化前性能：5D direct 与 OPUS linear core
+
+单位 **µs**。最后一列为 `8-wave / OPUS - 1` 的延迟差，负值表示 8-wave 延迟更低；
+它比较不同输入布局的 attention kernel，不代表同一个分页接口的端到端加速比。
+
+| 场景 | Dqk | 8-wave 5D | 4-wave static 5D | 4-wave dynamic 5D | AITER 5D | OPUS linear core | 8-wave / OPUS 延迟差 |
+|---|---:|---:|---:|---:|---|---:|---:|
+| noncausal Q10240 / KV2583 | 128 | 264.067 | 269.462 | 274.031 | N/A：无 page64 实例 | 241.051 | +9.55% |
+| noncausal Q10240 / KV2583 | 192 | 303.641 | 318.244 | 325.049 | N/A：无 page64 实例 | 292.581 | +3.78% |
+| causal Q=KV=32768 | 128 | 4597.028 | 4954.043 | 5536.846 | N/A：无 page64 实例 | 4720.933 | -2.62% |
+| causal Q=KV=32768 | 192 | 5444.459 | 6448.438 | 7125.702 | N/A：无 page64 实例 | 5283.595 | +3.04% |
+| SWA+sink Q16K/KV128K/W128 | 128 | 101.813 | **81.945** | 87.121 | N/A：无 page64 实例 | N/A：不支持 SWA/sink | — |
+| SWA+sink Q16K/KV128K/W128 | 192 | 118.101 | **95.748** | 101.849 | N/A：无 page64 实例 | N/A：不支持 SWA/sink | — |
+
+对应的有效 TFLOPS / 逻辑 TB/s：
+
+| 场景 | Dqk | 8-wave TFLOPS | 8-wave TB/s | OPUS TFLOPS | OPUS TB/s |
+|---|---:|---:|---:|---:|---:|
+| noncausal Q10240/KV2583 | 128 | 820.54 | 0.3227 | 898.89 | 0.3535 |
+| noncausal Q10240/KV2583 | 192 | 892.00 | 0.3508 | 925.72 | 0.3640 |
+| causal 32K | 128 | 956.74 | 0.0620 | 931.63 | 0.0604 |
+| causal 32K | 192 | 1009.78 | 0.0655 | 1040.53 | 0.0675 |
+| SWA+sink | 128 | 170.06 | 1.4013 | N/A | N/A |
+| SWA+sink | 192 | 183.25 | 1.5101 | N/A | N/A |
+
+SWA 的 `window_left=128` 是闭区间，每行 129 个可见 key，sink 为逐 head 的 FP32
+logit（-1 到 1）。有效 FLOPs 只计可见 QK/PV；TB/s 按 Q/O 和页对齐的可见 KV 并集
+计算最小逻辑流量，**不是 HBM counter**。**SWA 仍是 4-wave static 更快**。
+D128 noncausal 比真正 OPUS 慢 9.55%，不能用此前默认 ASM 的时间或“接近旧 FlyDSL
+core”来宣称与 OPUS 等速；D192 已测 full 场景仍有约 3–4% 差距。
+
+基准还保留 `aiter_linear` 作为独立补充列：D128 full 实际是 ASM group/causal_group，
+D192 full 是 OPUS group，SWA+sink 是 CK Tile；**不把这一整列称为 OPUS**。
+精确 kernel 名、全部五轮样本、默认 AITER 补充结果、不可用原因、source/binary hash
+及复现参数见 [paged_5d_opus_results.json](../pa_8wave/paged_5d_opus_results.json)。
+没有挑选最快一轮；下节的旧 FlyDSL core 验收是另一次测量、另一个 baseline。
+
+### 验收：与删除前 gather 分支的纯 core 比较
+
+MI350X gfx950，B1/Hq16/Hkv1，Q/K/V 和预分配输出相同。**同进程**保留修改前源码
+作为一次性外部 reference：只计旧 `attend_linear`，不计 gather；新实现计完整
+direct-paged 调用。共同预热后，每候选 20 warmup / 100 次 GPU profiler 采样，
+5 轮交替顺序中位数；不将历史不同轮次数字作为验收基准。
+
+| 场景 | Dqk | 新 direct-paged µs | 旧纯 core µs | 新/旧延迟差 |
+|---|---:|---:|---:|---:|
+| noncausal Q10240 / KV2583 | 128 | **266.163** | 260.183 | +2.30% |
+| noncausal Q10240 / KV2583 | 192 | **302.610** | 295.297 | +2.48% |
+| causal Q=KV=32768 | 128 | **4558.574** | 4436.378 | +2.75% |
+| causal Q=KV=32768 | 192 | **5381.104** | 5292.773 | +1.67% |
+| SWA+sink Q16K/KV128K/W128 | 128 | **102.691** | 101.898 | +0.78% |
+| SWA+sink Q16K/KV128K/W128 | 192 | **117.633** | 117.045 | +0.50% |
+
+**已测六种代表形状都在旧纯 core 的 3% 内，SWA 在 1% 内。** 这是接近性能，不是
+完全等速或任意 shape 的性能保证。原始每轮采样、source hash 与协议保存在
+[direct_paged_core_results.json](../pa_8wave/direct_paged_core_results.json)。当前运行路径
+没有保留旧 gather 分支。相对旧 core 最大绝对差分别为 noncausal 0.00048828125、
+causal 0.0009765625、SWA 0.001953125；独立 FP32 reference 与重复确定性检查均通过。
+
+### 优化前 direct-paged 实现变化与资源
+
+- 仍为 BM256/BN64、512 threads、完整 constexpr STAGGER、八阶段 ping/pong。
+- page ID 由 scalar load 提前读取，每个 KV tile 一次，跨 phase 复用到 K、V 和分段 K DMA。
+  页表 load 由 `lgkmcnt(0)` 完成，不清空 in-flight KV VMEM 队列。
+- K/V 从 SHUFFLE-5D 直接 coalesced 128-bit DMA 到 LDS。K 置换 token bits 2/3，
+  score mask 同步置换，P/V operand 因而匹配连续 8-token；V 只用 `ds_read_b128`。
+- 尾页 V 在已有访存等待阶段清零，防止 `0*NaN`；显式 LDS wait 后保留 scheduler fence，
+  避免 mask 算术前移到异步 read 完成之前。
+- SWA 直接跳过窗口外页；重复物理页和跨序列共享页支持。删除 Q16K/KV128K 的 D128
+  **64 MiB** / D192 **80 MiB** 线性 KV workspace，辅助 GPU buffer 为 **0 B**。
+- 无 LSE 性能 specialization：
+
+| Dqk | 模式 | VGPR | SGPR | LDS bytes | Private bytes | VGPR/SGPR spill |
+|---:|---|---:|---:|---:|---:|---:|
+| 128 | noncausal | 228 | 74 | 99840 | 0 | 0/0 |
+| 128 | causal 配对 | 221 | 83 | 99840 | 0 | 0/0 |
+| 128 | SWA+sink | 230 | 71 | 99840 | 0 | 0/0 |
+| 192 | noncausal | 256 | 77 | 149760 | 0 | 0/0 |
+| 192 | causal 配对 | 254 | 89 | 149760 | 0 | 0/0 |
+| 192 | SWA+sink | 256 | 75 | 149760 | 0 | 0/0 |
+
+原 165 项 direct 测试包含 poisoned tails、SWA/sink/空行/LSE、runtime 页表与长度更新、reverse
+causal 配对、strides/GQA、graph/stream，以及 **单 GPU launch / 零 workspace** 和共享页检查。
+物理 cache byte span 暂限 signed 32-bit offset；其他支持范围和复现命令见
+[8-wave README](../pa_8wave/README.md)。基准现在分别输出 `flydsl_5d`、`aiter_5d`、
+`opus_linear`、`aiter_linear` 和适用的两种 `4wave_*_5d`；不可用项明确标记且不计时。
+OPUS/default AITER 的 linear 数据只用于外部比较，当前 8-wave 实现没有 gather/core 分支。
+
+---
+
+## 历史：gather + OPUS 流水，D128 / SWA / sink（2026-09-05，已删除路径）
+
+**以下整节仅保留改造前数据，不代表当前接口或实现。最新结果以上方 direct-paged 为准。**
+
+本节替代下方 2026-09-03 的“当前”性能结论。实现为
+[pa_8wave_950.py](../pa_8wave/pa_8wave_950.py)，测试与同输入多候选基准为
+[test_pa_prefill.py](../pa_8wave/test_pa_prefill.py)。旧
+[pa_prefill_8w32x32.py](../pa_8wave/pa_prefill_8w32x32.py) 不再代表本节的 8-wave。
+本次没有修改 [pa_prefill_4wave.py](pa_prefill_4wave.py) 或 AITER 内核。
+
+### 新实现的功能范围
+
+| 项目 | 当前支持 |
+|---|---|
+| 架构 / dtype / page | gfx950 / BF16 / page64 SHUFFLE-5D |
+| Head dimension | **QK=128 或 192，V=128**；不是把 D128 padding 到 D192 |
+| Attention | full noncausal、bottom-right causal、**causal SWA** |
+| SWA | `window_left=-1` 禁用；非负整数表示闭区间 `[i+KV-Q-window_left, i+KV-Q]`，128 对应最多 129 个 key |
+| Sink | **可独立于 SWA 开启**；`has_sink=True` + 连续 FP32 `sink_ptr[Hq]`，值为未经 QK scale 缩放的自然 logit |
+| Sink 语义 | 每 head 一个 value=0 的虚拟 key，只增加 softmax 分母；有限 logit 或 `-inf`（禁用） |
+| 输出 | BF16 `out=`；可选 FP32 `LSE[total_q,Hq]`，包含 sink 分母，使用自然对数 |
+| 其他 | GQA/MHA、ragged batch、非零 prefix、尾页、非连续 Q/O 的连续 head dimension、scalar/per-token-head Q scale、scalar K/V scale、stream、预热后的 graph |
+| 空行 | 空 KV / 全遮罩行 `O=0`；无 sink 为 `LSE=-inf`，有 sink 为 `LSE=sink_logit` |
+
+SWA 与 sink 可分别使用，也可同时使用；SWA 不支持 noncausal。FP8、其他 head dim、
+V192、page32/128 和 sink-token 前缀不在这个新内核的范围内，不能套用下方旧实现的支持表。
+GPU prefix/page ID/max-length 必须一致，scale 必须有限且为正；热路径不读回 GPU
+metadata 做检查，KV byte span 暂限 signed 32-bit offset。
+
+### 计时与数据口径
+
+- **MI350X gfx950，PyTorch 2.9.1 / ROCm 7.2，B=1、Hq=16、Hkv=1、V128、page64**。
+- 每行同进程、同逻辑 Q/K/V、随机物理页表、预分配输出；20 次预热、100 次采样、
+  5 轮交替候选顺序取中位数。计时使用 `run_perftest` 的 **GPU profiler 时间**，
+  不含编译和首次分配；不是下方历史 CUDA-event 数据的续测。
+- `8-wave full` = **每次重新 gather + attention**，`core` 只计 attention；两者独立测量。
+  不缓存 KV 内容或输出，只复用 workspace 和编译结果。`4-wave` 是 direct-paged，
+  不需要 gather。不得拿 8-wave core 当作公开分页接口耗时。
+- `AITER linear` 只计已有线性 KV 的 attention；`AITER full` 使用与 8-wave **同一个
+  FlyDSL gather** 再调用 AITER。SWA 两边都只 gather 查询窗口并集覆盖的 KV 后缀，
+  不是复制全部 128K KV。Full 中位数不是两个独立中位数之和。
+- 每个候选先对独立 FP32 PyTorch reference 严格检查，`err=0` 才计时。性能输入的
+  padding 统一为 0：旧 4-wave 对 NaN padding 会产生 `0*NaN`，不兼容 poison 输入；
+  **新内核 correctness tests 仍使用 NaN poison 尾页**，未放宽测试容差。
+
+### Full attention：当前同轮对照
+
+时间单位均为 **µs**；括号中为 8-wave full 的有效 TFLOPS。
+
+| 场景 | Dqk | 8-wave full | 8-wave core | gather | AITER linear | AITER full | 4-wave static | 4-wave dynamic |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| noncausal Q10240 / KV2583 | 128 | **263.273（823.01T）** | 260.286 | 3.581 | 253.762 | 258.071 | 268.635 | 273.778 |
+| noncausal Q10240 / KV2583 | 192 | **299.365（904.74T）** | 295.001 | 3.820 | 291.320 | 295.888 | 317.724 | 324.786 |
+| causal Q=KV=32768 | 128 | **4439.95（990.59T）** | 4436.34 | 6.695 | 4504.92 | 4557.40 | 4908.97 | 5501.55 |
+| causal Q=KV=32768 | 192 | **5334.86（1030.53T）** | 5329.30 | 7.578 | 5281.14 | 5293.83 | 6442.38 | 7108.83 |
+
+目标 D192 noncausal 的完整分页接口比 AITER linear 慢 **2.76%**，比相同分页适配的
+AITER full 慢 **1.18%**，比本轮 4-wave static 快 **5.78%**。D128 noncausal full
+比 AITER linear 慢 3.75%；D128 causal full 在本轮略快于 AITER linear。以上只说明已测形状，
+不是全形状性能保证。
+
+### SWA + sink：Q16K、window_left=128
+
+使用每 head 不同的 FP32 sink（从 -1 到 1）。时间单位 **µs**：
+
+| Dqk | Total KV | 8-wave full | 8-wave core | gather | AITER linear | AITER full | 4-wave static | 4-wave dynamic |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 32K | 107.234 | 102.030 | 5.168 | 115.626 | 122.071 | **81.934** | 87.280 |
+| 128 | 64K | 106.905 | 101.441 | 5.260 | 116.421 | 122.220 | **81.902** | 87.331 |
+| 128 | 128K | 107.027 | 102.373 | 5.142 | 116.993 | 121.916 | **82.289** | 87.695 |
+| 192 | 32K | 121.993 | 116.671 | 5.864 | 126.538 | 130.533 | **96.057** | 101.626 |
+| 192 | 64K | 122.071 | 116.660 | 6.096 | 126.611 | 131.565 | **95.731** | 101.307 |
+| 192 | 128K | 122.969 | 116.913 | 5.891 | 125.643 | 131.914 | **95.864** | 102.523 |
+
+128K 上 8-wave full：D128 **161.77 TFLOPS / 1.491 TB/s**，D192
+**176.00 TFLOPS / 1.622 TB/s**。TB/s 为算法最小逻辑流量估计（Q/O、可见 KV 并集和
+gather 读写），不是硬件 HBM counter；TFLOPS 仅计每行 129 个可见 key，未把被 mask
+的 MFMA 工作算成有效 FLOPs。完整 benchmark 输出也列出所有候选的 TFLOPS/TB/s/err。
+
+**SWA 当前仍是 4-wave static 更快。** 128K 上，新 8-wave full 比 AITER linear 快
+约 8.52%（D128）/2.13%（D192），但比 4-wave static 慢约 30.06%/28.27%。8-wave
+保留 BM256 八阶段 OPUS 流水；窄窗口下一个 WG 处理各 wave 窗口的并集，固定
+prologue/barrier 与 masked work 的占比高。这里不把“新增支持”描述成超过 4-wave。
+SWA 时间随总 KV 32K→128K 基本不变，验证了后缀 gather 和 tile 裁剪路径。
+
+### AITER 实际路由（本轮 profiler 验证）
+
+| 模式 | 公开入口 | 实际 kernel |
+|---|---|---|
+| D192 full | `flash_attn_varlen_func` | `gqa_d192_v128_kernel<...>`，OPUS group mode |
+| D128 full | `flash_attn_varlen_func` | `aiter::fmha_fwd_hd128_bf16_group` / `...causal_group`，ASM |
+| D128 SWA+sink | `flash_attn_varlen_func` | CK Tile `BlockFmhaPipelineQRKSVSAsyncTrload` |
+| D192 SWA+sink | `flash_attn_varlen_func` | CK Tile `BlockFmhaPipelineQRKSVSAsync` |
+
+所以 D128/SWA 列标为 **AITER**，不能全称为 OPUS；本次没有强制更改 AITER 的环境路由。
+AITER full 的 gather 同样使用本次新实现，不应与历史全量 Triton gather 时间混比。
+
+### 实现与资源
+
+- D128 复用已验证的 D192 八阶段骨架，QK 每个 superunit 从 12 次 MFMA 改为 8 次；
+  K DMA 从 3 改为 2，rolling `vmcnt` 从 5 改为 4，LDS 从 149760 B 改为 99840 B。
+- SWA 按 query block 裁剪第一/最后 KV tile，mask 用闭区间检查。窄窗口不启用
+  causal 首尾配对；full causal 保留配对和镜像反向遍历。
+- Sink 只加入一次已完成跨 lane 归约的分母，并随 online maximum 一起重标定；
+  无 QK descale 乘到 sink，也不增加 PV 分子。
+- SWA gather 按序列裁去不可见 prefix，仍每次读取当前页表和 KV；workspace 保留
+  绝对 KV 索引，**只减少搬运，不缩减分配容量**。B1/Hkv1/KV128K workspace 为
+  D128 64 MiB、D192 80 MiB；本例只搬后缀 16512 tokens（258 页）。
+
+以下是本轮 fresh ISA，均为无 LSE 性能 specialization：
+
+| Dqk | 模式 | VGPR | SGPR | LDS bytes | Private bytes | VGPR/SGPR spill |
+|---:|---|---:|---:|---:|---:|---:|
+| 128 | noncausal | 220 | 68 | 99840 | 0 | 0/0 |
+| 128 | causal 配对 | 220 | 74 | 99840 | 0 | 0/0 |
+| 128 | SWA+sink | 222 | 62 | 99840 | 0 | 0/0 |
+| 192 | noncausal | 256 | 71 | 149760 | 0 | 0/0 |
+| 192 | causal 配对 | 256 | 80 | 149760 | 0 | 0/0 |
+| 192 | SWA+sink | 256 | 65 | 149760 | 0 | 0/0 |
+
+### 测试与复现
+
+完整 strict suite **159 passed**。新增覆盖：D128/D192 × 奇偶/尾页，SWA 0/1/63/64/128/129/512，
+有/无 sink，sink -80/0/80/-inf，空 KV/全遮罩 LSE，GQA/非连续 Q/O，scalar/per-token
+scale，runtime 长度/页表/sink 改变，graph/stream，无 LSE 重复一致性和 causal 首尾配对。
+窗口外页表可设成非法大 ID，证明不会读取不可见 prefix；另有 zero-QK/one-V 的精确
+129-key+1-sink 测试，验证输出 `129/130` 与 `LSE=log(130)`，防止 off-by-one/double-sink。
+
+从 pyhip 根目录，使用现有 GPU 环境 `/opt/venv/bin/python`：
+
+```bash
+FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python -m pytest -q tests/flydsl/pa_8wave/test_pa_prefill.py
+FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python tests/flydsl/pa_8wave/test_pa_prefill.py --head-dim 128 192
+FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python tests/flydsl/pa_8wave/test_pa_prefill.py --q-len 32768 --kv-len 32768 --causal 1 --head-dim 128 192
+FLYDSL_RUNTIME_ENABLE_CACHE=0 /opt/venv/bin/python tests/flydsl/pa_8wave/test_pa_prefill.py --q-len 16384 --kv-len 32768 65536 131072 --causal 1 --window-left 128 --sink 1 --head-dim 128 192
+```
+
+---
+
+## 历史基线（以下为 2026-09-03，非新 8-wave 结果）
+
 更新时间：2026-09-03。当前实现已完成gfx942/gfx950 BF16、架构原生FP8、
 non-SWA及gfx950 SWA支持。本文件以gfx950当前结果为主；2026-08的gfx942数据统一
 归档在“历史结果”中，不与当前表直接横向比较。
@@ -608,3 +1229,5 @@ FP8 D192 dynamic persistent kernel的执行ISA同样逐条一致。
 - BF16 D192：`tests/flydsl/pa_4wave/att_bf16_d192/ui_output_agent_32152_dispatch_13`；
 - FP8主要stall/MFMA：MFMA 36.674、VALU 12.619、barrier 7.413、VMEM-load 6.397、
   LDS-wait 5.900；两条barrier约128/145 cycles。
+
+</details>

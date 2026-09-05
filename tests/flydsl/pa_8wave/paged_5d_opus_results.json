@@ -1,0 +1,196 @@
+{
+  "date": "2026-09-05",
+  "gpu": "AMD Instinct MI350X",
+  "arch": "gfx950:sramecc+:xnack-",
+  "device": 0,
+  "python": "/opt/venv/bin/python",
+  "python_version": "3.10.12",
+  "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+  "hip": "7.2.26015-fc0010cf6a",
+  "dtype": "bfloat16",
+  "batch": 1,
+  "value_dim": 128,
+  "page_size": 64,
+  "seed": 20260905,
+  "source": {
+    "pyhip_head": "3c1960a",
+    "aiter_head": "4529fa9c72f06aa7144b2ebed3eb5ff01e3499d1",
+    "ck_head": "15e12dd7f25ee583617c78f66cb502ff9916585f",
+    "note": "Worktrees contain uncommitted changes; hashes below identify the measured files. This comparison did not modify either attention implementation or the AITER kernels.",
+    "sha256": {
+      "pyhip/tests/flydsl/pa_8wave/pa_8wave_950.py": "a61221591568def6cb9095b80a8889fd17c4f82e821e463553586dbd055a9428",
+      "pyhip/tests/flydsl/pa_8wave/test_pa_prefill.py": "59def8df6d4a896944a7bf655e65f89ff9896de1ee8c9232a7d80715e0ad4872",
+      "pyhip/tests/flydsl/pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "aiter/csrc/include/fmha_fwd_hd128_bf16_opus_kernel.hpp": "987dd5c534187cf70735100bbde4b96f8b7ac854dd002b029cced2971a4c627f",
+      "aiter/csrc/include/fmha_fwd_hd192_v128_bf16_opus_kernel.hpp": "d273c2cff3874f835224fa48b8969447487c3f57ca4a868b48625869bad2a574",
+      "aiter/csrc/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu": "91819779024400b470a9abc1f58a65961339b32fbe50ea6a57536c5f8eec22d5",
+      "aiter/aiter/jit/module_fmha_fwd_bf16_opus.so": "ff6864b877db0df323e0242de69bbf6558dfca0c3a2e372b127f421adc030b19"
+    }
+  },
+  "protocol": {
+    "same_process_per_shape": true,
+    "same_logical_inputs": true,
+    "same_physical_cache_for_5d_candidates": true,
+    "random_physical_page_order": true,
+    "preallocated_outputs": true,
+    "return_lse": false,
+    "tail_padding": "zero for all performance candidates; direct correctness tests retain NaN-poisoned tails",
+    "initial_warmup_cycles_all_candidates": 100,
+    "warmups_per_measurement": 20,
+    "iterations_per_measurement": 100,
+    "rounds": 5,
+    "num_rotate_args": 1,
+    "candidate_order": "dictionary order on even rounds, reversed on odd rounds",
+    "timing": "aiter.test_common.run_perftest GPU profiler microseconds; each sample is its filtered average (first iteration and IQR outliers excluded); result is median of five samples",
+    "excluded": "compilation, first allocation, reference, construction of logical linear KV, and host dispatch time",
+    "clock_control": "no clock or power settings changed for this comparison",
+    "correctness": "independent FP32 torch reference, rtol=atol=0.02, checkAllclose error ratio must be zero",
+    "flops": "2 * heads * visible_query_key_pairs * (dq + 128)",
+    "logical_bytes": "2 * (q * heads * (dq + 128) + visible_page_aligned_KV_union * kv_heads * (dq + 128)); not measured HBM traffic",
+    "env": {"FLYDSL_RUNTIME_ENABLE_CACHE": "0"},
+    "entry": "tests/flydsl/pa_8wave/test_pa_prefill.py",
+    "argv_sweeps": [
+      ["--head-dim", "128", "192"],
+      ["--q-len", "32768", "--kv-len", "32768", "--causal", "1", "--head-dim", "128", "192"],
+      ["--q-len", "16384", "--kv-len", "131072", "--causal", "1", "--window-left", "128", "--sink", "1", "--head-dim", "128", "192"]
+    ]
+  },
+  "candidate_semantics": {
+    "flydsl_5d": "Public direct-paged call, same original SHUFFLE-5D K/V and page table; one attention kernel, no gather or KV workspace.",
+    "4wave_static_5d": "Legacy 4-wave static scheduling, same original SHUFFLE-5D K/V and page table.",
+    "4wave_dynamic_5d": "Legacy 4-wave dynamic scheduling, same original SHUFFLE-5D K/V and page table.",
+    "aiter_5d": "mha_batch_prefill_func on the exact same 5D tensors and page table, with actual last-page lengths; no layout conversion or fallback.",
+    "opus_linear": "Explicit fmha_fwd_bf16_opus_fwd for D128 (prebuilt BSHD views) or fmha_fwd_bf16_opus_varlen_fwd for D192 (packed group mode). Identical logical linear KV is constructed before timing. Not a 5D/end-to-end paged timing. No SWA or sink support.",
+    "aiter_linear": "Supplementary flash_attn_varlen_func on prebuilt identical logical linear KV. Actual dispatch is ASM for D128 full, OPUS for D192 full, and CK for SWA+sink; not uniformly OPUS."
+  },
+  "aiter_5d_rejection": {
+    "observed": "All six production shapes and six small correctness probes returned no matching kernel found for page64.",
+    "source_gate": "3rdparty/composable_kernel/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py: SUPPORTED_PAGE_SIZE = [1, 16, 1024]; generated dispatch tests exact t.page_size equality. Page size 1 is linear-only.",
+    "note": "The 5D layout passes ABI validation. The generic error suffix mentioning >2GB/CDNA3 is not the cause in these small-cache gfx950 cases. No AITER source or build modification was made to add page64."
+  },
+  "validation": {"passed": 173, "skipped": 6, "skipped_reason": "missing AITER 5D page64 specialization", "original_direct_tests_passed": 165},
+  "cases": [
+    {
+      "q": 10240, "kv": 2583, "heads": 16, "kv_heads": 1, "dq": 128,
+      "causal": false, "window_left": -1, "has_sink": false,
+      "timing_us": {
+        "flydsl_5d": [262.9933333333333, 264.066896551724, 263.80990588235284, 265.8156041666668, 264.69128735632194],
+        "aiter_linear": [254.24952873563225, 253.8745176470588, 253.7220352941176, 254.26224999999994, 253.61053571428562],
+        "opus_linear": [240.76627710843377, 241.05115853658526, 240.55183132530107, 241.39087951807227, 241.17690361445784],
+        "4wave_static_5d": [269.3452926829269, 269.3407590361446, 269.59919047619053, 269.4618780487804, 269.5122352941176],
+        "4wave_dynamic_5d": [274.0308750000001, 274.5801894736842, 273.77869892473115, 274.54732258064524, 273.8343076923076]
+      },
+      "median_us": {"flydsl_5d": 264.066896551724, "aiter_linear": 253.8745176470588, "opus_linear": 241.05115853658526, "4wave_static_5d": 269.4618780487804, "4wave_dynamic_5d": 274.0308750000001},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "opus_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."},
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "opus_linear": ["void gqa_d128_kernel<opus_gqa_traits<32, 64, 128, 8, false> >(opus_gqa_kargs)"],
+        "aiter_linear": ["aiter::fmha_fwd_hd128_bf16_group"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    },
+    {
+      "q": 10240, "kv": 2583, "heads": 16, "kv_heads": 1, "dq": 192,
+      "causal": false, "window_left": -1, "has_sink": false,
+      "timing_us": {
+        "flydsl_5d": [299.7984719101122, 304.03609195402305, 302.41782352941186, 303.6413999999999, 303.7859425287355],
+        "aiter_linear": [292.4751904761905, 291.6305505617978, 290.8860602409639, 292.69088372093034, 292.3614823529414],
+        "opus_linear": [292.4863258426967, 292.58063953488363, 291.26111235955045, 292.73970930232565, 293.0764767441859],
+        "4wave_static_5d": [318.5126249999999, 318.24047058823515, 318.1694186046512, 318.26941860465115, 318.2437023809523],
+        "4wave_dynamic_5d": [325.0492183908045, 325.07293023255824, 324.59222352941174, 325.1924534883721, 324.87709302325584]
+      },
+      "median_us": {"flydsl_5d": 303.6413999999999, "aiter_linear": 292.3614823529414, "opus_linear": 292.58063953488363, "4wave_static_5d": 318.2437023809523, "4wave_dynamic_5d": 325.0492183908045},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "opus_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."},
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "opus_linear": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, false, true, false, false> >(opus_gqa_d192_kargs)"],
+        "aiter_linear": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, false, true, false, false> >(opus_gqa_d192_kargs)"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    },
+    {
+      "q": 32768, "kv": 32768, "heads": 16, "kv_heads": 1, "dq": 128,
+      "causal": true, "window_left": -1, "has_sink": false,
+      "timing_us": {
+        "flydsl_5d": [4595.73937647059, 4571.007141414142, 4597.027838383837, 4617.607545454545, 4619.611292929295],
+        "aiter_linear": [4543.217907894733, 4564.112580246914, 4571.748894736843, 4595.693688311688, 4604.570026315794],
+        "opus_linear": [4681.364080808081, 4704.412653061221, 4720.933181818182, 4732.338737373738, 4735.742121212119],
+        "4wave_static_5d": [4922.896091836733, 4935.027757575754, 4954.043216494846, 4964.616656565656, 4977.785453608247],
+        "4wave_dynamic_5d": [5498.2709595959595, 5499.035858585859, 5537.502252525257, 5536.846010101011, 5555.255585858587]
+      },
+      "median_us": {"flydsl_5d": 4597.027838383837, "aiter_linear": 4571.748894736843, "opus_linear": 4720.933181818182, "4wave_static_5d": 4954.043216494846, "4wave_dynamic_5d": 5536.846010101011},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "opus_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=512, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."},
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "opus_linear": ["void gqa_d128_kernel<opus_gqa_traits<32, 64, 128, 8, true> >(opus_gqa_kargs)"],
+        "aiter_linear": ["aiter::fmha_fwd_hd128_bf16_causal_group"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    },
+    {
+      "q": 32768, "kv": 32768, "heads": 16, "kv_heads": 1, "dq": 192,
+      "causal": true, "window_left": -1, "has_sink": false,
+      "timing_us": {
+        "flydsl_5d": [5444.506347826082, 5442.9091499999995, 5358.25270707071, 5444.459209876546, 5446.174037974685],
+        "aiter_linear": [5282.088518987344, 5283.227151162791, 5284.5467594936745, 5284.999857142856, 5284.614842105261],
+        "opus_linear": [5283.594734939761, 5283.39149411765, 5284.762174999999, 5285.021132530123, 5281.992239999999],
+        "4wave_static_5d": [6443.126447916672, 6440.298868686863, 6448.437626262627, 6455.874616161616, 6453.5567789473735],
+        "4wave_dynamic_5d": [7107.316071428569, 7101.848639175259, 7125.70230612245, 7130.126909090908, 7132.566551020412]
+      },
+      "median_us": {"flydsl_5d": 5444.459209876546, "aiter_linear": 5284.5467594936745, "opus_linear": 5283.594734939761, "4wave_static_5d": 6448.437626262627, "4wave_dynamic_5d": 7125.70230612245},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "opus_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=512, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."},
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "opus_linear": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, true, true, false, false> >(opus_gqa_d192_kargs)"],
+        "aiter_linear": ["void gqa_d192_v128_kernel<opus_gqa_d192_traits<32, 64, 8, true, true, false, false> >(opus_gqa_d192_kargs)"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    },
+    {
+      "q": 16384, "kv": 131072, "heads": 16, "kv_heads": 1, "dq": 128,
+      "causal": true, "window_left": 128, "has_sink": true,
+      "timing_us": {
+        "flydsl_5d": [90.09905154639173, 101.57870707070707, 102.53591919191929, 101.81346464646461, 102.31732323232326],
+        "aiter_linear": [116.19244897959193, 115.21962765957447, 117.00115662650597, 114.27025274725277, 114.84301136363628],
+        "4wave_static_5d": [82.68389898989898, 81.97156565656564, 81.38932323232328, 81.94487878787882, 81.91498989898984],
+        "4wave_dynamic_5d": [87.12123232323235, 87.9289393939394, 86.5273265306123, 87.43073737373737, 86.46626262626258]
+      },
+      "median_us": {"flydsl_5d": 101.81346464646461, "aiter_linear": 115.21962765957447, "4wave_static_5d": 81.94487878787882, "4wave_dynamic_5d": 87.12123232323235},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {
+        "opus_linear": "OPUS D128/D192 has no SWA or sink support",
+        "aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=2048, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."
+      },
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "aiter_linear": ["_ZN7ck_tile6kentryINS_8gfx950_tELi2ENS_13FmhaFwdKernelINS_34BlockFmhaPipelineQRKSVSAsyncTrloadINS_24BlockFmhaPipelineProblemIDF16bDF16bDF16bffDF16bhfDF16bfDF16bNS_13TileFmhaShapeINS_8sequenceIJLi128ELi64ELi32ELi128ELi16ELi128EEEENS6_IJLi4ELi1ELi1EEEENS6_IJLi32ELi32ELi16EEEES8_S9_Lb1EEELb1ENS_17ComposedAttentionILj0ELb1EEENS_30SimplifiedGenericAttentionMaskILb1EEELb1ENS_14TileFmhaTraitsILb1ELb1ELb0ELb0ELb0ELNS_22BlockAttentionBiasEnumE0ELb0ELb0ELb0ELNS_28BlockAttentionQuantScaleEnumE0ELin1ELb0ELb1EEEEENS_47BlockFmhaPipelineQRKSVSAsyncTrloadDefaultPolicyEEENS_17Default2DEpilogueINS_24Default2DEpilogueProblemIfDF16bLb1ELb0ELb1EEEvEEEEJNSQ_21FmhaFwdGroupModeKargsEEEENSt9enable_ifIXnt26kattr_no_packed_fp32_ops_vIT_EEvE4typeEDpT2_"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    },
+    {
+      "q": 16384, "kv": 131072, "heads": 16, "kv_heads": 1, "dq": 192,
+      "causal": true, "window_left": 128, "has_sink": true,
+      "timing_us": {
+        "flydsl_5d": [105.46894949494951, 118.10139130434781, 117.21798936170212, 118.28101063829783, 118.33053260869566],
+        "aiter_linear": [127.13394949494955, 125.3533854166666, 125.31707368421054, 125.09993939393937, 126.42201010101013],
+        "4wave_static_5d": [95.16071717171715, 95.74821212121212, 94.78170707070716, 95.92437373737377, 96.23024242424239],
+        "4wave_dynamic_5d": [101.29102020202016, 101.84861616161609, 101.22233333333328, 102.21106060606061, 102.40661616161616]
+      },
+      "median_us": {"flydsl_5d": 118.10139130434781, "aiter_linear": 125.3533854166666, "4wave_static_5d": 95.74821212121212, "4wave_dynamic_5d": 101.84861616161609},
+      "errors": {"flydsl_5d": 0.0, "aiter_linear": 0.0, "4wave_static_5d": 0.0, "4wave_dynamic_5d": 0.0},
+      "unavailable": {
+        "opus_linear": "OPUS D128/D192 has no SWA or sink support",
+        "aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=2048, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."
+      },
+      "dispatch": {
+        "flydsl_5d": ["_attention_kernel_0"],
+        "aiter_linear": ["_ZN7ck_tile6kentryINS_8gfx950_tELi2ENS_13FmhaFwdKernelINS_28BlockFmhaPipelineQRKSVSAsyncINS_24BlockFmhaPipelineProblemIDF16bDF16bDF16bffDF16bhfDF16bfDF16bNS_13TileFmhaShapeINS_8sequenceIJLi128ELi128ELi32ELi128ELi32ELi192EEEENS6_IJLi4ELi1ELi1EEEENS6_IJLi32ELi32ELi16EEEES8_S9_Lb1EEELb1ENS_17ComposedAttentionILj0ELb1EEENS_30SimplifiedGenericAttentionMaskILb1EEELb0ENS_14TileFmhaTraitsILb1ELb1ELb1ELb1ELb0ELNS_22BlockAttentionBiasEnumE0ELb0ELb0ELb0ELNS_28BlockAttentionQuantScaleEnumE0ELin1ELb0ELb1EEEEENS_35BlockFmhaPipelineQXKSVSCustomPolicyILb1ELb1ELi3ELi3EEEEENS_17Default2DEpilogueINS_24Default2DEpilogueProblemIfDF16bLb1ELb1ELb1EEEvEEEEJNSR_21FmhaFwdGroupModeKargsEEEENSt9enable_ifIXnt26kattr_no_packed_fp32_ops_vIT_EEvE4typeEDpT2_"]
+      },
+      "layout_note": "*_5d candidates share the exact paged cache; *_linear use identical logical KV prepared before timing"
+    }
+  ]
+}
