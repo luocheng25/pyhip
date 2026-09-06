@@ -1,0 +1,43 @@
+{
+  "candidate": "4static",
+  "dq": 192,
+  "q": 16384,
+  "kv": 131072,
+  "heads": 16,
+  "window": 128,
+  "query_tile": null,
+  "bn": null,
+  "sink": 1,
+  "lse": 0,
+  "dump_dir": "/tmp/swa1_final_isa/4static",
+  "output": "tests/flydsl/pa_1wave/resource_4static.json",
+  "gfx": "gfx950:sramecc+:xnack-",
+  "gpu": "AMD Instinct MI350X",
+  "source_sha256": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+  "source": "pa_4wave/pa_prefill_4wave.py",
+  "launches": 23,
+  "selected_iterations": [
+    21,
+    22,
+    23
+  ],
+  "correct": true,
+  "resources": {
+    "vgpr_count": 208,
+    "sgpr_count": 46,
+    "group_segment_fixed_size": 24960,
+    "private_segment_fixed_size": 0,
+    "vgpr_spill_count": 0,
+    "sgpr_spill_count": 0,
+    "wavefront_size": 64,
+    "max_flat_workgroup_size": 256,
+    "accum_offset": 208,
+    "agpr_count": 0
+  },
+  "mfma_static_sites": {
+    "v_mfma_f32_32x32x16_bf16": 40
+  },
+  "barrier_static_sites": 7,
+  "isa_sha256": "1e52f147669122ec408d6f891848fa20cd5fef18d92c3765f7534783fe57f4f0",
+  "isa_path": "/tmp/swa1_final_isa/4static/attention_kernel_static_0/21_final_isa.s"
+}

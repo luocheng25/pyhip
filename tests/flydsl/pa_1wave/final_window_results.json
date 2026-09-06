@@ -1,0 +1,1122 @@
+[
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 128,
+    "window": 0,
+    "samples_us": {
+      "1w_auto": [
+        41.03275757575758,
+        41.836898989898984,
+        41.852336734693864,
+        41.50075280898874,
+        42.36374747474745
+      ],
+      "4w_static": [
+        52.611808080808046,
+        52.648575757575756,
+        52.27523232323233,
+        51.95198989898989,
+        52.798484848484826
+      ],
+      "4w_dynamic": [
+        59.1639696969697,
+        59.47832323232323,
+        59.26659595959594,
+        59.226585858585835,
+        58.929212121212124
+      ],
+      "8w_static": [
+        76.52778494623657,
+        76.79861797752808,
+        76.7168888888889,
+        77.16087500000003,
+        76.86965656565653
+      ],
+      "8w_persistent": [
+        73.3681212121212,
+        73.59822580645161,
+        73.14466666666667,
+        73.32003030303034,
+        73.92124468085102
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 16,
+        "block_n": 16,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 41.836898989898984,
+      "4w_static": 52.611808080808046,
+      "4w_dynamic": 59.226585858585835,
+      "8w_static": 76.79861797752808,
+      "8w_persistent": 73.3681212121212
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 134217728,
+    "logical_bytes": 142606336
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 128,
+    "window": 16,
+    "samples_us": {
+      "1w_auto": [
+        44.552459183673506,
+        48.24396969696968,
+        50.31516161616161,
+        50.08162244897958,
+        48.909858585858615
+      ],
+      "4w_static": [
+        68.5820808080808,
+        67.14457894736842,
+        67.447898989899,
+        67.74205050505047,
+        68.43412244897956
+      ],
+      "4w_dynamic": [
+        73.09214141414145,
+        72.97658585858585,
+        73.65135353535356,
+        73.98712121212121,
+        72.94060824742274
+      ],
+      "8w_static": [
+        86.22514141414142,
+        86.65560869565213,
+        85.16530303030308,
+        86.91445454545453,
+        86.39116842105263
+      ],
+      "8w_persistent": [
+        85.32814141414137,
+        85.49623232323236,
+        85.33176767676767,
+        85.53760204081635,
+        85.27636734693878
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 16,
+        "block_n": 16,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 48.909858585858615,
+      "4w_static": 67.74205050505047,
+      "4w_dynamic": 73.09214141414145,
+      "8w_static": 86.39116842105263,
+      "8w_persistent": 85.33176767676767
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 2281701376,
+    "logical_bytes": 142639104
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 128,
+    "window": 64,
+    "samples_us": {
+      "1w_auto": [
+        53.36011111111111,
+        59.386831578947444,
+        58.919515151515135,
+        58.85526262626267,
+        58.81364646464644
+      ],
+      "4w_static": [
+        70.15223232323233,
+        69.3349693877551,
+        70.00031313131316,
+        68.78087628865983,
+        69.32231313131311
+      ],
+      "4w_dynamic": [
+        75.37263636363636,
+        74.4183541666667,
+        74.37906060606058,
+        74.24984693877558,
+        74.24903061224488
+      ],
+      "8w_static": [
+        88.43411111111106,
+        88.85391919191918,
+        87.32654945054941,
+        88.48178787878788,
+        87.22881818181814
+      ],
+      "8w_persistent": [
+        86.4922222222223,
+        86.6110202020202,
+        86.4893939393939,
+        87.65065656565656,
+        86.72296808510642
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 58.85526262626267,
+      "4w_static": 69.3349693877551,
+      "4w_dynamic": 74.37906060606058,
+      "8w_static": 88.43411111111106,
+      "8w_persistent": 86.6110202020202
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 8724152320,
+    "logical_bytes": 142639104
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 128,
+    "window": 512,
+    "samples_us": {
+      "1w_auto": [
+        139.4814936708861,
+        147.69411702127664,
+        149.40826881720432,
+        147.6594947368421,
+        150.17667346938777
+      ],
+      "4w_static": [
+        157.03767010309284,
+        154.70502127659586,
+        155.92379166666663,
+        154.0381808510638,
+        155.88591489361707
+      ],
+      "4w_dynamic": [
+        164.12909375000004,
+        165.78172448979595,
+        164.486581632653,
+        165.19134020618563,
+        164.22659374999998
+      ],
+      "8w_static": [
+        158.87239361702126,
+        160.07076288659786,
+        159.33399999999995,
+        159.08516842105263,
+        159.6195052631579
+      ],
+      "8w_persistent": [
+        157.11062765957442,
+        157.54635416666667,
+        157.66591836734688,
+        157.54060215053758,
+        157.86137500000004
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 147.69411702127664,
+      "4w_static": 155.88591489361707,
+      "4w_dynamic": 164.486581632653,
+      "8w_static": 159.33399999999995,
+      "8w_persistent": 157.54635416666667
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 68853694464,
+    "logical_bytes": 142868480
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 128,
+    "window": 1024,
+    "samples_us": {
+      "1w_auto": [
+        238.48565853658525,
+        249.11657142857146,
+        246.38936842105264,
+        244.9337473684211,
+        247.08670707070712
+      ],
+      "4w_static": [
+        249.02232608695655,
+        247.5126170212765,
+        249.90721428571436,
+        247.16878494623663,
+        248.8755161290322
+      ],
+      "4w_dynamic": [
+        261.52799999999996,
+        263.52388421052626,
+        261.55758695652173,
+        261.05820000000006,
+        260.760945054945
+      ],
+      "8w_static": [
+        236.40343877551024,
+        234.7376888888889,
+        236.6911818181819,
+        236.32994949494952,
+        236.92102040816317
+      ],
+      "8w_persistent": [
+        234.04987878787878,
+        233.56532631578952,
+        233.03020430107517,
+        231.62011702127649,
+        233.72582828282825
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 246.38936842105264,
+      "4w_static": 248.8755161290322,
+      "4w_dynamic": 261.52799999999996,
+      "8w_static": 236.40343877551024,
+      "8w_persistent": 233.56532631578952
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 137573171200,
+    "logical_bytes": 143130624
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "window": 0,
+    "samples_us": {
+      "1w_auto": [
+        48.24075257731956,
+        49.97939393939394,
+        49.852515151515156,
+        49.944636363636384,
+        50.660222222222224
+      ],
+      "4w_static": [
+        64.43850505050503,
+        62.13659595959599,
+        62.34791919191927,
+        63.47159595959597,
+        62.944303030303026
+      ],
+      "4w_dynamic": [
+        67.67375757575755,
+        68.5828888888889,
+        68.29036363636362,
+        69.10412121212123,
+        68.464101010101
+      ],
+      "8w_static": [
+        87.0381333333333,
+        87.19349484536092,
+        87.17588888888888,
+        87.3415454545455,
+        87.41256250000004
+      ],
+      "8w_persistent": [
+        83.08853061224484,
+        82.60417582417583,
+        83.05169696969703,
+        83.01533333333333,
+        82.95442105263155
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 16,
+        "block_n": 16,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 49.944636363636384,
+      "4w_static": 62.944303030303026,
+      "4w_dynamic": 68.464101010101,
+      "8w_static": 87.19349484536092,
+      "8w_persistent": 83.01533333333333
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 167772160,
+    "logical_bytes": 178257920
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "window": 16,
+    "samples_us": {
+      "1w_auto": [
+        50.61254545454546,
+        57.332383838383855,
+        56.5157878787879,
+        57.540239583333346,
+        58.18454545454545
+      ],
+      "4w_static": [
+        81.36557575757571,
+        80.01845454545453,
+        80.62776767676768,
+        79.15269791666663,
+        80.43706060606064
+      ],
+      "4w_dynamic": [
+        84.2330612244898,
+        86.2093838383838,
+        84.57457575757576,
+        85.0323737373737,
+        85.22026262626258
+      ],
+      "8w_static": [
+        98.00537373737374,
+        97.85444680851063,
+        97.45342424242429,
+        98.32457575757579,
+        98.06556565656558
+      ],
+      "8w_persistent": [
+        96.34182795698923,
+        96.31156565656565,
+        96.08045454545459,
+        94.99031313131313,
+        95.65861616161618
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 16,
+        "block_n": 16,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 57.332383838383855,
+      "4w_static": 80.43706060606064,
+      "4w_dynamic": 85.0323737373737,
+      "8w_static": 98.00537373737374,
+      "8w_persistent": 96.08045454545459
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 2852126720,
+    "logical_bytes": 178298880
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "window": 64,
+    "samples_us": {
+      "1w_auto": [
+        61.50546464646466,
+        67.9610408163265,
+        68.99744444444444,
+        67.58163636363636,
+        68.25924242424242
+      ],
+      "4w_static": [
+        82.05044444444448,
+        81.08031313131316,
+        81.22293939393937,
+        81.1902121212121,
+        80.87585858585865
+      ],
+      "4w_dynamic": [
+        85.52854545454548,
+        86.45424242424242,
+        85.50470707070707,
+        87.43891919191921,
+        86.02149494949492
+      ],
+      "8w_static": [
+        99.76745454545456,
+        100.12342424242422,
+        99.66401010101008,
+        100.44020202020202,
+        99.79694949494954
+      ],
+      "8w_persistent": [
+        98.40780808080805,
+        98.17079381443293,
+        97.19887878787874,
+        97.9647362637362,
+        98.66195959595962
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 67.9610408163265,
+      "4w_static": 81.1902121212121,
+      "4w_dynamic": 86.02149494949492,
+      "8w_static": 99.79694949494954,
+      "8w_persistent": 98.17079381443293
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 10905190400,
+    "logical_bytes": 178298880
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "window": 512,
+    "samples_us": {
+      "1w_auto": [
+        168.75460000000007,
+        177.54166666666674,
+        177.93351063829786,
+        177.59807142857133,
+        178.4771145833333
+      ],
+      "4w_static": [
+        181.38677551020422,
+        179.02097959183675,
+        179.00798947368423,
+        178.41890816326534,
+        179.8736530612245
+      ],
+      "4w_dynamic": [
+        192.73696938775518,
+        191.59801041666665,
+        191.10778947368422,
+        192.47164210526313,
+        190.09808421052628
+      ],
+      "8w_static": [
+        181.19915957446798,
+        182.33537755102043,
+        181.65861052631587,
+        183.59624489795917,
+        182.1023061224489
+      ],
+      "8w_persistent": [
+        179.72886315789475,
+        180.5834795918367,
+        180.3457216494846,
+        179.34442105263162,
+        180.8108367346939
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 177.59807142857133,
+      "4w_static": 179.02097959183675,
+      "4w_dynamic": 191.59801041666665,
+      "8w_static": 182.1023061224489,
+      "8w_persistent": 180.3457216494846
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 86067118080,
+    "logical_bytes": 178585600
+  },
+  {
+    "q": 16384,
+    "kv": 131072,
+    "dq": 192,
+    "window": 1024,
+    "samples_us": {
+      "1w_auto": [
+        288.75420652173915,
+        296.0976153846154,
+        299.0481818181819,
+        299.9272765957447,
+        299.58072727272736
+      ],
+      "4w_static": [
+        288.40460869565214,
+        286.02690109890096,
+        287.8463478260869,
+        286.10167021276595,
+        288.0059239130436
+      ],
+      "4w_dynamic": [
+        303.87334831460663,
+        303.70190804597723,
+        304.193902173913,
+        304.34528089887635,
+        304.91827173913055
+      ],
+      "8w_static": [
+        269.8204166666667,
+        270.6333645833334,
+        267.85127173913054,
+        269.2714526315788,
+        268.2417282608696
+      ],
+      "8w_persistent": [
+        268.44696774193545,
+        268.2963258426968,
+        265.18350549450554,
+        267.28249450549447,
+        266.0464065934065
+      ]
+    },
+    "source_sha256": {
+      "pa_1wave/swa_1wave.py": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "pa_1wave/test_swa_1wave.py": "71299bbfbe537ba3798fab2128f8dd7a6f9f8a75d4f474dbf74c53b54bd4e968",
+      "pa_4wave/pa_prefill_4wave.py": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "pa_8wave/pa_8wave_950.py": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "pa_8wave/test_pa_prefill.py": "7e9c0fb50fba37f510f6ce2e5e7bf56ea7825725872a27dfa9a6d2751cdbf96d"
+    },
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+    "hip": "7.2.26015-fc0010cf6a",
+    "batch": 1,
+    "heads": 16,
+    "kv_heads": 1,
+    "dv": 128,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true,
+    "preallocated_output": true,
+    "with_lse": false,
+    "seed": 20260905,
+    "dispatches": {
+      "1w_auto": [
+        "_swa32_kernel_0"
+      ],
+      "4w_static": [
+        "attention_kernel_static_0"
+      ],
+      "4w_dynamic": [
+        "attention_kernel_0"
+      ],
+      "8w_static": [
+        "_attention_kernel_0"
+      ],
+      "8w_persistent": [
+        "_attention_persistent_kernel_0"
+      ]
+    },
+    "single_wave_tiles": {
+      "1w_auto": {
+        "query_tile": 32,
+        "block_n": 32,
+        "threads": 64
+      }
+    },
+    "timing": {
+      "method": "aiter.run_perftest",
+      "common_warmup": 100,
+      "warmup": 20,
+      "iterations": 100,
+      "trials": 5,
+      "alternating_candidate_order": true
+    },
+    "median_us": {
+      "1w_auto": 299.0481818181819,
+      "4w_static": 287.8463478260869,
+      "4w_dynamic": 304.193902173913,
+      "8w_static": 269.2714526315788,
+      "8w_persistent": 267.28249450549447
+    },
+    "errors": {
+      "1w_auto": 0.0,
+      "4w_static": 0.0,
+      "4w_dynamic": 0.0,
+      "8w_static": 0.0,
+      "8w_persistent": 0.0
+    },
+    "effective_flops": 171966464000,
+    "logical_bytes": 178913280
+  }
+]

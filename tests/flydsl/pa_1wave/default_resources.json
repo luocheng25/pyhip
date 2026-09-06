@@ -1,0 +1,598 @@
+[
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 0,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w0_l0",
+    "output": "/tmp/swa1_default_resources/d128_w0_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 116,
+      "sgpr_count": 33,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 116,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 4,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "88f8e91e09066fa1701d10a7a0322c1bb76e52dfe8054b79a33b69e300938e45",
+    "isa_path": "/tmp/swa1_default_resources/d128_w0_l0/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 0,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w0_l1",
+    "output": "/tmp/swa1_default_resources/d128_w0_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 118,
+      "sgpr_count": 34,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 120,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 4,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "56513a6ef049f39721c68e52f2f842e98f9856f5c5762795f5991c82756256f4",
+    "isa_path": "/tmp/swa1_default_resources/d128_w0_l1/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 16,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w16_l0",
+    "output": "/tmp/swa1_default_resources/d128_w16_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 114,
+      "sgpr_count": 31,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 116,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 4,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "ff1a5f10ed48f6f9b042d5367b1f8a30da0757227b9d6d8e1809f489a4015e91",
+    "isa_path": "/tmp/swa1_default_resources/d128_w16_l0/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 16,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w16_l1",
+    "output": "/tmp/swa1_default_resources/d128_w16_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 116,
+      "sgpr_count": 32,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 116,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 4,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "1c63dd61120792b70ef94ee89c3da351a081999fa395f9e9083d669632dbefd9",
+    "isa_path": "/tmp/swa1_default_resources/d128_w16_l1/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 128,
+    "query_tile": 32,
+    "bn": 32,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w128_l0",
+    "output": "/tmp/swa1_default_resources/d128_w128_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      512
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 213,
+      "sgpr_count": 34,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 216,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 32
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "dd06731fdc99c3d102e0d9c67fd873a2682c213c19b32870f7f7387e12fa5276",
+    "isa_path": "/tmp/swa1_default_resources/d128_w128_l0/_swa32_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 128,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 128,
+    "query_tile": 32,
+    "bn": 32,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d128_w128_l1",
+    "output": "/tmp/swa1_default_resources/d128_w128_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      512
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 236,
+      "sgpr_count": 34,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 236,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 32
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "9e070c19ca0e266dc08f76e7a6dac6bf5e56825ff4f3cf5db638ba58112dcd51",
+    "isa_path": "/tmp/swa1_default_resources/d128_w128_l1/_swa32_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 0,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w0_l0",
+    "output": "/tmp/swa1_default_resources/d192_w0_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 127,
+      "sgpr_count": 42,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 128,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 6,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "8910794c82b9a749ae42d35534136558a6e142199590e654c7a32a1bc9e6227a",
+    "isa_path": "/tmp/swa1_default_resources/d192_w0_l0/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 0,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w0_l1",
+    "output": "/tmp/swa1_default_resources/d192_w0_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 136,
+      "sgpr_count": 40,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 136,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 6,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "e3071fc8c4c7038bebdfac23083cc06a8df9d68d34b1e5a2ded79325733af684",
+    "isa_path": "/tmp/swa1_default_resources/d192_w0_l1/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 16,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w16_l0",
+    "output": "/tmp/swa1_default_resources/d192_w16_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 128,
+      "sgpr_count": 36,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 128,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 6,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "d3ea7133b25a9ab34dacc71f03c2459ab8d8cc4045357444142697a766029ab9",
+    "isa_path": "/tmp/swa1_default_resources/d192_w16_l0/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 16,
+    "query_tile": 16,
+    "bn": 16,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w16_l1",
+    "output": "/tmp/swa1_default_resources/d192_w16_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      1024
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 127,
+      "sgpr_count": 36,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 128,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 6,
+      "v_mfma_f32_16x16x16_bf16": 8
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "5d686b42be0057fc2bea841c021ca535a09c6e7c3f43d43d3b734e0bbe20c544",
+    "isa_path": "/tmp/swa1_default_resources/d192_w16_l1/_swa_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 128,
+    "query_tile": 32,
+    "bn": 32,
+    "sink": 1,
+    "lse": 0,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w128_l0",
+    "output": "/tmp/swa1_default_resources/d192_w128_l0.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      512
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 238,
+      "sgpr_count": 36,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 240,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 40
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "68d0f8c82d63445f423d509263247f9a84043363316561138c39c729fd859c86",
+    "isa_path": "/tmp/swa1_default_resources/d192_w128_l0/_swa32_kernel_0/21_final_isa.s"
+  },
+  {
+    "candidate": "1wave",
+    "dq": 192,
+    "q": 16384,
+    "kv": 131072,
+    "heads": 16,
+    "window": 128,
+    "query_tile": 32,
+    "bn": 32,
+    "sink": 1,
+    "lse": 1,
+    "dump_dir": "/tmp/swa1_default_resources/d192_w128_l1",
+    "output": "/tmp/swa1_default_resources/d192_w128_l1.json",
+    "gfx": "gfx950:sramecc+:xnack-",
+    "gpu": "AMD Instinct MI350X",
+    "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+    "source": "pa_1wave/swa_1wave.py",
+    "launches": 23,
+    "selected_iterations": [
+      21,
+      22,
+      23
+    ],
+    "threads": 64,
+    "grid": [
+      16,
+      1,
+      512
+    ],
+    "correct": true,
+    "resources": {
+      "vgpr_count": 248,
+      "sgpr_count": 34,
+      "group_segment_fixed_size": 0,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "wavefront_size": 64,
+      "max_flat_workgroup_size": 64,
+      "accum_offset": 248,
+      "agpr_count": 0
+    },
+    "mfma_static_sites": {
+      "v_mfma_f32_16x16x32_bf16": 40
+    },
+    "barrier_static_sites": 0,
+    "isa_sha256": "d3c5529f87a46a683b30f844f5dfd49b24350ecb14cf99a7c7bafe3ab96362d1",
+    "isa_path": "/tmp/swa1_default_resources/d192_w128_l1/_swa32_kernel_0/21_final_isa.s"
+  }
+]

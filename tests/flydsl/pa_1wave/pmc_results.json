@@ -1,0 +1,214 @@
+{
+  "workload": {
+    "dq": 192,
+    "dv": 128,
+    "q": 16384,
+    "kv": 131072,
+    "window": 128,
+    "heads": 16,
+    "kv_heads": 1,
+    "batch": 1,
+    "page": 64,
+    "dtype": "bfloat16",
+    "sink": true
+  },
+  "tool": "rocprofv3 1.1.0 / ROCm 7.2",
+  "selected_iterations": [
+    21,
+    22,
+    23
+  ],
+  "launch_script": "profile_swa_1wave.py",
+  "counter_config": "pmc.txt",
+  "candidates": {
+    "1wave": {
+      "source": "pa_1wave/swa_1wave.py",
+      "source_sha256": "44b32d3bc5feb29e8088686397babb4552bfe5c3ed18653c5041e1657b07bf01",
+      "csv_path": "/tmp/swa1_final_pmc_csv/1wave/pmc_1/counters_counter_collection.csv",
+      "csv_sha256": "57dba8c0422edf624ff1d513cc18c339bb076b8633f98c8e27faaeeae4954918",
+      "counter_samples": {
+        "SQ_INSTS_LDS": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1638400.0,
+          1638400.0,
+          1638400.0
+        ],
+        "SQ_INSTS_VALU": [
+          9060637.0,
+          9060637.0,
+          9060637.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          950272.0,
+          950272.0,
+          950272.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      },
+      "dispatch_ids": [
+        38,
+        39,
+        40
+      ],
+      "kernel_names": [
+        "_swa32_kernel_0"
+      ],
+      "workgroup_size": 64,
+      "grid_threads": 524288,
+      "mfma_mnk": [
+        16,
+        16,
+        32
+      ],
+      "flops_per_mfma_instruction": 16384,
+      "executed_mfma_flops": [
+        26843545600.0,
+        26843545600.0,
+        26843545600.0
+      ]
+    },
+    "4static": {
+      "source": "pa_4wave/pa_prefill_4wave.py",
+      "source_sha256": "7ed2215b0027881af91ad5e12f253288254396db8a21265c5d3bfd65e8d5d375",
+      "csv_path": "/tmp/swa1_final_pmc_csv/4static_matched/pmc_1/counters_counter_collection.csv",
+      "csv_sha256": "760bf81dab10216d1cc560cafab4aa81d7bcc1f522218c58e03e4ec2afbe7a69",
+      "counter_samples": {
+        "SQ_INSTS_LDS": [
+          1081344.0,
+          1081344.0,
+          1081344.0
+        ],
+        "SQ_INSTS_MFMA": [
+          1310720.0,
+          1310720.0,
+          1310720.0
+        ],
+        "SQ_INSTS_VALU": [
+          14926304.0,
+          14926304.0,
+          14926304.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          917504.0,
+          917504.0,
+          917504.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          786432.0,
+          786432.0,
+          786432.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      },
+      "dispatch_ids": [
+        38,
+        39,
+        40
+      ],
+      "kernel_names": [
+        "attention_kernel_static_0"
+      ],
+      "workgroup_size": 256,
+      "grid_threads": 524288,
+      "mfma_mnk": [
+        32,
+        32,
+        16
+      ],
+      "flops_per_mfma_instruction": 32768,
+      "executed_mfma_flops": [
+        42949672960.0,
+        42949672960.0,
+        42949672960.0
+      ]
+    },
+    "8static": {
+      "source": "pa_8wave/pa_8wave_950.py",
+      "source_sha256": "975757800802f8b4d30ebd325a0fc0763a8b0d5346c329836b2e7c2b8b553c69",
+      "csv_path": "/tmp/swa1_final_pmc_csv/8static/pmc_1/counters_counter_collection.csv",
+      "csv_sha256": "aaec7f9f633bcfaa91b9d53bf708dcc43b99957ba015a099c948f82842f203e3",
+      "counter_samples": {
+        "SQ_INSTS_LDS": [
+          2064384.0,
+          2064384.0,
+          2064384.0
+        ],
+        "SQ_INSTS_MFMA": [
+          983040.0,
+          983040.0,
+          983040.0
+        ],
+        "SQ_INSTS_VALU": [
+          15520129.0,
+          15520129.0,
+          15520129.0
+        ],
+        "SQ_INSTS_VMEM_RD": [
+          425984.0,
+          425984.0,
+          425984.0
+        ],
+        "SQ_LDS_BANK_CONFLICT": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "SQ_WAVES": [
+          8192.0,
+          8192.0,
+          8192.0
+        ]
+      },
+      "dispatch_ids": [
+        38,
+        39,
+        40
+      ],
+      "kernel_names": [
+        "_attention_kernel_0"
+      ],
+      "workgroup_size": 512,
+      "grid_threads": 524288,
+      "mfma_mnk": [
+        32,
+        32,
+        16
+      ],
+      "flops_per_mfma_instruction": 32768,
+      "executed_mfma_flops": [
+        32212254720.0,
+        32212254720.0,
+        32212254720.0
+      ]
+    }
+  },
+  "notes": [
+    "VMEM instruction counts are not memory bytes; no HBM traffic claim.",
+    "ELF/ISA metadata, not the profiler VGPR_Count, is authoritative for register counts.",
+    "16x16x32 BF16 MFMA does half the FLOPs of 32x32x16 BF16 MFMA; compare executed FLOPs, not instruction counts.",
+    "Instrumented counter-collection timestamps are not benchmark latency."
+  ],
+  "effective_flops": 21642608640,
+  "useful_mfma_flops_fraction": {
+    "1wave": 0.80625,
+    "4static": 0.50390625,
+    "8static": 0.671875
+  }
+}
