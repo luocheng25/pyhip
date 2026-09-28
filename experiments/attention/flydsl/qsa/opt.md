@@ -2890,3 +2890,56 @@ QSA选集与route未改：真实M12000每层dense2051行（17.092%）。L3 TP2 u
 本轮“全链零spill已解决”限定于上述当前ROCm/FlyDSL/Triton版本、gfx942、已验证QSA API和测试矩阵。53项完整时延≤3%与54项资源通过分开报告；唯一普通门禁失败与一次profile入口失败均保留。最大本轮current普通样本为overbudget/TP8 full5.387ms（中位0.606ms），其它多层TP2也有约3.9ms长尾，不因此宣布p99 SLA或所有历史绝对最快稳定重现。前轮MHA8192共同慢阶段不是本次任务，MHA源码未改，也未声称其已恢复。
 
 所有新脚本、包、ELF、日志、JSON仅在本研究目录；本节追加前的opt284234字节旧正文及其SHA保留，没有新增Markdown报告。修改范围为两处运行时、原测试入口与既有说明文档，不动SGLang、原暂存项/HEAD/index、旧5D归档或原9078服务；无硬件写入、无自动切换Python、无模型部署。正常测试的Triton ELF门禁和禁止旧Torch归约的热路径/graph检查将持续防止该缺口回流。
+
+## 2026-09-28：direct填充T上限归因与query对D-split共享原型（未集成）
+
+> 本机hjbog-srdc-52，物理GPU3 MI308X/gfx942/80CU，PTL Enabled/VECTOR,F8。**本机PyHIP `.venv`没有torch**，本轮改用system `/usr/bin/python3`（Torch2.12.0+rocm7.2.4、Triton3.7.1+rocm7.2.4、FlyDSL0.3.4.1），与前文.venv环境不同，数字不与前文同场比较。**本机没有真实capture**，下文全部为合成选择：每query保留512块，相邻query随机换出δ块。δ=100时相邻query共享82.4%。前文另一环境中的真实L3 TP2 union为2790µs，介于本机合成δ=100（2629µs）与δ=256（3459µs）之间，因此真实相邻共享率可能略低于δ=100；这只是跨环境近似，不代表真实分布。生产源码、路由和测试均未修改。
+
+### 1. 原因：direct受每CU向量访存通路上限约束，不是流水问题
+
+- packed direct每个query每32token读取K+V共32KiB，只执行64条16x16x16 MFMA，按16头填充约为16FLOP/B。
+- [向量访存探针](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/vmem_ceiling.py)测得dwordx4通路上限约9.0TB/s（约61B/clk/CU），与footprint和occupancy无关。direct以8.52TB/s运行（95%），对应填充上限约142–145T；本机正式结果为134.6T。
+- 同一kernel去掉K/V访存（结果无效，仅计时）为1403µs，折合241T；只保留访存为2717µs，不低于原kernel，所以它是访存bound。LDS ds_read_b128实测约126B/clk/CU。
+- union/dense让8个wave共享LDS中的同一K/V tile，每条MFMA对应的全局字节约为1/8，受LDS/MFMA共同限制，所以填充T可达206–217T。但它的填充工作量包含union膨胀，墙钟不一定更快（例如δ=256时union 3459µs，direct 2511µs）。
+- 结论：单query直读K/V的direct，无论怎样交织都不能超过约145填充T。要和union持平，必须跨query共享K/V字节。
+
+### 2. 原型：query对D-split共享（[pair5.py](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/pair5.py)）
+
+- 每个CTA有2个wave，负责2个相邻query。Triton planner把两者共同选择的块排到行首，并给出共同块数。
+- Phase1处理这些共同块：wave h只加载K/V的D半区h，为两个query计算该半区的QK和PV，所以每个共享字节只读一次；wave h只对自己的query做softmax。每chunk通过一次LDS交换传递chunk t+1的部分分数，以及chunk t的P/alpha；QK(t+1)与softmax(t)重叠。结束时两个wave交换O半区。
+- Phase2沿用原单wave循环，由每个wave处理自己query的私有块。数学顺序与原实现不同，但容差不变：全部行与direct最大差1.95e-3，与reference最大误差6.8e-4。
+- 资源：250VGPR/48SGPR/16KiB LDS，spill和private均为0。
+
+### 3. 正式结果（合成M12000/H12/HK1）
+
+每实现使用10个独立buffer、2warmup、128sample，每轮按ABCD/DCBA交错，并使用原`cudaPerf`。pair计时含每次pack，pair+planner另含每次重建共同块表。填充T使用direct口径；union使用它自身的膨胀填充量。计时后逐buffer检查实际输出。
+
+| δ | 相邻共享 | direct µs/填充T | pair µs/填充T | pair+planner µs/填充T | forced union µs/自身填充T | 配对比 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 30 | 93.9% | 2507.8/134.7 | 1994.6/169.3 | 2052.6/164.5 | 1876.2/206.4 | 0.8207 |
+| 100 | 82.4% | 2509.6/134.6 | 2040.8/165.5 | 2099.4/160.9 | 2628.8/213.1 | 0.8386 |
+| 256 | 61.5% | 2511.2/134.5 | 2124.8/159.0 | 2180.5/154.9 | 3458.5/216.5 | 0.8705 |
+| 450 | 41.2% | 2509.3/134.6 | 2256.9/149.7 | 2310.0/146.2 | 3875.7/217.4 | 0.9223 |
+
+原始数据保存在[formal_20260928.json](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/formal_20260928.json)，共2048条raw，含δ=30 direct单个9.8ms和δ=256 pair+planner单个6.4ms长尾。入口及4次采样前门禁通过；**结束门禁gfx=17%，失败**。该值在本进程刚结束工作后读取，随后复查为0%，但仍按失败记录，未重跑。
+
+**目标未达到**：δ=100时填充T为134.6→160.9（含planner），时延下降16.3%，仍低于union约200T。高重合δ=30也只有164.5T，说明瓶颈已经转到phase1本身。
+
+### 4. 未采用候选与消融
+
+以下均为探索口径（单buffer、64sample、δ=100），不是正式结果。
+
+- LDS共享W=4原型结果正确，但为2680µs，慢于direct；非流水的pair为2404µs。K双缓冲（循环展开2）增至268VGPR，occupancy减半，phase1变慢到2330µs。
+- 启用packed FP32慢约2%；显式sched_group交织慢2–5%；无条件rescale比ballot跳过版慢3%。
+- 仅计时消融（δ=100、phase1基线1592µs）：去掉K载入−144µs，去掉V载入−81µs；另在无条件rescale版上，去掉barrier−66µs、去掉rescale−145µs。phase1的MFMA利用率约57%，限制来自2wave/SIMD、每chunk barrier耦合和访存延迟；再提高需要更多VGPR或LDS，而当前16KiB LDS/CTA已达到4CTA/CU上限。
+
+### 5. 调试中发现的问题（已写入repo记忆）
+
+- inline-asm `ds_read_b128`是异步写回，但LLVM认为asm结束时目的寄存器已定义。未使用的目的寄存器在`s_waitcnt`前被VALU复用，迟到的LDS数据覆盖了buffer地址，产生只在某些寄存器分配下出现的确定性小误差。asm读取后应立即wait并加`sched_barrier`，也不要留下dead目的寄存器。
+- FlyDSL磁盘缓存不跟踪jit函数内读取的`os.environ`；调试开关必须作为模块级常量，或设置`FLYDSL_RUNTIME_ENABLE_CACHE=0`。
+
+### 6. 状态与后续
+
+没有集成到生产代码。原因有三：没有真实数据验证；收益达不到目标；集成还需要在union rebuild之后运行planner（依赖dense_membership），支持gated混合路由，增加M×512 int32共同块表（M12000时24.6MB），并重新标定1.7路由阈值。
+
+若要接近union，需要更大的共享组（W≥4，并用LDS暂存K/V半区或四分区）来继续降低每MFMA的字节数，同时控制barrier和VGPR成本。下一步应先用真实TP2 L3/L47 capture复测相邻共享率和本原型，再决定是否集成。
