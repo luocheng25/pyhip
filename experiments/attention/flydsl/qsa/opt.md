@@ -2943,3 +2943,27 @@ QSA选集与route未改：真实M12000每层dense2051行（17.092%）。L3 TP2 u
 没有集成到生产代码。原因有三：没有真实数据验证；收益达不到目标；集成还需要在union rebuild之后运行planner（依赖dense_membership），支持gated混合路由，增加M×512 int32共同块表（M12000时24.6MB），并重新标定1.7路由阈值。
 
 若要接近union，需要更大的共享组（W≥4，并用LDS暂存K/V半区或四分区）来继续降低每MFMA的字节数，同时控制barrier和VGPR成本。下一步应先用真实TP2 L3/L47 capture复测相邻共享率和本原型，再决定是否集成。
+
+### 7. 补充：真实capture复测（同日，GPU3）
+
+用户提供的`a.gz`解压为[8份真实capture](../../../../mytest/mydata/qsa_real_study_20260925/capture/inputs)，按manifest核对sha256一致。使用[bench_real.py](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/bench_real.py)，协议与合成正式一致（10buffer/2warmup/128sample，每样本正反交替顺序）：TP0四份×TP2/4/8，另TP1四份×TP2复核。三次运行共32768条raw，全部门禁通过（读取前本进程空闲3s）。所有实现与capture输出最大差均为0.03125，在rtol=atol=0.02内，各buffer输出bitwise一致。
+
+- **相邻共享率**：全部pair为71.0%～81.7%；TP2下被路由到direct的pair为65.2%～77.3%。
+- **kernel层面**：12场强制全direct与全pair对比，pair+planner配对比0.830～0.851，填充T由134–138升到159–167。
+- **保持1.7路由，只替换direct**：
+  - TP2：union+direct→union+pair配对比0.929～0.980；
+  - TP4：1.002～1.025，direct行仅0–608，planner成为净开销；
+  - TP8：1.004～1.005，没有direct行。
+- **完整调用（手工复现qsa()的设备工作，与生产计时差≤0.3%）**：TP2稀疏行全部走pair，四份配对比0.873～0.910，例如L47 M12000 3027.3→2644.2µs。TP4/8全走pair慢2.4%～62%，因为union在该head数下明显更快。
+- 路由结论来自同一批两层数据，**没有留出集**。TP1四份与TP0选择相同、只是head不同，复核结果一致（全走pair配对比0.871～0.903）。
+- 生产代码和路由仍未修改。完整表格见[try.md](try.md)1.4节，raw见[real_formal_tp0_20260928.json](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/real_formal_tp0_20260928.json)、[real_formal_tp0_full_20260928.json](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/real_formal_tp0_full_20260928.json)和[real_formal_tp1_full_20260928.json](../../../../mytest/mydata/qsa_direct_roofline_20260928_01/real_formal_tp1_full_20260928.json)。
+
+### 8. 继续优化的结果与上限（同日）
+
+- **已采用**：planner改为1 warp（57→35µs，输出一致）。TP2正式复测中，pair+planner配对比为0.834～0.841（161–163T）；稀疏行全走pair的完整调用配对比为0.867～0.902。
+- **未采用**：K分片提前发射（+0.7%）；lazy rescale（−0.6%，且数值不再与原版bitwise一致）。
+- **2-wave workgroup的放置**：两个wave实测总在不同SIMD上。
+- **上限（真实L3 M12000 TP2）**：请求字节13.61GB，达6.6TB/s，即global load峰值的71%；MFMA为峰值的54%。两阶段完全重叠时的设计上限约216T，当前达到其74%。
+  - 差距来自共享阶段的访存停顿（约187µs）、barrier（约55µs）和rescale分支（约79µs）。
+  - VGPR 250/256、LDS 64/64KiB均已用满，每SIMD只能有2个wave。再加一份K缓冲就会触发occupancy减半，实测慢42%。
+  - 因此该设计实际止于约160–167填充T；达到200T需要换用新设计。详见[try.md](try.md)第7节。
