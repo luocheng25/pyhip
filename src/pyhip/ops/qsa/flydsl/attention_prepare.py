@@ -19,7 +19,6 @@ UNION_STEP = tl.constexpr(3.2)  # per N64 step of the slowest union CTA
 ROW_STEP = tl.constexpr(0.7)  # per BN32 step of the longest direct row
 ROUTE_MARGIN = tl.constexpr(0.05)
 DIRECT_FIXED, PACK_BLOCK, DIRECT_CU_STEP = 41.0, 0.0041, 0.304
-PROMOTE_RATIO = 1.8
 # K3 holds every task-sort width from 2**7 to 2**12 and picks one per launch, so task counts
 # never compile a new variant. Four warps keep the mask CTAs fine-grained.
 SORT_MIN_LOG, SORT_MAX_LOG = tl.constexpr(7), tl.constexpr(12)
@@ -161,7 +160,6 @@ def _masks(Blocks, Membership, Masks, Counts, Costs, Meta, program, TILES,
     task = program * (B // 64) + lanes // 64
     tile, part = TILES - 1 - task // PARTS, task % PARTS
     live = task < TILES * PARTS
-    # Proposal-2 tiles are built too: routing may promote them in this launch.
     live &= tl.load(Costs + tile * 3 + 2, live, 0) != 0
     count = tl.load(Counts + tile, live, 0)
     first = part * 16 + (lanes % 64) // 4
@@ -216,7 +214,7 @@ def _compact_scan(Dense, Blocks, Membership, tile, end, budget, MAX_BLOCKS, CAPA
 
 @triton.jit(do_not_specialize=["MAX_BLOCKS", "CAPACITY"])
 def attention_compact(Dense, Blocks, Membership, Counts, Costs, Meta, DirectFlag,
-                      MAX_BLOCKS, CAPACITY, RATIO, PROMOTE, MEMBERS64: tl.constexpr = False):
+                      MAX_BLOCKS, CAPACITY, RATIO, MEMBERS64: tl.constexpr = False):
     if tl.program_id(0) == 0:
         tl.store(DirectFlag, 0)
     # Last tile first: in a causal request it holds the most blocks.
@@ -229,8 +227,7 @@ def attention_compact(Dense, Blocks, Membership, Counts, Costs, Meta, DirectFlag
     tokens = tl.minimum(visible // 4, 512) * 4 + visible % 4
     steps = tl.where(queries < rows, tl.cdiv(tokens, 32), 0)
     direct_tiles = tl.sum(steps)
-    # Candidates up to PROMOTE are compacted too, so routing may promote them.
-    budget = PROMOTE * direct_tiles.to(tl.float32)
+    budget = RATIO * direct_tiles.to(tl.float32)
     # Membership words hold one bit per query row (64-bit for BQ > 32). The scan width follows
     # MAX_BLOCKS at run time, so KV lengths never compile a new variant.
     end = tl.minimum(MAX_BLOCKS, tl.cdiv(position + rows, 4))
@@ -241,8 +238,7 @@ def attention_compact(Dense, Blocks, Membership, Counts, Costs, Meta, DirectFlag
     else:
         count, start = _compact_scan(Dense, Blocks, Membership, tile, end, budget, MAX_BLOCKS, CAPACITY, 1024)
     padded = (16 * tl.cdiv(count, 16)).to(tl.float32)
-    candidate = (start >= end) & (padded <= budget)
-    proposal = tl.where(candidate & (padded <= RATIO * direct_tiles.to(tl.float32)), 1, tl.where(candidate, 2, 0))
+    proposal = ((start >= end) & (padded <= budget)).to(tl.int32)
     tl.store(Counts + tile, count)
     tl.store(Costs + tile * 3, direct_tiles)
     tl.store(Costs + tile * 3 + 1, tl.max(steps))
@@ -258,44 +254,29 @@ def _route_cost(union_sum, union_max, direct_sum, direct_max, TASK_SHARE, DIRECT
 
 @triton.jit
 def _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, C: tl.constexpr, J: tl.constexpr):
-    # Union and direct run back to back, so one long union task or a few direct
-    # rows set a latency floor the per-tile rule cannot see. Compare the
-    # per-tile proposal 1 with all-direct, promoting the proposal-2 tiles, and
-    # demoting union tiles above J thresholds; return (mode, threshold).
-    lanes = tl.arange(0, C)
-    shares = tl.exp2(-0.5 * (tl.arange(0, J) + 1).to(tl.float32))
+    # Union and direct run back to back, so one long union task or a few direct rows set a
+    # latency floor the per-tile rule cannot see. Return the most N64 steps a union tile keeps:
+    # every proposal-1 tile, those within max * 2**(-j/2) for j = 1..J-2, or none (-1).
+    lanes, slots = tl.arange(0, C), tl.arange(0, J)
     # One wave of lanes accumulates and reduces without cross-wave exchange,
     # and stays small for the mask CTAs sharing this launch's registers.
-    zero = tl.zeros((C,), tl.int32)
-    steps1, steps2, direct0, direct1, direct2 = zero, zero, zero, zero, zero
-    max1, max2, row0, row1, row2 = zero, zero, zero, zero, zero
+    union_sum = tl.zeros((C,), tl.int32)
+    union_max = tl.zeros((C,), tl.int32)
     for start in tl.range(0, TILES, C, loop_unroll_factor=1):
         index = start + lanes
         valid = index < TILES
-        steps = tl.cdiv(tl.load(Counts + index, valid, 0), 16)
-        direct = tl.load(Costs + index * 3, valid, 0)
-        row = tl.load(Costs + index * 3 + 1, valid, 0)
-        proposal = tl.load(Costs + index * 3 + 2, valid, 0)
-        steps1 += tl.where(proposal == 1, steps, 0)
-        steps2 += tl.where(proposal == 2, steps, 0)
-        direct0 += tl.where(proposal == 0, direct, 0)
-        direct1 += tl.where(proposal == 1, direct, 0)
-        direct2 += tl.where(proposal == 2, direct, 0)
-        max1 = tl.maximum(max1, tl.where(proposal == 1, steps, 0))
-        max2 = tl.maximum(max2, tl.where(proposal == 2, steps, 0))
-        row0 = tl.maximum(row0, tl.where(proposal == 0, row, 0))
-        row1 = tl.maximum(row1, tl.where(proposal == 1, row, 0))
-        row2 = tl.maximum(row2, tl.where(proposal == 2, row, 0))
-    steps1, steps2, max1, max2 = tl.sum(steps1), tl.sum(steps2), tl.max(max1), tl.max(max2)
-    direct0, direct1, direct2 = tl.sum(direct0), tl.sum(direct1), tl.sum(direct2)
-    row0, row1, row2 = tl.max(row0), tl.max(row1), tl.max(row2)
-    thresholds = (max1.to(tl.float32) * shares).to(tl.int32)
+        union = tl.load(Costs + index * 3 + 2, valid, 0) == 1
+        steps = tl.where(union, tl.cdiv(tl.load(Counts + index, valid, 0), 16), 0)
+        union_sum += steps
+        union_max = tl.maximum(union_max, steps)
+    union_sum, union_max = tl.sum(union_sum), tl.max(union_max)
+    limits = tl.where(slots < J - 1, (union_max.to(tl.float32) * tl.exp2(-0.5 * slots.to(tl.float32))).to(tl.int32), -1)
     k_sum = tl.zeros((J, C), tl.int32)
     k_max = tl.zeros((J, C), tl.int32)
     d_sum = tl.zeros((J, C), tl.int32)
     d_max = tl.zeros((J, C), tl.int32)
-    # Demotion only shortens union when its longest task, not throughput, sets its time.
-    latency_bound = max1.to(tl.float32) > steps1.to(tl.float32) * TASK_SHARE
+    # Only a union phase set by its longest task, not by throughput, gains from a shorter one.
+    latency_bound = union_max.to(tl.float32) > union_sum.to(tl.float32) * TASK_SHARE
     for start in tl.range(0, tl.where(latency_bound, TILES, 0), C, loop_unroll_factor=1):
         index = start + lanes
         valid = index < TILES
@@ -303,48 +284,28 @@ def _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, C: tl.co
         direct = tl.load(Costs + index * 3, valid, 0)
         row = tl.load(Costs + index * 3 + 1, valid, 0)
         proposal = tl.load(Costs + index * 3 + 2, valid, 0)
-        keep = (proposal[None, :] == 1) & (steps[None, :] <= thresholds[:, None])
+        keep = (proposal[None, :] == 1) & (steps[None, :] <= limits[:, None])
         k_sum += tl.where(keep, steps[None, :], 0)
         k_max = tl.maximum(k_max, tl.where(keep, steps[None, :], 0))
         d_sum += tl.where(keep, 0, direct[None, :])
         d_max = tl.maximum(d_max, tl.where(keep, 0, row[None, :]))
-    k_sum, k_max = tl.sum(k_sum, axis=1), tl.max(k_max, axis=1)
-    d_sum, d_max = tl.sum(d_sum, axis=1), tl.max(d_max, axis=1)
-    zero = tl.full((), 0, tl.int32)
-    formula = _route_cost(steps1, max1, direct0 + direct2, tl.maximum(row0, row2),
-                          TASK_SHARE, DIRECT_STEP, DIRECT_FIXED)
-    all_direct = _route_cost(zero, zero, direct0 + direct1 + direct2, tl.maximum(tl.maximum(row0, row1), row2),
-                             TASK_SHARE, DIRECT_STEP, DIRECT_FIXED)
-    promoted = _route_cost(steps1 + steps2, tl.maximum(max1, max2), direct0, row0,
-                           TASK_SHARE, DIRECT_STEP, DIRECT_FIXED)
-    promoted = tl.where(steps2 > 0, promoted, float("inf"))
-    demoted = _route_cost(k_sum, k_max, d_sum, d_max, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED)
-    demoted = tl.where(latency_bound, demoted, float("inf"))
-    choice = tl.argmin(demoted, axis=0)
-    best_demoted = tl.min(demoted, axis=0)
-    threshold = tl.sum(tl.where(tl.arange(0, J) == choice, thresholds, 0))
-    best = tl.minimum(tl.minimum(all_direct, promoted), best_demoted)
-    # 0 keeps the proposal, 1 all direct, 2 promotes, 3 demotes above threshold.
-    mode = tl.where(best >= formula * (1.0 - ROUTE_MARGIN), 0,
-                    tl.where(best == all_direct, 1, tl.where(best == promoted, 2, 3)))
-    return mode, threshold
+    costs = _route_cost(tl.sum(k_sum, axis=1), tl.max(k_max, axis=1), tl.sum(d_sum, axis=1),
+                        tl.max(d_max, axis=1), TASK_SHARE, DIRECT_STEP, DIRECT_FIXED)
+    # Keeping every union tile wins ties and must be 5% slower to lose.
+    costs = tl.where(slots == 0, costs * (1.0 - ROUTE_MARGIN), costs)
+    limit = tl.sum(tl.where(slots == tl.argmin(costs, axis=0), limits, 0))
+    return tl.where(latency_bound, limit, union_max)
 
 
 @triton.jit
-def _routed(proposal, steps, mode, threshold):
-    keep = (mode != 1) & tl.where(mode == 2, proposal != 0, proposal == 1)
-    return keep & ((mode != 3) | (steps <= threshold))
-
-
-@triton.jit
-def _order(Counts, Costs, Active, Order, DirectFlag, program, mode, threshold,
+def _order(Counts, Costs, Active, Order, DirectFlag, program, threshold,
            TASKS, HK: tl.constexpr, SLICES: tl.constexpr, GRID,
            SIZE: tl.constexpr, SHIFT, WIDE: tl.constexpr):
     rank = program * SIZE + tl.arange(0, SIZE)
     tile = (rank % (TASKS // HK)) // SLICES
     valid = rank < TASKS
     count = tl.load(Counts + tile, valid, 0)
-    active = _routed(tl.load(Costs + tile * 3 + 2, valid, 0), tl.cdiv(count, 16), mode, threshold)
+    active = (tl.load(Costs + tile * 3 + 2, valid, 0) == 1) & (tl.cdiv(count, 16) <= threshold)
     # The first head's first slice of each tile publishes the route.
     publish = valid & (rank < TASKS // HK) & (rank % SLICES == 0)
     tl.store(Active + tile, active.to(tl.int32), publish)
@@ -371,12 +332,12 @@ def attention_order_masks(Counts, Costs, Active, Order, DirectFlag, Blocks, Memb
                           ROUTE: tl.constexpr, MEMBERS64: tl.constexpr):
     program = tl.program_id(0)
     if program < ORDER_CTAS:
-        mode, threshold = tl.full((), 0, tl.int32), tl.full((), 0, tl.int32)
+        threshold = tl.full((), 2**31 - 1, tl.int32)
         if ROUTE:
-            mode, threshold = _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, 64, 8)
+            threshold = _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, 64, 8)
         for exponent in tl.static_range(SORT_MIN_LOG, SORT_MAX_LOG + 1):
             if SIZE == 1 << exponent:
-                _order(Counts, Costs, Active, Order, DirectFlag, program, mode, threshold,
+                _order(Counts, Costs, Active, Order, DirectFlag, program, threshold,
                        TASKS, HK, SLICES, GRID, 1 << exponent, SHIFT, WIDE)
     else:
         _masks(Blocks, Membership, Masks, Counts, Costs, Meta, program - ORDER_CTAS, TILES,
@@ -467,10 +428,9 @@ def _launches(inputs, plan):
         MEMBERS64=plan is not None and plan.query_tile > 32, num_warps=1)
     if plan is None or plan.num_tiles == 0:
         return
-    promote = max(PROMOTE_RATIO, plan.union_ratio) if plan.routing else plan.union_ratio
     yield attention_compact, (plan.num_tiles,), (plan.dense_membership, plan.blocks, plan.membership,
         plan.counts, plan.costs, plan.metadata, plan.direct_flag, plan.max_blocks, plan.block_capacity,
-        plan.union_ratio, promote), dict(MEMBERS64=plan.query_tile > 32, num_warps=4)
+        plan.union_ratio), dict(MEMBERS64=plan.query_tile > 32, num_warps=4)
     slices = triton.cdiv(plan.query_tile * plan.group_padded, 128)
     tasks = plan.num_tiles * inputs.k.shape[1] * slices
     numel = plan.task_order.numel()

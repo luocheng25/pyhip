@@ -187,9 +187,7 @@ def test_raw_direct_over_budget(monkeypatch):
 
 @triton.jit
 def _route_probe(Counts, Costs, Result, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED):
-    mode, threshold = _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, 64, 8)
-    tl.store(Result, mode)
-    tl.store(Result + 1, threshold)
+    tl.store(Result, _route(Counts, Costs, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, 64, 8))
 
 
 @pytest.mark.parametrize("proposal,blocks,share,expected", [
@@ -197,8 +195,6 @@ def _route_probe(Counts, Costs, Result, TILES, TASK_SHARE, DIRECT_STEP, DIRECT_F
     pytest.param([1] * 6 + [0] * 26, [3500] * 6 + [3600] * 26, 1 / 32, [0] * 32, id="latency-direct"),
     # Four long union tasks set the union time; the short ones stay union, the long ones go direct.
     pytest.param([1] * 64, [1920] * 4 + [160] * 60, 1 / 80, [0] * 4 + [1] * 60, id="latency-demote"),
-    # One near-threshold direct tile would add a whole pack and direct launch after union.
-    pytest.param([1] * 102 + [2], [768] * 102 + [1120], 1 / 80, [1] * 103, id="tail-promote"),
     pytest.param([1] * 600 + [0] * 600, [640] * 600 + [5120] * 600, 1 / 80, [1] * 600 + [0] * 600,
                  id="throughput-keep"),
 ])
@@ -207,22 +203,19 @@ def test_route_guard(proposal, blocks, share, expected):
     tiles = len(proposal)
     counts = torch.tensor(blocks, dtype=torch.int32, device=device)
     costs = torch.tensor([[650, 65, p] for p in proposal], dtype=torch.int32, device=device)
-    result = torch.empty(2, dtype=torch.int32, device=device)
+    result = torch.empty(1, dtype=torch.int32, device=device)
     _route_probe[(1,)](counts, costs, result, tiles, share, 0.0038, 50.0, num_warps=4)
-    mode, threshold = result.cpu().tolist()
+    threshold = int(result.item())
     steps = [-(-b // 16) for b in blocks]
-    final = [int(mode != 1 and (p != 0 if mode == 2 else p == 1) and (mode != 3 or s <= threshold))
-             for p, s in zip(proposal, steps)]
-    assert final == expected, (mode, threshold)
+    assert [int(p == 1 and s <= threshold) for p, s in zip(proposal, steps)] == expected, threshold
 
 
-def test_route_promotes_direct_tail(monkeypatch):
-    # One straddling high-sharing tile is just above the per-tile ratio; union must absorb it.
+def test_route_keeps_direct_tail(monkeypatch):
+    # Tiles just above the per-tile ratio stay direct: union and gated direct write one output.
     monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
     _check(_make_case((1024,), (30000,), 12, _gpu(), shared=True))
-    workspace = next(reversed(_runtime._workspaces.values()))
-    assert bool((workspace.union.costs[:, 2] == 2).any())
-    assert bool((workspace.union.active == 1).all())
+    active = next(reversed(_runtime._workspaces.values())).union.active
+    assert bool((active == 1).any()) and bool((active == 0).any())
 
 
 @pytest.mark.parametrize("ordered", (True, False), ids=("ascending", "unordered"))
