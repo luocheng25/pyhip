@@ -192,44 +192,205 @@ attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 
 约束：Q/O为连续BF16 `[M,H,256]`，K/V为连续BF16 `[N,HK,256]`，`H/HK≤16`，16B对齐、inference-only；QSA不接受5D KV。`indices`是连续int32 `[M,2051]`，每行最多512个完整唯一四token块（块可乱序），接该query的0–3因果尾token，再填−1；ID为请求内逻辑token。`query_lens`/`prefix_lens`是host长度，packed请求的K/V按请求拼接；默认单请求prefix=`N-M`。默认scale=1/16，`out`不与输入重叠。违反上述选择布局的行会在GPU上trap，进程中止。
 
-### 接入prefill indexer，再把选择交给attention
+### Indexer接口
 
-下面是调用方已有projection和缓存metadata时的适配函数，变量是参数而非隐藏全局。**indexer Q/K的D128与attention的D256是不同投影**；indexer的compressed pool不是attention的V缓存。
+[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L294)和[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L388)都从调用方`index_qk_proj`之后的`qk`开始，返回同一种token选择，可原样交给attention。除`qk`外都是关键字参数，两个入口中同名参数含义相同；只依赖PyHIP，不需要SGLang/AITER。
+
+共同约定：
+
+- 只支持gfx942。Indexer固定4个Q头、1个K头、D=128、压缩比4、每行选512个压缩块。**indexer的D128投影与attention的D256是不同投影**，compressed池也不是attention的KV缓存。
+- 所有tensor在同一GPU，除表中注明外必须连续。`key_state`、`rope_state`、`compressed`原地更新。
+- 槽号全部由调用方给出。SGLang的pending ring每请求8个槽（压缩比的2倍）：请求r（从1开始）的位置p在槽`8r + p%8`；请求0从不分配，`[0,8)`是dump行。首token物理槽为s的4-token组，压缩key在`compressed[s//4]`；slot 0是惰性写入位置。dump行和slot 0会被并发写入，不能当数据读。
+- 返回int32 `[rows,2051]`：每行先是选中的压缩块，按块号升序、每块展开成4个token（最多2048个）；紧接着是0–3个因果尾token（最后一个完整组之后、到query本身为止）；其余填−1。Token ID是请求内逻辑位置。位置p的query可见`(p+1)//4`个压缩key，不超过512个时全选；分数相同时取块号小的。
+- 第一次调用时编译（缓存为空时prefill约2秒、decode约3秒），之后任何长度组合都不再编译。
+
+下面的示例共用这组参数（普通RoPE，rotary_dim=64）：
+
+```python
+import torch
+
+device = torch.device("cuda", 0)
+D = 128
+inv_freq = 1.0 / 10000 ** (torch.arange(0, 64, 2, device=device) / 64)
+angles = torch.arange(262144 + 64, device=device)[:, None] * inv_freq
+cos_sin_cache = torch.cat((angles.cos(), angles.sin()), 1).to(torch.bfloat16)  # [positions, 64]：前半cos，后半sin
+axis_map = torch.zeros(32, device=device, dtype=torch.int32)                  # 普通RoPE：每个旋转对都用轴0
+q_weight = torch.zeros(D, device=device, dtype=torch.bfloat16)                # Gemma RMSNorm：x·rstd·(1+w)
+k_weight = torch.zeros(D, device=device, dtype=torch.bfloat16)
+```
+
+#### prefill_indexer
+
+```python
+indices = prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state,
+                          write_locs, member_rows, group_sequences, group_ends, rope_matrix, compressed,
+                          token_slot_table, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
+                          seq_lens, extend_lens, q_out=None)           # → int32 [T, 2051]
+```
+
+T是本批query行数（各请求的行按请求顺序拼接），R是请求数，G是本批写压缩key的组数（可含padding），S、C分别是ring和压缩池的槽数，N是RoPE表的行数。
+
+| 参数 | 类型与shape | 说明 |
+|---|---|---|
+| `qk` | BF16 `[T,640]` | `index_qk_proj`输出：每行4个query头×128，后接1个key×128 |
+| `heads` | int | 必须是4 |
+| `seq_lens` | host int序列 `[R]` | 各请求本批之后的总长度（prefix + 本批行数） |
+| `extend_lens` | host int序列 `[R]` | 各请求本批的行数（可为0），合计T且大于0；prefix = `seq_lens − extend_lens`必须是4的倍数 |
+| `positions` | int64 `[T]`或`[3,T]`，末维stride为1 | RoPE位置；一维时三个轴相同，`[3,T]`是MRoPE的三个轴 |
+| `logical_positions` | int64 `[T]` | 请求内位置，必须等于prefix + i；不符时top-k在GPU上trap，进程中止 |
+| `state_slots` | int64 `[T]` | 每行写进pending ring的槽：请求最后一个不完整组的行写`8r + p%8`，其余行写dump行`p%8` |
+| `key_state` | BF16 `[S,1,128]` | pending ring中的原始key，在`state_slots`处写入 |
+| `rope_state` | int64 `[S,3]` | pending ring中的三轴位置，与`key_state`同槽号 |
+| `write_locs` | int32 `[G]` | 本批凑满的组（4个成员都在本批）写入的压缩槽；padding填0 |
+| `member_rows` | int64 `[G]` | 每组首成员在`qk`中的行号；padding填0 |
+| `group_sequences`、`group_ends` | int64 `[G]` | 每组所属请求、组末token的请求内位置；只检查形状，kernel不读 |
+| `rope_matrix` | int64 `[T,3]` | 每行的三轴位置（即`positions`转置）；压缩key用首成员那一行的位置 |
+| `compressed` | BF16 `[C,1,128]`，小于2GiB | 压缩key池：本批在`write_locs`写入；logits经`token_slot_table`读取全部可见key（含prefix） |
+| `token_slot_table` | int32 `[R, ≥max(seq_lens)]`，列stride为1 | 各请求每个token的物理槽；请求s的第j个压缩key在`token_slot_table[s,4j]//4` |
+| `cos_sin_cache` | BF16或FP32 `[N,rotary_dim]` | RoPE表，每行前半cos、后半sin，须覆盖所有位置；要求`rotary_dim%4==0`，`rotary_dim/2`与`128−rotary_dim`是2的幂（模型为64）；只有BF16表与SGLang逐bit一致 |
+| `axis_map` | int32 `[rotary_dim/2]` | 每个旋转对用哪个位置轴（0/1/2，按MRoPE分段）；普通RoPE全为0 |
+| `q_weight`、`k_weight` | BF16 `[128]` | Gemma RMSNorm权重，按`x·rstd·(1+w)`作用于q和k |
+| `q_eps`、`k_eps` | float | RMSNorm的epsilon |
+| `q_out` | 可选，BF16 `[T,4,128]` | 给定时写入归一化并加RoPE后的index Q（SGLang数值校验用） |
+
+注意事项：
+
+- 只用于eager调用：host按`(seq_lens, extend_lens)`规划布局（缓存最近8种），一次pinned上传，不同步stream。
+- 单请求最多65536个压缩key（262144 token）；logits临时缓冲每块不超过256MiB。
+- Chunked prefill时，前面各块写入的压缩key由logits经`token_slot_table`读取；每块只压缩4个成员都在本块的组，所以prefix必须按4对齐。
+- 每次调用返回新分配的indices，之后的调用不会改写。
+
+示例：单请求、没有prefix。真实调用时`qk`来自`index_qk_proj`，缓存和槽号来自调用方的KV管理。
 
 ```python
 from pyhip.ops.qsa.flydsl.indexer import prefill_indexer
-from pyhip.ops.qsa.flydsl.attention import attention
 
-def qsa_prefill(q, k, v, projected_index_qk, meta, query_lens, prefix_lens, out=None):
-    indices = prefill_indexer(
-        projected_index_qk, heads=4, positions=meta.positions, logical_positions=meta.logical_positions,
-        state_slots=meta.state_slots, key_state=meta.key_state, rope_state=meta.rope_state,
-        write_locs=meta.write_locs, member_rows=meta.member_rows, group_sequences=meta.group_sequences,
-        group_ends=meta.group_ends, rope_matrix=meta.rope_matrix, compressed=meta.compressed,
-        token_slot_table=meta.token_slot_table, cos_sin_cache=meta.cos_sin_cache, axis_map=meta.axis_map,
-        q_weight=meta.q_weight, k_weight=meta.k_weight, q_eps=meta.q_eps, k_eps=meta.k_eps,
-        seq_lens=meta.seq_lens, extend_lens=meta.extend_lens)
-    return attention(q, k, v, indices,
-                     query_lens=query_lens, prefix_lens=prefix_lens, out=out)
+T, RING, r = 12000, 8, 1                    # 请求槽1；请求0是dump
+pos = torch.arange(T, device=device)        # int64
+table = (64 + pos).to(torch.int32)[None]    # token → 物理槽；4-token组按4对齐
+groups = torch.arange(T // 4, device=device)
+key_state = torch.zeros((r + 1) * RING, 1, D, device=device, dtype=torch.bfloat16)
+rope_state = torch.zeros((r + 1) * RING, 3, device=device, dtype=torch.int64)
+compressed = torch.zeros((64 + T) // 4 + 1, 1, D, device=device, dtype=torch.bfloat16)
+indices = prefill_indexer(
+    torch.randn(T, 5 * D, device=device).to(torch.bfloat16),       # index_qk_proj输出
+    heads=4, positions=pos, logical_positions=pos,
+    state_slots=torch.where(pos >= T // 4 * 4, r * RING + pos % RING, pos % RING),
+    key_state=key_state, rope_state=rope_state,
+    write_locs=(table[0, groups * 4] // 4).int(), member_rows=groups * 4,
+    group_sequences=torch.zeros_like(groups), group_ends=groups * 4 + 3,
+    rope_matrix=pos[:, None].expand(-1, 3).contiguous(), compressed=compressed,
+    token_slot_table=table, cos_sin_cache=cos_sin_cache, axis_map=axis_map,
+    q_weight=q_weight, k_weight=k_weight, q_eps=1e-6, k_eps=1e-6,
+    seq_lens=(T,), extend_lens=(T,))
+# int32 [12000, 2051]；例如第3000行可见750个压缩key，选512块共2048个token，再接1个尾token
+# 交给attention（q/k/v是attention自己的D256投影）：attention(q, k, v, indices, query_lens=(T,), prefix_lens=(0,))
 ```
 
-`projected_index_qk`是调用方GEMM输出的连续BF16 `[M,640]`（4×128 query＋1×128 key），其余都是[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L294)的关键字参数（`meta`只是示例中调用方的metadata），所有tensor在同一GPU：
+#### decode_indexer
 
-| 参数 | 契约 |
-|---|---|
-| `heads`、`seq_lens`、`extend_lens` | 4；host最终序列长度和本次query长度；prefix按4token组对齐 |
-| `positions`、`logical_positions` | int64 `[M]`或三轴`[3,M]`；int64 `[M]`，请求内prefix+i，不符时GPU trap、进程中止 |
-| `state_slots`、`key_state`、`rope_state` | int64 `[M]` ring槽；BF16 `[slots,1,128]`；int64 `[slots,3]`，原地更新 |
-| `write_locs`、`member_rows`、`group_sequences`、`group_ends` | int32组写槽、int64本次QK首成员行、请求编号、请求内组末位置；保留原slot0 padding规则 |
-| `rope_matrix`、`compressed` | int64 `[M,3]`；BF16 `[compressed_slots,1,128]`，原地更新 |
-| `token_slot_table` | int32 `[requests,max_seq]`，每token物理槽，组首物理槽/4定位compressed key |
-| `cos_sin_cache`、`axis_map` | 连续BF16/FP32 `[positions,64]`；int32 `[32]`选择三轴 |
-| `q_weight`、`k_weight`、`q_eps`、`k_eps` | BF16 `[128]` Gemma RMSNorm增量权重；host epsilon |
-| `q_out` | 可选；连续BF16 `[M,4,128]`，给定时写入归一化后的index Q（数值校验用） |
+```python
+indices = decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, rope_state, write_locs,
+                         group_locs, compressed, page_table, lengths, cos_sin_cache, axis_map, q_weight,
+                         k_weight, q_eps, k_eps, seq_lens, verify=False, q_out=None, logits_out=None)
+# → int32 [B, 2051]
+```
 
-单请求最多65536个compressed key/262144token；返回int32 `[M,2051]`，每行块号升序，可原样交给attention（attention对每行照常校验和排序，复制或改写后的indices结果相同）。slot0与ring保留行是惰性写入区域，不能作为有效数据读取。不要把mean、RoPE或slot规划隐去当成免费预处理。
+B是行数（每行一个query token，含CUDA graph的padding行），P是页表宽度（页数）。`key_state`、`rope_state`、`cos_sin_cache`、`axis_map`、`q_weight`、`k_weight`、`q_eps`、`k_eps`与prefill相同，下表不再重复。
 
-Decode使用[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L388)，同样从投影后的`qk`开始，与prefill同名的参数含义相同（每行一个query）；另有`group_locs`（int32 `[rows,4]`，组成员的ring槽）、`page_table`（int32 `[rows,pages]`，16-key compressed page，表宽最多4096页即65536个compressed key）和`lengths`（int32 `[rows]` compressed key数），`logical_positions`、`seq_lens`是int32 `[rows]`设备张量。可选的`q_out`、`logits_out`取回Q和logits，`logits_out`的存储须在末尾多留512个值。全部算子由PyHIP实现，无需SGLang/AITER。Decode每行必须属于不同请求；MTP的TARGET_VERIFY窗口（一个请求占连续多行）传`verify=True`，压缩在所有行写完ring之后另起一个launch，与SGLang顺序一致。先eager预热，再capture；graph重放可原地更新长度和位置。prefill入口不是通用decode替代。
+| 参数 | 类型与shape | 说明 |
+|---|---|---|
+| `qk` | BF16 `[B,640]` | 每行一个新token的`index_qk_proj`输出 |
+| `positions` | int64 `[B]`或`[3,B]` | RoPE位置，同prefill |
+| `logical_positions` | int32 `[B]` | 本行query的请求内位置（= `seq_lens − 1`）；decode不校验位置 |
+| `seq_lens` | int32 `[B]` | 本行所在序列含当前token的长度 |
+| `state_slots` | int64 `[B]` | 当前token写进ring的槽`8r + p%8`；padding行写dump行 |
+| `group_locs` | int32 `[B,4]` | 以本位置结尾的组的4个成员（位置p−3..p，最早的在前，小于0时按0）在ring中的槽`8r + 成员位置%8` |
+| `write_locs` | int32 `[B]` | 本token补满一组（`seq_lens%4==0`）时该组的压缩槽，否则0 |
+| `compressed` | BF16 `[C,1,128]`，小于2GiB | 压缩key池，按每页16个key读取；本步补满的组先写入，再参与本步选择 |
+| `page_table` | int32 `[B,P]`，P ≤ 4096 | 本行第p页对应压缩key `16·page_table[row,p] + [0,16)`；logits宽16·P |
+| `lengths` | int32 `[B]` | 本行可见的压缩key数，= `seq_lens // 4` |
+| `verify` | bool | False：各行必须属于不同请求；True：MTP的TARGET_VERIFY窗口，一个请求占连续W（≤4）行 |
+| `q_out` | 可选，BF16 `[B,4,128]` | 写入归一化并加RoPE后的index Q |
+| `logits_out` | 可选，FP32 `[B,16·P]` | 写入logits；其存储须在末尾多留512个值（top-k按512个值对齐读取） |
+
+注意事项：
+
+- 所有metadata都在设备上，可在CUDA graph中capture。必须先eager调用一次以完成编译（第一次`verify=True`另编译verify用的两个kernel），未预热就在capture中调用会报错。重放前原地更新各张量的内容，地址不能变。
+- `verify=False`时prep只看得到本行自己的ring写入，所以同一请求不能占多行。`verify=True`时压缩在所有行写完ring之后另起一个launch（与SGLang顺序一致）；ring每请求必须有8个槽，窗口才不会覆盖组内窗口之前的成员。
+- 调用前，prefill和之前各步写入的`key_state`、`rope_state`、`compressed`必须已就绪。
+- padding行用请求0：`state_slots`、`group_locs`指向dump行，`write_locs`和`lengths`为0；其输出忽略。
+
+示例：CUDA graph decode，每请求一行，按每页64 token分配物理槽。
+
+```python
+from pyhip.ops.qsa.flydsl.indexer import decode_indexer
+
+B, CONTEXT, RING = 4, 16384, 8
+pages = CONTEXT // 64                       # 每页64 token = 16个压缩key
+requests = torch.arange(1, B + 1, device=device)
+base = 64 * (1 + (requests - 1) * pages)    # 请求r占物理槽base[r] + [0, CONTEXT)
+key_state = torch.zeros((B + 1) * RING, 1, D, device=device, dtype=torch.bfloat16)
+rope_state = torch.zeros((B + 1) * RING, 3, device=device, dtype=torch.int64)
+compressed = torch.zeros((1 + B * pages) * 16, 1, D, device=device, dtype=torch.bfloat16)
+page_table = (base[:, None] // 64 + torch.arange(pages, device=device)).int()
+# graph中地址固定的输入
+qk = torch.empty(B, 5 * D, device=device, dtype=torch.bfloat16)
+positions = torch.empty(B, device=device, dtype=torch.int64)
+state_slots = torch.empty_like(positions)
+seq_lens = torch.empty(B, device=device, dtype=torch.int32)
+logical_positions, lengths, write_locs = (torch.empty_like(seq_lens) for _ in range(3))
+group_locs = torch.empty(B, 4, device=device, dtype=torch.int32)
+
+def step(seq):                              # int64 [B]：各请求含当前token的长度
+    p = seq - 1
+    qk.copy_(torch.randn_like(qk))          # 新token的index_qk_proj输出
+    positions.copy_(p)
+    logical_positions.copy_(p)
+    seq_lens.copy_(seq)
+    lengths.copy_(seq // 4)
+    state_slots.copy_(requests * RING + p % RING)
+    members = (p[:, None] - torch.arange(3, -1, -1, device=device)).clamp_min(0)
+    group_locs.copy_(requests[:, None] * RING + members % RING)
+    write_locs.copy_(torch.where(seq % 4 == 0, (base + p) // 4, 0))
+
+def run():
+    return decode_indexer(
+        qk, positions=positions, logical_positions=logical_positions, state_slots=state_slots,
+        key_state=key_state, rope_state=rope_state, write_locs=write_locs, group_locs=group_locs,
+        compressed=compressed, page_table=page_table, lengths=lengths, cos_sin_cache=cos_sin_cache,
+        axis_map=axis_map, q_weight=q_weight, k_weight=k_weight, q_eps=1e-6, k_eps=1e-6, seq_lens=seq_lens)
+
+seq = torch.tensor([3001, 12000, 5, 9000], device=device)
+step(seq)
+run()                                       # eager预热，完成编译
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    out = run()                             # out在graph的内存池里
+step(seq + 1)                               # 下一个token：原地更新内容
+graph.replay()                              # out各行有效token数：2050、2049、6、2049
+```
+
+MTP verify：一个请求占连续W（≤4）行，每行的metadata按该行自己的位置计算，再传`verify=True`（capture方式同上）：
+
+```python
+W = 4
+requests_w, base_w = requests.repeat_interleave(W), base.repeat_interleave(W)
+seq_w = (torch.tensor([3001, 12000, 5, 9000], device=device).repeat_interleave(W)
+         + torch.arange(W, device=device).repeat(B))                    # 窗口内各行的序列长度
+p = seq_w - 1
+members = (p[:, None] - torch.arange(3, -1, -1, device=device)).clamp_min(0)
+out = decode_indexer(
+    torch.randn(B * W, 5 * D, device=device).to(torch.bfloat16), positions=p, logical_positions=p.int(),
+    state_slots=requests_w * RING + p % RING, key_state=key_state, rope_state=rope_state,
+    write_locs=torch.where(seq_w % 4 == 0, (base_w + p) // 4, 0).int(),
+    group_locs=(requests_w[:, None] * RING + members % RING).int(), compressed=compressed,
+    page_table=page_table.repeat_interleave(W, 0).contiguous(), lengths=(seq_w // 4).int(),
+    cos_sin_cache=cos_sin_cache, axis_map=axis_map, q_weight=q_weight, k_weight=k_weight,
+    q_eps=1e-6, k_eps=1e-6, seq_lens=seq_w.int(), verify=True)   # int32 [16, 2051]
+```
+
+以上示例已在gfx942上运行：[检查脚本](../../mytest/qsa_readme_indexer_examples.py)按顺序直接执行本节的代码块，并核对注释中的结果。
 
 ### attention CUDA graph
 
