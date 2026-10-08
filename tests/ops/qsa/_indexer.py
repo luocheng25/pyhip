@@ -18,6 +18,8 @@ from pyhip.ops.qsa.flydsl import indexer
 
 HEADS, DIM, ROTARY, PAGE = 4, 128, 64, 64
 RATIO, TOPK, WIDTH = 4, 512, 2051
+# SGLang's pending ring: slots req * RING + position % RING (a verify window plus the members before it).
+RING = 2 * RATIO
 STATE_NAMES = ("key_state", "rope_state", "compressed")
 
 
@@ -108,7 +110,7 @@ def synthetic(seq_lens, extend_lens, device, seed=11, *, section=(11, 11, 10), i
         for position in range(prefix, length):
             logical_host.append(position)
             pending = position >= length // RATIO * RATIO
-            slots_host.append((request + 1) * RATIO + position % RATIO if pending else position % RATIO)
+            slots_host.append((request + 1) * RING + position % RING if pending else position % RING)
         for block in range(prefix // RATIO, length // RATIO):
             groups.append(((starts[request] + block * RATIO) // RATIO,
                            row_start + block * RATIO - prefix, request, block * RATIO + RATIO - 1))
@@ -118,7 +120,7 @@ def synthetic(seq_lens, extend_lens, device, seed=11, *, section=(11, 11, 10), i
     plan = torch.tensor(groups, dtype=torch.int64, device=device)
     logical = torch.tensor(logical_host, dtype=torch.int64, device=device)
     positions = logical.clone() if position_axes == 1 else torch.stack((logical, logical + 3, logical + 7))
-    state = _state(device, (batch + 1) * RATIO, (starts[-1] + width) // RATIO, generator)
+    state = _state(device, (batch + 1) * RING, (starts[-1] + width) // RATIO, generator)
     inputs = dict(
         qk=torch.randn((rows, (HEADS + 1) * DIM), generator=generator, device=device).to(torch.bfloat16),
         heads=HEADS, positions=positions, logical_positions=logical,
@@ -183,7 +185,7 @@ def _mean_reference(members):
 def reference_prep(inputs, initial_state, *, decode=False):
     """Q, valid state writes and packed keys, without any implementation helper.
 
-    Reserved ring rows 0..3 and compressed slot 0 are inert racing destinations;
+    Reserved ring rows [0, RING) and compressed slot 0 are inert racing destinations;
     they have no defined final value and are never used as reference data.
     """
     state = clone_state(initial_state)
@@ -192,7 +194,7 @@ def reference_prep(inputs, initial_state, *, decode=False):
     coordinates = _rope_matrix(inputs["positions"])
     q = norm_rope_reference(raw[:, :HEADS], coordinates[:, None].expand(-1, HEADS, -1),
                             inputs["q_weight"], inputs["cos_sin_cache"], inputs["axis_map"], inputs["q_eps"])
-    live = inputs["state_slots"] >= RATIO
+    live = inputs["state_slots"] >= RING
     slots = inputs["state_slots"][live].long()
     assert slots.unique().numel() == slots.numel(), "valid ring writes must be request-local and unique"
     state["key_state"][slots, 0] = raw[live, HEADS]
@@ -230,7 +232,7 @@ def assert_exact(actual, expected, label):
 def assert_state(source, expected):
     report = {}
     for name in STATE_NAMES:
-        lo = 1 if name == "compressed" else RATIO
+        lo = 1 if name == "compressed" else RING
         actual, wanted = source.inputs[name][lo:], expected.state[name][lo:]
         assert_exact(actual, wanted, name)
         report[f"{name}_rows_written"] = int((wanted != source.state[name][lo:]).flatten(1).any(1).sum())
@@ -429,10 +431,10 @@ def decode_forward_case(lengths, device, *, window=1, padding=0, seed=17, contex
     for request in range(1, requests + 1):
         table[request] = PAGE * (1 + (request - 1) * pages) + torch.arange(context, device=device)
     slots = (1 + requests * pages) * 16
-    state = _state(device, (requests + 1) * RATIO, slots, generator)
+    state = _state(device, (requests + 1) * RING, slots, generator)
     for request, length in enumerate(lengths, 1):
         for position in range(max(0, length - 1 - RATIO), length - 1):
-            state["rope_state"][request * RATIO + position % RATIO] = torch.tensor(
+            state["rope_state"][request * RING + position % RING] = torch.tensor(
                 (position, position + 3, position + 7), device=device)
     parameters = _parameters(generator, device, context)
     inputs = dict(qk=torch.empty((rows, (HEADS + 1) * DIM), dtype=torch.bfloat16, device=device),
@@ -475,9 +477,9 @@ def decode_step(source, lengths):
     inputs["query_positions"].copy_(positions)
     inputs["lengths"].copy_(sequences // RATIO)
     inputs["positions"].copy_(torch.stack((positions, positions + 3, positions + 7)))
-    inputs["state_slots"].copy_(requests * RATIO + positions % RATIO)
+    inputs["state_slots"].copy_(requests * RING + positions % RING)
     members = (positions[:, None] - torch.arange(RATIO - 1, -1, -1, device=device)).clamp_min(0)
-    inputs["group_locs"].copy_(requests[:, None] * RATIO + members % RATIO)
+    inputs["group_locs"].copy_(requests[:, None] * RING + members % RING)
     last_slots = source.table[requests, positions].long()
     inputs["write_locs"].copy_(torch.where(sequences % RATIO == 0, last_slots // RATIO, 0))
     inputs["page_table"].copy_(source.table[requests, ::PAGE].long() // PAGE)

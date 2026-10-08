@@ -632,7 +632,7 @@ PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLa
 
 decode时每行是一个请求的当前token；MTP verify时一个请求占连续W（≤4）行，即bonus token和草稿token（位置L..L+W−1）。
 
-1. **D0（每行一个program）**：q做norm/RoPE；本token的key和位置写进pending ring；按SGLang的固定形状，把group_locs指向的4个成员求均值并norm/RoPE，写到write_locs（与SGLang逐bit一致）。每步每行都压缩一次：只有本token补满一组（seq_len是4的倍数）时write_locs才是该组的压缩槽，否则是惰性的slot 0，结果丢弃。verify时D0只做q和ring写，压缩由D0′在本次所有行写完ring之后完成，与SGLang先写全部ring、再gather的顺序一致（这一顺序的问题见4.4）。
+1. **D0（每行一个program）**：q做norm/RoPE；本token的key和位置写进pending ring；按SGLang的固定形状，把group_locs指向的4个成员求均值并norm/RoPE，写到write_locs（与SGLang逐bit一致）。每步每行都压缩一次：只有本token补满一组（seq_len是4的倍数）时write_locs才是该组的压缩槽，否则是惰性的slot 0，结果丢弃。verify时D0只做q和ring写，压缩由D0′在本次所有行写完ring之后完成，与SGLang先写全部ring、再gather的顺序一致；SGLang的ring每个请求有2×ratio个槽，窗口行不会覆盖该组在窗口之前的成员。
 2. **D1（(splits, B)个CTA）**：按页表只读本行的压缩key（每页16个），MFMA算logits；超出本行长度的位置写-inf。
 3. **D2（每行一个8-wave CTA）**：与prefill共用选择核心，选512个块并展开成2051宽的token行。
 
@@ -666,7 +666,7 @@ q = norm_rope(qk[row, 0:4])                     # 4个query头
 slot = state_slots[row]：key_state[slot] = qk[row, 4]；rope_state[slot] = 3轴位置   # 本token进pending ring
 # 按SGLang的固定形状压缩group_locs指向的4个成员（最早的在前）。SGLang先写ring再gather，
 # 所以成员恰是本行自己的槽时，直接用本token的key（寄存器里的值）
-# group_locs[row] = 位置pos−3..pos在ring中的4个槽（位置小于0时按位置0）；
+# group_locs[row] = 位置pos−3..pos在ring中的4个槽（位置小于0时按位置0；SGLang的槽号是req·8 + pos%8）；
 # write_locs[row] = 本token补满一组时该组的压缩槽，否则是惰性slot 0；graph的padding行属于从不分配的request 0，读写都落在dump行
 if verify: return                               # verify不在D0里压缩（COMPRESS是constexpr）
 mean = Σ_{g∈group_locs[row]} (g==slot ? 本token的key : key_state[g]) / 4（BF16舍入）
@@ -751,7 +751,6 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。
-- MTP verify窗口跨过压缩边界时，SGLang原生的压缩key是错的，PyHIP为了逐bit一致也照样复现：每个请求的pending ring只有4个槽，而本次所有行先写ring、再gather，边界行之后的草稿行会覆盖该组在窗口之前的成员。窗口起点L%4为1/2/3时，该组用了错误的成员和RoPE位置，与逐token decode相比余弦只有0.68/0.45/0.27（[单卡演示](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)）。修复要在SGLang把ring扩到每个请求2×ratio个槽，PyHIP的槽号来自SGLang元数据，不用改。
 - 服务验收是数值验收（attention `.02/.02`、prep逐bit），不是模型质量或生成文本逐bit一致的验收。
 
 ### 4.5 当前数据来源
@@ -762,7 +761,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - Prefill与decode indexer：[qsa_compile_once_20261002_01](../../../../../mytest/mydata/qsa_compile_once_20261002_01/official_indexer_2/kernels.txt)。
 - 长行decode和host下发：[qsa_perf_final_20261002_01](../../../../../mytest/mydata/qsa_perf_final_20261002_01/official_decode_long/kernels.txt)、[host.json](../../../../../mytest/mydata/qsa_perf_final_20261002_01/host.json)。
 - 服务性能与数值验收：[qsa_route_threshold_service_20261004_01](../../../../../mytest/mydata/qsa_route_threshold_service_20261004_01/summary.json)。
-- MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_verify_20261008_01](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)。
+- MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_ringfix_20261008_01](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)。
 
 ## 5. 优化历史
 
@@ -807,7 +806,9 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - **10-02 union单一变体、indexer去特化、首次调用预编译**：union在SOFFSET上钳位越过KV末端的部分尾块，删除TAIL_BOUNDS变体，KV长度非4倍数的请求快约3.4%；I1/I2/D0不做整数特化；每种head形状第一次调用attention时预编译全部变体（见4.3）。服务测量中没有编译，吞吐与上一轮相差不超过±0.4%。[编译清单](../../../../../mytest/mydata/qsa_fresh_compile_20261002_03)、[union A/B](../../../../../mytest/mydata/qsa_compile_once_20261002_01/union_ab_final.log)、[服务](../../../../../mytest/mydata/qsa_compile_once_service_20261002_01/summary.json)
 - **10-04 删除候选提升**：比较两种删法后保留逐tile阈值1.7（np17）：真实12k和服务布局路由不变，少数TP2高共享、P0 4k随机选择和TP4分块布局attention慢8–21%（每次forward约多0.7–1.6ms）；改用阈值1.8（np18）会把代价移到真实TP2 12k上。[评估](../../../../../mytest/mydata/qsa_promote_eval_20261003_01/summary.json)、[改动](../../../../../mytest/mydata/qsa_promote_remove_20261003_01)
 - **10-04 K3路由改为单一阈值**：全direct只在少数混合批中有约10%收益，且它就是“全部降级”这一档；路由改为一个步数阈值（8档），594个布局的路由和输出与原实现逐位相同，attention_prepare.py 513→489行。服务复测吞吐与10-02相差不超过±0.35%，TTFT/ITL中位数不超过±0.8%。[评估](../../../../../mytest/mydata/qsa_route_simplify_20261004_01)、[改动](../../../../../mytest/mydata/qsa_route_threshold_20261004_01)、[服务](../../../../../mytest/mydata/qsa_route_threshold_service_20261004_01/summary.json)
-- **10-06～10-08 MTP的verify走PyHIP**：EAGLE 3/1/4时目标模型每步跑CUDA graph TARGET_VERIFY（每请求4行窗口），不再跑DECODE，PyHIP原先只接管prefill。`decode_forward(verify=True)`中D0只做q和ring写，新增的D0′在本次所有行写完ring后再压缩，按SGLang先写全部ring、再gather的顺序，q、ring和压缩key逐bit一致；SGLang把graph TARGET_VERIFY交给PyHIP。C1 profile中每个verify graph的indexer由约5.67ms降到0.36ms，verify graph在TP2由21.74ms降到16.22ms、TP4由19.65ms降到14.28ms。服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +15.4%/+24.2%/+30.3%/+33.5%（原生取热缓存复测；首轮原生C8在测量中编译了12次`apply_interleaved_rope_kernel`），TP4 +18.6%/+30.3%/+34.7%/+41.3%；相对10-06只接prefill的PyHIP，TP2快13.4%–21.1%。TEST=1验收TP2/TP4每rank每层217/222次verify校验全部通过。同时发现原生verify窗口跨压缩边界时ring被覆盖（见4.4）。[服务](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)、[基线](../../../../../mytest/mydata/qsa_mtp_baseline_20261006_01/analysis.json)、[ring演示](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)
+- **10-06～10-08 MTP的verify走PyHIP**：EAGLE 3/1/4时目标模型每步跑CUDA graph TARGET_VERIFY（每请求4行窗口），不再跑DECODE，PyHIP原先只接管prefill。`decode_forward(verify=True)`中D0只做q和ring写，新增的D0′在本次所有行写完ring后再压缩，按SGLang先写全部ring、再gather的顺序，q、ring和压缩key逐bit一致；SGLang把graph TARGET_VERIFY交给PyHIP。C1 profile中每个verify graph的indexer由约5.67ms降到0.36ms，verify graph在TP2由21.74ms降到16.22ms、TP4由19.65ms降到14.28ms。服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +15.4%/+24.2%/+30.3%/+33.5%（原生取热缓存复测；首轮原生C8在测量中编译了12次`apply_interleaved_rope_kernel`），TP4 +18.6%/+30.3%/+34.7%/+41.3%；相对10-06只接prefill的PyHIP，TP2快13.4%–21.1%。TEST=1验收TP2/TP4每rank每层217/222次verify校验全部通过。这些数字测于下一条的ring修复之前。[服务](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)、[基线](../../../../../mytest/mydata/qsa_mtp_baseline_20261006_01/analysis.json)
+- **10-08 修复原生verify的ring覆盖**：SGLang原生每个请求的pending ring只有ratio个槽，而verify先写本次所有行、再gather，窗口跨过压缩边界时，边界之后的草稿行会覆盖该组在窗口之前的成员：窗口起点L%4为1/2/3时，该组压缩key与逐token decode的余弦只有0.68/0.45/0.27，PyHIP为了逐bit一致也照样复现。SGLang把ring扩到每个请求2×ratio个槽（`qsa_ring_slots_per_request`，两个槽号builder、graph元数据kernel、pool和验收一起改），修复后4种对齐都与逐token decode逐bit一致；新增的回归测试在旧布局下对齐1–3失败。PyHIP不用改，测试夹具改用同一布局。修复后服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +17.5%/+23.4%/+27.7%/+29.7%、TP4 +21.5%/+28.8%/+33.8%/+41.6%，16场测量都没有服务中编译；TEST=1验收TP2/TP4每rank每层234/247次verify校验全部通过。[修复前](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)、[修复后](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_02/result.json)、[服务](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)
+- **10-08 查明MTP接受长度差**：用64个与服务基准同协议的prompt（ShareGPT首轮平铺到12000 token，前32个就是基准用的），C1贪心逐请求记录，原生、PyHIP、只用PyHIP indexer、只用PyHIP attention各跑两轮。两边输出相同时，接受的草稿逐步一致；同一段文本的teacher-forced对数似然也相同（自然续写上PyHIP每token高0.008，置信区间含0）。差距全部来自生成的文本不同：prefill的微小数值差（PyHIP attention与indexer各自都在容差内）在near-tie处翻转贪心选择，原生自己两轮之间也有45%的prompt输出不同。基准的32个prompt里有2个在PyHIP下稳定走到更难预测的分支（第25个在`<|im_start|>`之后续成user而不是assistant），占约75%的差距；另外32个prompt没有差距，64个prompt两轮合并差1.5%且置信区间含0，原生同配置两轮之间就差2.3%。不是verify或draft的问题，也不是数值退化。ring修复后轨迹又变了，服务基准中两边的接受长度相当（TP2差0.5%以内，TP4 PyHIP反而高0.5%–1.2%）。[研究](../../../../../mytest/mydata/qsa_accept_study_20261008_01/summary.json)
 
 ### 评估过但未采用
 
