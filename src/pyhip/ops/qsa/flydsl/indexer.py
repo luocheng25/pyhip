@@ -268,10 +268,12 @@ def prefill_indexer(qk, **kwargs):
     """Return int32 [T, 2051] token selections and update the QSA pending/compressed caches.
 
     qk is the contiguous BF16 ``index_qk_proj`` output [T, (heads + 1) * D]. Host
-    seq/extend lengths describe the packed extend batch; request-local query
-    positions must equal ``prefix + i`` (checked on device: a mismatch traps on the
-    GPU, which aborts the process). ``write_locs`` and the
-    other group tensors are SGLang's extend write plan, including slot-0 padding.
+    seq/extend lengths describe the packed extend batch; every prefix
+    (seq_len - extend_len) must be a multiple of 4, because a chunk compresses only
+    groups whose four members are its own rows. Request-local query positions must
+    equal ``prefix + i`` (checked on device: a mismatch traps on the GPU, which aborts
+    the process). ``write_locs`` and the other group tensors are SGLang's extend
+    write plan, including slot-0 padding.
     """
     return _run(qk, **kwargs)[0]
 
@@ -299,6 +301,9 @@ def _run(qk, *, heads, positions, logical_positions, state_slots, key_state, rop
         raise ValueError("rotary_dim/2 and head_dim-rotary_dim must be powers of two")
     if len(seq_lens) != len(extend_lens) or any(s < e or e < 0 for s, e in zip(seq_lens, extend_lens)):
         raise ValueError("Invalid host sequence/extend lengths")
+    if any((s - e) % _RATIO for s, e in zip(seq_lens, extend_lens)):
+        raise ValueError(f"prefill_indexer requires every prefix (seq_len - extend_len) to be aligned to "
+                         f"compress_ratio={_RATIO}")
     if max(seq_lens) // _RATIO > MAX_COMPRESSED_KEYS or rows == 0:
         raise ValueError(f"Rows must be non-empty and have at most {MAX_COMPRESSED_KEYS} compressed keys")
     _check(qk, "qk", torch.bfloat16, (rows, (heads + 1) * head_dim))
