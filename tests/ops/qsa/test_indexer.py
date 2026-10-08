@@ -20,22 +20,17 @@ PREFILL_CASES = (
     ((2177,), (129,)),
     ((2055, 16, 13), (7, 0, 9)),
 )
-# Compressed-key lengths, page-table width and heads; zero rows model decode padding.
+# Sequence lengths, padding rows and context: 2044-2052 tokens straddle the 512-key top-k on a 528-key page
+# table (not a multiple of 512); 262144 tokens reach the 65536-key limit.
 DECODE_CASES = (
-    ((0, 1, 15, 16, 17), 4, 4),
-    ((511, 512, 513), 64, 4),
-    ((513,), 33, 4),
-    ((3000,), 256, 4),
-    (tuple(3000 + 37 * i for i in range(29)) + (0, 0, 0), 256, 8),
-    ((65536,), 4096, 4),
-)
-DECODE_FORWARD_CASES = (
     ((1,), 0, 64),
     ((5, 8, 3, 12), 1, 256),
+    ((2044, 2048, 2052), 0, 2112),
     ((12000, 11888, 11667, 11851), 0, 16384),
+    ((262144,), 0, 262144),
 )
 # TARGET_VERIFY windows: first-row lengths cover every alignment of the compression boundary.
-VERIFY_FORWARD_CASES = (
+VERIFY_CASES = (
     ((9, 10, 11, 12), 4, 2, 64),
     ((4003, 6, 1023, 2), 4, 1, 8192),
     ((17, 30, 5), 3, 0, 64),
@@ -109,13 +104,13 @@ def test_prep_kernels_compile_once(device):
         return [len(kernel.device_caches[device.index][0]) for kernel in kernels]
 
     def verify(lengths):
-        source = helpers.decode_forward_case(lengths, device, window=4, context=64)
-        helpers.indexer.decode_forward(**source.inputs, verify=True)
+        source = helpers.decode_case(lengths, device, window=4, context=64)
+        helpers.indexer.decode_indexer(**source.inputs, verify=True)
 
     helpers.indexer.indexer_logits._COMPILED.pop(device, None)
     helpers.indexer.prefill_indexer(**helpers.synthetic((9,), (9,), device).inputs)
     assert device in helpers.indexer.indexer_logits._COMPILED
-    helpers.indexer.decode_forward(**helpers.decode_forward_case((7,), device, context=64).inputs)
+    helpers.indexer.decode_indexer(**helpers.decode_case((7,), device, context=64).inputs)
     verify((7,))
     first = counts()
     for seq_lens, extend_lens in (((1,), (1,)), ((64,), (64,)), ((60,), (60,)), ((2177,), (129,)),
@@ -123,94 +118,68 @@ def test_prep_kernels_compile_once(device):
         helpers.indexer.prefill_indexer(**helpers.synthetic(seq_lens, extend_lens, device).inputs)
     for rows in (2, 16, 32):
         lengths = tuple(range(5, 5 + rows))
-        helpers.indexer.decode_forward(**helpers.decode_forward_case(lengths, device, context=64).inputs)
+        helpers.indexer.decode_indexer(**helpers.decode_case(lengths, device, context=64).inputs)
         verify(lengths)
     assert counts() == first
 
 
-@pytest.mark.parametrize("lengths,pages,heads", DECODE_CASES,
-                         ids=("short-pages", "topk-boundary", "compact-pages", "single", "ragged-padded", "max-keys"))
-def test_decode_operator(lengths, pages, heads, device):
-    source = helpers.decode_case(lengths, pages, device, heads=heads)
+@pytest.mark.parametrize("lengths,padding,context", DECODE_CASES,
+                         ids=("short", "mixed-padded", "topk-boundary", "long-ragged", "max-keys"))
+def test_decode_operator(lengths, padding, context, device):
+    source = helpers.decode_case(lengths, device, padding=padding, context=context)
+    expected = helpers.reference_prep(source.inputs, source.state, decode=True)
     output = helpers.indexer.decode_indexer(**source.inputs)
-    helpers.check_decode(source, output)
+    helpers.check_decode(source, output, expected=expected)
 
 
 def test_decode_graph_replay(device):
-    source = helpers.decode_case((3000, 0, 700, 4096), 256, device, pool=600)
-    helpers.indexer.decode_indexer(**source.inputs)
-    torch.cuda.synchronize(device)
-    addresses = _addresses(source)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = helpers.indexer.decode_indexer(**source.inputs)
-    lengths = (513, 512, 0, 4095)
-    fresh = helpers.decode_case(lengths, 256, device, seed=19, pool=600)
-    for name, tensor in source.inputs.items():
-        tensor.copy_(fresh.inputs[name])
-    source.host["compressed_lengths"] = lengths
-    graph.replay()
-    helpers.check_decode(source, output)
-    assert _addresses(source) == addresses
-
-
-@pytest.mark.parametrize("lengths,padding,context", DECODE_FORWARD_CASES,
-                         ids=("short", "mixed-padded", "long-ragged"))
-def test_decode_forward_operator(lengths, padding, context, device):
-    source = helpers.decode_forward_case(lengths, device, padding=padding, context=context)
-    expected = helpers.reference_prep(source.inputs, source.state, decode=True)
-    output = helpers.indexer.decode_forward(**source.inputs)
-    helpers.check_decode_forward(source, output, expected=expected)
-
-
-def test_decode_forward_graph_replay(device):
     lengths = (4003, 6, 1023, 2)
-    source = helpers.decode_forward_case(lengths, device, padding=2, context=8192)
+    source = helpers.decode_case(lengths, device, padding=2, context=8192)
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
-    warm = helpers.indexer.decode_forward(**source.inputs)
-    helpers.check_decode_forward(source, warm, expected=expected)
+    warm = helpers.indexer.decode_indexer(**source.inputs)
+    helpers.check_decode(source, warm, expected=expected)
     torch.cuda.synchronize(device)
     helpers.reset_state(source)
     addresses = _addresses(source)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = helpers.indexer.decode_forward(**source.inputs)
+        output = helpers.indexer.decode_indexer(**source.inputs)
     # Advance only independent history before crossing the next compression boundary.
     source.state = expected.state
     helpers.reset_state(source)
     helpers.decode_step(source, tuple(length + 1 for length in lengths))
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
     graph.replay()
-    helpers.check_decode_forward(source, output, expected=expected)
+    helpers.check_decode(source, output, expected=expected)
     assert _addresses(source) == addresses
 
 
-@pytest.mark.parametrize("lengths,window,padding,context", VERIFY_FORWARD_CASES,
+@pytest.mark.parametrize("lengths,window,padding,context", VERIFY_CASES,
                          ids=("alignments", "long-padded", "window3", "window2-padded"))
-def test_verify_forward_operator(lengths, window, padding, context, device):
-    source = helpers.decode_forward_case(lengths, device, window=window, padding=padding, context=context)
-    helpers.check_decode_forward(source)
+def test_verify_operator(lengths, window, padding, context, device):
+    source = helpers.decode_case(lengths, device, window=window, padding=padding, context=context)
+    helpers.check_decode(source)
 
 
-def test_verify_forward_graph_replay(device):
+def test_verify_graph_replay(device):
     lengths = (4003, 6, 1023, 2)
-    source = helpers.decode_forward_case(lengths, device, window=4, padding=2, context=8192)
+    source = helpers.decode_case(lengths, device, window=4, padding=2, context=8192)
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
-    warm = helpers.indexer.decode_forward(**source.inputs, verify=True)
-    helpers.check_decode_forward(source, warm, expected=expected)
+    warm = helpers.indexer.decode_indexer(**source.inputs, verify=True)
+    helpers.check_decode(source, warm, expected=expected)
     torch.cuda.synchronize(device)
     helpers.reset_state(source)
     addresses = _addresses(source)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = helpers.indexer.decode_forward(**source.inputs, verify=True)
+        output = helpers.indexer.decode_indexer(**source.inputs, verify=True)
     # The next window starts after each request's accepted tokens and rewrites the rejected rows.
     source.state = expected.state
     helpers.reset_state(source)
     helpers.decode_step(source, tuple(length + accepted for length, accepted in zip(lengths, (4, 1, 3, 2))))
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
     graph.replay()
-    helpers.check_decode_forward(source, output, expected=expected)
+    helpers.check_decode(source, output, expected=expected)
     assert _addresses(source) == addresses
 
 

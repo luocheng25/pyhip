@@ -1,9 +1,9 @@
 """Synthetic public QSA indexer checks and default operator/kernel timing.
 
-Prefill and decode-forward start after projection; decode selects from prepared
-Q and paged keys. Decode timing is one public-operator graph replay. Fixture
-construction, projection, resets, compilation and independent PyTorch references
-are untimed. Default execution reports operator and individual kernel timing.
+Prefill and decode start after projection. Decode timing is one public-operator
+graph replay. Fixture construction, projection, resets, compilation and
+independent PyTorch references are untimed. Default execution reports operator
+and individual kernel timing.
 """
 
 import argparse
@@ -34,10 +34,8 @@ from tests.ops.qsa._benchmark import (  # noqa: E402
 )
 
 BENCHMARK_BUFFERS, BENCHMARK_SAMPLES = 10, 128
-MODES = {"prefill": "prefill_indexer", "decode": "decode_indexer", "decode-forward": "decode_forward"}
-OPERATORS = dict(prefill_indexer=helpers.indexer.prefill_indexer,
-                 decode_indexer=helpers.indexer.decode_indexer,
-                 decode_forward=helpers.indexer.decode_forward)
+MODES = {"prefill": "prefill_indexer", "decode": "decode_indexer"}
+OPERATORS = dict(prefill_indexer=helpers.indexer.prefill_indexer, decode_indexer=helpers.indexer.decode_indexer)
 
 
 def _source_hashes(sources):
@@ -58,9 +56,7 @@ def _save_sources(folder, sources, expected):
 def _check_output(source, mode, output, expected):
     if mode == "prefill_indexer":
         return helpers.check(source, actual=output, expected=expected)
-    if mode == "decode_indexer":
-        return helpers.check_decode(source, output)
-    return helpers.check_decode_forward(source, output, expected=expected)
+    return helpers.check_decode(source, output, expected=expected)
 
 
 def _operator_table(name, report):
@@ -112,8 +108,7 @@ def benchmark(make_source, folder, gpu, *, mode="prefill_indexer", check_only=Tr
         with torch.cuda.device(gpu):
             for buffer in range(buffers):
                 source = make_source(buffer)
-                expected = None if mode == "decode_indexer" else helpers.reference_prep(
-                    source.inputs, source.state, decode=mode == "decode_forward")
+                expected = helpers.reference_prep(source.inputs, source.state, decode=mode == "decode_indexer")
                 helpers.reset_state(source)
                 output = OPERATORS[mode](**source.inputs)
                 checked = _check_output(source, mode, output, expected)
@@ -227,26 +222,18 @@ def main(argv=None):
     timing.add_argument("--check-only", action="store_true", help="correctness only; no timing")
     timing.add_argument("--perf", action="store_true", help="performance is the default")
     parser.add_argument("--rows", nargs="+", type=int, help="decode batch sizes (default: 1 32)")
-    parser.add_argument("--keys", nargs="+", type=int, help="decode compressed-key counts (default: 3000)")
-    parser.add_argument("--lengths", nargs="+", type=int,
-                        help="prefill or decode-forward token lengths (default: 12000)")
+    parser.add_argument("--lengths", nargs="+", type=int, help="prefill or decode token lengths (default: 12000)")
     parser.add_argument("--buffers", type=int, choices=(BENCHMARK_BUFFERS,), default=BENCHMARK_BUFFERS)
     parser.add_argument("--samples", type=int, default=BENCHMARK_SAMPLES)
     parser.add_argument("--output", type=Path, default=default_output("indexer"))
     args = parser.parse_args(argv)
     if args.gpu < 0 or args.samples < args.buffers:
         parser.error("Require gpu >= 0 and samples >= 10")
-    if args.keys is not None and args.mode not in ("all", "decode"):
-        parser.error("--keys requires --mode decode")
-    if args.lengths is not None and args.mode == "decode":
-        parser.error("--lengths requires --mode prefill or decode-forward")
     if args.rows is not None and args.mode == "prefill":
-        parser.error("--rows requires a decode mode; use --lengths for prefill")
-    for option, values in (("rows", args.rows), ("keys", args.keys), ("lengths", args.lengths)):
+        parser.error("--rows requires --mode decode; use --lengths for prefill")
+    for option, values in (("rows", args.rows), ("lengths", args.lengths)):
         if values is not None and (min(values) < 1 or len(set(values)) != len(values)):
             parser.error(f"--{option} values must be positive and distinct")
-    if max(args.keys or [3000]) > helpers.indexer.MAX_COMPRESSED_KEYS:
-        parser.error("Too many compressed keys")
     if max(args.lengths or [12000]) > helpers.indexer.MAX_COMPRESSED_KEYS * 4:
         parser.error("Token lengths exceed the supported context")
     if not args.output.resolve().is_relative_to(DATA.resolve()):
@@ -259,18 +246,12 @@ def main(argv=None):
         for length in args.lengths or [12000]:
             jobs.append((f"prefill_n{length}", "prefill", lambda buffer, n=length: helpers.synthetic(
                 (n,), (n,), device, seed=11 + buffer)))
-    for mode in ("decode", "decode-forward"):
-        if args.mode not in ("all", mode):
-            continue
+    if args.mode in ("all", "decode"):
         for rows in args.rows or (1, 32):
-            for size in (args.keys or [3000]) if mode == "decode" else (args.lengths or [12000]):
-                if mode == "decode":
-                    jobs.append((f"decode_r{rows}_k{size}", mode, lambda buffer, r=rows, k=size: helpers.decode_case(
-                        (k,) * r, (k + 15) // 16, device, seed=r + 1000 * buffer)))
-                else:
-                    jobs.append((f"decode_forward_r{rows}_n{size}", mode,
-                                 lambda buffer, r=rows, n=size: helpers.decode_forward_case(
-                                     (n,) * r, device, context=(n + 63) // 64 * 64, seed=r + 1000 * buffer)))
+            for length in args.lengths or [12000]:
+                jobs.append((f"decode_r{rows}_n{length}", "decode",
+                             lambda buffer, r=rows, n=length: helpers.decode_case(
+                                 (n,) * r, device, context=(n + 63) // 64 * 64, seed=r + 1000 * buffer)))
     with recording_matrix(args.output, [name for name, _, _ in jobs],
                           check_only=args.check_only) as reports:
         for name, mode, make_source in jobs:

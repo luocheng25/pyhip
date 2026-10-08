@@ -325,7 +325,12 @@ def check(source, *, actual=None, q=None, packed=None, expected=None):
     inputs = source.inputs
     expected = reference_prep(inputs, source.state) if expected is None else expected
     if actual is None:
-        actual, q, packed = indexer._prefill(**inputs)
+        q = torch.empty((source.rows, HEADS, DIM), dtype=torch.bfloat16, device=inputs["qk"].device)
+        actual = indexer.prefill_indexer(**inputs, q_out=q)
+        # The keys the logits read, request by request: a group's key sits at its first token's slot // RATIO.
+        table, compressed = inputs["token_slot_table"], inputs["compressed"]
+        packed = torch.cat([compressed[table[s, :n // RATIO * RATIO:RATIO].long() // RATIO, 0]
+                            for s, n in enumerate(source.seq_lens)])
     assert actual.shape == (source.rows, WIDTH) and actual.dtype == torch.int32, "prefill token frame"
     if q is not None:
         assert_exact(q, expected.q, "index Q must be bitexact")
@@ -352,41 +357,10 @@ def check(source, *, actual=None, q=None, packed=None, expected=None):
     return report
 
 
-def decode_case(lengths, pages, device, heads=HEADS, seed=5, pool=None):
-    """Direct paged Q/K inputs; lengths are compressed-key counts, including graph-padding zero."""
-    if not lengths or min(lengths) < 0 or max(lengths) > pages * 16 or heads not in (4, 8) or pages < 1:
-        raise ValueError("Require 4/8 heads and compressed lengths within the page-table width")
-    generator = torch.Generator(device=device).manual_seed(seed)
-    rows, needed = len(lengths), sum(math.ceil(n / 16) for n in lengths)
-    total = needed + 3 if pool is None else pool
-    if total < max(needed, 1):
-        raise ValueError("Not enough independent cache pages")
-    cache = torch.randn((total, 16, 1, DIM), generator=generator, device=device).to(torch.bfloat16)
-    order = torch.randperm(total, generator=generator, device=device).to(torch.int32)
-    table = order[torch.randint(0, total, (rows, pages), generator=generator, device=device)]
-    used = 0
-    for row, length in enumerate(lengths):
-        count = math.ceil(length / 16)
-        table[row, :count] = order[used:used + count]
-        used += count
-    q = torch.randn((rows, heads, DIM), generator=generator, device=device).to(torch.bfloat16)
-    q[:, HEADS:] = 0
-    compressed = torch.tensor(lengths, dtype=torch.int32, device=device)
-    sequences = compressed * RATIO + torch.randint(0, RATIO, (rows,), generator=generator, device=device).int()
-    inputs = dict(q=q, cache=cache, page_table=table, lengths=compressed,
-                  query_positions=sequences - 1, sequence_lengths=sequences)
-    return SimpleNamespace(name=f"decode_r{rows}_k{'-'.join(map(str, lengths[:4]))}", inputs=inputs, state={},
-                           rows=rows, host=dict(compressed_lengths=tuple(lengths)))
-
-
 @torch.no_grad()
-def check_decode(source, actual=None, *, logits=None, q=None, compressed=None):
-    """Check the actual selection/logits; a supplied result is never replaced by another launch."""
+def _check_selection(source, actual, *, q, compressed, logits=None):
+    """Check a decode selection (and its logits when given) against FP64 scores of the reference Q and keys."""
     inputs = source.inputs
-    if actual is None:
-        actual, logits = indexer._decode_select(**inputs)
-    q = inputs["q"] if q is None else q
-    cache = inputs["cache"] if compressed is None else compressed
     assert actual.shape == (q.shape[0], WIDTH) and actual.dtype == torch.int32, "decode token frame"
     if logits is not None:
         assert logits.shape == (q.shape[0], inputs["page_table"].shape[1] * 16) and logits.dtype == torch.float32
@@ -395,8 +369,8 @@ def check_decode(source, actual=None, *, logits=None, q=None, compressed=None):
     for row, count in enumerate(inputs["lengths"].cpu().tolist()):
         pages = inputs["page_table"][row, :math.ceil(count / 16)].long()
         slots = (pages[:, None] * 16 + torch.arange(16, device=q.device)).flatten()[:count]
-        exact = _scores(q[row:row + 1, :HEADS], cache.reshape(-1, DIM)[slots])
-        positions, sequences = inputs["query_positions"][row:row + 1], inputs["sequence_lengths"][row:row + 1]
+        exact = _scores(q[row:row + 1, :HEADS], compressed.reshape(-1, DIM)[slots])
+        positions, sequences = inputs["logical_positions"][row:row + 1], inputs["seq_lens"][row:row + 1]
         counts = _counts(positions, sequences)
         assert int(counts[0]) == count, "decode compressed length disagrees with the token frame"
         checked = assert_topk(actual[row:row + 1], positions, sequences, exact)
@@ -416,7 +390,7 @@ def check_decode(source, actual=None, *, logits=None, q=None, compressed=None):
 
 
 @torch.no_grad()
-def decode_forward_case(lengths, device, *, window=1, padding=0, seed=17, context=65536):
+def decode_case(lengths, device, *, window=1, padding=0, seed=17, context=65536):
     """Static tensor buffers for after-projection decode, with page-64 request allocation.
 
     ``window`` > 1 builds a TARGET_VERIFY layout: each request owns ``window`` consecutive rows whose
@@ -444,11 +418,10 @@ def decode_forward_case(lengths, device, *, window=1, padding=0, seed=17, contex
                   write_locs=torch.empty(rows, dtype=torch.int32, device=device),
                   page_table=torch.empty((rows, pages), dtype=torch.int32, device=device),
                   lengths=torch.empty(rows, dtype=torch.int32, device=device),
-                  query_positions=torch.empty(rows, dtype=torch.int32, device=device),
-                  sequence_lengths=torch.empty(rows, dtype=torch.int32, device=device),
+                  logical_positions=torch.empty(rows, dtype=torch.int32, device=device),
+                  seq_lens=torch.empty(rows, dtype=torch.int32, device=device),
                   **clone_state(state), **parameters)
-    inputs["cache"] = inputs["compressed"].view(-1, 16, 1, DIM)
-    name = f"decode_forward_n{'-'.join(map(str, lengths))}{f'_w{window}' if window > 1 else ''}_pad{padding}"
+    name = f"decode_n{'-'.join(map(str, lengths))}{f'_w{window}' if window > 1 else ''}_pad{padding}"
     source = SimpleNamespace(name=name, inputs=inputs, state=state, table=table, requests=requests, rows=rows,
                              window=window, padding=padding, context=context,
                              host=dict(request_ids=tuple(request for request in range(1, requests + 1)
@@ -473,8 +446,8 @@ def decode_step(source, lengths):
     sequences = torch.tensor(source.seq_lens, dtype=torch.int64, device=device)
     requests = torch.tensor(source.host["request_ids"], dtype=torch.int64, device=device)
     positions = sequences - 1
-    inputs["sequence_lengths"].copy_(sequences)
-    inputs["query_positions"].copy_(positions)
+    inputs["seq_lens"].copy_(sequences)
+    inputs["logical_positions"].copy_(positions)
     inputs["lengths"].copy_(sequences // RATIO)
     inputs["positions"].copy_(torch.stack((positions, positions + 3, positions + 7)))
     inputs["state_slots"].copy_(requests * RING + positions % RING)
@@ -487,13 +460,19 @@ def decode_step(source, lengths):
 
 
 @torch.no_grad()
-def check_decode_forward(source, actual=None, *, q=None, logits=None, expected=None):
+def check_decode(source, actual=None, *, q=None, logits=None, expected=None):
+    """Check a decode (or verify) invocation; a supplied result is never replaced by another launch."""
     expected = reference_prep(source.inputs, source.state, decode=True) if expected is None else expected
     if actual is None:
-        actual, q, logits = indexer._decode_forward(**source.inputs, verify=source.window > 1)
+        rows, width = source.rows, source.inputs["page_table"].shape[1] * 16
+        device = source.inputs["qk"].device
+        q = torch.empty((rows, HEADS, DIM), dtype=torch.bfloat16, device=device)
+        logits = torch.empty(rows * width + indexer._PAD, dtype=torch.float32, device=device)
+        logits = logits[:rows * width].view(rows, width)
+        actual = indexer.decode_indexer(**source.inputs, verify=source.window > 1, q_out=q, logits_out=logits)
     if q is not None:
         assert_exact(q, expected.q, "decode Q must be bitexact, including padding rows")
     report = dict(case=source.name, q_checked=q is not None, **assert_state(source, expected))
-    report["selection"] = check_decode(source, actual, logits=logits, q=expected.q,
-                                       compressed=expected.state["compressed"])
+    report["selection"] = _check_selection(source, actual, q=expected.q, compressed=expected.state["compressed"],
+                                           logits=logits)
     return report

@@ -6,10 +6,9 @@ so only accumulation order differs from the Torch einsum reference. Top-k (FlyDS
 ``indexer_topk.py``) keeps the 512 largest ordered FP32 keys; ties keep the
 lowest block ids. Each row holds the selected blocks' tokens in ascending block
 order (PyHIP attention reads such rows without sorting), then 0..3 causal tail
-tokens, then -1, matching SGLang's fixed-width token ABI. Decode (``decode_indexer``) uses paged logits
-(``indexer_decode.py``) and the shared FlyDSL top-k/expand; ``decode_forward`` also fuses the
-CUDA-graph decode q prep, pending-ring store and group compression into one bit-exact kernel
-(TARGET_VERIFY windows compress in a second launch).
+tokens, then -1, matching SGLang's fixed-width token ABI. Decode (``decode_indexer``) fuses the CUDA-graph
+q prep, pending-ring store and group compression into one bit-exact kernel (TARGET_VERIFY windows compress
+in a second launch), then runs paged logits (``indexer_decode.py``) and the shared FlyDSL top-k/expand.
 """
 
 from collections import OrderedDict
@@ -24,7 +23,7 @@ import triton.language as tl
 from . import indexer_decode, indexer_logits, indexer_topk
 from .attention_prepare import upload
 
-__all__ = ["MAX_COMPRESSED_KEYS", "decode_forward", "decode_indexer", "prefill_indexer"]
+__all__ = ["MAX_COMPRESSED_KEYS", "decode_indexer", "prefill_indexer"]
 
 _LOGITS_BUDGET_BYTES = 256 * 1024 * 1024
 # The top-k kernel keeps chosen block ids as uint16.
@@ -292,34 +291,28 @@ def _check(tensor, name, dtype, shape=None, contiguous=True):
                          f"{tensor.dtype} {tuple(tensor.shape)}")
 
 
-def prefill_indexer(qk, **kwargs):
+def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state, write_locs,
+                    member_rows, group_sequences, group_ends, rope_matrix, compressed, token_slot_table,
+                    cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps, seq_lens, extend_lens, q_out=None):
     """Return int32 [T, 2051] token selections and update the QSA pending/compressed caches.
 
-    qk is the contiguous BF16 ``index_qk_proj`` output [T, (heads + 1) * D]. Host
-    seq/extend lengths describe the packed extend batch; every prefix
-    (seq_len - extend_len) must be a multiple of 4, because a chunk compresses only
-    groups whose four members are its own rows. Request-local query positions must
-    equal ``prefix + i`` (checked on device: a mismatch traps on the GPU, which aborts
-    the process). ``write_locs`` and the other group tensors are SGLang's extend
-    write plan, including slot-0 padding.
+    qk is the contiguous BF16 ``index_qk_proj`` output [T, (heads + 1) * D] (heads=4, D=128). Host
+    ``seq_lens``/``extend_lens`` describe the packed extend batch; every prefix (seq_len - extend_len)
+    must be a multiple of 4, because a chunk compresses only groups whose four members are its own rows.
+    ``positions`` are the RoPE positions (int64 [T] or [3, T]); request-local ``logical_positions``
+    (int64 [T]) must equal ``prefix + i`` (checked on device: a mismatch traps on the GPU, which aborts
+    the process).
+
+    Updated in place: ``key_state`` (BF16 [slots, 1, D]) and ``rope_state`` (int64 [slots, 3]) at the
+    rows' pending-ring ``state_slots`` (int64 [T]), and ``compressed`` (BF16 [compressed_slots, 1, D],
+    under 2 GiB). ``write_locs`` (int32 [G]), ``member_rows``, ``group_sequences``, ``group_ends``
+    (int64 [G]) and ``rope_matrix`` (int64 [T, 3]) are SGLang's extend write plan, including slot-0
+    padding. ``token_slot_table`` (int32 [requests, >= max(seq_lens)]) holds each token's physical slot;
+    a group's compressed key sits at its first token's slot // 4. ``cos_sin_cache`` (BF16/FP32
+    [positions, rotary_dim]) and ``axis_map`` (int32 [rotary_dim / 2]) give the multi-axis RoPE,
+    ``q_weight``/``k_weight`` (BF16 [D]) and ``q_eps``/``k_eps`` the Gemma RMSNorms. If given,
+    ``q_out`` (BF16 [T, heads, D]) receives the normalized index queries.
     """
-    return _run(qk, **kwargs)[0]
-
-
-def _prefill(qk, **kwargs):
-    """prefill_indexer's (selection, normalized q) plus the request-ordered compressed keys the logits
-    read (token_slot_table[s, 4j] / 4 for key j of request s), for validation."""
-    out, q = _run(qk, **kwargs)
-    table, compressed = kwargs["token_slot_table"], kwargs["compressed"]
-    keys = [compressed[table[s, :n // _RATIO * _RATIO:_RATIO].long() // _RATIO, 0]
-            for s, n in enumerate(kwargs["seq_lens"]) if n >= _RATIO]
-    return out, q, torch.cat(keys) if keys else compressed.new_empty((0, compressed.shape[-1]))
-
-
-def _run(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state,
-         write_locs, member_rows, group_sequences, group_ends, rope_matrix, compressed,
-         token_slot_table, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-         seq_lens, extend_lens):
     device, head_dim = qk.device, q_weight.numel()
     rows = sum(extend_lens)
     rotary_dim = cos_sin_cache.shape[1]
@@ -360,11 +353,14 @@ def _run(qk, *, heads, positions, logical_positions, state_slots, key_state, rop
     tensors = (qk, positions, logical_positions, state_slots, key_state, rope_state, write_locs, member_rows,
                group_sequences, group_ends, rope_matrix, compressed, token_slot_table, cos_sin_cache, axis_map,
                q_weight, k_weight)
+    if q_out is not None:
+        _check(q_out, "q_out", torch.bfloat16, (rows, heads, head_dim))
+        tensors += (q_out,)
     if any(t.device != device for t in tensors):
         raise ValueError("All indexer tensors must be on one device")
 
     layout = _layout(tuple(seq_lens), tuple(extend_lens), device)
-    q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=device)
+    q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=device) if q_out is None else q_out
     stats = torch.empty((rows, 2), dtype=torch.int32, device=device)
     _indexer_q_prep[(-(-rows // _TB),)](qk, q, q_weight, key_state, rope_state, state_slots, positions,
                                         positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache,
@@ -386,53 +382,45 @@ def _run(qk, *, heads, positions, logical_positions, state_slots, key_state, rop
             indexer_logits.launch(q, compressed, token_slot_table, view, chunk.items, chunk.width, scale, stats)
         indexer_topk.launch(view, chunk.width, chunk.row0, chunk.rows, logical_positions, layout.row_info, out,
                             stats)
-    return out, q
+    return out
 
 
-def decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths):
-    """Paged decode selection for 4 BF16 heads: int32 [rows, 2051] token indices.
+def decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, rope_state, write_locs, group_locs,
+                   compressed, page_table, lengths, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
+                   seq_lens, verify=False, q_out=None, logits_out=None):
+    """CUDA-graph decode counterpart of ``prefill_indexer``: int32 [rows, 2051] token selections.
 
-    q is [rows, H >= 4, 128] BF16 with contiguous rows (only heads 0..3 are read), cache the
-    [pages, 16, 1, 128] BF16 compressed pool, page_table int32 [rows, P] (rows score 16 * P keys)
-    and lengths the int32 compressed lengths. Only the logits change (FlyDSL paged kernel reading
-    each row's own keys instead of the whole table width). FlyDSL top-k and expansion share
-    the prefill selection core. Everything is device-side, so the call is CUDA-graph capturable
-    after eager warmup. Each row has at most MAX_COMPRESSED_KEYS compressed keys.
+    One row per query token; ``qk``, ``positions``, ``state_slots``, the caches and the RoPE/norm parameters
+    are as in ``prefill_indexer``. One Triton kernel reproduces SGLang's unfused (BF16 cos/sin) q norm/RoPE,
+    the pending-ring key and RoPE-position store at ``state_slots`` and the fixed-shape compression of
+    ``group_locs`` (int32 [rows, 4] ring slots, oldest member first) into ``write_locs`` (int32 [rows], the
+    inert slot 0 when the row completes no group) bit for bit. Rows must belong to distinct requests (each
+    row only sees its own ring store) unless ``verify=True``: a TARGET_VERIFY window has several rows per
+    request, so the compression runs as a second launch after every row's ring store, in SGLang's order.
+
+    Selection reads ``compressed`` as 16-key pages: page p of a row holds keys 16 * page_table[row, p] +
+    [0, 16) (``page_table`` int32 [rows, pages], at most 65536 keys per row). ``lengths``, ``logical_positions``
+    and ``seq_lens`` (int32 [rows]) are each row's compressed-key count, query position and sequence length.
+    Everything stays on device, so the call is CUDA-graph capturable after an eager warmup. If given,
+    ``q_out`` (BF16 [rows, 4, D]) receives the normalized index queries and ``logits_out`` (FP32
+    [rows, 16 * pages] whose storage extends 512 values past it) the logits.
     """
-    return _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths)[0]
-
-
-def _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths):
-    rows, width = q.shape[0], page_table.shape[1] * 16
+    rows, heads, head_dim = qk.shape[0], 4, q_weight.numel()
+    width = page_table.shape[1] * 16
     if width > MAX_COMPRESSED_KEYS:
         raise ValueError(f"Decode supports at most {MAX_COMPRESSED_KEYS} compressed keys per row")
-    logits = torch.empty(rows * width + _PAD, dtype=torch.float32, device=q.device)[:rows * width].view(rows, width)
-    out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=q.device)
-    indexer_decode.launch(q, cache, page_table, lengths, logits, float(np.float32(1.0) / np.float32(math.sqrt(128))))
-    indexer_topk.launch_decode(logits, lengths.contiguous(), query_positions.contiguous(),
-                               sequence_lengths.contiguous(), out)
-    return out, logits
-
-
-def decode_forward(qk, **kwargs):
-    """SGLang's CUDA-graph decode ``QSAIndexer.forward_cuda`` after ``index_qk_proj``: int32 [rows, 2051].
-
-    One Triton kernel reproduces the unfused (BF16 cos/sin) q norm/RoPE, the pending-ring key and
-    RoPE-position store at ``state_slots`` and the fixed-shape compression of ``group_locs``
-    (oldest member first) into ``write_locs`` bit for bit; ``decode_indexer`` then selects tokens.
-    Rows must belong to distinct requests (each row only sees its own ring store) unless
-    ``verify=True``: a TARGET_VERIFY window has several rows per request, so the compression runs as
-    a second launch after every row's ring store, in SGLang's order.
-    """
-    return _decode_forward(qk, **kwargs)[0]
-
-
-def _decode_forward(qk, *, positions, state_slots, group_locs, write_locs, key_state, rope_state, compressed,
-                    cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps, cache, page_table, lengths,
-                    query_positions, sequence_lengths, verify=False):
-    rows, heads, head_dim = qk.shape[0], 4, q_weight.numel()
+    if q_out is not None:
+        _check(q_out, "q_out", torch.bfloat16, (rows, heads, head_dim))
+    if logits_out is not None:
+        _check(logits_out, "logits_out", torch.float32, (rows, width))
+        if logits_out.untyped_storage().nbytes() < (logits_out.storage_offset() + rows * width + _PAD) * 4:
+            raise ValueError(f"logits_out storage must extend {_PAD} values past the logits")
+    q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=qk.device) if q_out is None else q_out
+    logits = logits_out
+    if logits is None:
+        logits = torch.empty(rows * width + _PAD, dtype=torch.float32, device=qk.device)[:rows * width]
+        logits = logits.view(rows, width)
     rotary_dim = cos_sin_cache.shape[1]
-    q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=qk.device)
     _indexer_decode_prep[(rows,)](qk, q, q_weight, k_weight, key_state, rope_state, compressed, state_slots,
                                   group_locs, write_locs, positions,
                                   positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache, axis_map,
@@ -442,5 +430,9 @@ def _decode_forward(qk, *, positions, state_slots, group_locs, write_locs, key_s
         _indexer_ring_compress[(rows,)](key_state, rope_state, compressed, group_locs, write_locs, cos_sin_cache,
                                         axis_map, k_weight, head_dim, k_eps, D=head_dim, ROT=rotary_dim,
                                         RATIO=_RATIO, CACHE_STRIDE=cos_sin_cache.stride(0), num_warps=4)
-    tokens, logits = _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths)
-    return tokens, q, logits
+    out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=qk.device)
+    indexer_decode.launch(q, compressed, page_table, lengths, logits,
+                          float(np.float32(1.0) / np.float32(math.sqrt(head_dim))))
+    indexer_topk.launch_decode(logits, lengths.contiguous(), logical_positions.contiguous(), seq_lens.contiguous(),
+                               out)
+    return out

@@ -7,7 +7,7 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 | 内容 | 入口 |
 |---|---|
 | 完整attention：恢复/校验/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L179) |
-| prefill indexer、decode select、decode forward | [indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py) |
+| prefill indexer、decode indexer（含MTP verify） | [indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py) |
 | 共用MHA helper与BF16 D256线性内核 | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py)、[mha_pa_bf16_256_linear_942.py](../../src/pyhip/ops/mha/flydsl/mha_pa_bf16_256_linear_942.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
 | 合成indexer完整调用 | [test_indexer.py](test_indexer.py) |
@@ -28,7 +28,7 @@ python -m pip install -e .
 
 FlyDSL的持久编译缓存在源码只改了嵌套helper时可能返回旧kernel。升级或修改PyHIP后，先清空该缓存，或为测试设置新的空目录：`export FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d)`。
 
-所有kernel都在各入口的第一次调用时编译，之后任何批次组合都不再编译：每种head形状（H, HK, scale）第一次调用attention时，编译该形状可能用到的全部变体（不建计划、每种union tile行数）；prefill indexer、decode和MTP verify（`decode_forward(verify=True)`）的kernel在各自第一次调用时编译。Triton和FlyDSL缓存都为空时，第一次attention在H12/H6/H3（TP2/4/8）约需36/39/68秒，第一次prefill indexer约2秒，第一次decode约3秒。服务应在启动或预热阶段完成这些调用；CUDA graph capture中不编译，capture前仍须eager预热。
+所有kernel都在各入口的第一次调用时编译，之后任何批次组合都不再编译：每种head形状（H, HK, scale）第一次调用attention时，编译该形状可能用到的全部变体（不建计划、每种union tile行数）；prefill indexer、decode和MTP verify（`decode_indexer(verify=True)`）的kernel在各自第一次调用时编译。Triton和FlyDSL缓存都为空时，第一次attention在H12/H6/H3（TP2/4/8）约需36/39/68秒，第一次prefill indexer约2秒，第一次decode约3秒。服务应在启动或预热阶段完成这些调用；CUDA graph capture中不编译，capture前仍须eager预热。
 
 ## 1. 整体正确性与合成性能
 
@@ -46,14 +46,12 @@ QSA_REPLAY_GPU=2 .venv/bin/python -m pytest -q \
 .venv/bin/python benchmarks/qsa/test_indexer.py --gpu 2 --mode prefill \
   --lengths 12000 --output mytest/mydata/qsa_prefill_perf_new
 .venv/bin/python benchmarks/qsa/test_indexer.py --gpu 2 --mode decode \
-  --rows 1 32 --keys 3000 --perf --output mytest/mydata/qsa_decode_perf_new
-.venv/bin/python benchmarks/qsa/test_indexer.py --gpu 2 --mode decode-forward \
-  --rows 1 32 --lengths 12000 --perf --output mytest/mydata/qsa_decode_forward_perf_new
+  --rows 1 32 --lengths 12000 --perf --output mytest/mydata/qsa_decode_perf_new
 ```
 
-不依赖真实capture或数据集。CLI默认执行整体性能和当前逐kernel计时；`--check-only`仅验证，`--perf`作为兼容参数保留。省略`--output`时自动创建mytest/mydata下的新目录。Attention默认M12000、TP2/4/8；indexer默认prefill12000、decode的1/32行x3000key和decode-forward的1/32行x12000token。Attention的qsa/forced_direct/forced_union比较相同选择；prefix_*三项只比较共同的2051行完整因果前缀，不能与长稀疏选择当作同语义。
+不依赖真实capture或数据集。CLI默认执行整体性能和当前逐kernel计时；`--check-only`仅验证，`--perf`作为兼容参数保留。省略`--output`时自动创建mytest/mydata下的新目录。Attention默认M12000、TP2/4/8；indexer默认prefill12000和decode的1/32行x12000token。Attention的qsa/forced_direct/forced_union比较相同选择；prefix_*三项只比较共同的2051行完整因果前缀，不能与长稀疏选择当作同语义。
 
-Attention完整计时含恢复/校验/构表/分流、必要KV pack及计算，不含公共入口检查、workspace查找、输出分配、JIT、indexer或服务KV gather。Indexer三模式从投影后输入开始，不含projection GEMM；prefill为eager调用，decode/decode-forward为单次graph replay，后者包含完整prep和selection。
+Attention完整计时含恢复/校验/构表/分流、必要KV pack及计算，不含公共入口检查、workspace查找、输出分配、JIT、indexer或服务KV gather。Indexer两种模式都从投影后输入开始，不含projection GEMM；prefill为eager调用，decode为单次graph replay，包含完整prep和selection。
 
 原cudaPerf、10独立buffer、2warmup、128samples，保留首尾和慢样本。Attention基本精度`.02/.02`不变，indexer按完整token ABI、FP64 top-k边界`1e-5`及逐bit缓存状态校验；decode返回顺序不要求固定。输出为summary.json/CSV、raw.csv、逐例JSON、源码和地址证据。`complete=false`的数据不能作为有效性能。
 
@@ -80,12 +78,12 @@ Case               Kernel                              Median_us   Status
 m12000_tp2         0:attention_recover_scatter            <实测值>    valid/invalid
 m12000_tp2         3:attention_union                      <实测值>    valid/invalid
 prefill_n12000     0:indexer_q_prep                       <实测值>    valid/invalid
-decode_r1_k3000    0:qsa_indexer_decode_logits            <实测值>    valid/invalid
+decode_r1_n12000   1:qsa_indexer_decode_logits            <实测值>    valid/invalid
 ```
 
 ### 当前实测
 
-2026-10-02/03，MI308X/gfx942，原cudaPerf、10buffers、2warmup、128samples，每次运行使用新建的FlyDSL缓存目录，均在GPU2（PCI 0000:a4:00.0）上实测。Attention是2026-10-04把K3路由改为单一步数阈值之后重测的；indexer是10-02去掉整数特化和首次调用预编译之后测的，此后未改；长行decode select用到的kernel沿用10-02较早的测量。每次开始前8张卡use均为0%。Attention测量期间，本会话在GPU5、GPU6上同时运行check-only和pytest；indexer测量期间，本会话在GPU4–6上运行编译清单；都没有使用GPU2。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒，取全部样本中位数；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
+2026-10-02/03，MI308X/gfx942，原cudaPerf、10buffers、2warmup、128samples，每次运行使用新建的FlyDSL缓存目录，均在GPU2（PCI 0000:a4:00.0）上实测。Attention是2026-10-04把K3路由改为单一步数阈值之后重测的；indexer是10-02去掉整数特化和首次调用预编译之后测的。每次开始前8张卡use均为0%。Attention测量期间，本会话在GPU5、GPU6上同时运行check-only和pytest；indexer测量期间，本会话在GPU4–6上运行编译清单；都没有使用GPU2。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒，取全部样本中位数；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
 
 Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数），超出时走raw。逐tile公式之后，attention_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，attention_recover_scatter逐行排序；PyHIP prefill indexer的升序输出同样排序，只有块号恰为0,1,2,…的完整因果前缀行跳过排序。
 
@@ -111,27 +109,17 @@ Prefill indexer：M12000、4个D128 Q头、ratio4、top512；投影GEMM不在计
 
 整体prefill_indexer另测为291.061微秒，包含公开入口内的分配与准备。
 
-Decode indexer：每请求3000个压缩key（12000 token）；select只选块，forward包含投影后的prep和选块，两者均不含GEMM。Decode top-k每行一个512线程CTA，与prefill共用同一选择实现。
+Decode indexer：每请求3000个压缩key（12000 token），包含投影后的prep和选块，不含GEMM。Decode top-k每行一个512线程CTA，与prefill共用同一选择实现。
 
-| Kernel | select B1 | select B32 | forward B1 | forward B32 |
-|---|---:|---:|---:|---:|
-| indexer_decode_prep | 不调用 | 不调用 | 9.960 | 10.920 |
-| qsa_indexer_decode_logits | 9.880 | 16.320 | 9.840 | 16.680 |
-| qsa_indexer_decode_topk（含展开） | 14.280 | 15.160 | 14.640 | 15.320 |
+| Kernel | B1 | B32 |
+|---|---:|---:|
+| indexer_decode_prep | 9.960 | 10.920 |
+| qsa_indexer_decode_logits | 9.840 | 16.680 |
+| qsa_indexer_decode_topk（含展开） | 14.640 | 15.320 |
 
-整体select图重放B1/B32为18.720 / 25.441微秒，forward为22.240 / 31.400微秒。
+整体图重放B1/B32为22.240 / 31.400微秒。
 
-长行decode select（`--mode decode --rows 1 8 32 --keys 16384 32768 65536`）：
-
-| 压缩key | logits B1/B8/B32 | top-k（含展开）B1/B8/B32 | 整体B1/B8/B32 |
-|---:|---:|---:|---:|
-| 16384 | 9.960 / 20.540 / 53.400 | 19.760 / 20.240 / 20.540 | 24.120 / 34.800 / 66.361 |
-| 32768 | 12.200 / 31.280 / 85.161 | 26.281 / 27.080 / 27.360 | 32.600 / 52.040 / 117.521 |
-| 65536 | 13.960 / 47.260 / 183.501 | 39.340 / 40.221 / 42.200 | 47.640 / 88.020 / 217.421 |
-
-B8的32768/65536 key和全部B32长行读取的压缩key最多，10个独立buffer稳定地分成快慢两组：同一buffer始终在同一组，差别只出现在logits（各buffer的top-k一致），应来自buffer所在的显存位置。两组的logits相差13–19%，整体相差8–16%（如B32、65536 key的logits约154/184微秒，整体约191/221微秒）。全样本中位数取决于两组样本的比例，换卡或重新分配后可能在两组之间移动。
-
-以上为当前版本绝对性能，不包含旧新对照；attention共3个case、18行kernel结果、2304条整体raw，indexer默认5个case、14行kernel结果、640条整体raw，长行decode 9个case、18行kernel结果、1152条整体raw，均未筛除慢样本。记录索引保留在[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)，复现只需本页已跟踪入口。
+以上为当前版本绝对性能，不包含旧新对照；attention共3个case、18行kernel结果、2304条整体raw，indexer为prefill 1个case、decode 2个case，共10行kernel结果、384条整体raw，均未筛除慢样本。记录索引保留在[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)，复现只需本页已跟踪入口。
 
 公开入口的CPU下发时间（GPU保持忙，60次中位数，TP2/4/8相同）：attention建union计划时约87µs，不建计划时约54µs；prefill_indexer在M12000时约195µs，3请求时约247µs。图重放不含这部分；eager prefill中GPU时间短于它的调用（如2051行完整前缀、64行长prefix）受host限制。
 
@@ -212,14 +200,20 @@ attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 from pyhip.ops.qsa.flydsl.indexer import prefill_indexer
 from pyhip.ops.qsa.flydsl.attention import attention
 
-def qsa_prefill(q, k, v, projected_index_qk, indexer_metadata,
-                query_lens, prefix_lens, out=None):
-    indices = prefill_indexer(projected_index_qk, **indexer_metadata)
+def qsa_prefill(q, k, v, projected_index_qk, meta, query_lens, prefix_lens, out=None):
+    indices = prefill_indexer(
+        projected_index_qk, heads=4, positions=meta.positions, logical_positions=meta.logical_positions,
+        state_slots=meta.state_slots, key_state=meta.key_state, rope_state=meta.rope_state,
+        write_locs=meta.write_locs, member_rows=meta.member_rows, group_sequences=meta.group_sequences,
+        group_ends=meta.group_ends, rope_matrix=meta.rope_matrix, compressed=meta.compressed,
+        token_slot_table=meta.token_slot_table, cos_sin_cache=meta.cos_sin_cache, axis_map=meta.axis_map,
+        q_weight=meta.q_weight, k_weight=meta.k_weight, q_eps=meta.q_eps, k_eps=meta.k_eps,
+        seq_lens=meta.seq_lens, extend_lens=meta.extend_lens)
     return attention(q, k, v, indices,
                      query_lens=query_lens, prefix_lens=prefix_lens, out=out)
 ```
 
-`projected_index_qk`是调用方GEMM输出的连续BF16 `[M,640]`（4×128 query＋1×128 key）。`indexer_metadata`必须包含[原始接口](../../src/pyhip/ops/qsa/flydsl/indexer.py#L319)的以下键，所有tensor在同一GPU：
+`projected_index_qk`是调用方GEMM输出的连续BF16 `[M,640]`（4×128 query＋1×128 key），其余都是[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L294)的关键字参数（`meta`只是示例中调用方的metadata），所有tensor在同一GPU：
 
 | 参数 | 契约 |
 |---|---|
@@ -231,10 +225,11 @@ def qsa_prefill(q, k, v, projected_index_qk, indexer_metadata,
 | `token_slot_table` | int32 `[requests,max_seq]`，每token物理槽，组首物理槽/4定位compressed key |
 | `cos_sin_cache`、`axis_map` | 连续BF16/FP32 `[positions,64]`；int32 `[32]`选择三轴 |
 | `q_weight`、`k_weight`、`q_eps`、`k_eps` | BF16 `[128]` Gemma RMSNorm增量权重；host epsilon |
+| `q_out` | 可选；连续BF16 `[M,4,128]`，给定时写入归一化后的index Q（数值校验用） |
 
 单请求最多65536个compressed key/262144token；返回int32 `[M,2051]`，每行块号升序，可原样交给attention（attention对每行照常校验和排序，复制或改写后的indices结果相同）。slot0与ring保留行是惰性写入区域，不能作为有效数据读取。不要把mean、RoPE或slot规划隐去当成免费预处理。
 
-Decode使用`decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths)`，或`decode_forward(projected_index_qk, **decode_metadata)`；实际签名和graph要求见[indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py)。全部算子由PyHIP实现，无需SGLang/AITER。完整decode每行必须属于不同请求；MTP的TARGET_VERIFY窗口（一个请求占连续多行）传`verify=True`，压缩在所有行写完ring之后另起一个launch，与SGLang顺序一致。page table是16-key compressed page，长度是compressed key数，表宽最多4096页（65536个compressed key）。先eager预热logits及top-k，再capture；graph重放可原地更新长度和位置。prefill入口不是通用decode替代。
+Decode使用[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L388)，同样从投影后的`qk`开始，与prefill同名的参数含义相同（每行一个query）；另有`group_locs`（int32 `[rows,4]`，组成员的ring槽）、`page_table`（int32 `[rows,pages]`，16-key compressed page，表宽最多4096页即65536个compressed key）和`lengths`（int32 `[rows]` compressed key数），`logical_positions`、`seq_lens`是int32 `[rows]`设备张量。可选的`q_out`、`logits_out`取回Q和logits，`logits_out`的存储须在末尾多留512个值。全部算子由PyHIP实现，无需SGLang/AITER。Decode每行必须属于不同请求；MTP的TARGET_VERIFY窗口（一个请求占连续多行）传`verify=True`，压缩在所有行写完ring之后另起一个launch，与SGLang顺序一致。先eager预热，再capture；graph重放可原地更新长度和位置。prefill入口不是通用decode替代。
 
 ### attention CUDA graph
 

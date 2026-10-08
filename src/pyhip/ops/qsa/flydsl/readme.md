@@ -482,17 +482,17 @@ SGLang在每个QSA层的extend forward中调用一次，各TP rank重复计算�
 
 可见压缩key不超过512个的行不需要logits，I5直接全选；整个tile都不超过512时不建item。
 
-#### 2.2.1 入口（[prefill_indexer](indexer.py#L295)、[_run](indexer.py#L319)、[_Layout](indexer.py#L225)）
+#### 2.2.1 入口（[prefill_indexer](indexer.py#L294)、[_Layout](indexer.py#L224)）
 
 ```python
 prefill_indexer(qk[T,640], *, heads=4, positions, logical_positions, state_slots, key_state, rope_state,
                 write_locs, member_rows, group_sequences, group_ends, rope_matrix, compressed,
                 token_slot_table, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-                seq_lens, extend_lens):
+                seq_lens, extend_lens, q_out=None):
     host检查：4头、D128、rotary维度约束、每请求≤65536个压缩key、各张量的dtype/形状/设备、压缩池<2GiB
     # group_sequences、group_ends只检查形状，kernel不用
     layout = _layout(seq_lens, extend_lens)      # 按长度LRU缓存8个；numpy规划，一次pinned上传，不同步stream
-    q = empty[T,4,128]；stats = empty[T,2]
+    q = q_out或empty[T,4,128]；stats = empty[T,2]  # SGLang数值校验传q_out取回q
     I1                                           # q norm/RoPE、ring写、stats复位
     if groups: I2                                # 本次凑满的4-token组写进压缩池
     out = empty[T,2051]
@@ -501,7 +501,6 @@ prefill_indexer(qk[T,640], *, heads=4, positions, logical_positions, state_slots
         if chunk.items or I4尚未编译: I4 → logits[rows, width]，并折叠stats   # 第一次调用即编译；没有item时launcher不发kernel
         I5 → out[row0 : row0+rows]               # 行位置与host布局不符时在这里trap
     return out
-# _prefill（SGLang数值校验用）另外返回q，以及按请求顺序取出的压缩key
 
 _Layout(seq_lens, extend_lens):                  # 只由host长度决定
     prefix_r = seq_r - extend_r；compressed_r = seq_r//4       # 请求r的压缩key数
@@ -512,7 +511,7 @@ _Layout(seq_lens, extend_lens):                  # 只由host长度决定
           → (row0, local0, rows, request, start, end)             # local0为块内的行号
 ```
 
-#### 2.2.2 I1–I2（[_indexer_q_prep](indexer.py#L80)、[_indexer_k_compress](indexer.py#L122)）
+#### 2.2.2 I1–I2（[_indexer_q_prep](indexer.py#L79)、[_indexer_k_compress](indexer.py#L121)）
 
 ```python
 # I1、I2、D0的行数、组数和position stride列入do_not_specialize：任何取值都复用同一份编译结果
@@ -617,7 +616,7 @@ select(x, low, high, nan):                          # 选x最大的512个块，�
 
 ### 3.1 调用链
 
-PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLang在CUDA graph decode和MTP的CUDA graph TARGET_VERIFY中每层调用一次`decode_forward`（verify时`verify=True`；eager decode/verify走原生路径）；各TP rank重复计算，TP2/4/8相同。
+PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLang在CUDA graph decode和MTP的CUDA graph TARGET_VERIFY中每层调用一次`decode_indexer`（verify时`verify=True`；eager decode/verify走原生路径）；各TP rank重复计算，TP2/4/8相同。
 
 | # | Kernel（实现） | grid×block，LDS | 作用 |
 |---|---|---|---|
@@ -638,27 +637,25 @@ decode时每行是一个请求的当前token；MTP verify时一个请求占连�
 
 长度、位置和页表都在设备端读取，grid只由页表宽度决定，所以graph重放时可以原地更新。
 
-#### 3.2.1 入口（[decode_forward](indexer.py#L417)、[_decode_select](indexer.py#L405)）
+#### 3.2.1 入口（[decode_indexer](indexer.py#L388)）
 
 ```python
-decode_forward(qk[B,640], *, positions, state_slots, group_locs[B,4], write_locs[B], key_state, rope_state,
-               compressed, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-               cache[pages,16,1,128], page_table[B,P], lengths[B], query_positions[B], sequence_lengths[B],
-               verify=False):
-    # 每行一个query token；cache是按页（每页16个压缩key）看的压缩池，lengths是各行的压缩key数
-    q = empty[B,4,128]
+decode_indexer(qk[B,640], *, positions, logical_positions[B], state_slots, key_state, rope_state, write_locs[B],
+               group_locs[B,4], compressed, page_table[B,P], lengths[B], cos_sin_cache, axis_map, q_weight,
+               k_weight, q_eps, k_eps, seq_lens[B], verify=False, q_out=None, logits_out=None):
+    # 每行一个query token，同名参数与prefill含义相同；compressed按页（每页16个压缩key）读，lengths是各行的压缩key数
+    q = q_out或empty[B,4,128]
     D0                                          # q norm/RoPE、ring写；verify=False时还压缩一个组
     if verify: D0′                              # 所有行的ring写之后，压缩各行的组
-    width = 16·P（≤65536）；logits = empty[B·width + 512] FP32；out = empty[B,2051]
+    width = 16·P（≤65536）；logits = logits_out或empty[B·width + 512] FP32；out = empty[B,2051]
     D1                                          # 按页表算本行logits
     D2                                          # 选512个块并展开成token
     return out
 # verify=False时各行必须属于不同请求（D0只看得到本行自己的ring写）；verify=True时一个请求可占多行
-# 先eager预热再capture，graph重放可原地更新长度与位置
-# decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths)只做D1+D2
+# 先eager预热再capture，graph重放可原地更新长度与位置；SGLang数值校验传q_out、logits_out取回Q和logits
 ```
 
-#### 3.2.2 D0 prep与D0′ verify压缩（[_indexer_decode_prep](indexer.py#L148)、[_indexer_ring_compress](indexer.py#L196)）
+#### 3.2.2 D0 prep与D0′ verify压缩（[_indexer_decode_prep](indexer.py#L147)、[_indexer_ring_compress](indexer.py#L195)）
 
 ```python
 # grid = B，256线程；每行一个program，复现SGLang CUDA graph decode未融合的prep（BF16 cos/sin，逐bit一致）
@@ -684,7 +681,7 @@ compressed[write_locs[row]] = k
 
 ```python
 # grid = (splits, B)，256线程 = 4 wave，LDS 4×4KiB；splits = max(1, min(ceil(P/4), ceil(8·CU/B)))
-# cache按页看压缩池：每页16个压缩key（4KiB）；page_table[row, p]是本行第p页的物理页号
+# compressed按页看：每页16个压缩key（4KiB）；page_table[row, p]是本行第p页的物理页号
 # 静态grid覆盖页表宽度内的任意长度，实际长度在设备端读取（graph安全，无host同步）
 length = min(lengths[row], width)；pages = ceil(length/16)
 CTA x的wave w处理页 p = 4x+w, 4x+w+step, …（step = 4·splits）；第一页就超出pages的wave直接退出
@@ -706,7 +703,7 @@ for 本wave的页，每64页一批:
 ```python
 # grid = B，512线程 = 8 wave，一行由8个wave分担；LDS：8个直方图（各257个int）+ 每wave 4个归约字 + 64个候选 + 512个uint16（约9.7KiB）
 # 算法与I5相同（共用_write_row、select、基数选择和归并），结果与单wave逐位相同；差别如下
-count = lengths[row]；vis = query_positions[row] + 1；seq_len = sequence_lengths[row]   # 不做位置校验
+count = lengths[row]；vis = logical_positions[row] + 1；seq_len = seq_lens[row]   # 不做位置校验
 分工：共ngroups = ceil(count/512)组，wave w负责连续的组[w·per, (w+1)·per) ∩ [0, ngroups)，per = ceil(ngroups/8)
 low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的min/max/NaN，写进LDS归约字，CTA barrier后合并
 直方图：每wave一个；找阈值时把8个直方图的对应bin相加
@@ -735,7 +732,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 ### 4.2 接口
 
 - Attention只接受3D BF16 Q/O `[M,H,256]`、K/V `[N,HK,256]`和int32 `[M,2051]`选择（完整唯一的四token块、0–3个因果尾token、-1填充），local heads共享选择，`H/HK ≤ 16`。只支持gfx942；5D布局已撤销。
-- Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多65536个压缩key（262144 token）。Prefill输出每行块号升序，可原样交给attention。
+- Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多65536个压缩key（262144 token）。Prefill输出每行块号升序，可原样交给attention。`prefill_indexer`和`decode_indexer`除`qk`外都是显式关键字参数，同名参数含义相同；可选的`q_out`（decode另有`logits_out`）取回归一化后的index Q（和logits）。
 - 不另设校验launch：attention的K1发现非法行、prefill top-k发现query位置与host布局不符时执行`s_trap 2`，GPU队列出错，进程以HSA异常（code 0x1016，日志含kernel名）中止。Decode不校验位置。
 
 ### 4.3 Graph、scratch与编译
@@ -759,7 +756,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 
 - Attention逐kernel与整体：[qsa_route_threshold_20261004_01](../../../../../mytest/mydata/qsa_route_threshold_20261004_01/official_attention/kernels.txt)。
 - Prefill与decode indexer：[qsa_compile_once_20261002_01](../../../../../mytest/mydata/qsa_compile_once_20261002_01/official_indexer_2/kernels.txt)。
-- 长行decode和host下发：[qsa_perf_final_20261002_01](../../../../../mytest/mydata/qsa_perf_final_20261002_01/official_decode_long/kernels.txt)、[host.json](../../../../../mytest/mydata/qsa_perf_final_20261002_01/host.json)。
+- host下发：[host.json](../../../../../mytest/mydata/qsa_perf_final_20261002_01/host.json)。
 - 服务性能与数值验收：[qsa_route_threshold_service_20261004_01](../../../../../mytest/mydata/qsa_route_threshold_service_20261004_01/summary.json)。
 - MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_ringfix_20261008_01](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)。
 
@@ -809,6 +806,8 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - **10-06～10-08 MTP的verify走PyHIP**：EAGLE 3/1/4时目标模型每步跑CUDA graph TARGET_VERIFY（每请求4行窗口），不再跑DECODE，PyHIP原先只接管prefill。`decode_forward(verify=True)`中D0只做q和ring写，新增的D0′在本次所有行写完ring后再压缩，按SGLang先写全部ring、再gather的顺序，q、ring和压缩key逐bit一致；SGLang把graph TARGET_VERIFY交给PyHIP。C1 profile中每个verify graph的indexer由约5.67ms降到0.36ms，verify graph在TP2由21.74ms降到16.22ms、TP4由19.65ms降到14.28ms。服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +15.4%/+24.2%/+30.3%/+33.5%（原生取热缓存复测；首轮原生C8在测量中编译了12次`apply_interleaved_rope_kernel`），TP4 +18.6%/+30.3%/+34.7%/+41.3%；相对10-06只接prefill的PyHIP，TP2快13.4%–21.1%。TEST=1验收TP2/TP4每rank每层217/222次verify校验全部通过。这些数字测于下一条的ring修复之前。[服务](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)、[基线](../../../../../mytest/mydata/qsa_mtp_baseline_20261006_01/analysis.json)
 - **10-08 修复原生verify的ring覆盖**：SGLang原生每个请求的pending ring只有ratio个槽，而verify先写本次所有行、再gather，窗口跨过压缩边界时，边界之后的草稿行会覆盖该组在窗口之前的成员：窗口起点L%4为1/2/3时，该组压缩key与逐token decode的余弦只有0.68/0.45/0.27，PyHIP为了逐bit一致也照样复现。SGLang把ring扩到每个请求2×ratio个槽（`qsa_ring_slots_per_request`，两个槽号builder、graph元数据kernel、pool和验收一起改），修复后4种对齐都与逐token decode逐bit一致；新增的回归测试在旧布局下对齐1–3失败。PyHIP不用改，测试夹具改用同一布局。修复后服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +17.5%/+23.4%/+27.7%/+29.7%、TP4 +21.5%/+28.8%/+33.8%/+41.6%，16场测量都没有服务中编译；TEST=1验收TP2/TP4每rank每层234/247次verify校验全部通过。[修复前](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)、[修复后](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_02/result.json)、[服务](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)
 - **10-08 查明MTP接受长度差**：用64个与服务基准同协议的prompt（ShareGPT首轮平铺到12000 token，前32个就是基准用的），C1贪心逐请求记录，原生、PyHIP、只用PyHIP indexer、只用PyHIP attention各跑两轮。两边输出相同时，接受的草稿逐步一致；同一段文本的teacher-forced对数似然也相同（自然续写上PyHIP每token高0.008，置信区间含0）。差距全部来自生成的文本不同：prefill的微小数值差（PyHIP attention与indexer各自都在容差内）在near-tie处翻转贪心选择，原生自己两轮之间也有45%的prompt输出不同。基准的32个prompt里有2个在PyHIP下稳定走到更难预测的分支（第25个在`<|im_start|>`之后续成user而不是assistant），占约75%的差距；另外32个prompt没有差距，64个prompt两轮合并差1.5%且置信区间含0，原生同配置两轮之间就差2.3%。不是verify或draft的问题，也不是数值退化。ring修复后轨迹又变了，服务基准中两边的接受长度相当（TP2差0.5%以内，TP4 PyHIP反而高0.5%–1.2%）。[研究](../../../../../mytest/mydata/qsa_accept_study_20261008_01/summary.json)
+- **10-08 prefill_indexer改为显式参数**：签名从`(qk, **kwargs)`改为显式关键字参数（原`_run`并入，`_run`和`_prefill`删除）。新增可选`q_out`接收归一化后的q；SGLang数值校验靠它取回q，按请求取压缩key的逻辑移到校验方。SGLang用显式关键字绑定一次调用（`functools.partial`），校验经同一绑定运行PyHIP。
+- **10-08 decode入口与prefill对齐**：`decode_forward(qk, **kwargs)`改为显式参数并更名`decode_indexer`，与prefill同义的参数同名（`query_positions`→`logical_positions`、`sequence_lengths`→`seq_lens`）；去掉`cache`，直接按16-key页读`compressed`（SGLang的cache本就是它的reshape）。SGLang只用这一个decode入口；只选块的旧`decode_indexer(q, cache, …)`、`_decode_select`、`_decode_forward`和benchmark的select模式（`--keys`）删除，数值校验改用`q_out`、`logits_out`取回Q和logits。原select测试覆盖的边界（511–513个key、非512倍数的528-key页表、65536个key上限）并入decode测试。删除前benchmark说明中的select数据：3000 key B1/B32整体18.720/25.441微秒；长行65536 key B1/B8/B32整体47.640/88.020/217.421微秒，其余见[长行数据](../../../../../mytest/mydata/qsa_perf_final_20261002_01/official_decode_long/kernels.txt)。两项接口改动后的TEST=1服务验收全部通过（GPU0/1被其他会话占用，用户启动脚本复制一份只把设备改为4–7）：普通decode的TP2/TP4每rank 372次attention校验，每层31次prefill、292次graph decode校验；MTP（EAGLE 3/1/4）TP2/TP4每rank每层30/31次prefill、216/248次verify校验，MTP草稿层另有30/31次prefill校验；日志无异常、无设备端断言。[验收](../../../../../mytest/mydata/qsa_api_service_20261008_01/summary.json)
 
 ### 评估过但未采用
 
