@@ -28,7 +28,7 @@ python -m pip install -e .
 
 FlyDSL的持久编译缓存在源码只改了嵌套helper时可能返回旧kernel。升级或修改PyHIP后，先清空该缓存，或为测试设置新的空目录：`export FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d)`。
 
-所有kernel都在各入口的第一次调用时编译，之后任何批次组合都不再编译：每种head形状（H, HK, scale）第一次调用attention时，编译该形状可能用到的全部变体（不建计划、每种union tile行数）；prefill indexer和decode的kernel在各自第一次调用时编译。Triton和FlyDSL缓存都为空时，第一次attention在H12/H6/H3（TP2/4/8）约需36/39/68秒，第一次prefill indexer约2秒，第一次decode约3秒。服务应在启动或预热阶段完成这些调用；CUDA graph capture中不编译，capture前仍须eager预热。
+所有kernel都在各入口的第一次调用时编译，之后任何批次组合都不再编译：每种head形状（H, HK, scale）第一次调用attention时，编译该形状可能用到的全部变体（不建计划、每种union tile行数）；prefill indexer、decode和MTP verify（`decode_forward(verify=True)`）的kernel在各自第一次调用时编译。Triton和FlyDSL缓存都为空时，第一次attention在H12/H6/H3（TP2/4/8）约需36/39/68秒，第一次prefill indexer约2秒，第一次decode约3秒。服务应在启动或预热阶段完成这些调用；CUDA graph capture中不编译，capture前仍须eager预热。
 
 ## 1. 整体正确性与合成性能
 
@@ -158,6 +158,25 @@ PyHIP的kernel都在各入口的第一次调用时编译（见“目录和依赖
 
 本轮独立数值验收TP2/TP4各35请求全部通过，TEST=1，覆盖24k分块和32并发；每个rank的12个QSA层都完成attention与prefill indexer校验（各372次）。这不是模型质量或生成文本bitexact验收。12份独立rank trace确认各PyHIP rank运行当前decode top-k（4请求profile中每rank 240次），原生组无该kernel；profile计时不混入本表。原始证据与过程由[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)索引，本页命令不依赖本地未提交研究脚本或报告。
 
+### MTP（EAGLE 3/1/4）
+
+2026-10-08，模型、launcher、服务配置和32请求、名义12000输入/350输出的协议同上（实际`mem_fraction_static`仍为TP2 0.8075、TP4 0.7225），SGLang另加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（QSA要求topk为1、草稿token不超过4）。两组都开MTP；PyHIP组的indexer在prefill和CUDA graph TARGET_VERIFY中由PyHIP计算，verify的attention、draft模型和draft extend仍是SGLang原生。PyHIP为HEAD `cd07379`之上的工作区改动，SGLang为HEAD `c3c4bc8`之上的工作区改动。
+
+| TP | 并发 | 原生token/s | PyHIP token/s | 吞吐变化 | TTFT中位数(ms，原生/PyHIP) | ITL中位数(ms，原生/PyHIP) | 接受长度(原生/PyHIP) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 87.024 | 100.444 | +15.42% | 1110.452 / 944.874 | 7.459 / 6.299 | 3.60 / 3.47 |
+| 2 | 2 | 124.729 | 154.903 | +24.19% | 1117.703 / 964.771 | 8.405 / 6.556 | 3.56 / 3.50 |
+| 2 | 4 | 155.691 | 202.780 | +30.25% | 1227.003 / 971.924 | 11.080 / 7.295 | 3.56 / 3.48 |
+| 2 | 8 | 189.910 | 253.447 | +33.46% | 1169.205 / 1799.181 | 14.091 / 8.612 | 3.53 / 3.49 |
+| 4 | 1 | 97.295 | 115.370 | +18.58% | 901.885 / 729.582 | 6.886 / 5.735 | 3.59 / 3.50 |
+| 4 | 2 | 138.590 | 180.611 | +30.32% | 934.650 / 745.851 | 8.014 / 6.106 | 3.54 / 3.52 |
+| 4 | 4 | 181.606 | 244.589 | +34.68% | 933.788 / 754.173 | 9.899 / 6.733 | 3.54 / 3.51 |
+| 4 | 8 | 219.382 | 310.065 | +41.34% | 1919.522 / 1532.486 | 13.230 / 7.675 | 3.53 / 3.52 |
+
+TP2原生是同一源码、热缓存的复测：首轮原生TP2在C8测量中编译了12次`apply_interleaved_rope_kernel`（每次约0.3秒），C1–C8为85.394/124.318/162.108/162.399 token/s；复测没有编译，C4与首轮相差约4%，可作为该协议轮间波动的量级。C8的TTFT主要由排队决定（解码更快时请求到达更密，与prefill交错更多），不宜单独比较。PyHIP的接受长度比原生低约1%–4%；10-06只接prefill的PyHIP已有同样的差距（3.47–3.51对3.54–3.55），不是verify路径引入的。与上表非MTP的PyHIP相比，MTP+PyHIP的吞吐在TP2高13%–34%、TP4高14%–41%，并发越高收益越小。
+
+数值验收TP2/TP4各35请求全部通过（TEST=1）：每个rank的12个QSA层各完成217/222次graph verify校验，q、ring和压缩key与原生逐bit一致、选择合法。原生与PyHIP的verify压缩都受[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)4.4节所述ring覆盖问题影响（PyHIP逐bit复现），本表不代表修复后的数值。
+
 ## 4. 外部集成示例
 
 ### 已有合法选中token时调用attention
@@ -198,7 +217,7 @@ def qsa_prefill(q, k, v, projected_index_qk, indexer_metadata,
                      query_lens=query_lens, prefix_lens=prefix_lens, out=out)
 ```
 
-`projected_index_qk`是调用方GEMM输出的连续BF16 `[M,640]`（4×128 query＋1×128 key）。`indexer_metadata`必须包含[原始接口](../../src/pyhip/ops/qsa/flydsl/indexer.py#L289)的以下键，所有tensor在同一GPU：
+`projected_index_qk`是调用方GEMM输出的连续BF16 `[M,640]`（4×128 query＋1×128 key）。`indexer_metadata`必须包含[原始接口](../../src/pyhip/ops/qsa/flydsl/indexer.py#L319)的以下键，所有tensor在同一GPU：
 
 | 参数 | 契约 |
 |---|---|
@@ -213,7 +232,7 @@ def qsa_prefill(q, k, v, projected_index_qk, indexer_metadata,
 
 单请求最多65536个compressed key/262144token；返回int32 `[M,2051]`，每行块号升序，可原样交给attention（attention对每行照常校验和排序，复制或改写后的indices结果相同）。slot0与ring保留行是惰性写入区域，不能作为有效数据读取。不要把mean、RoPE或slot规划隐去当成免费预处理。
 
-Decode使用`decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths)`，或`decode_forward(projected_index_qk, **decode_metadata)`；实际签名和graph要求见[indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py)。全部算子由PyHIP实现，无需SGLang/AITER。完整decode每行必须属于不同请求，page table是16-key compressed page，长度是compressed key数，表宽最多4096页（65536个compressed key）。先eager预热logits及top-k，再capture；graph重放可原地更新长度和位置。prefill入口不是通用decode替代。
+Decode使用`decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths)`，或`decode_forward(projected_index_qk, **decode_metadata)`；实际签名和graph要求见[indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py)。全部算子由PyHIP实现，无需SGLang/AITER。完整decode每行必须属于不同请求；MTP的TARGET_VERIFY窗口（一个请求占连续多行）传`verify=True`，压缩在所有行写完ring之后另起一个launch，与SGLang顺序一致。page table是16-key compressed page，长度是compressed key数，表宽最多4096页（65536个compressed key）。先eager预热logits及top-k，再capture；graph重放可原地更新长度和位置。prefill入口不是通用decode替代。
 
 ### attention CUDA graph
 
@@ -244,6 +263,8 @@ PATH="/opt/lc/pyhip/.venv/bin:$PATH" TP_SIZE=2 \
   LOG_FILE=/opt/lc/pyhip/mytest/mydata/qsa_serving_new/tp2_pyhip/server.log \
   bash scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh --random-seed 42
 ```
+
+MTP对照在上面的launcher命令后追加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`，其余不变。
 
 服务就绪并完成统一预热后，在另一终端执行。替换输出目录标识以匹配当前TP/实现；每种配置依次测C1/C2/C4/C8：
 

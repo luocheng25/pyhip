@@ -482,7 +482,7 @@ SGLang在每个QSA层的extend forward中调用一次，各TP rank重复计算�
 
 可见压缩key不超过512个的行不需要logits，I5直接全选；整个tile都不超过512时不建item。
 
-#### 2.2.1 入口（[prefill_indexer](indexer.py#L267)、[_run](indexer.py#L289)、[_Layout](indexer.py#L197)）
+#### 2.2.1 入口（[prefill_indexer](indexer.py#L295)、[_run](indexer.py#L319)、[_Layout](indexer.py#L225)）
 
 ```python
 prefill_indexer(qk[T,640], *, heads=4, positions, logical_positions, state_slots, key_state, rope_state,
@@ -512,7 +512,7 @@ _Layout(seq_lens, extend_lens):                  # 只由host长度决定
           → (row0, local0, rows, request, start, end)             # local0为块内的行号
 ```
 
-#### 2.2.2 I1–I2（[_indexer_q_prep](indexer.py#L79)、[_indexer_k_compress](indexer.py#L121)）
+#### 2.2.2 I1–I2（[_indexer_q_prep](indexer.py#L80)、[_indexer_k_compress](indexer.py#L122)）
 
 ```python
 # I1、I2、D0的行数、组数和position stride列入do_not_specialize：任何取值都复用同一份编译结果
@@ -617,11 +617,12 @@ select(x, low, high, nan):                          # 选x最大的512个块，�
 
 ### 3.1 调用链
 
-PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLang在CUDA graph decode中每层调用一次`decode_forward`（eager decode走原生路径）；各TP rank重复计算，TP2/4/8相同。
+PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLang在CUDA graph decode和MTP的CUDA graph TARGET_VERIFY中每层调用一次`decode_forward`（verify时`verify=True`；eager decode/verify走原生路径）；各TP rank重复计算，TP2/4/8相同。
 
 | # | Kernel（实现） | grid×block，LDS | 作用 |
 |---|---|---|---|
-| D0 | _indexer_decode_prep（Triton） | B×256 | q norm/RoPE、ring写、按group_locs压缩并写池（与SGLang逐bit一致） |
+| D0 | _indexer_decode_prep（Triton） | B×256 | q norm/RoPE、ring写；decode时还按group_locs压缩并写池（与SGLang逐bit一致） |
+| D0′ | _indexer_ring_compress（Triton） | B×256 | 仅verify：所有行写完ring后，再按group_locs压缩并写池 |
 | D1 | qsa_indexer_decode_logits（FlyDSL） | (splits, B)×256，16KiB | 按页表只读本行的压缩K，MFMA算logits |
 | D2 | qsa_indexer_decode_topk（FlyDSL） | B×512，约9.7KiB | 每行一个CTA（8 wave）选top-512并展开token |
 
@@ -629,32 +630,35 @@ PyHIP在decode只负责indexer，decode attention仍是SGLang原生实现。SGLa
 
 #### 3.2.0 整体流程
 
-每行是一个请求的当前token。
+decode时每行是一个请求的当前token；MTP verify时一个请求占连续W（≤4）行，即bonus token和草稿token（位置L..L+W−1）。
 
-1. **D0（每行一个program）**：q做norm/RoPE；本token的key和位置写进pending ring；按SGLang的固定形状，把group_locs指向的4个成员求均值并norm/RoPE，写到write_locs（与SGLang逐bit一致）。每步每行都压缩一次：只有本token补满一组（seq_len是4的倍数）时write_locs才是该组的压缩槽，否则是惰性的slot 0，结果丢弃。
+1. **D0（每行一个program）**：q做norm/RoPE；本token的key和位置写进pending ring；按SGLang的固定形状，把group_locs指向的4个成员求均值并norm/RoPE，写到write_locs（与SGLang逐bit一致）。每步每行都压缩一次：只有本token补满一组（seq_len是4的倍数）时write_locs才是该组的压缩槽，否则是惰性的slot 0，结果丢弃。verify时D0只做q和ring写，压缩由D0′在本次所有行写完ring之后完成，与SGLang先写全部ring、再gather的顺序一致（这一顺序的问题见4.4）。
 2. **D1（(splits, B)个CTA）**：按页表只读本行的压缩key（每页16个），MFMA算logits；超出本行长度的位置写-inf。
 3. **D2（每行一个8-wave CTA）**：与prefill共用选择核心，选512个块并展开成2051宽的token行。
 
 长度、位置和页表都在设备端读取，grid只由页表宽度决定，所以graph重放时可以原地更新。
 
-#### 3.2.1 入口（[decode_forward](indexer.py#L384)、[_decode_select](indexer.py#L372)）
+#### 3.2.1 入口（[decode_forward](indexer.py#L417)、[_decode_select](indexer.py#L405)）
 
 ```python
 decode_forward(qk[B,640], *, positions, state_slots, group_locs[B,4], write_locs[B], key_state, rope_state,
                compressed, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-               cache[pages,16,1,128], page_table[B,P], lengths[B], query_positions[B], sequence_lengths[B]):
-    # 每行是一个请求的当前token；cache是按页（每页16个压缩key）看的压缩池，lengths是各行的压缩key数
+               cache[pages,16,1,128], page_table[B,P], lengths[B], query_positions[B], sequence_lengths[B],
+               verify=False):
+    # 每行一个query token；cache是按页（每页16个压缩key）看的压缩池，lengths是各行的压缩key数
     q = empty[B,4,128]
-    D0                                          # q norm/RoPE、ring写、压缩一个组
+    D0                                          # q norm/RoPE、ring写；verify=False时还压缩一个组
+    if verify: D0′                              # 所有行的ring写之后，压缩各行的组
     width = 16·P（≤65536）；logits = empty[B·width + 512] FP32；out = empty[B,2051]
     D1                                          # 按页表算本行logits
     D2                                          # 选512个块并展开成token
     return out
-# 各行必须属于不同请求（每行只看得到自己的ring写）；先eager预热再capture，graph重放可原地更新长度与位置
+# verify=False时各行必须属于不同请求（D0只看得到本行自己的ring写）；verify=True时一个请求可占多行
+# 先eager预热再capture，graph重放可原地更新长度与位置
 # decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths)只做D1+D2
 ```
 
-#### 3.2.2 D0 prep（[_indexer_decode_prep](indexer.py#L147)）
+#### 3.2.2 D0 prep与D0′ verify压缩（[_indexer_decode_prep](indexer.py#L148)、[_indexer_ring_compress](indexer.py#L196)）
 
 ```python
 # grid = B，256线程；每行一个program，复现SGLang CUDA graph decode未融合的prep（BF16 cos/sin，逐bit一致）
@@ -664,8 +668,15 @@ slot = state_slots[row]：key_state[slot] = qk[row, 4]；rope_state[slot] = 3轴
 # 所以成员恰是本行自己的槽时，直接用本token的key（寄存器里的值）
 # group_locs[row] = 位置pos−3..pos在ring中的4个槽（位置小于0时按位置0）；
 # write_locs[row] = 本token补满一组时该组的压缩槽，否则是惰性slot 0；graph的padding行属于从不分配的request 0，读写都落在dump行
+if verify: return                               # verify不在D0里压缩（COMPRESS是constexpr）
 mean = Σ_{g∈group_locs[row]} (g==slot ? 本token的key : key_state[g]) / 4（BF16舍入）
 k = norm_rope(mean, k_weight)，位置取首成员（首成员是自己时用本token位置）
+compressed[write_locs[row]] = k
+
+# D0′：grid = B，256线程，仅verify。D0已把本次所有行的key和位置写进ring（同一请求的W行占W个槽），
+# 与SGLang一样全部从ring读成员
+mean = Σ_{g∈group_locs[row]} key_state[g] / 4（BF16舍入）
+k = norm_rope(mean, k_weight)，位置取rope_state[group_locs[row, 0]]
 compressed[write_locs[row]] = k
 ```
 
@@ -716,7 +727,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 | [attention_union.py](attention_union.py) | K5 union：M128×N64，按任务顺序的持久grid，两组wave错拍流水 |
 | [attention_direct_packed.py](attention_direct_packed.py) | K6 pack与K7 packed direct，以及packed/raw共用的direct helper |
 | [attention_direct.py](attention_direct.py) | Direct计划（`DirectPlan`、`prepare`）与K7′ raw direct |
-| [indexer.py](indexer.py) | Prefill/decode入口与布局，I1、I2、D0三个Triton kernel |
+| [indexer.py](indexer.py) | Prefill/decode入口与布局，I1、I2、D0、D0′四个Triton kernel |
 | [indexer_logits.py](indexer_logits.py) | I4 prefill logits（顺带归约每行min/max） |
 | [indexer_topk.py](indexer_topk.py) | I5/D2：prefill与decode共用的top-512选择、升序归并和token展开 |
 | [indexer_decode.py](indexer_decode.py) | D1 decode logits（按页表读压缩key） |
@@ -732,7 +743,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - Graph capture前须在同一stream、同一layout上eager调用一次。工作区只保存layout元数据和计划；scratch来自每个(device, stream)一块按需增长的arena，同stream的各layout共用。Capture时固定当时的缓冲，arena之后增长不影响graph里的指针；同一stream上capture的graph不得彼此并发重放，也不得与该stream上的eager调用并发。
 - 精确长度、任务数、grid和容量，以及K2/K3的排序宽度、移位量、tile行数和扫描宽度都是运行时参数；零任务launcher不发GPU kernel。
 - 每种(device, H, HK, scale)第一次调用attention（不在capture中）时，先用全因果dummy跑不建计划和每种可用的tile行数，编译全部变体：H12为K1两种、K2/K3各一种、union一种（10行）、packed与raw direct各两种；H6另有21行union；H3另有42行union及使用64位成员的K1–K3。Triton和FlyDSL缓存都为空时，这次调用在H12/H6/H3约需36/39/68秒，之后任何layout都不再编译。
-- Indexer的I1、I2、D0对行数、组数和position stride不做整数特化，各只编译一份；prefill第一次调用即编译logits（即使该批没有行需要logits），decode的三个kernel在第一次decode调用时编译。
+- Indexer的I1、I2、D0对行数、组数和position stride不做整数特化，各只编译一份；prefill第一次调用即编译logits（即使该批没有行需要logits），decode的三个kernel在第一次decode调用时编译，verify另需的不压缩D0与D0′在第一次verify调用时编译（SGLang在graph capture前的eager预热中）。
 - FlyDSL持久缓存的键只追踪被编译函数的源码，只改嵌套`@flyc.jit`或helper时可能返回旧kernel。修改PyHIP后先清空缓存，或设置新的`FLYDSL_RUNTIME_CACHE_DIR`。
 
 ### 4.4 已知限制
@@ -740,6 +751,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。
+- MTP verify窗口跨过压缩边界时，SGLang原生的压缩key是错的，PyHIP为了逐bit一致也照样复现：每个请求的pending ring只有4个槽，而本次所有行先写ring、再gather，边界行之后的草稿行会覆盖该组在窗口之前的成员。窗口起点L%4为1/2/3时，该组用了错误的成员和RoPE位置，与逐token decode相比余弦只有0.68/0.45/0.27（[单卡演示](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)）。修复要在SGLang把ring扩到每个请求2×ratio个槽，PyHIP的槽号来自SGLang元数据，不用改。
 - 服务验收是数值验收（attention `.02/.02`、prep逐bit），不是模型质量或生成文本逐bit一致的验收。
 
 ### 4.5 当前数据来源
@@ -750,6 +762,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - Prefill与decode indexer：[qsa_compile_once_20261002_01](../../../../../mytest/mydata/qsa_compile_once_20261002_01/official_indexer_2/kernels.txt)。
 - 长行decode和host下发：[qsa_perf_final_20261002_01](../../../../../mytest/mydata/qsa_perf_final_20261002_01/official_decode_long/kernels.txt)、[host.json](../../../../../mytest/mydata/qsa_perf_final_20261002_01/host.json)。
 - 服务性能与数值验收：[qsa_route_threshold_service_20261004_01](../../../../../mytest/mydata/qsa_route_threshold_service_20261004_01/summary.json)。
+- MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_verify_20261008_01](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)。
 
 ## 5. 优化历史
 
@@ -762,7 +775,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - 服务数值验收：TEST=1，TP2/TP4各35请求（含24k分块、32并发和短请求），每个rank的12层都校验attention与prefill indexer。服务性能：原生与PyHIP依次测TP2/TP4×C1/C2/C4/C8，每档32请求、12000输入/350输出，计时时关闭校验。服务测量期间不得修改被哈希的源码（10-02有一轮因此作废）。
 - Graph中前后依赖的空kernel，每个边界约1.86µs（grid不超过47）或2.91µs（grid 640）；rocprofv3给每个kernel多算约2.65µs（[floor_g*.json与trace](../../../../../mytest/mydata/qsa_decode_fusion_20261004_01)）。
 
-### 2026-09-25～10-07：初版到直接接入
+### 2026-09-25～10-08：初版到直接接入
 
 - **09-25 单接口**：一个attention调用在内部管理metadata和scratch，分dense因果前缀、跨query union和block-native direct三路（dense于10-02删除）。临时插件完成真实TP2接入和输入捕获。[模型profile](../../../../../mytest/mydata/sglang_tp2_qsa_latest_20260925_01/README.md)
 - **09-25～26 Union**：tile 10行、按N64步数排序任务、蛇形分配、4+4 wave错拍流水，真实两层prepared union约4086/3844→2791/2700µs。[证据](../../../../../mytest/mydata/qsa_union_210t_20260925_01/README.md)
@@ -794,6 +807,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - **10-02 union单一变体、indexer去特化、首次调用预编译**：union在SOFFSET上钳位越过KV末端的部分尾块，删除TAIL_BOUNDS变体，KV长度非4倍数的请求快约3.4%；I1/I2/D0不做整数特化；每种head形状第一次调用attention时预编译全部变体（见4.3）。服务测量中没有编译，吞吐与上一轮相差不超过±0.4%。[编译清单](../../../../../mytest/mydata/qsa_fresh_compile_20261002_03)、[union A/B](../../../../../mytest/mydata/qsa_compile_once_20261002_01/union_ab_final.log)、[服务](../../../../../mytest/mydata/qsa_compile_once_service_20261002_01/summary.json)
 - **10-04 删除候选提升**：比较两种删法后保留逐tile阈值1.7（np17）：真实12k和服务布局路由不变，少数TP2高共享、P0 4k随机选择和TP4分块布局attention慢8–21%（每次forward约多0.7–1.6ms）；改用阈值1.8（np18）会把代价移到真实TP2 12k上。[评估](../../../../../mytest/mydata/qsa_promote_eval_20261003_01/summary.json)、[改动](../../../../../mytest/mydata/qsa_promote_remove_20261003_01)
 - **10-04 K3路由改为单一阈值**：全direct只在少数混合批中有约10%收益，且它就是“全部降级”这一档；路由改为一个步数阈值（8档），594个布局的路由和输出与原实现逐位相同，attention_prepare.py 513→489行。服务复测吞吐与10-02相差不超过±0.35%，TTFT/ITL中位数不超过±0.8%。[评估](../../../../../mytest/mydata/qsa_route_simplify_20261004_01)、[改动](../../../../../mytest/mydata/qsa_route_threshold_20261004_01)、[服务](../../../../../mytest/mydata/qsa_route_threshold_service_20261004_01/summary.json)
+- **10-06～10-08 MTP的verify走PyHIP**：EAGLE 3/1/4时目标模型每步跑CUDA graph TARGET_VERIFY（每请求4行窗口），不再跑DECODE，PyHIP原先只接管prefill。`decode_forward(verify=True)`中D0只做q和ring写，新增的D0′在本次所有行写完ring后再压缩，按SGLang先写全部ring、再gather的顺序，q、ring和压缩key逐bit一致；SGLang把graph TARGET_VERIFY交给PyHIP。C1 profile中每个verify graph的indexer由约5.67ms降到0.36ms，verify graph在TP2由21.74ms降到16.22ms、TP4由19.65ms降到14.28ms。服务吞吐（MTP原生→MTP+PyHIP）TP2 C1–C8 +15.4%/+24.2%/+30.3%/+33.5%（原生取热缓存复测；首轮原生C8在测量中编译了12次`apply_interleaved_rope_kernel`），TP4 +18.6%/+30.3%/+34.7%/+41.3%；相对10-06只接prefill的PyHIP，TP2快13.4%–21.1%。TEST=1验收TP2/TP4每rank每层217/222次verify校验全部通过。同时发现原生verify窗口跨压缩边界时ring被覆盖（见4.4）。[服务](../../../../../mytest/mydata/qsa_mtp_verify_20261008_01/analysis.json)、[基线](../../../../../mytest/mydata/qsa_mtp_baseline_20261006_01/analysis.json)、[ring演示](../../../../../mytest/mydata/qsa_native_verify_ring_20261008_01/result.json)
 
 ### 评估过但未采用
 

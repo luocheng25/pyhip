@@ -8,7 +8,8 @@ lowest block ids. Each row holds the selected blocks' tokens in ascending block
 order (PyHIP attention reads such rows without sorting), then 0..3 causal tail
 tokens, then -1, matching SGLang's fixed-width token ABI. Decode (``decode_indexer``) uses paged logits
 (``indexer_decode.py``) and the shared FlyDSL top-k/expand; ``decode_forward`` also fuses the
-CUDA-graph decode q prep, pending-ring store and group compression into one bit-exact kernel.
+CUDA-graph decode q prep, pending-ring store and group compression into one bit-exact kernel
+(TARGET_VERIFY windows compress in a second launch).
 """
 
 from collections import OrderedDict
@@ -146,7 +147,8 @@ def _ring_member(KeyState, loc, own, key, cols, D: tl.constexpr):
 @triton.jit(do_not_specialize=["position_stride"])
 def _indexer_decode_prep(QK, Q, QWeight, KWeight, KeyState, RopeState, Compressed, Slots, GroupLocs, WriteLocs,
                          Positions, position_stride, Cache, Axis, n_cols, q_eps, k_eps, H: tl.constexpr,
-                         D: tl.constexpr, ROT: tl.constexpr, RATIO: tl.constexpr, CACHE_STRIDE: tl.constexpr):
+                         D: tl.constexpr, ROT: tl.constexpr, RATIO: tl.constexpr, CACHE_STRIDE: tl.constexpr,
+                         COMPRESS: tl.constexpr):
     # One CUDA-graph decode row: q norm/RoPE, pending-ring store, then SGLang's fixed-shape
     # compression of the group ending at this token (oldest member first, written to WriteLocs).
     row = tl.program_id(0)
@@ -170,20 +172,46 @@ def _indexer_decode_prep(QK, Q, QWeight, KWeight, KeyState, RopeState, Compresse
     axes = tl.arange(0, 4)
     tl.store(RopeState + slot * 3 + axes, tl.load(Positions + axes * position_stride + row, mask=axes < 3, other=0),
              mask=axes < 3)
+    if COMPRESS:
+        first = tl.load(GroupLocs + row * RATIO).to(tl.int64)
+        own = first == slot
+        acc = _ring_member(KeyState, first, own, key, cols, D)
+        acc_other = _ring_member(KeyState, first, own, key_other, other, D)
+        for member in tl.static_range(1, RATIO):
+            loc = tl.load(GroupLocs + row * RATIO + member).to(tl.int64)
+            acc = acc + _ring_member(KeyState, loc, loc == slot, key, cols, D)
+            acc_other = acc_other + _ring_member(KeyState, loc, loc == slot, key_other, other, D)
+        mean = (acc * (1.0 / RATIO)).to(tl.bfloat16).to(tl.float32)
+        mean_other = (acc_other * (1.0 / RATIO)).to(tl.bfloat16).to(tl.float32)
+        one = tl.zeros([1], dtype=tl.int64)
+        c0 = tl.where(own, r0, tl.load(RopeState + first * 3)) + one
+        c1 = tl.where(own, r1, tl.load(RopeState + first * 3 + 1)) + one
+        c2 = tl.where(own, r2, tl.load(RopeState + first * 3 + 2)) + one
+        k = _norm_rope(mean[None, :], mean_other[None, :], n_cols, k_eps, KWeight, Cache, Axis, c0, c1, c2, 1, D,
+                       ROT, CACHE_STRIDE)
+        tl.store(Compressed + tl.load(WriteLocs + row).to(tl.int64) * D + cols[None, :], k)
+
+
+@triton.jit
+def _indexer_ring_compress(KeyState, RopeState, Compressed, GroupLocs, WriteLocs, Cache, Axis, KWeight, n_cols, k_eps,
+                           D: tl.constexpr, ROT: tl.constexpr, RATIO: tl.constexpr, CACHE_STRIDE: tl.constexpr):
+    # The fused decode compression after every row's ring store has landed (all members read back).
+    row = tl.program_id(0)
+    cols = tl.arange(0, D)
+    other = _partner(cols, ROT)
     first = tl.load(GroupLocs + row * RATIO).to(tl.int64)
-    own = first == slot
-    acc = _ring_member(KeyState, first, own, key, cols, D)
-    acc_other = _ring_member(KeyState, first, own, key_other, other, D)
+    acc = tl.load(KeyState + first * D + cols).to(tl.float32)
+    acc_other = tl.load(KeyState + first * D + other).to(tl.float32)
     for member in tl.static_range(1, RATIO):
         loc = tl.load(GroupLocs + row * RATIO + member).to(tl.int64)
-        acc = acc + _ring_member(KeyState, loc, loc == slot, key, cols, D)
-        acc_other = acc_other + _ring_member(KeyState, loc, loc == slot, key_other, other, D)
+        acc = acc + tl.load(KeyState + loc * D + cols).to(tl.float32)
+        acc_other = acc_other + tl.load(KeyState + loc * D + other).to(tl.float32)
     mean = (acc * (1.0 / RATIO)).to(tl.bfloat16).to(tl.float32)
     mean_other = (acc_other * (1.0 / RATIO)).to(tl.bfloat16).to(tl.float32)
     one = tl.zeros([1], dtype=tl.int64)
-    c0 = tl.where(own, r0, tl.load(RopeState + first * 3)) + one
-    c1 = tl.where(own, r1, tl.load(RopeState + first * 3 + 1)) + one
-    c2 = tl.where(own, r2, tl.load(RopeState + first * 3 + 2)) + one
+    c0 = tl.load(RopeState + first * 3) + one
+    c1 = tl.load(RopeState + first * 3 + 1) + one
+    c2 = tl.load(RopeState + first * 3 + 2) + one
     k = _norm_rope(mean[None, :], mean_other[None, :], n_cols, k_eps, KWeight, Cache, Axis, c0, c1, c2, 1, D, ROT,
                    CACHE_STRIDE)
     tl.store(Compressed + tl.load(WriteLocs + row).to(tl.int64) * D + cols[None, :], k)
@@ -392,14 +420,16 @@ def decode_forward(qk, **kwargs):
     One Triton kernel reproduces the unfused (BF16 cos/sin) q norm/RoPE, the pending-ring key and
     RoPE-position store at ``state_slots`` and the fixed-shape compression of ``group_locs``
     (oldest member first) into ``write_locs`` bit for bit; ``decode_indexer`` then selects tokens.
-    Rows must belong to distinct requests (each row only sees its own ring store).
+    Rows must belong to distinct requests (each row only sees its own ring store) unless
+    ``verify=True``: a TARGET_VERIFY window has several rows per request, so the compression runs as
+    a second launch after every row's ring store, in SGLang's order.
     """
     return _decode_forward(qk, **kwargs)[0]
 
 
 def _decode_forward(qk, *, positions, state_slots, group_locs, write_locs, key_state, rope_state, compressed,
                     cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps, cache, page_table, lengths,
-                    query_positions, sequence_lengths):
+                    query_positions, sequence_lengths, verify=False):
     rows, heads, head_dim = qk.shape[0], 4, q_weight.numel()
     rotary_dim = cos_sin_cache.shape[1]
     q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=qk.device)
@@ -407,6 +437,10 @@ def _decode_forward(qk, *, positions, state_slots, group_locs, write_locs, key_s
                                   group_locs, write_locs, positions,
                                   positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache, axis_map,
                                   head_dim, q_eps, k_eps, H=heads, D=head_dim, ROT=rotary_dim, RATIO=_RATIO,
-                                  CACHE_STRIDE=cos_sin_cache.stride(0), num_warps=4)
+                                  CACHE_STRIDE=cos_sin_cache.stride(0), COMPRESS=not verify, num_warps=4)
+    if verify:
+        _indexer_ring_compress[(rows,)](key_state, rope_state, compressed, group_locs, write_locs, cos_sin_cache,
+                                        axis_map, k_weight, head_dim, k_eps, D=head_dim, ROT=rotary_dim,
+                                        RATIO=_RATIO, CACHE_STRIDE=cos_sin_cache.stride(0), num_warps=4)
     tokens, logits = _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths)
     return tokens, q, logits

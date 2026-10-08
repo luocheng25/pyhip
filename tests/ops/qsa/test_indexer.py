@@ -34,6 +34,13 @@ DECODE_FORWARD_CASES = (
     ((5, 8, 3, 12), 1, 256),
     ((12000, 11888, 11667, 11851), 0, 16384),
 )
+# TARGET_VERIFY windows: first-row lengths cover every alignment of the compression boundary.
+VERIFY_FORWARD_CASES = (
+    ((9, 10, 11, 12), 4, 2, 64),
+    ((4003, 6, 1023, 2), 4, 1, 8192),
+    ((17, 30, 5), 3, 0, 64),
+    ((12000, 11889), 2, 3, 16384),
+)
 
 
 @pytest.fixture
@@ -92,19 +99,24 @@ def test_prefill_position_mismatch_traps(device):
 
 
 def test_prep_kernels_compile_once(device):
-    """Row counts, group counts, position strides and decode batches of any value (1, multiples of
-    16, others) reuse one compiled q_prep, k_compress and decode_prep; a first prefill whose rows
-    need no logits still compiles the logits kernel."""
+    """Row counts, group counts, position strides and decode/verify batches of any value (1, multiples
+    of 16, others) reuse one compiled q_prep, k_compress, ring_compress and decode_prep per mode; a
+    first prefill whose rows need no logits still compiles the logits kernel."""
     kernels = (helpers.indexer._indexer_q_prep, helpers.indexer._indexer_k_compress,
-               helpers.indexer._indexer_decode_prep)
+               helpers.indexer._indexer_decode_prep, helpers.indexer._indexer_ring_compress)
 
     def counts():
         return [len(kernel.device_caches[device.index][0]) for kernel in kernels]
+
+    def verify(lengths):
+        source = helpers.decode_forward_case(lengths, device, window=4, context=64)
+        helpers.indexer.decode_forward(**source.inputs, verify=True)
 
     helpers.indexer.indexer_logits._COMPILED.pop(device, None)
     helpers.indexer.prefill_indexer(**helpers.synthetic((9,), (9,), device).inputs)
     assert device in helpers.indexer.indexer_logits._COMPILED
     helpers.indexer.decode_forward(**helpers.decode_forward_case((7,), device, context=64).inputs)
+    verify((7,))
     first = counts()
     for seq_lens, extend_lens in (((1,), (1,)), ((64,), (64,)), ((60,), (60,)), ((2177,), (129,)),
                                   ((4096, 63), (4096, 63))):
@@ -112,6 +124,7 @@ def test_prep_kernels_compile_once(device):
     for rows in (2, 16, 32):
         lengths = tuple(range(5, 5 + rows))
         helpers.indexer.decode_forward(**helpers.decode_forward_case(lengths, device, context=64).inputs)
+        verify(lengths)
     assert counts() == first
 
 
@@ -166,6 +179,35 @@ def test_decode_forward_graph_replay(device):
     source.state = expected.state
     helpers.reset_state(source)
     helpers.decode_step(source, tuple(length + 1 for length in lengths))
+    expected = helpers.reference_prep(source.inputs, source.state, decode=True)
+    graph.replay()
+    helpers.check_decode_forward(source, output, expected=expected)
+    assert _addresses(source) == addresses
+
+
+@pytest.mark.parametrize("lengths,window,padding,context", VERIFY_FORWARD_CASES,
+                         ids=("alignments", "long-padded", "window3", "window2-padded"))
+def test_verify_forward_operator(lengths, window, padding, context, device):
+    source = helpers.decode_forward_case(lengths, device, window=window, padding=padding, context=context)
+    helpers.check_decode_forward(source)
+
+
+def test_verify_forward_graph_replay(device):
+    lengths = (4003, 6, 1023, 2)
+    source = helpers.decode_forward_case(lengths, device, window=4, padding=2, context=8192)
+    expected = helpers.reference_prep(source.inputs, source.state, decode=True)
+    warm = helpers.indexer.decode_forward(**source.inputs, verify=True)
+    helpers.check_decode_forward(source, warm, expected=expected)
+    torch.cuda.synchronize(device)
+    helpers.reset_state(source)
+    addresses = _addresses(source)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = helpers.indexer.decode_forward(**source.inputs, verify=True)
+    # The next window starts after each request's accepted tokens and rewrites the rejected rows.
+    source.state = expected.state
+    helpers.reset_state(source)
+    helpers.decode_step(source, tuple(length + accepted for length, accepted in zip(lengths, (4, 1, 3, 2))))
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
     graph.replay()
     helpers.check_decode_forward(source, output, expected=expected)

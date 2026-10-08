@@ -414,12 +414,17 @@ def check_decode(source, actual=None, *, logits=None, q=None, compressed=None):
 
 
 @torch.no_grad()
-def decode_forward_case(lengths, device, *, padding=0, seed=17, context=65536):
-    """Static tensor buffers for after-projection decode, with page-64 request allocation."""
-    if not lengths or min(lengths) < 1 or max(lengths) > context or context % PAGE or padding < 0:
-        raise ValueError("Require positive lengths within a page-64 context and nonnegative padding")
+def decode_forward_case(lengths, device, *, window=1, padding=0, seed=17, context=65536):
+    """Static tensor buffers for after-projection decode, with page-64 request allocation.
+
+    ``window`` > 1 builds a TARGET_VERIFY layout: each request owns ``window`` consecutive rows whose
+    first row has sequence length ``lengths[i]``."""
+    if (not lengths or min(lengths) < 1 or max(lengths) + window - 1 > context or context % PAGE or padding < 0
+            or not 1 <= window <= RATIO):
+        raise ValueError("Require positive lengths whose windows fit a page-64 context, 1..4-row windows and "
+                         "nonnegative padding")
     generator = torch.Generator(device=device).manual_seed(seed)
-    requests, rows, pages = len(lengths), len(lengths) + padding, context // PAGE
+    requests, rows, pages = len(lengths), len(lengths) * window + padding, context // PAGE
     table = torch.zeros((requests + 1, context), dtype=torch.int32, device=device)
     for request in range(1, requests + 1):
         table[request] = PAGE * (1 + (request - 1) * pages) + torch.arange(context, device=device)
@@ -441,9 +446,11 @@ def decode_forward_case(lengths, device, *, padding=0, seed=17, context=65536):
                   sequence_lengths=torch.empty(rows, dtype=torch.int32, device=device),
                   **clone_state(state), **parameters)
     inputs["cache"] = inputs["compressed"].view(-1, 16, 1, DIM)
-    source = SimpleNamespace(name=f"decode_forward_n{'-'.join(map(str, lengths))}_pad{padding}", inputs=inputs,
-                             state=state, table=table, requests=requests, rows=rows, padding=padding, context=context,
-                             host=dict(request_ids=tuple(range(1, requests + 1)) + (0,) * padding),
+    name = f"decode_forward_n{'-'.join(map(str, lengths))}{f'_w{window}' if window > 1 else ''}_pad{padding}"
+    source = SimpleNamespace(name=name, inputs=inputs, state=state, table=table, requests=requests, rows=rows,
+                             window=window, padding=padding, context=context,
+                             host=dict(request_ids=tuple(request for request in range(1, requests + 1)
+                                                         for _ in range(window)) + (0,) * padding),
                              generator=generator)
     decode_step(source, lengths)
     return source
@@ -452,12 +459,13 @@ def decode_forward_case(lengths, device, *, padding=0, seed=17, context=65536):
 @torch.no_grad()
 def decode_step(source, lengths):
     """Refresh host metadata and existing tensor contents, never graph-visible addresses."""
-    if len(lengths) != source.requests or min(lengths) < 1 or max(lengths) > source.context:
+    if (len(lengths) != source.requests or min(lengths) < 1
+            or max(lengths) + source.window - 1 > source.context):
         raise ValueError("decode step must preserve the request frame and fit the context")
     inputs, device = source.inputs, source.inputs["qk"].device
-    if max(lengths) + 6 >= inputs["cos_sin_cache"].shape[0]:
+    if max(lengths) + source.window + 5 >= inputs["cos_sin_cache"].shape[0]:
         raise ValueError("RoPE cache does not cover this step's three position axes")
-    source.host["sequence_lengths"] = tuple(lengths) + (1,) * source.padding
+    source.host["sequence_lengths"] = tuple(n + j for n in lengths for j in range(source.window)) + (1,) * source.padding
     source.host["compressed_lengths"] = tuple(n // RATIO for n in source.host["sequence_lengths"])
     source.seq_lens = source.host["sequence_lengths"]
     sequences = torch.tensor(source.seq_lens, dtype=torch.int64, device=device)
@@ -480,7 +488,7 @@ def decode_step(source, lengths):
 def check_decode_forward(source, actual=None, *, q=None, logits=None, expected=None):
     expected = reference_prep(source.inputs, source.state, decode=True) if expected is None else expected
     if actual is None:
-        actual, q, logits = indexer._decode_forward(**source.inputs)
+        actual, q, logits = indexer._decode_forward(**source.inputs, verify=source.window > 1)
     if q is not None:
         assert_exact(q, expected.q, "decode Q must be bitexact, including padding rows")
     report = dict(case=source.name, q_checked=q is not None, **assert_state(source, expected))
