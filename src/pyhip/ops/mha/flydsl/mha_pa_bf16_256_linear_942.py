@@ -568,6 +568,7 @@ def run(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, *, out,
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("warm this linear specialization before graph capture")
+            # flyc.compile also launches this first call.
             _COMPILED[key] = flyc.compile(_launch, *args)
         else:
             compiled(*args)

@@ -194,7 +194,7 @@ attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 
 ### Indexer接口
 
-[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L294)和[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L388)都从调用方`index_qk_proj`之后的`qk`开始，返回同一种token选择，可原样交给attention。除`qk`外都是关键字参数，两个入口中同名参数含义相同；只依赖PyHIP，不需要SGLang/AITER。
+[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L323)和[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L401)都从调用方`index_qk_proj`之后的`qk`开始，返回同一种token选择，可原样交给attention。除`qk`外都是关键字参数，两个入口中同名参数含义相同；只依赖PyHIP，不需要SGLang/AITER。
 
 共同约定：
 
@@ -302,7 +302,7 @@ B是行数（每行一个query token，含CUDA graph的padding行），P是页�
 |---|---|---|
 | `qk` | BF16 `[B,640]` | 每行一个新token的`index_qk_proj`输出 |
 | `positions` | int64 `[B]`或`[3,B]` | RoPE位置，同prefill |
-| `logical_positions` | int32 `[B]` | 本行query的请求内位置（= `seq_lens − 1`）；decode不校验位置 |
+| `logical_positions` | int32（也可int64）`[B]` | 本行query的请求内位置（= `seq_lens − 1`）；decode不校验位置 |
 | `seq_lens` | int32 `[B]` | 本行所在序列含当前token的长度 |
 | `state_slots` | int64 `[B]` | 当前token写进ring的槽`8r + p%8`；padding行写dump行 |
 | `group_locs` | int32 `[B,4]` | 以本位置结尾的组的4个成员（位置p−3..p，最早的在前，小于0时按0）在ring中的槽`8r + 成员位置%8` |

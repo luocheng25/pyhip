@@ -903,6 +903,7 @@ class _PagedAttention:
                 key = (device, signature)
                 compiled = self._compiled.get(key)
                 if compiled is None:
+                    # flyc.compile also launches this first call.
                     self._compiled[key] = flyc.compile(self._launch, *args)
                 else:
                     compiled(*args)

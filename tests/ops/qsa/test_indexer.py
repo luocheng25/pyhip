@@ -132,6 +132,23 @@ def test_decode_operator(lengths, padding, context, device):
     helpers.check_decode(source, output, expected=expected)
 
 
+MALFORMED_DECODE = {"qk": lambda t: t[:0], "page_table": lambda t: t[:, :0], "lengths": lambda t: t.long(),
+                    "group_locs": lambda t: t[:, :3], "seq_lens": lambda t: t[1:],
+                    "logical_positions": lambda t: t.float(), "positions": lambda t: t.int()}
+
+
+@pytest.mark.parametrize("name", MALFORMED_DECODE)
+def test_decode_rejects_malformed_inputs(name, device):
+    """Malformed decode inputs raise before any launch writes the caches."""
+    source = helpers.decode_case((7, 9), device, context=64)
+    state = [source.inputs[key].clone() for key in helpers.STATE_NAMES]
+    inputs = dict(source.inputs, **{name: MALFORMED_DECODE[name](source.inputs[name])})
+    with pytest.raises(ValueError):
+        helpers.indexer.decode_indexer(**inputs)
+    for key, before in zip(helpers.STATE_NAMES, state):
+        assert torch.equal(source.inputs[key], before)
+
+
 def test_decode_graph_replay(device):
     lengths = (4003, 6, 1023, 2)
     source = helpers.decode_case(lengths, device, padding=2, context=8192)

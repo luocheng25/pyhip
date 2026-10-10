@@ -285,10 +285,39 @@ def _layout(seq_lens, extend_lens, device):
 
 
 def _check(tensor, name, dtype, shape=None, contiguous=True):
-    if tensor.dtype != dtype or (shape is not None and tuple(tensor.shape) != tuple(shape)) or (
+    dtypes = dtype if isinstance(dtype, tuple) else (dtype,)
+    if tensor.dtype not in dtypes or (shape is not None and tuple(tensor.shape) != tuple(shape)) or (
             contiguous and not tensor.is_contiguous()):
-        raise ValueError(f"{name} must be {'contiguous ' if contiguous else ''}{dtype} {shape}, got "
-                         f"{tensor.dtype} {tuple(tensor.shape)}")
+        raise ValueError(f"{name} must be {'contiguous ' if contiguous else ''}{' or '.join(map(str, dtypes))} "
+                         f"{shape}, got {tensor.dtype} {tuple(tensor.shape)}")
+
+
+def _check_shared(qk, rows, heads, positions, state_slots, key_state, rope_state, compressed, cos_sin_cache,
+                  axis_map, q_weight, k_weight):
+    """Checks shared by prefill and decode; returns rotary_dim."""
+    head_dim = q_weight.numel()
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.dtype not in (torch.bfloat16, torch.float32) or (
+            not cos_sin_cache.is_contiguous()):
+        raise ValueError("cos_sin_cache must be a contiguous BF16/FP32 [positions, rotary_dim] table")
+    rotary_dim = cos_sin_cache.shape[1]
+    if heads != 4 or head_dim != 128 or rotary_dim % 4 or not 0 < rotary_dim < head_dim:
+        raise ValueError("The gfx942 indexer kernels require 4 heads, D128 and 0<rotary_dim<D")
+    if any(n & (n - 1) for n in (rotary_dim // 2, head_dim - rotary_dim)):
+        raise ValueError("rotary_dim/2 and head_dim-rotary_dim must be powers of two")
+    if (positions.dtype != torch.int64 or positions.ndim not in (1, 2) or positions.stride(-1) != 1
+            or positions.shape[-1] != rows or (positions.ndim == 2 and positions.shape[0] != 3)):
+        raise ValueError("positions must be int64 [rows] or [3, rows] with a unit token stride")
+    _check(qk, "qk", torch.bfloat16, (rows, (heads + 1) * head_dim))
+    _check(state_slots, "state_slots", torch.int64, (rows,))
+    _check(key_state, "key_state", torch.bfloat16, (key_state.shape[0], 1, head_dim))
+    _check(rope_state, "rope_state", torch.int64, (key_state.shape[0], 3))
+    _check(compressed, "compressed", torch.bfloat16, (compressed.shape[0], 1, head_dim))
+    _check(axis_map, "axis_map", torch.int32, (rotary_dim // 2,))
+    _check(q_weight, "q_weight", torch.bfloat16, (head_dim,))
+    _check(k_weight, "k_weight", torch.bfloat16, (head_dim,))
+    if compressed.numel() * compressed.element_size() >= 2**31:
+        raise ValueError("The compressed key pool must be smaller than 2 GiB")
+    return rotary_dim
 
 
 def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state, write_locs,
@@ -315,11 +344,6 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
     """
     device, head_dim = qk.device, q_weight.numel()
     rows = sum(extend_lens)
-    rotary_dim = cos_sin_cache.shape[1]
-    if heads != 4 or head_dim != 128 or rotary_dim % 4 or not 0 < rotary_dim < head_dim:
-        raise ValueError("The gfx942 indexer kernels require 4 heads, D128 and 0<rotary_dim<D")
-    if any(n & (n - 1) for n in (rotary_dim // 2, head_dim - rotary_dim)):
-        raise ValueError("rotary_dim/2 and head_dim-rotary_dim must be powers of two")
     if len(seq_lens) != len(extend_lens) or any(s < e or e < 0 for s, e in zip(seq_lens, extend_lens)):
         raise ValueError("Invalid host sequence/extend lengths")
     if any((s - e) % _RATIO for s, e in zip(seq_lens, extend_lens)):
@@ -327,29 +351,18 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
                          f"compress_ratio={_RATIO}")
     if max(seq_lens) // _RATIO > MAX_COMPRESSED_KEYS or rows == 0:
         raise ValueError(f"Rows must be non-empty and have at most {MAX_COMPRESSED_KEYS} compressed keys")
-    _check(qk, "qk", torch.bfloat16, (rows, (heads + 1) * head_dim))
+    rotary_dim = _check_shared(qk, rows, heads, positions, state_slots, key_state, rope_state, compressed,
+                               cos_sin_cache, axis_map, q_weight, k_weight)
     _check(logical_positions, "logical_positions", torch.int64, (rows,))
-    _check(state_slots, "state_slots", torch.int64, (rows,))
-    _check(key_state, "key_state", torch.bfloat16, (key_state.shape[0], 1, head_dim))
-    _check(rope_state, "rope_state", torch.int64, (key_state.shape[0], 3))
     groups = write_locs.numel()
     _check(write_locs, "write_locs", torch.int32, (groups,))
     for tensor, name in ((member_rows, "member_rows"), (group_sequences, "group_sequences"),
                          (group_ends, "group_ends")):
         _check(tensor, name, torch.int64, (groups,))
     _check(rope_matrix, "rope_matrix", torch.int64, (rows, 3))
-    _check(compressed, "compressed", torch.bfloat16, (compressed.shape[0], 1, head_dim))
     _check(token_slot_table, "token_slot_table", torch.int32, (len(seq_lens), token_slot_table.shape[1]), False)
-    _check(axis_map, "axis_map", torch.int32, (rotary_dim // 2,))
-    _check(q_weight, "q_weight", torch.bfloat16, (head_dim,))
-    _check(k_weight, "k_weight", torch.bfloat16, (head_dim,))
-    if (cos_sin_cache.dtype not in (torch.bfloat16, torch.float32) or not cos_sin_cache.is_contiguous()
-            or positions.dtype != torch.int64 or positions.ndim not in (1, 2) or positions.stride(-1) != 1
-            or positions.shape[-1] != rows or (positions.ndim == 2 and positions.shape[0] != 3)
-            or token_slot_table.stride(1) != 1 or token_slot_table.shape[1] < max(seq_lens)):
-        raise ValueError("Unsupported RoPE cache, positions or token-slot table layout")
-    if compressed.numel() * compressed.element_size() >= 2**31:
-        raise ValueError("The compressed key pool must be smaller than 2 GiB")
+    if token_slot_table.stride(1) != 1 or token_slot_table.shape[1] < max(seq_lens):
+        raise ValueError("Unsupported token-slot table layout")
     tensors = (qk, positions, logical_positions, state_slots, key_state, rope_state, write_locs, member_rows,
                group_sequences, group_ends, rope_matrix, compressed, token_slot_table, cos_sin_cache, axis_map,
                q_weight, k_weight)
@@ -400,27 +413,42 @@ def decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, 
 
     Selection reads ``compressed`` as 16-key pages: page p of a row holds keys 16 * page_table[row, p] +
     [0, 16) (``page_table`` int32 [rows, pages], at most 65536 keys per row). ``lengths``, ``logical_positions``
-    and ``seq_lens`` (int32 [rows]) are each row's compressed-key count, query position and sequence length.
-    Everything stays on device, so the call is CUDA-graph capturable after an eager warmup. If given,
-    ``q_out`` (BF16 [rows, 4, D]) receives the normalized index queries and ``logits_out`` (FP32
-    [rows, 16 * pages] whose storage extends 512 values past it) the logits.
+    and ``seq_lens`` (int32 [rows]; ``logical_positions`` may be int64) are each row's compressed-key count,
+    query position and sequence length. Everything stays on device, so the call is CUDA-graph capturable
+    after an eager warmup. If given, ``q_out`` (BF16 [rows, 4, D]) receives the normalized index queries and
+    ``logits_out`` (FP32 [rows, 16 * pages] whose storage extends 512 values past it) the logits.
     """
+    if qk.ndim != 2 or page_table.ndim != 2 or 0 in (qk.shape[0], page_table.shape[1]):
+        raise ValueError("qk and page_table must be 2-D with at least one row and one page")
     rows, heads, head_dim = qk.shape[0], 4, q_weight.numel()
     width = page_table.shape[1] * 16
     if width > MAX_COMPRESSED_KEYS:
         raise ValueError(f"Decode supports at most {MAX_COMPRESSED_KEYS} compressed keys per row")
+    rotary_dim = _check_shared(qk, rows, heads, positions, state_slots, key_state, rope_state, compressed,
+                               cos_sin_cache, axis_map, q_weight, k_weight)
+    for tensor, name in ((write_locs, "write_locs"), (lengths, "lengths")):
+        _check(tensor, name, torch.int32, (rows,))
+    _check(logical_positions, "logical_positions", (torch.int32, torch.int64), (rows,), False)
+    _check(seq_lens, "seq_lens", torch.int32, (rows,), False)
+    _check(group_locs, "group_locs", torch.int32, (rows, _RATIO))
+    _check(page_table, "page_table", torch.int32, (rows, page_table.shape[1]))
+    tensors = (qk, positions, logical_positions, state_slots, key_state, rope_state, write_locs, group_locs,
+               compressed, page_table, lengths, cos_sin_cache, axis_map, q_weight, k_weight, seq_lens)
     if q_out is not None:
         _check(q_out, "q_out", torch.bfloat16, (rows, heads, head_dim))
+        tensors += (q_out,)
     if logits_out is not None:
         _check(logits_out, "logits_out", torch.float32, (rows, width))
         if logits_out.untyped_storage().nbytes() < (logits_out.storage_offset() + rows * width + _PAD) * 4:
             raise ValueError(f"logits_out storage must extend {_PAD} values past the logits")
+        tensors += (logits_out,)
+    if any(t.device != qk.device for t in tensors):
+        raise ValueError("All indexer tensors must be on one device")
     q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=qk.device) if q_out is None else q_out
     logits = logits_out
     if logits is None:
         logits = torch.empty(rows * width + _PAD, dtype=torch.float32, device=qk.device)[:rows * width]
         logits = logits.view(rows, width)
-    rotary_dim = cos_sin_cache.shape[1]
     _indexer_decode_prep[(rows,)](qk, q, q_weight, k_weight, key_state, rope_state, compressed, state_slots,
                                   group_locs, write_locs, positions,
                                   positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache, axis_map,
