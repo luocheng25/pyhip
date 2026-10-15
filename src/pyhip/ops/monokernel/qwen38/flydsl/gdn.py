@@ -6,10 +6,11 @@ SGLang's Triton kernel (BF16-rounded tap products summed in FP32, SiLU, BF16), w
 shifts x into the conv state of the row's slot. Rows with a negative slot write zero CONV and keep
 their state.
 
-``gdn_recurrent``: one 256-thread CTA per (row, v-head); thread ``t`` owns state row ``t // 2`` and K
-half ``t % 2``. L2-normalized q (scaled by 128^-0.5) and k of the head's k-head, ``beta =
-bf16(sigmoid(b))``, decay ``exp(-exp(A_log) * softplus(a + dt_bias))``; then ``S *= decay``,
-``delta = (v - S k) beta``, ``S += delta k^T``, ``core = bf16(S q)`` and the gated RMSNorm
+``gdn_recurrent``: one 512-thread CTA per (row, v-head) running ``phases.recurrent`` (shared with the
+fused launch); thread ``t`` owns state row ``t // 4`` and 32 columns. L2-normalized q (scaled by
+128^-0.5) and k of the head's k-head, ``beta = bf16(sigmoid(b))``, decay
+``exp(-exp(A_log) * softplus(a + dt_bias))``; then ``S *= decay``, ``delta = (v - S k) beta``,
+``S += delta k^T``, ``core = bf16(S q)`` and the gated RMSNorm
 ``y = bf16(core * rsqrt(mean(core^2) + eps) * w * sigmoid(z))``.
 """
 
@@ -18,12 +19,11 @@ from functools import cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import range_constexpr
 
 from ..config import QWEN38_FLASH_NEXT
-from ._ir import (DPP_XOR1, DROP, barrier, bf16_pair, bf16_round, bf16_word, buffer, dpp, exp_accurate, lds_base,
-                  lds_load, lds_store, load, scalar, sigmoid_accurate, softplus, sqrt_accurate, store, store_short,
-                  wave_sum, words)
+from ._ir import (DROP, barrier, bf16_pair, bf16_round, bf16_word, buffer, exp_accurate, lds_base,
+                  load, scalar, store, words)
 from .linear import WAVES, Gemm, _call, tiles_for
 
 HIDDEN, D, KERNEL = QWEN38_FLASH_NEXT.hidden, QWEN38_FLASH_NEXT.gdn_head_dim, QWEN38_FLASH_NEXT.conv_kernel
@@ -105,103 +105,27 @@ def make_qkvz_conv(n, conv_dim, tiles):
 
 @cache
 def make_recurrent(v_heads, k_heads, conv_dim, eps):
-    key_dim = k_heads * D
-    width = conv_dim + v_heads * D  # QKVZ row: conv channels then z
-    group = v_heads // k_heads
-    scale = D ** -0.5
+    from . import phases
+    from ._phase import THREADS, Ctx
+    from .sync import address
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    width = conv_dim + v_heads * D  # QKVZ row: conv channels then z
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def gdn_recurrent(CONV: fx.Tensor, QKVZ: fx.Tensor, BA: fx.Tensor, ALOG: fx.Tensor, DTB: fx.Tensor,
                       NW: fx.Tensor, SSM: fx.Tensor, SLOTS: fx.Tensor, CORE: fx.Tensor, Y: fx.Tensor, rows: fx.Int32):
-        storage = fx.SharedAllocator().allocate(fx.Array[fx.Int32, 4, 16]).peek()
-        shared = lds_base(storage, 4)
-        tid = fx.Int32(fx.thread_idx.x)
-        lane, wave = tid & 63, scalar(tid >> 6)
-        cta = fx.Int32(fx.block_idx.x)
-        row, head = cta // v_heads, cta % v_heads
-        kv = head // group
-        v, half = tid >> 1, tid & 1
-        slot = scalar(load(buffer(SLOTS, rows * 4), row * 4, words=1))
-        active = slot >= 0
-        conv = buffer(CONV, conv_dim * 2, row * conv_dim)
-        q_words, k_words = [], []
-        for i in range_constexpr(8):
-            q_load = load(conv, (kv * D + half * 64) * 2 + i * 16)
-            k_load = load(conv, (key_dim + kv * D + half * 64) * 2 + i * 16)
-            q_words += [q_load[j] for j in range_constexpr(4)]
-            k_words += [k_load[j] for j in range_constexpr(4)]
-        q, k = _bf16s(q_words), _bf16s(k_words)
-        column = 2 * key_dim + head * D + v
-        v_lo, v_hi = bf16_pair(load(conv, (column >> 1) * 4, words=1))
-        value = ((column & 1) == 1).select(v_hi, v_lo)
-        q_sq, k_sq = fx.Float32(0.0), fx.Float32(0.0)
-        for i in range_constexpr(64):
-            q_sq = q_sq + q[i] * q[i]
-            k_sq = k_sq + k[i] * k[i]
-        q_sq = q_sq + dpp(q_sq, DPP_XOR1)
-        k_sq = k_sq + dpp(k_sq, DPP_XOR1)
-        q_den, k_den = sqrt_accurate(q_sq + L2NORM_EPS), sqrt_accurate(k_sq + L2NORM_EPS)
-        qn = [q[i] / q_den * scale for i in range_constexpr(64)]
-        kn = [k[i] / k_den for i in range_constexpr(64)]
-        ba = buffer(BA, rows * 2 * v_heads * 2)
-        b_lo, b_hi = bf16_pair(load(ba, ((row * 2 * v_heads + head) >> 1) * 4, words=1))
-        b = ((head & 1) == 1).select(b_hi, b_lo)
-        a_index = row * 2 * v_heads + v_heads + head
-        a_lo, a_hi = bf16_pair(load(ba, (a_index >> 1) * 4, words=1))
-        a = ((a_index & 1) == 1).select(a_hi, a_lo)
-        beta = bf16_round(sigmoid_accurate(b))
-        dt_lo, dt_hi = bf16_pair(load(buffer(DTB, v_heads * 2), (head >> 1) * 4, words=1))
-        dt = ((head & 1) == 1).select(dt_hi, dt_lo)
-        a_log = load(buffer(ALOG, v_heads * 4), head * 4, words=1).bitcast(fx.Float32)
-        g = (fx.Float32(0.0) - exp_accurate(a_log)) * softplus(a + dt)
-        decay = exp_accurate(g)
-        base = fx.Int64(active.select(slot, fx.Int32(0))) * (v_heads * D * D) + fx.Int64(head) * (D * D)
-        ssm = buffer(SSM, D * D * 4, base)
-        row_offset = (v * D + half * 64) * 4
-        state = []
-        for i in range_constexpr(16):
-            chunk = load(ssm, active.select(row_offset + i * 16, fx.Int32(DROP))).bitcast(fx.Float32)
-            state += [chunk[j] for j in range_constexpr(4)]
-        state = [s * decay for s in state]
-        ks = fx.Float32(0.0)
-        for i in range_constexpr(64):
-            ks = ks + state[i] * kn[i]
-        ks = ks + dpp(ks, DPP_XOR1)
-        delta = (value - ks) * beta
-        state = [state[i] + delta * kn[i] for i in range_constexpr(64)]
-        out = fx.Float32(0.0)
-        for i in range_constexpr(64):
-            out = out + state[i] * qn[i]
-        out = out + dpp(out, DPP_XOR1)
-        core = active.select(bf16_round(out), fx.Float32(0.0))
-        for i in range_constexpr(16):
-            store(ssm, active.select(row_offset + i * 16, fx.Int32(DROP)),
-                  words([state[4 * i + j] for j in range_constexpr(4)], fx.Float32).bitcast(fx.Int32))
-        squares = wave_sum((half == 0).select(core * core, fx.Float32(0.0)), lane)
-        if lane == 0:
-            lds_store(shared + wave * 4, squares.bitcast(fx.Int32), words=1)
-        barrier()
-        total = lds_load(shared, words=1).bitcast(fx.Float32)
-        for w in range_constexpr(1, 4):
-            total = total + lds_load(shared + w * 4, words=1).bitcast(fx.Float32)
-        rstd = fx.Float32(rocdl.rsq(fx.Float32.ir_type, (total * (1.0 / D) + eps).ir_value()))
-        w_lo, w_hi = bf16_pair(load(buffer(NW, D * 2), (v >> 1) * 4, words=1))
-        weight = ((v & 1) == 1).select(w_hi, w_lo)
-        z_index = row * width + conv_dim + head * D + v
-        z_lo, z_hi = bf16_pair(load(buffer(QKVZ, rows * width * 2), (z_index >> 1) * 4, words=1))
-        z = ((z_index & 1) == 1).select(z_hi, z_lo)
-        normed = core * rstd * weight * sigmoid_accurate(z)
-        store_short(buffer(CORE, rows * v_heads * D * 2), (half == 0).select((cta * D + v) * 2, fx.Int32(DROP)),
-                    (core.bitcast(fx.Int32) >> 16))
-        bits = (bf16_word(normed, normed).bitcast(fx.Int32)) & 0xFFFF
-        store_short(buffer(Y, rows * v_heads * D * 2), (half == 0).select((cta * D + v) * 2, fx.Int32(DROP)), bits)
+        ctx = Ctx(rows, False, lds_words=THREADS // 64)
+        phases.recurrent(ctx, buffer(CONV, rows * conv_dim * 2), buffer(QKVZ, rows * width * 2),
+                         buffer(BA, rows * 2 * v_heads * 2), buffer(ALOG, v_heads * 4), buffer(DTB, v_heads * 2),
+                         buffer(NW, D * 2), address(SSM), buffer(SLOTS, rows * 4), buffer(CORE, rows * v_heads * D * 2),
+                         buffer(Y, rows * v_heads * D * 2), v_heads, k_heads, conv_dim, eps)
 
     @flyc.jit
     def launch(CONV: fx.Tensor, QKVZ: fx.Tensor, BA: fx.Tensor, ALOG: fx.Tensor, DTB: fx.Tensor, NW: fx.Tensor,
                SSM: fx.Tensor, SLOTS: fx.Tensor, CORE: fx.Tensor, Y: fx.Tensor, rows: fx.Int32, stream: fx.Stream):
         if rows > 0:
             gdn_recurrent(CONV, QKVZ, BA, ALOG, DTB, NW, SSM, SLOTS, CORE, Y, rows).launch(
-                grid=(rows * v_heads, 1, 1), block=(256, 1, 1), stream=stream)
+                grid=(rows * v_heads, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch
 

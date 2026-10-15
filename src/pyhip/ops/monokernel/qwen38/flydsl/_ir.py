@@ -58,10 +58,10 @@ def store(rsrc, offset, value, aux=0):
                                aux=rocdl_aux(aux))
 
 
-def store_short(rsrc, offset, bits):
+def store_short(rsrc, offset, bits, aux=0):
     """Store the low 16 bits of an i32."""
     value = arith.trunci(ir.IntegerType.get_signless(16), fx.Int32(bits).ir_value())
-    rocdl.raw_ptr_buffer_store(value, rsrc, fx.Int32(offset).ir_value(), fx.Int32(0).ir_value(), aux=rocdl_aux(0))
+    rocdl.raw_ptr_buffer_store(value, rsrc, fx.Int32(offset).ir_value(), fx.Int32(0).ir_value(), aux=rocdl_aux(aux))
 
 
 def words(values, dtype=fx.Int32):

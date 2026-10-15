@@ -1,12 +1,14 @@
-"""Per-rank GPU time of the staged MonoKernel GDN decode layer (no all-reduce), real weights.
+"""Per-rank GPU time of the MonoKernel GDN decode layer (no all-reduce), real weights.
 
 For each TP size and batch S, rotates over ``--layers`` distinct GDN layers of one rank (their
 weights exceed the 256 MiB MALL, so every layer streams its weights from HBM) and over 10 input
-buffer sets. One CUDA graph holds 10 layer calls (attention phase, MLP phase with the rank partial
-standing in for the reduced output, finish); after 2 warmup replays, 128 timed replays give the
-median time per layer. ``--profile`` adds a per-stage breakdown from the torch profiler.
+buffer sets. One CUDA graph holds 10 layer calls; after 2 warmup replays, 128 timed replays give the
+median time per layer. ``--impl staged``: attention phase, MLP phase with the rank partial standing
+in for the reduced output, finish (one launch per stage). ``--impl fused``: the attention half with
+the combine of the previous layer's output and the MLP half (two persistent launches).
+``--profile`` adds a per-kernel breakdown from the torch profiler.
 
-    .venv/bin/python benchmarks/monokernel/bench_layer.py --tp 2 4 --rows 1 4 8 16 32 64
+    .venv/bin/python benchmarks/monokernel/bench_layer.py --impl staged fused --tp 2 4 --rows 1 4 16 64
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ if not __package__:
 
 from benchmarks.monokernel.check_reference import MODEL_DIR  # noqa: E402
 from pyhip.ops.monokernel.qwen38.config import QWEN38_FLASH_NEXT, LayerKind, shard  # noqa: E402
+from pyhip.ops.monokernel.qwen38.flydsl.fused import FusedGdnLayer, FusedWorkspace  # noqa: E402
 from pyhip.ops.monokernel.qwen38.flydsl.hc import hc_combine_norm  # noqa: E402
 from pyhip.ops.monokernel.qwen38.flydsl.layer import LayerWorkspace, StagedLayer  # noqa: E402
 from pyhip.ops.monokernel.qwen38.weights import CheckpointLayer, pack_layer, sglang_format, shard_layer_weights  # noqa: E402
@@ -42,7 +45,7 @@ def load(model_dir, layer_ids, rank_shard, device):
     return layers
 
 
-def bench(layers, rows, device):
+def bench(layers, rows, device, impl="staged"):
     c = QWEN38_FLASH_NEXT
     s = layers[0].shard
     gen = torch.Generator(device=device).manual_seed(rows)
@@ -57,12 +60,28 @@ def bench(layers, rows, device):
               for _ in layers]
     out, out_normed = torch.empty_like(hs[0]), torch.empty_like(hs[0])
 
-    def call(i):
-        layer = layers[i % len(layers)]
-        conv, ssm = states[i % len(layers)]
-        partial = layer.attention_phase(hns[i % BUFFERS], slots, conv, ssm, work)
-        partial = layer.mlp_phase(hs[i % BUFFERS], partial, work)
-        layer.finish(partial, layer.served["hc_attn_norm"], out, out_normed, work)
+    if impl == "fused":
+        fused = [FusedGdnLayer(layer.shard, layer.served, layer.packed) for layer in layers]
+        fwork = FusedWorkspace(rows, s, device)
+        ys = [torch.randn(rows, c.hidden, generator=gen, device=device).to(torch.bfloat16) for _ in range(BUFFERS)]
+        gain_prev = torch.rand(rows, c.hc_count, generator=gen, device=device) * 2
+        gain_a, gain_m = torch.empty_like(gain_prev), torch.empty_like(gain_prev)
+        part_a, part_m = torch.empty_like(ys[0]), torch.empty_like(ys[0])
+        h_cur, h1 = torch.empty_like(hs[0]), torch.empty_like(hs[0])
+
+        def call(i):
+            layer = fused[i % len(fused)]
+            conv, ssm = states[i % len(fused)]
+            layer.attention(hs[i % BUFFERS], slots, conv, ssm, part_a, fwork, combine=(ys[i % BUFFERS], gain_prev),
+                            h_out=h_cur, gain_out=gain_a)
+            layer.mlp(h_cur, part_a, gain_a, h1, gain_m, part_m, fwork)
+    else:
+        def call(i):
+            layer = layers[i % len(layers)]
+            conv, ssm = states[i % len(layers)]
+            partial = layer.attention_phase(hns[i % BUFFERS], slots, conv, ssm, work)
+            partial = layer.mlp_phase(hs[i % BUFFERS], partial, work)
+            layer.finish(partial, layer.served["hc_attn_norm"], out, out_normed, work)
 
     for i in range(BUFFERS):  # compile every kernel outside the graph
         call(i)
@@ -105,6 +124,7 @@ def profile(call, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--impl", nargs="+", default=["staged", "fused"], choices=["staged", "fused"])
     parser.add_argument("--tp", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64])
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 2, 4, 5, 6, 8])
@@ -118,12 +138,13 @@ def main():
         for tp in args.tp:
             layers = load(args.model_dir, args.layers, shard(tp, 0), device)
             for rows in args.rows:
-                us, call = bench(layers, rows, device)
-                item = dict(tp=tp, rows=rows, layer_us=round(us, 2))
-                if args.profile:
-                    item["stages_us"] = {k: round(v, 2) for k, v in profile(call, device).items()}
-                report.append(item)
-                print(json.dumps(item), flush=True)
+                for impl in args.impl:
+                    us, call = bench(layers, rows, device, impl)
+                    item = dict(impl=impl, tp=tp, rows=rows, layer_us=round(us, 2))
+                    if args.profile:
+                        item["stages_us"] = {k: round(v, 2) for k, v in profile(call, device).items()}
+                    report.append(item)
+                    print(json.dumps(item), flush=True)
             del layers
             torch.cuda.empty_cache()
     if args.output:

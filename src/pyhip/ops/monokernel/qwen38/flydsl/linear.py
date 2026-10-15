@@ -166,7 +166,7 @@ def make_linear(n, k, tiles, weight="fp8", epilogue="scaled", ksplit=1, n_out=No
 _COMPILED = {}
 
 
-def _call(key, builder, args):
+def _call(key, builder, args, hints=None):
     function = _COMPILED.get(key)
     if function is None:
         if torch.cuda.is_current_stream_capturing():
@@ -174,7 +174,7 @@ def _call(key, builder, args):
         # FlyDSL keys its disk cache on scalar closure values only; parameters held in objects (e.g.
         # Gemm's K) would let another configuration's kernel load, so the full key goes in a hint.
         # flyc.compile also runs the call once; launching again would repeat in-place state updates.
-        with CompilationContext.compile_hints({"monokernel_config": repr(key)}):
+        with CompilationContext.compile_hints({"monokernel_config": repr(key), **(hints or {})}):
             _COMPILED[key] = flyc.compile(builder, *args)
         return
     function(*args)
