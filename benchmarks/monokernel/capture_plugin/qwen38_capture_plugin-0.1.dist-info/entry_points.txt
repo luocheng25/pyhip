@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+qwen38_capture = qwen38_capture_plugin:register

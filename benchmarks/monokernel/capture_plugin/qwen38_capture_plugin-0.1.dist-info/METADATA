@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: qwen38-capture-plugin
+Version: 0.1
+Summary: Qwen3.8 decode-layer tensor capture for the FlyDSL MonoKernel golden check (mytest only)
