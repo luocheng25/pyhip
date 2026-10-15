@@ -6,10 +6,12 @@ rows, no ReplaySSM) every main-model layer other than the PLE layer runs as: the
 attention all-reduce, the fused MLP half (combine with the reduced mixer output .. MoE partial), SGLang's
 MoE all-reduce, and the combine with the next layer's attention-branch norm when SGLang fuses it
 (``hc_consumer``). The attention half of a GDN layer is one fused launch (attention-branch norm ..
-``out_proj`` partial); a full-attention layer runs the fused attention-branch HC mix, then SGLang's own
-``self_attention`` (QSA indexer, attention, gate, ``o_proj``). Everything else (prefill, MTP
-verify/draft, the MTP draft layer, layer 1) stays native. The launches are CUDA-graph capturable;
-kernels compile during SGLang's eager warmup.
+``out_proj`` partial); a full-attention layer runs the fused ``prep`` launch (attention-branch mix ..
+q/k norm, MRoPE and the KV store into SGLang's pool), SGLang's QSA indexer on the mixed input, and the
+fused ``core`` launch (sparse attention over the selected positions .. ``o_proj`` partial). With
+``PYHIP_MONOKERNEL_ATTENTION=native`` the full-attention layer runs the fused mix, then SGLang's own
+``self_attention``. Everything else (prefill, MTP verify/draft, the MTP draft layer, layer 1) stays
+native. The launches are CUDA-graph capturable; kernels compile during SGLang's eager warmup.
 
 ``PYHIP_MONOKERNEL_VALIDATE=1`` (eager batches only) also runs the native layer on the same input
 (and GDN states), logs per-layer metrics against it and keeps the MonoKernel results.
@@ -23,7 +25,7 @@ import os
 import torch
 
 from .config import LayerKind, shard
-from .flydsl.fused import FusedGdnLayer, FusedLayer, FusedWorkspace
+from .flydsl.fused import FusedAttentionLayer, FusedGdnLayer, FusedLayer, FusedWorkspace
 from .flydsl.hc import hc_combine_norm
 from .weights import SGLANG_NAMES, pack_layer
 
@@ -41,6 +43,7 @@ class _Runtime:
         self.layers = {}
         self.workspaces = {}
         self.validate = _enabled("PYHIP_MONOKERNEL_VALIDATE")
+        self.native_attention = os.environ.get("PYHIP_MONOKERNEL_ATTENTION", "mono") == "native"
         self.calls = 0
         self.capture_ids = False
         self.native_ids = None
@@ -68,7 +71,7 @@ class _Runtime:
             served = {name: params[path] for name, path in SGLANG_NAMES[kind].items()}
             with torch.no_grad():
                 packed = pack_layer(served, kind, rank_shard.config)
-            mono = (FusedGdnLayer if kind is LayerKind.LINEAR else FusedLayer)(rank_shard, served, packed)
+            mono = (FusedGdnLayer if kind is LayerKind.LINEAR else FusedAttentionLayer)(rank_shard, served, packed)
             self.layers[layer.layer_id] = mono
             logger.info("MonoKernel %s layer %d ready (tp=%d rank=%d)", kind.value, layer.layer_id, rank_shard.tp,
                         rank_shard.rank)
@@ -94,12 +97,39 @@ def _gdn_state(layer):
     return slots.to(torch.int32), cache.conv[0], cache.temporal
 
 
-def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, self_attention=None):
-    """One decode layer; ``self_attention(x)`` (full-attention layers) returns SGLang's ``o_proj`` partial."""
+def _int64(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.dtype == torch.int64 else tensor.to(torch.int64)
+
+
+def _attention_core(rt: _Runtime, mono: FusedAttentionLayer, layer, h, work, gain, positions, forward_batch):
+    """``prep`` launch, SGLang's QSA indexer on the mixed input, ``core`` launch: this rank's ``o_proj``
+    partial of a full-attention layer."""
+    from sglang.srt.model_executor.forward_context import get_req_to_token_pool, get_token_to_kv_pool
+
+    rows, hidden = h.shape[0], mono.shard.config.hidden
+    x = torch.empty(rows, hidden, dtype=torch.bfloat16, device=h.device)
+    if rt.native_attention:
+        mono.mix(h, x, work, gain)
+        return layer.self_attention(positions=positions, hidden_states=x, forward_batch=forward_batch)
+    pool = get_token_to_kv_pool()
+    k_cache, v_cache = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
+    rotary = layer.rotary_emb
+    rotary._match_cos_sin_cache_dtype(x)
+    mono.prep(h, x, positions, _int64(forward_batch.out_cache_loc), k_cache, v_cache, rotary.cos_sin_cache, work,
+              gain)
+    topk = layer._compute_qsa_topk_indices(x, positions, forward_batch).to(torch.int32).contiguous()
+    part = torch.empty(rows, hidden, dtype=torch.bfloat16, device=h.device)
+    mono.core(topk, get_req_to_token_pool().req_to_token, _int64(forward_batch.req_pool_indices),
+              _int64(forward_batch.seq_lens), k_cache, v_cache, part, work)
+    return part
+
+
+def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, attention=None):
+    """One decode layer; ``attention = (positions, forward_batch)`` for a full-attention layer."""
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
     from sglang.srt.layers.dp_attention import attn_tp_all_reduce
 
-    mono = rt.layer(layer, LayerKind.LINEAR if self_attention is None else LayerKind.FULL)
+    mono = rt.layer(layer, LayerKind.LINEAR if attention is None else LayerKind.FULL)
     width = mono.shard.config.hc_width
     h = hidden_states if hidden_states.shape[-1] == width else torch.cat([hidden_states] * mono.shard.config.hc_count,
                                                                          dim=-1)
@@ -108,14 +138,12 @@ def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, self_attention=
     work = rt.workspace(mono, h.device)
     hidden = mono.shard.config.hidden
     gains = torch.empty(2, rows, mono.shard.config.hc_count, dtype=torch.float32, device=h.device)
-    if self_attention is None:
+    if attention is None:
         slots, conv, ssm = _gdn_state(layer)
         part_a = torch.empty(rows, hidden, dtype=torch.bfloat16, device=h.device)
         mono.attention(h, slots, conv, ssm, part_a, work, gain_out=gains[0])
     else:
-        x = torch.empty(rows, hidden, dtype=torch.bfloat16, device=h.device)
-        mono.mix(h, x, work, gains[0])
-        part_a = self_attention(x)
+        part_a = _attention_core(rt, mono, layer, h, work, gains[0], *attention)
     attn = attn_tp_all_reduce(part_a)
     h1 = torch.empty_like(h)
     part_m = torch.empty_like(attn)
@@ -138,16 +166,16 @@ def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict:
                 ulp1=float((delta <= ulp).float().mean()))
 
 
-def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, self_attention=None):
+def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, attention=None):
     """MonoKernel layer, then the native layer from the same input (GDN: and states), compared. A
     full-attention layer's KV, indexer ring and compressed-key writes are rewritten by the native run before
     it reads them, so they need no restore; they end up native."""
-    gdn = self_attention is None
+    gdn = attention is None
     if gdn:
         slots, conv, ssm = _gdn_state(layer)
         index = slots.long()
         conv_before, ssm_before = conv[index].clone(), ssm[index].clone()
-    out, normed = _mono_layer(rt, layer, hidden_states, hc_consumer, self_attention)
+    out, normed = _mono_layer(rt, layer, hidden_states, hc_consumer, attention)
     rows = out.shape[0]
     mono = rt.layers[layer.layer_id]
     slots_per_row = mono.shard.config.top_k + 1
@@ -204,14 +232,11 @@ def attention_layer_forward(original, layer, positions, hidden_states, residual,
         return original(layer, positions, hidden_states, residual, forward_batch, **kwargs)
     rt.calls += 1
     consumer = kwargs.get("hc_consumer")
-
-    def self_attention(x):
-        return layer.self_attention(positions=positions, hidden_states=x, forward_batch=forward_batch)
-
+    attention = (positions, forward_batch)
     if rt.validate and not torch.cuda.is_current_stream_capturing():
         return _validated(rt, lambda: original(layer, positions, hidden_states, residual, forward_batch, **kwargs),
-                          layer, hidden_states, consumer, self_attention)
-    return _mono_layer(rt, layer, hidden_states, consumer, self_attention)
+                          layer, hidden_states, consumer, attention)
+    return _mono_layer(rt, layer, hidden_states, consumer, attention)
 
 
 _HOOKS = {
@@ -232,4 +257,5 @@ def register():
         hooks["sglang.srt.models.qwen2_moe.Qwen2MoeSparseMoeBlock._append_shared_to_topk_output"] = append_shared
     for target, hook in hooks.items():
         HookRegistry.register(target, hook, HookType.AROUND)
-    logger.info("MonoKernel decode hooks registered (validate=%s)", _RUNTIME.validate)
+    logger.info("MonoKernel decode hooks registered (validate=%s, attention=%s)", _RUNTIME.validate,
+                "native" if _RUNTIME.native_attention else "mono")
