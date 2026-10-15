@@ -416,7 +416,40 @@ TP4 C8 输出吞吐 298.4 tok/s，高于 PyHIP QSA 的 273.1 和 MonoKernel 的 
 | `h1` | BF16 [rows, 10240] | mlp_norm |
 | `sync` | 两行 128 字节计数器（到达、离开） | grid barrier |
 
-### 1. 接口层：SGLang → 插件
+### 1. 接口层：SGLang 如何进入插件
+
+#### 1.1 进程启动：注册并打上 hook
+
+每个 TP rank 都是一个 scheduler 子进程，各自执行一遍下面的流程，所以每个 rank 的 decoder layer 都被包装。
+
+```python
+# SGLang：managers/scheduler.py 中 scheduler 子进程的入口在最开始调用 load_plugins()
+def load_plugins():                                           # plugins/__init__.py（只读）
+    for ep in entry_points(group="sglang.srt.plugins"):      # GENERAL_PLUGINS_GROUP
+        if SGLANG_PLUGINS and ep.name not in SGLANG_PLUGINS.split(","): continue   # 白名单，为空时全部加载
+        ep.load()()                                           # 调用 register()；serve.py 设 SGLANG_PLUGINS=qwen38_monokernel
+    HookRegistry.apply_hooks()                                # 把登记过的方法替换为包装函数（plugins/hook_registry.py）
+
+# 入口点由 benchmarks/monokernel/plugin/qwen38_monokernel_plugin-0.1.dist-info/entry_points.txt 声明：
+#   [sglang.srt.plugins] qwen38_monokernel = qwen38_monokernel_plugin:register
+# 该目录需在 PYTHONPATH 中；qwen38_monokernel_plugin.py 只有一行：
+#   from pyhip.ops.monokernel.qwen38.sglang_plugin import register
+def register():                                               # sglang_plugin.py
+    if not PYHIP_MONOKERNEL: return                           # 未设置：不注册任何 hook，后面全部是原生实现
+    _RUNTIME = _Runtime()
+    #   validate = PYHIP_MONOKERNEL_VALIDATE；native_attention = (PYHIP_MONOKERNEL_ATTENTION == "native")
+    #   fused_ar = (PYHIP_MONOKERNEL_AR != "aiter")；layers = {}，workspaces = {}（懒初始化，见 2.1）
+    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpLinearDecoderLayer.forward",
+                          gdn_layer_forward, AROUND)
+    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpAttentionDecoderLayer.forward",
+                          attention_layer_forward, AROUND)
+    if validate:                                              # 只在验证模式（场景 D）
+        HookRegistry.register("sglang.srt.models.qwen2_moe.Qwen2MoeSparseMoeBlock._append_shared_to_topk_output",
+                              append_shared, AROUND)
+# AROUND：apply_hooks 后，Layer.forward(*args) 变成 hook(original_forward, *args)（hook_registry._wrap_fn）
+```
+
+#### 1.2 每次前向：从模型循环到分派
 
 ```python
 # SGLang：models/qwen4_exp.py Qwen4ExpModel.forward（只读，未修改）
@@ -425,81 +458,82 @@ residual = None                                               # 层间：上一�
 for i in range(48):
     hidden_states, residual = layers[i](positions=positions, hidden_states=hidden_states, residual=residual,
                                         forward_batch=forward_batch, hc_consumer=_hc_consumers[i], ...)
+    # layers[i](...) 实际进入下面的 hook：GDN 层 → gdn_layer_forward，full attention 层 → attention_layer_forward
 hidden_states, _ = hyper_connection_mixer.mix(hidden_states, residual)
-
-# 插件加载：SGLANG_PLUGINS=qwen38_monokernel → 入口点 sglang.srt.plugins:qwen38_monokernel
-#   （benchmarks/monokernel/plugin/qwen38_monokernel_plugin.py）→ sglang_plugin.register
-# HookRegistry、AROUND：plugins/hook_registry.py；get_attn_backend、get_token_to_kv_pool、get_req_to_token_pool：
-#   model_executor/forward_context.py；LINEAR、FULL：config.LayerKind；_int64：sglang_plugin._int64（转 int64）
-def register():                                               # sglang_plugin.py
-    if not PYHIP_MONOKERNEL: return
-    _RUNTIME = _Runtime()     # validate = PYHIP_MONOKERNEL_VALIDATE；native_attention = (PYHIP_MONOKERNEL_ATTENTION == "native")
-                              # fused_ar = (PYHIP_MONOKERNEL_AR != "aiter")
-    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpLinearDecoderLayer.forward", gdn_layer_forward, AROUND)
-    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpAttentionDecoderLayer.forward",
-                          attention_layer_forward, AROUND)
+# _hc_consumers[i]：下一层的 attn_hyper_connection；第 47 层为 hyper_connection_mixer；
+#   下一层带 PLE 时为 None（只有第 0 层，因为第 1 层带 PLE）
 
 def gdn_layer_forward(original, layer, hidden_states, residual=None, **kw):          # sglang_plugin.py
-    if not _RUNTIME.accepts(layer, kw["forward_batch"], hidden_states):
-        return original(layer, hidden_states, residual, **kw)                         # 原生层
-    return _mono_layer(_RUNTIME, layer, hidden_states, kw["hc_consumer"], hn=residual)
+    rt = _RUNTIME
+    if rt is None or not rt.accepts(layer, kw["forward_batch"], hidden_states):
+        return original(layer, hidden_states, residual, **kw)                         # 场景 E
+    rt.calls += 1
+    if rt.validate and not torch.cuda.is_current_stream_capturing():
+        return _validated(rt, lambda: original(layer, hidden_states, residual, **kw),
+                          layer, hidden_states, kw["hc_consumer"], hn=residual)       # 场景 D
+    return _mono_layer(rt, layer, hidden_states, kw["hc_consumer"], hn=residual)     # 场景 A、B
 
 def attention_layer_forward(original, layer, positions, hidden_states, residual, forward_batch, **kw):
-    if not _RUNTIME.accepts(layer, forward_batch, hidden_states):
-        return original(layer, positions, hidden_states, residual, forward_batch, **kw)
-    return _mono_layer(_RUNTIME, layer, hidden_states, kw["hc_consumer"], (positions, forward_batch), hn=residual)
-# 两个 hook 在 VALIDATE=1 且不在 graph 捕获中时改走 _validated（再跑两次原生层并比较），服务路径不经过
+    # 与 gdn_layer_forward 相同，只是多传 attention = (positions, forward_batch)：
+    #   不接受 → original(layer, positions, hidden_states, residual, forward_batch, **kw)        # 场景 E
+    #   验证   → _validated(rt, <原生调用>, layer, hidden_states, kw["hc_consumer"], attention, hn=residual)   # 场景 D
+    #   其余   → _mono_layer(rt, layer, hidden_states, kw["hc_consumer"], attention, hn=residual)              # A、B、C
 
 def _Runtime.accepts(layer, batch, hidden_states):                                   # sglang_plugin.py
-    return (batch.forward_mode.is_decode()
+    return (batch is not None and batch.forward_mode.is_decode()                      # 只接受普通 DECODE
             and layer.layer_id != 1 and layer.ple is None                             # PLE_LAYER = 1
             and layer.config.num_hidden_layers != 1                                    # MTP draft 模型只有 1 层
             and 0 < hidden_states.shape[0] <= 64                                       # CAPACITY
             and get_attn_backend().linear_attn_backend.forward_metadata.replayssm_write_pos is None)
+# get_attn_backend、get_token_to_kv_pool、get_req_to_token_pool：model_executor/forward_context.py
+# LINEAR、FULL：config.LayerKind；_int64：sglang_plugin._int64（转 int64）
 
 def _mono_layer(rt, layer, hidden_states, hc_consumer, attention=None, hn=None):     # sglang_plugin.py
     kind = LINEAR if attention is None else FULL
-    mono = rt.layer(layer, kind)                                                      # §2
-    h = hidden_states if hidden_states.shape[-1] == 10240 else cat([hidden_states] * 4, dim=-1)
+    mono = rt.layer(layer, kind)                                                      # 2.1
+    h = hidden_states if hidden_states.shape[-1] == 10240 else cat([hidden_states] * 4, dim=-1)   # 第 0 层
     if hn is not None and (hn.shape != h.shape or not hn.is_contiguous()):
         hn = None
-    work = rt.workspace(mono, h.device)                                               # §2
+    work = rt.workspace(mono, h.device)                                               # 2.1
     norm_next = hc_consumer.hc_norm.weight if hc_consumer is not None else mono.served["hc_attn_norm"]
     out, normed = empty_like(h), empty_like(h)                                        # BF16 [rows, 10240]
     if work.comm is None or (kind == FULL and rt.native_attention):
-        _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention)    # §2 末尾
-    elif kind == LINEAR:
-        slots, conv_state, ssm_state = _gdn_state(layer)
-        mono.layer(h, slots, conv_state, ssm_state, norm_next, out, normed, work, hn=hn)      # FusedGdnLayer.layer
+        _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention)    # 场景 B、C
     else:
-        positions, fb = attention
-        pool, k_cache, v_cache, req_to_token, req_pool, seq_lens = _attention_pools(layer, fb)
-        layer.rotary_emb._match_cos_sin_cache_dtype(h)
-        mono.layer(h, positions, _int64(fb.out_cache_loc), k_cache, v_cache, layer.rotary_emb.cos_sin_cache,
-                   req_pool, seq_lens, req_to_token, pool.get_qsa_key_state_buffer(layer.layer_id),
-                   pool.qsa_rope_position_buffer, pool.get_qsa_compressed_k_buffer(layer.layer_id),
-                   norm_next, out, normed, work, hn=hn)                               # FusedAttentionLayer.layer
+        mono.layer(...)                                                                # 场景 A
     return out, (normed if hc_consumer is not None else None)                         # 下一层的 (hidden_states, residual)
-
-def _gdn_state(layer):                                                                # sglang_plugin.py
-    backend = get_attn_backend().linear_attn_backend
-    cache = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    return backend.forward_metadata.mamba_cache_indices.to(int32), cache.conv[0], cache.temporal
-
-def _attention_pools(layer, fb):                                                      # sglang_plugin.py
-    pool = get_token_to_kv_pool()
-    return (pool, pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id),
-            get_req_to_token_pool().req_to_token, _int64(fb.req_pool_indices), _int64(fb.seq_lens))
 ```
 
-### 2. 宿主层：权重、工作区、启动
+### 2. 各场景的调用链
+
+#### 2.0 场景总表
+
+| 场景 | 触发条件 | 每层的 GPU 启动 | SGLang 仍执行的部分 |
+|---|---|---|---|
+| A mono 模式（服务默认） | `PYHIP_MONOKERNEL=1`；`PYHIP_MONOKERNEL_AR` 不是 aiter；attention TP 等于 TP；attention 层还要求 `PYHIP_MONOKERNEL_ATTENTION` 不是 native | 1 次：`gdn_layer` 或 `attn_layer` | 无（整层替换，含两次 all-reduce） |
+| B 拆分模式（AITER all-reduce） | `PYHIP_MONOKERNEL_AR=aiter`，或 attention TP 不等于 TP（DP attention，未测）：`work.comm is None` | GDN 层：`attention`、`mlp`、`hc_combine_norm`；attention 层：`prep`、`core`、`mlp`、`hc_combine_norm`；另加 SGLang 的 2 次 all-reduce | `attn_tp_all_reduce`、`tensor_model_parallel_all_reduce` |
+| C 拆分模式（原生 attention） | `PYHIP_MONOKERNEL_ATTENTION=native`；只影响 attention 层，GDN 层按 A 或 B | `mix`、SGLang 的 attention、all-reduce、`mlp`、all-reduce、`hc_combine_norm` | `self_attention`（qkv、q/k norm、RoPE、KV 写入、QSA indexer、稀疏注意力、o_proj）与 2 次 all-reduce |
+| D 验证模式 | `PYHIP_MONOKERNEL_VALIDATE=1`，且当前批不在 CUDA graph 捕获中 | 先按 A、B 或 C 跑一遍 MonoKernel，再跑两遍原生层 | 原生层整层两遍（参考值、重复值） |
+| E 原生 | 插件未启用，或 `accepts` 为假 | 无 MonoKernel 启动 | 整层 |
+
+SGLang 自己的 `SGLANG_USE_PYHIP_QSA=1`（serve.py 的 mono_pyhip 臂）只改变 SGLang 原生路径的实现：prefill，以及场景 C、E 中原生 attention 的实现。它不改变 A、B 的进入方式。
+
+#### 2.1 所有 MonoKernel 场景共用：懒初始化与编译
+
+第一次进入 `_mono_layer` 时才构造，之后复用：
+
+- `_Runtime.layer` 每层构造一次；
+- `_Runtime.workspace` 每个设备构造一次，其中 `PeerMemory` 是 TP 组的集合操作，各 rank 在同一层的同一次调用里同时到达；
+- `_call` 对每个新的 key 编译一次。
+
+SGLang 在捕获 decode CUDA graph 前，会对每个 batch 大小先 eager 跑两遍前向（`model_executor/runner_backend/` 下的 graph 后端，例如 `full_cuda_graph_backend.py` 的 `for _ in range(2): forward_fn()`），编译就发生在这两遍里。如果 graph 捕获时遇到没编译过的 key，`_call` 直接报错。
 
 ```python
-def _Runtime.layer(layer, kind):                    # sglang_plugin.py；每层首次调用时构造并缓存
+def _Runtime.layer(layer, kind):                    # sglang_plugin.py；每层首次调用时构造并缓存在 rt.layers
     # get_tensor_model_parallel_*、get_tp_group、get_attn_tp_group：SGLang distributed/
     rank_shard = shard(tp=get_tensor_model_parallel_world_size(), rank=get_tensor_model_parallel_rank())  # config.shard
     params = dict(layer.named_parameters())
-    served = {name: params[path] for name, path in SGLANG_NAMES[kind].items()}       # weights.SGLANG_NAMES
+    served = {name: params[path] for name, path in SGLANG_NAMES[kind].items()}       # weights.SGLANG_NAMES，原地引用
     packed = pack_layer(served, kind, QWEN38_FLASH_NEXT)
     return (FusedGdnLayer if kind == LINEAR else FusedAttentionLayer)(rank_shard, served, packed)
 
@@ -510,13 +544,13 @@ def pack_layer(served, kind, config):               # weights.py；shuffle = shu
     packed["router_shared"] = cat(shuffle(served["router"]), shuffle(pad16(served["shared_gate"])))  # [528, 2560]
     if kind == LINEAR: packed["gdn_ba"] = shuffle(pad16(served["gdn_ba"]))         # [BA_ROWS(48|32), 2560]
     else:              packed["index_qk"] = shuffle(served["index_qk"])            # [640, 2560]
-    # 另有 router、shared_gate 的单独副本，供拆分路径与阶段内核使用
+    # 另有 router、shared_gate 的单独副本，供阶段内核使用
 
-def _Runtime.workspace(mono, device):               # sglang_plugin.py；每设备一次
+def _Runtime.workspace(mono, device):               # sglang_plugin.py；每设备一次，缓存在 rt.workspaces
     max_blocks = ceil(get_req_to_token_pool().req_to_token.shape[1] / 64) * 16          # 262148 → 65552
     tp_group = get_tp_group()
     comm = (PeerMemory(region_bytes(tp, 64), tp_group.cpu_group, device)
-            if fused_ar and get_attn_tp_group().world_size == tp_group.world_size else None)
+            if fused_ar and get_attn_tp_group().world_size == tp_group.world_size else None)   # None → 场景 B
     return FusedWorkspace(64, mono.shard, device, max_blocks, comm)
     # FusedWorkspace（fused.py）：dims = shard_dims(shard, max_blocks)
     #   = (conv_dim, value_dim, v_heads, INTER_P, 512, 11, heads, 65552)；scratch = zeros(scratch_layout(dims, 64) 字节)
@@ -529,6 +563,48 @@ def PeerMemory(size, group, device):                # peer.py；每个 rank 执�
     table = int64[16]([*bases, 0 补到 8 项, rank, 0 ...])                  # TABLE_WORDS = 16
     dist.barrier(group)                             # 所有区域清零并映射后才会有 kernel 写入
 
+def _call(key, builder, args, hints):                # linear.py；所有 MonoKernel 启动都经过这里
+    if key not in _COMPILED:
+        if torch.cuda.is_current_stream_capturing(): raise RuntimeError("warm MonoKernel stages before graph capture")
+        with CompilationContext.compile_hints({"monokernel_config": repr(key), **hints}):
+            _COMPILED[key] = flyc.compile(builder, *args)      # 编译并执行这一次（不再重复启动）
+    else:
+        _COMPILED[key](*args)    # @flyc.jit launch：kernel(...).launch(grid, block, stream)
+```
+
+#### 2.2 场景 A：mono 模式（服务默认）
+
+调用链如下（每层一次 GPU 启动，两次 all-reduce 都在启动内）：
+
+```text
+Qwen4ExpModel.forward → layers[i].forward（包装）→ gdn_layer_forward / attention_layer_forward
+  → _mono_layer → FusedGdnLayer.layer / FusedAttentionLayer.layer → _call → kernel gdn_layer / attn_layer（§3、§4）
+```
+
+```python
+# _mono_layer 中 work.comm 非 None、且不是 native attention 时：
+if kind == LINEAR:
+    slots, conv_state, ssm_state = _gdn_state(layer)
+    mono.layer(h, slots, conv_state, ssm_state, norm_next, out, normed, work, hn=hn)
+else:
+    positions, fb = attention
+    pool, k_cache, v_cache, req_to_token, req_pool, seq_lens = _attention_pools(layer, fb)
+    layer.rotary_emb._match_cos_sin_cache_dtype(h)
+    mono.layer(h, positions, _int64(fb.out_cache_loc), k_cache, v_cache, layer.rotary_emb.cos_sin_cache,
+               req_pool, seq_lens, req_to_token, pool.get_qsa_key_state_buffer(layer.layer_id),
+               pool.qsa_rope_position_buffer, pool.get_qsa_compressed_k_buffer(layer.layer_id),
+               norm_next, out, normed, work, hn=hn)
+
+def _gdn_state(layer):                                                                # sglang_plugin.py
+    backend = get_attn_backend().linear_attn_backend
+    cache = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    return backend.forward_metadata.mamba_cache_indices.to(int32), cache.conv[0], cache.temporal
+
+def _attention_pools(layer, fb):                                                      # sglang_plugin.py
+    pool = get_token_to_kv_pool()
+    return (pool, pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id),
+            get_req_to_token_pool().req_to_token, _int64(fb.req_pool_indices), _int64(fb.seq_lens))
+
 def FusedGdnLayer.layer(h, slots, conv_state, ssm_state, norm_next, out, normed, work, hn=None):   # fused.py
     rows = h.shape[0]; tiles = tiles_for(rows); tp = work.comm.world; normed_in = hn is not None
     all_phases = tuple(range(len(layer_phases(GDN_LAYER_PHASES, normed_in))))      # 18，或 19（含 norm）
@@ -539,6 +615,7 @@ def FusedGdnLayer.layer(h, slots, conv_state, ssm_state, norm_next, out, normed,
     #          norm_next, out, normed, work.comm.table)；指针顺序 = GDN_LAYER_ARGS
     key = ("gdn_layer", device, dims, k_heads, BA_ROWS, tiles, 64, eps, 80, tp, normed_in, all_phases, False)
     _call(key, make_gdn_layer(dims, k_heads, BA_ROWS, tiles, 64, eps, 80, tp, normed_in, all_phases), args, HINTS)
+    # launch：gdn_layer(...).launch(grid=(80,1,1), block=(512,1,1), stream=current_stream)
 
 def FusedAttentionLayer.layer(h, positions, cache_loc, k_cache, v_cache, table, req_pool, seq_lens, req_to_token,
                               ring, ring_pos, compressed, norm_next, out, normed, work, hn=None):    # fused.py
@@ -551,27 +628,117 @@ def FusedAttentionLayer.layer(h, positions, cache_loc, k_cache, v_cache, table, 
             req_to_token.numel() * 4, ring.shape[0], compressed.numel() * 2, current_stream)   # 顺序 = ATTN_LAYER_ARGS
     key = ("attn_layer", device, dims, tiles, 64, eps, 80, tp, normed_in, all_phases, False)
     _call(key, make_attn_layer(dims, tiles, 64, eps, 80, tp, normed_in, all_phases), args, HINTS)
-
-def _call(key, builder, args, hints):                # linear.py
-    if key not in _COMPILED:                         # SGLang 的 eager warmup 中发生；graph 捕获时首次遇到会报错
-        with CompilationContext.compile_hints({"monokernel_config": repr(key), "waves_per_eu": 2}):
-            _COMPILED[key] = flyc.compile(builder, *args)      # 编译并执行这一次（不再重复启动）
-    else:
-        _COMPILED[key](*args)    # @flyc.jit launch：gdn_layer / attn_layer(...).launch(grid=(80,1,1), block=(512,1,1), stream)
-
-def _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention):        # 非服务默认路径
-    # PYHIP_MONOKERNEL_AR=aiter，或 attention 层 PYHIP_MONOKERNEL_ATTENTION=native，或 attention TP ≠ TP
-    # gains = FP32 [2, rows, 4]；part_a、part_m、x = BF16 [rows, 2560]；h1 = BF16 [rows, 10240]（均为新分配）
-    if GDN: mono.attention(h, slots, conv, ssm, part_a, work, gain_out=gains[0])      # make_attention：1 次启动
-    elif native_attention: mono.mix(h, x, work, gains[0]); part_a = layer.self_attention(positions, x, fb)
-    else: mono.prep(...); mono.core(..., part_a, work)                                # make_attn_prep、make_attn_core
-    attn = attn_tp_all_reduce(part_a)                                                 # SGLang/AITER
-    mono.mlp(h, attn, gains[0], h1, gains[1], part_m, work)                           # make_mlp
-    moe = tensor_model_parallel_all_reduce(part_m)                                    # SGLang/AITER
-    hc_combine_norm(h1, moe, gains[1], norm_next, out, normed)                        # flydsl/hc.py 单独 kernel
 ```
 
+- **层间衔接**：第 0 层没有 `residual`，`normed_in=False`，启动内先做 norm；输入是 embedding 复制成的 4 个分支。第 0 层的 `hc_consumer` 为 None，返回 `(out, None)` 给原生的第 1 层。第 2 层起，`residual` 是上一层（第 1 层由原生实现）融合出的本层 norm，`normed_in=True`。第 47 层的 `NORM_NEXT` 是 `hyper_connection_mixer` 的 norm，返回的 `normed` 交给最后的 `hyper_connection_mixer.mix`。
+- **CUDA graph**：捕获时 hook 照常执行，launch 被录进 graph，`out`、`normed` 从 graph 的内存池分配。重放时不经过 Python，直接重放录下的 `gdn_layer`/`attn_layer`，指针都指向 SGLang 的静态输入缓冲和池。
+
+#### 2.3 场景 B：拆分模式（AITER all-reduce）
+
+调用链：`_mono_layer`（`work.comm is None`）→ `_split_layer`。每层在两次 all-reduce 处拆开，两次 all-reduce 由 SGLang（AITER custom all-reduce）完成。这个模式不使用 `residual`（`hn`），第一个启动自己从 `h` 做 norm。
+
+```python
+def _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention):        # sglang_plugin.py
+    rows = h.shape[0]
+    gains = empty(2, rows, 4, FP32)                 # [0]：attention 分支 combine 增益；[1]：MLP 分支
+    if attention is None:                           # GDN 层
+        slots, conv, ssm = _gdn_state(layer)
+        part_a = empty(rows, 2560, BF16)
+        mono.attention(h, slots, conv, ssm, part_a, work, gain_out=gains[0])    # FusedGdnLayer.attention → kernel attention
+    else:                                           # full attention 层
+        part_a = _attention_core(rt, mono, layer, h, work, gains[0], *attention)
+    attn = attn_tp_all_reduce(part_a)               # SGLang layers/dp_attention.py
+    h1, part_m = empty_like(h), empty_like(attn)
+    mono.mlp(h, attn, gains[0], h1, gains[1], part_m, work)                      # FusedLayer.mlp → kernel mlp
+    moe = tensor_model_parallel_all_reduce(part_m)  # SGLang distributed/
+    hc_combine_norm(h1, moe, gains[1], norm_next, out, normed)                   # flydsl/hc.py → kernel hc_combine_norm
+
+def _attention_core(rt, mono, layer, h, work, gain, positions, fb):              # sglang_plugin.py
+    x, part = empty(rows, 2560, BF16), empty(rows, 2560, BF16)
+    if rt.native_attention: ...                     # 场景 C
+    k_cache, v_cache, req_to_token, req_pool, seq_lens = _attention_prep(mono, layer, h, x, work, gain, positions, fb)
+    #   _attention_prep：_attention_pools + _match_cos_sin_cache_dtype(x)
+    #   + mono.prep(h, x, positions, _int64(fb.out_cache_loc), k_cache, v_cache, cos_sin_cache, work, gain,
+    #               req_pool, seq_lens, req_to_token, ring, ring_pos, compressed)  # FusedAttentionLayer.prep → kernel prep
+    mono.core(req_to_token, req_pool, seq_lens, k_cache, v_cache, part, work)   # FusedAttentionLayer.core → kernel core
+    return part
+```
+
+拆分模式的各个 kernel 与 §4 的阶段对应如下。前五个都是 80 个 CTA × 512 线程的常驻启动，阶段之间用 grid barrier。它们与 §3 的整层启动有三处不同：
+
+- 输出写进宿主传入的缓冲（`OUT`），不推送到其它 rank，也没有握手；
+- `mlp_norm` 的 y 来自 SGLang 归约后的 `attn`，不是 `comm.sources(0)`；
+- 增益、`h1` 是宿主传入的张量，不在 scratch 中。
+
+| kernel（构造函数） | 宿主方法 | 阶段（§4） | 写出 |
+|---|---|---|---|
+| `attention`（`fused.make_attention`） | `FusedGdnLayer.attention` | norm、hc_down、hc_lowrank、hc_mix_up、quant_ba、qkvz_conv、recurrent、quant_y、out_proj | `part_a`（out_proj 部分和）、`gains[0]`、conv/SSM 状态 |
+| `prep`（`fused.make_attn_prep`） | `FusedAttentionLayer.prep` | norm、hc_down、hc_lowrank、hc_mix_up、quant_index、qkv、qk_prep、compress、logits | `x`、`gains[0]`、KV/ring/compressed；scratch 中的 `S.qkv`、`S.q`、`S.index_logits` 供随后的 `core` 读取 |
+| `core`（`fused.make_attn_core`） | `FusedAttentionLayer.core` | topk、scores、values、combine_gate、quant_y、o_proj | `part_a`（o_proj 部分和） |
+| `mix`（`fused.make_mix`） | `FusedLayer.mix` | norm、hc_down、hc_lowrank、hc_mix_up | `x`、`gains[0]`（场景 C） |
+| `mlp`（`fused.make_mlp`） | `FusedLayer.mlp` | mlp_norm、hc_down、hc_lowrank、hc_mix_up、router、topk、plan、moe_up、moe_down | `h1`、`gains[1]`、`part_m`（MoE 部分和） |
+| `hc_combine_norm`（`hc.make_combine_norm`） | `hc.hc_combine_norm` | 同 §4 的 combine，但每个（行，分支）一个 320 线程 CTA，共 rows·4 个 CTA | `out`、`normed` |
+
+#### 2.4 场景 C：拆分模式（原生 attention）
+
+调用链：`attention_layer_forward` → `_mono_layer`（`kind == FULL and rt.native_attention`）→ `_split_layer` → `_attention_core` 的原生分支。GDN 层不受影响，仍按场景 A 或 B。
+
+```python
+# _attention_core 中 rt.native_attention 为真时
+mono.mix(h, x, work, gain)                                   # FusedLayer.mix → kernel mix：norm + HC mix → x、gains[0]
+part = layer.self_attention(positions=positions, hidden_states=x, forward_batch=fb)
+#   SGLang 原生：qkv_proj、q/k norm、RoPE、KV 写入、QSA indexer、稀疏注意力、o_proj，返回本 rank 的部分和
+#   （SGLANG_USE_PYHIP_QSA=1 时这里的 QSA 用 PyHIP 实现）
+return part
+# 之后同场景 B：attn_tp_all_reduce → mono.mlp → tensor_model_parallel_all_reduce → hc_combine_norm
+```
+
+#### 2.5 场景 D：验证模式（`PYHIP_MONOKERNEL_VALIDATE=1`）
+
+只在 eager 批上比较：graph 捕获的批照常走 A、B 或 C，不比较。serve.py 的 validate 模式加 `--disable-cuda-graph`，所以每个 decode 批都比较。MonoKernel 一侧调用 `_mono_layer`，按当前环境变量走 A、B 或 C，所以验证覆盖的就是当前配置的模式。
+
+```python
+def _validated(rt, run_native, layer, hidden_states, hc_consumer, attention=None, hn=None):   # sglang_plugin.py
+    gdn = attention is None
+    if gdn:                                          # GDN 状态会被两边各更新一次，先保存
+        slots, conv, ssm = _gdn_state(layer); index = slots.long()
+        conv_before, ssm_before = conv[index].clone(), ssm[index].clone()
+    out, normed = _mono_layer(rt, layer, hidden_states, hc_consumer, attention, hn)          # MonoKernel（A、B、C）
+    ids = work.view("ids", (rows, 11), int32).clone()                                         # MonoKernel 的路由（S.ids）
+    if gdn:
+        conv_mono, ssm_mono = conv[index].clone(), ssm[index].clone()
+        conv[index], ssm[index] = conv_before, ssm_before                                     # 恢复，让原生层同起点
+    rt.capture_ids = True
+    ref_out, ref_normed = run_native()               # 原生层；append_shared 把原生 topk_ids（含共享专家）存进 rt.native_ids
+    rt.capture_ids = False
+    report = {layer, rows, out: _metrics(out, ref_out)}                                       # rel_l2、max_abs、ulp1
+    if gdn:
+        report.conv, report.ssm = _metrics(conv_mono, conv[index]), _metrics(ssm_mono, ssm[index])
+        conv[index], ssm[index] = conv_before, ssm_before
+    repeat_out, _ = run_native()                     # 原生层再跑一遍：原生自身的波动（HC mix、MoE 原子累加等）
+    report.native_repeat = _metrics(repeat_out, ref_out)
+    if normed is not None and ref_normed is not None: report.normed = _metrics(normed, ref_normed)
+    same = 每行排序后的 ids 与 rt.native_ids 相同
+    report.route_mismatch_rows = 行数(~same);  report.out_same_route = _metrics(out[same], ref_out[same])
+    logger.info("MonoKernel validate %s", report)
+    if gdn: conv[index], ssm[index] = conv_mono, ssm_mono                                      # 后续步骤沿用 MonoKernel 的状态
+    return out, normed                               # 下一层用 MonoKernel 的结果
+# attention 层的 KV、ring、compressed 由 MonoKernel 写入后，又被两次原生运行在读取前覆盖，最终是原生写入的值
+```
+
+#### 2.6 场景 E：原生（不进入 MonoKernel）
+
+以下情况由 hook 直接调用 `original(...)`，整层走 SGLang 原生实现：
+
+- 没有设置 `PYHIP_MONOKERNEL=1`（此时根本没有注册 hook），或 `SGLANG_PLUGINS` 不含 `qwen38_monokernel`；
+- 不是普通 DECODE：prefill/extend、MTP 的 draft extend 与 target verify、idle 批；
+- 第 1 层（PLE）；MTP draft 模型的层（`num_hidden_layers == 1`）；
+- 本批行数为 0 或超过 64（CAPACITY）；
+- 线性注意力后端带 ReplaySSM（`replayssm_write_pos` 不为 None）。
+
 ### 3. kernel 骨架
+
+以下是场景 A 的整层 kernel。场景 B、C 的 kernel 使用同一组阶段函数，区别见 2.3。
 
 ```python
 # fused.make_gdn_layer → @flyc.kernel gdn_layer(<GDN_LAYER_ARGS>, rows, conv_state_bytes)
