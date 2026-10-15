@@ -1,6 +1,6 @@
 # Qwen3.8 MonoKernel：使用说明与最终结果
 
-MonoKernel 在 SGLang 服务中把 Qwen3.8-Flash-Next（`qwen4_exp`）的 decode 层换成每层一次常驻 kernel 启动。一次启动内完成以下全部计算：attention 分支的 HC mix、mixer（GDN，或 full attention + QSA indexer）、两次 TP all-reduce、MLP 分支的 HC mix、MoE、层末 combine，以及下一层的 HC norm。本页只维护当前使用说明、最终有效结果和验收状态；修改与优化过程追加到[源码readme](../../src/pyhip/ops/monokernel/qwen38/readme.txt)。
+MonoKernel 在 SGLang 服务中把 Qwen3.8-Flash-Next（`qwen4_exp`）的 decode 层换成每层一次常驻 kernel 启动。一次启动内完成以下全部计算：attention 分支的 HC mix、mixer（GDN，或 full attention + QSA indexer）、两次 TP all-reduce、MLP 分支的 HC mix、MoE、层末 combine，以及下一层的 HC norm。本页只维护当前使用说明、最终有效结果和验收状态；修改与优化过程追加到[源码readme](../../src/pyhip/ops/monokernel/qwen38/readme.md)。
 
 ## 当前状态
 
