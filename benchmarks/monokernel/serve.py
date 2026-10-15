@@ -7,7 +7,8 @@ The ``mono`` arm loads the ``qwen38_monokernel`` plugin (benchmarks/monokernel/p
 unchanged) with ``PYHIP_MONOKERNEL=1`` from a snapshot of ``src/pyhip`` copied into the run folder
 (``source/``), so later edits cannot reach a running server; every run gets a fresh FlyDSL cache.
 The ``pyhip`` arm is SGLang's own PyHIP QSA path (``SGLANG_USE_PYHIP_QSA=1``: QSA attention and the
-prefill/decode indexers in PyHIP, everything else native) on the same snapshot.
+prefill/decode indexers in PyHIP, everything else native) on the same snapshot; ``mono_pyhip`` combines
+both (MonoKernel decode layers, PyHIP QSA prefill).
 
 Modes:
 * ``validate``: eager server (no CUDA graphs), ``PYHIP_MONOKERNEL_VALIDATE=1``; real-text prompts at
@@ -93,10 +94,12 @@ def environment(folder, args):
                CUDA_VISIBLE_DEVICES=visible, PYTHONUNBUFFERED="1", OMP_NUM_THREADS="4",
                PATH=os.pathsep.join((str(Path(sys.executable).parent), env["PATH"])),
                FLYDSL_RUNTIME_CACHE_DIR=str(cache / "flydsl"), SGLANG_PLUGINS="")
-    if args.arm == "mono":
+    if args.arm in ("mono", "mono_pyhip"):
         env.update(PYTHONPATH=os.pathsep.join(item for item in (*snapshot(folder), env.get("PYTHONPATH")) if item),
                    SGLANG_PLUGINS="qwen38_monokernel", PYHIP_MONOKERNEL="1",
                    PYHIP_MONOKERNEL_VALIDATE="1" if args.mode == "validate" else "0")
+        if args.arm == "mono_pyhip":
+            env.update(SGLANG_USE_PYHIP_QSA="1", SGLANG_TEST_PYHIP_QSA="0")
     elif args.arm == "pyhip":
         env.update(PYTHONPATH=os.pathsep.join(item for item in (*snapshot(folder), env.get("PYTHONPATH")) if item),
                    SGLANG_USE_PYHIP_QSA="1", SGLANG_TEST_PYHIP_QSA="1" if args.mode == "validate" else "0")
@@ -202,7 +205,7 @@ def bench(folder, port, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--arm", choices=("native", "pyhip", "mono"), required=True)
+    parser.add_argument("--arm", choices=("native", "pyhip", "mono", "mono_pyhip"), required=True)
     parser.add_argument("--mode", choices=("validate", "bench"), required=True)
     parser.add_argument("--tp", type=int, choices=(2, 4), default=2)
     parser.add_argument("--devices", required=True, help="comma-separated visible GPUs, one per TP rank")
