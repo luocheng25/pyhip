@@ -26,10 +26,10 @@ from . import phases as ph
 from ._ir import store, words
 from ._phase import THREADS, Ctx, buffer_at
 from .linear import _call, tiles_for
-from .sync import STRIPE_WORDS, _if, grid_barrier, grid_exit
+from .sync import STRIPE_WORDS, _if, grid_arrive, grid_exit, grid_wait
 
 C, H, WIDTH, LOWRANK = ph.C, ph.H, ph.WIDTH, ph.LOWRANK
-ATTENTION_PHASES = ("norm", "hc_down", "hc_lowrank", "hc_mix_up", "quant_x", "qkvz_ba", "recurrent", "quant_y",
+ATTENTION_PHASES = ("norm", "hc_down", "hc_lowrank", "hc_mix_up", "quant_ba", "qkvz_conv", "recurrent", "quant_y",
                     "out_proj")
 MLP_PHASES = ("norm", "hc_down", "hc_lowrank", "hc_mix_up", "router", "topk", "plan", "moe_up", "moe_down")
 SHARED_LOGITS = 16
@@ -93,16 +93,20 @@ def _stamp(ctx, timeline, slot, columns):
 
 
 def _run(ctx, steps, selected, sync_address, ctas, timeline=None):
-    """Run the selected phases with grid barriers between them. With ``timeline``, slot ``2 k`` is the
-    start of phase ``k`` and ``2 k + 1`` the end of its work (before the barrier)."""
+    """Run the selected ``(prefetch, run)`` phases with grid barriers between them: ``prefetch`` (weights
+    of the phase's first round) is issued between the barrier's arrive and wait and handed to ``run``.
+    With ``timeline``, slot ``2 k`` is the start of phase ``k`` and ``2 k + 1`` the end of its work."""
     chosen = [steps[i] for i in selected]
     columns = 2 * len(chosen)
-    for i, step in enumerate(chosen):
+    for i, (prefetch, run) in enumerate(chosen):
         if i:
-            grid_barrier(sync_address, i - 1, ctas, ctx.tid, coherent_data=True)
+            grid_arrive(sync_address, ctx.tid)
+        pre = prefetch() if prefetch is not None else None
+        if i:
+            grid_wait(sync_address, i - 1, ctas, ctx.tid)
         if timeline is not None:
             _stamp(ctx, timeline, 2 * i, columns)
-        step()
+        run(pre)
         if timeline is not None:
             _stamp(ctx, timeline, 2 * i + 1, columns)
     if len(chosen) > 1:
@@ -135,26 +139,36 @@ def make_attention(dims, k_heads, ba_rows, tiles, capacity, combine, eps, ctas, 
         ba = at("ba", rows * 2 * v_heads * 2)
         core, y = at("core", rows * value_dim * 2), at("y", rows * value_dim * 2)
         yq, ys = at("yq", rows * value_dim), at("ys", rows * 4)
-        h_in = buffer_at(H_IN, rows * WIDTH * 2)
-        gain = buffer_at(GAIN_OUT, rows * C * 4)
         slots = buffer_at(SLOTS, rows * 4)
+        w_dn = buffer_at(HC_DN, ph.DOWN_ROWS * WIDTH * 2)
+        w_up = buffer_at(HC_UP, WIDTH * LOWRANK * 2)
+        w_ba = buffer_at(W_BA, ba_rows * H * 2)
+        w_qkvz = buffer_at(W_QKVZ, n_qkvz * H)
+        w_out = buffer_at(W_OUT, H * value_dim)
         steps = [
-            lambda: ph.combine_norm(ctx, h_in, buffer_at(Y_IN, rows * H * 2), buffer_at(GAIN_IN, rows * C * 4),
-                                    buffer_at(NORM_W, WIDTH * 2), buffer_at(H_OUT, rows * WIDTH * 2), hn, combine,
-                                    eps),
-            lambda: ph.hc_down(ctx, hn, buffer_at(HC_DN, ph.DOWN_ROWS * WIDTH * 2), partial, tiles),
-            lambda: ph.hc_lowrank(ctx, partial, low, gain),
-            lambda: ph.hc_mix_up(ctx, low, buffer_at(HC_UP, WIDTH * LOWRANK * 2), hn, x, tiles),
-            lambda: ph.quant(ctx, x, xq, xs, H),
-            lambda: ph.qkvz_ba(ctx, xq, xs, buffer_at(W_QKVZ, n_qkvz * H), buffer_at(S_QKVZ, n_qkvz * 4),
-                               buffer_at(CONV_W, conv_dim * 4 * 2), slots, buffer_at(CONV_STATE, conv_state_bytes),
-                               qkvz, conv, x, buffer_at(W_BA, ba_rows * H * 2), ba, n_qkvz, conv_dim, ba_rows // 16,
-                               2 * v_heads, tiles),
-            lambda: ph.recurrent(ctx, conv, qkvz, ba, buffer_at(A_LOG, v_heads * 4), buffer_at(DT_BIAS, v_heads * 2),
-                                 buffer_at(GDN_NORM, ph.D * 2), SSM, slots, core, y, v_heads, k_heads, conv_dim, eps),
-            lambda: ph.quant(ctx, y, yq, ys, value_dim),
-            lambda: ph.out_proj(ctx, yq, ys, buffer_at(W_OUT, H * value_dim), buffer_at(S_OUT, H * 4),
-                                buffer_at(OUT, rows * H * 2), value_dim, tiles),
+            (None, lambda pre: ph.combine_norm(ctx, buffer_at(H_IN, rows * WIDTH * 2), buffer_at(Y_IN, rows * H * 2),
+                                               buffer_at(GAIN_IN, rows * C * 4), buffer_at(NORM_W, WIDTH * 2),
+                                               buffer_at(H_OUT, rows * WIDTH * 2), hn, combine, eps)),
+            (lambda: ph.hc_down_gemv(ctx, hn, w_dn, tiles, ctas).prefetch(),
+             lambda pre: ph.hc_down(ctx, hn, w_dn, partial, tiles, ctas, pre)),
+            (None, lambda pre: ph.hc_lowrank(ctx, partial, low, buffer_at(GAIN_OUT, rows * C * 4))),
+            (lambda: ph.hc_mix_up_gemv(ctx, low, w_up, tiles, ctas).prefetch(),
+             lambda pre: ph.hc_mix_up(ctx, low, w_up, hn, x, tiles, ctas, pre)),
+            (lambda: ph.ba_gemv(ctx, x, w_ba, ba_rows // 16, tiles).prefetch(),
+             lambda pre: ph.quant_ba(ctx, x, xq, xs, w_ba, ba, ba_rows // 16, 2 * v_heads, tiles, ctas, pre)),
+            (lambda: ph.qkvz_gemv(ctx, xq, w_qkvz, n_qkvz, tiles, ctas).prefetch(),
+             lambda pre: ph.qkvz_conv(ctx, xq, xs, w_qkvz, buffer_at(S_QKVZ, n_qkvz * 4),
+                                      buffer_at(CONV_W, conv_dim * 4 * 2), slots,
+                                      buffer_at(CONV_STATE, conv_state_bytes), qkvz, conv, n_qkvz, conv_dim, tiles,
+                                      ctas, pre)),
+            (lambda: ph.recurrent_prefetch(ctx, slots, SSM, v_heads),
+             lambda pre: ph.recurrent(ctx, conv, qkvz, ba, buffer_at(A_LOG, v_heads * 4),
+                                      buffer_at(DT_BIAS, v_heads * 2), buffer_at(GDN_NORM, ph.D * 2), SSM, slots,
+                                      core, y, v_heads, k_heads, conv_dim, eps, pre)),
+            (None, lambda pre: ph.quant(ctx, y, yq, ys, value_dim)),
+            (lambda: ph.out_proj_gemv(ctx, yq, w_out, value_dim, tiles, ctas).prefetch(),
+             lambda pre: ph.out_proj(ctx, yq, ys, w_out, buffer_at(S_OUT, H * 4), buffer_at(OUT, rows * H * 2),
+                                     value_dim, tiles, ctas, pre)),
         ]
         _run(ctx, steps, selected, SCRATCH + layout["sync"], ctas, TIMELINE if timed else None)
 
@@ -182,8 +196,8 @@ def make_mlp(dims, tiles, capacity, eps, ctas, selected, timed=False):
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def mlp(H_IN: fx.Int64, ATTN: fx.Int64, GAIN_IN: fx.Int64, NORM_W: fx.Int64, H_OUT: fx.Int64,
             GAIN_OUT: fx.Int64, SCRATCH: fx.Int64, HC_DN: fx.Int64, HC_UP: fx.Int64, W_ROUTER: fx.Int64,
-            W_SHARED: fx.Int64, W13: fx.Int64, S13: fx.Int64, W2: fx.Int64, S2: fx.Int64, OUT: fx.Int64,
-            TIMELINE: fx.Int64, rows: fx.Int32):
+            W13: fx.Int64, S13: fx.Int64, W2: fx.Int64, S2: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64,
+            rows: fx.Int32):
         ctx = Ctx(rows, fused)
 
         def at(name, num_bytes):
@@ -199,30 +213,35 @@ def make_mlp(dims, tiles, capacity, eps, ctas, selected, timed=False):
         plan = at("plan", (1 + 3 * (n_experts + 1)) * 4)
         route_row, route_weight = at("route_row", routes * 4), at("route_weight", routes * 4)
         mid = at("mid", routes * inter * 2)
+        w_dn = buffer_at(HC_DN, ph.DOWN_ROWS * WIDTH * 2)
+        w_up = buffer_at(HC_UP, WIDTH * LOWRANK * 2)
+        w_router = buffer_at(W_ROUTER, (n_experts + 16) * H * 2)
         steps = [
-            lambda: ph.combine_norm(ctx, buffer_at(H_IN, rows * WIDTH * 2), buffer_at(ATTN, rows * H * 2),
-                                    buffer_at(GAIN_IN, rows * C * 4), buffer_at(NORM_W, WIDTH * 2),
-                                    buffer_at(H_OUT, rows * WIDTH * 2), hn, True, eps),
-            lambda: ph.hc_down(ctx, hn, buffer_at(HC_DN, ph.DOWN_ROWS * WIDTH * 2), partial, tiles),
-            lambda: ph.hc_lowrank(ctx, partial, low, buffer_at(GAIN_OUT, rows * C * 4)),
-            lambda: ph.hc_mix_up(ctx, low, buffer_at(HC_UP, WIDTH * LOWRANK * 2), hn, x, tiles),
-            lambda: ph.router(ctx, x, buffer_at(W_ROUTER, n_experts * H * 2), buffer_at(W_SHARED, 16 * H * 2),
-                              logits, shared, n_experts, tiles),
-            lambda: ph.topk_rows(ctx, logits, shared, ids, weights, n_experts, top_k),
-            lambda: ph.plan(ctx, ids, weights, plan, route_row, route_weight, n_experts, top_k),
-            lambda: ph.moe_up(ctx, x, W13, S13, plan, route_row, mid, n_experts, top_k, inter, tiles),
-            lambda: ph.moe_down(ctx, mid, W2, S2, plan, route_row, route_weight, buffer_at(OUT, rows * H * 2),
-                                n_experts, top_k, inter, tiles),
+            (None, lambda pre: ph.combine_norm(ctx, buffer_at(H_IN, rows * WIDTH * 2), buffer_at(ATTN, rows * H * 2),
+                                               buffer_at(GAIN_IN, rows * C * 4), buffer_at(NORM_W, WIDTH * 2),
+                                               buffer_at(H_OUT, rows * WIDTH * 2), hn, True, eps)),
+            (lambda: ph.hc_down_gemv(ctx, hn, w_dn, tiles, ctas).prefetch(),
+             lambda pre: ph.hc_down(ctx, hn, w_dn, partial, tiles, ctas, pre)),
+            (None, lambda pre: ph.hc_lowrank(ctx, partial, low, buffer_at(GAIN_OUT, rows * C * 4))),
+            (lambda: ph.hc_mix_up_gemv(ctx, low, w_up, tiles, ctas).prefetch(),
+             lambda pre: ph.hc_mix_up(ctx, low, w_up, hn, x, tiles, ctas, pre)),
+            (lambda: ph.router_gemv(ctx, x, w_router, n_experts, tiles, ctas).prefetch(),
+             lambda pre: ph.router(ctx, x, w_router, logits, shared, n_experts, tiles, ctas, pre)),
+            (None, lambda pre: ph.topk_rows(ctx, logits, shared, ids, weights, n_experts, top_k)),
+            (None, lambda pre: ph.plan(ctx, ids, weights, plan, route_row, route_weight, n_experts, top_k)),
+            (None, lambda pre: ph.moe_up(ctx, x, W13, S13, plan, route_row, mid, n_experts, top_k, inter, tiles)),
+            (None, lambda pre: ph.moe_down(ctx, mid, W2, S2, plan, route_row, route_weight,
+                                           buffer_at(OUT, rows * H * 2), n_experts, top_k, inter, tiles)),
         ]
         _run(ctx, steps, selected, SCRATCH + layout["sync"], ctas, TIMELINE if timed else None)
 
     @flyc.jit
     def launch(H_IN: fx.Int64, ATTN: fx.Int64, GAIN_IN: fx.Int64, NORM_W: fx.Int64, H_OUT: fx.Int64,
                GAIN_OUT: fx.Int64, SCRATCH: fx.Int64, HC_DN: fx.Int64, HC_UP: fx.Int64, W_ROUTER: fx.Int64,
-               W_SHARED: fx.Int64, W13: fx.Int64, S13: fx.Int64, W2: fx.Int64, S2: fx.Int64, OUT: fx.Int64,
-               TIMELINE: fx.Int64, rows: fx.Int32, stream: fx.Stream):
-        mlp(H_IN, ATTN, GAIN_IN, NORM_W, H_OUT, GAIN_OUT, SCRATCH, HC_DN, HC_UP, W_ROUTER, W_SHARED, W13, S13, W2,
-            S2, OUT, TIMELINE, rows).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
+               W13: fx.Int64, S13: fx.Int64, W2: fx.Int64, S2: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64,
+               rows: fx.Int32, stream: fx.Stream):
+        mlp(H_IN, ATTN, GAIN_IN, NORM_W, H_OUT, GAIN_OUT, SCRATCH, HC_DN, HC_UP, W_ROUTER, W13, S13, W2, S2, OUT,
+            TIMELINE, rows).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch
 
@@ -291,7 +310,7 @@ class FusedGdnLayer:
         ptr = lambda t: t.data_ptr()  # noqa: E731
         stream = torch.cuda.current_stream(h.device)
         args = (ptr(h), ptr(attn), ptr(gain_attn), ptr(w["hc_mlp_norm"]), ptr(h1), ptr(gain_out), ptr(work.scratch),
-                ptr(p["hc_mlp_dn"]), ptr(p["hc_mlp_up"]), ptr(p["router"]), ptr(p["shared_gate"]), ptr(w["moe_w13"]),
+                ptr(p["hc_mlp_dn"]), ptr(p["hc_mlp_up"]), ptr(p["router_shared"]), ptr(w["moe_w13"]),
                 ptr(w["moe_w13_scale"]), ptr(w["moe_w2"]), ptr(w["moe_w2_scale"]), ptr(out),
                 0 if timeline is None else ptr(timeline), rows, stream)
         timed = timeline is not None

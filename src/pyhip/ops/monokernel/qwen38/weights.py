@@ -299,7 +299,8 @@ def pack_hc_up(up: torch.Tensor, config: Qwen38Config) -> torch.Tensor:
 def pack_layer(served: dict, kind: LayerKind, config: Qwen38Config) -> dict[str, torch.Tensor]:
     """MonoKernel-owned BF16 copies of one layer, 16x16-shuffled for the stage kernels.
 
-    ``hc_*_dn`` stacks the low-rank down rows, the 4 inject rows and zero rows to 336.
+    ``hc_*_dn`` stacks the low-rank down rows, the 4 inject rows and zero rows to 336;
+    ``router_shared`` stacks the router rows and the shared-expert gate padded to 16 rows (fused path).
     """
 
     packed = {}
@@ -309,6 +310,7 @@ def pack_layer(served: dict, kind: LayerKind, config: Qwen38Config) -> dict[str,
         packed[f"{prefix}_up"] = pack_hc_up(served[f"{prefix}_up"], config)
     packed["router"] = shuffle_16x16(served["router"])
     packed["shared_gate"] = shuffle_16x16(_pad_rows(served["shared_gate"]))
+    packed["router_shared"] = torch.cat((packed["router"], packed["shared_gate"]))
     if kind is LayerKind.LINEAR:
         packed["gdn_ba"] = shuffle_16x16(_pad_rows(served["gdn_ba"]))
     else:

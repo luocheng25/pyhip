@@ -230,6 +230,29 @@ def fabs(value):
     return (value.bitcast(fx.Uint32) & fx.Uint32(0x7FFFFFFF)).bitcast(fx.Float32)
 
 
+# ---------------------------------------------------------- packed FP32 (v_pk_*_f32)
+
+
+def f32x2(a, b):
+    return fx.Vector.from_elements([a, b], fx.Float32)
+
+
+def bf16x2_f32(word):
+    """One DWORD of two BF16 values as a packed FP32 pair (low element first)."""
+    bits = fx.Int32(word)
+    return fx.Vector.from_elements([bits << 16, bits & fx.Int32(-65536)], fx.Int32).bitcast(fx.Float32)
+
+
+def fma2(a, b, c):
+    """Packed ``a * b + c`` on FP32 pairs (single rounding)."""
+    v2 = ir.VectorType.get([2], fx.Float32.ir_type)
+    return fx.Vector(llvm.call_intrinsic(v2, "llvm.fma.v2f32", [raw(a), raw(b), raw(c)], [], []))
+
+
+def splat2(value):
+    return f32x2(value, value)
+
+
 # ------------------------------------------------------------- lane exchange
 
 

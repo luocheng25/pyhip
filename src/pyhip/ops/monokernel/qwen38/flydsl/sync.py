@@ -1,10 +1,11 @@
 """Launch-wide synchronization for persistent MonoKernel launches (all CTAs co-resident).
 
-``grid_barrier`` counts arrivals on one 32-bit global counter that only grows during a launch:
-barrier ``k`` (0-based) waits until it reaches ``(k + 1) * ctas``. Thread 0 of each CTA releases
-the CTA's writes at agent scope (L2 write-back on gfx942), arrives, spins with ``s_sleep`` and
-acquires (L2/L1 invalidate) before the CTA proceeds. ``grid_exit`` lets the last CTA reset the
-counters, so a captured graph replays from zero.
+``grid_barrier`` counts arrivals on 32-bit global counters that only grow during a launch: barrier
+``k`` (0-based) waits until they reach ``(k + 1) * ctas``. Every thread first waits for its stores to
+be acknowledged, then thread 0 arrives and spins with ``s_sleep``. Without ``coherent_data`` it also
+releases/acquires at agent scope (L2 write-back and invalidate on gfx942). ``grid_arrive`` and
+``grid_wait`` split the barrier so independent loads (weights) can be issued in between.
+``grid_exit`` lets the last CTA reset the counters, so a captured graph replays from zero.
 """
 
 import flydsl.expr as fx
@@ -62,6 +63,13 @@ def grid_barrier(counter, ordinal, ctas, tid, coherent_data=False, stripes=1):
     With ``coherent_data`` the caller moves every cross-CTA value with device-coherent (sc1)
     loads/stores, so the barrier skips the agent-scope L2 write-back and invalidate; every thread
     still waits for its stores to be acknowledged before the CTA arrives."""
+    grid_arrive(counter, tid, coherent_data, stripes)
+    grid_wait(counter, ordinal, ctas, tid, coherent_data, stripes)
+
+
+def grid_arrive(counter, tid, coherent_data=True, stripes=1):
+    """First half of ``grid_barrier``: the CTA's stores are acknowledged, then thread 0 arrives. Loads
+    that do not depend on other CTAs (weights) may be issued before ``grid_wait``."""
     rocdl.s_waitcnt(VMCNT0)
     llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
     barrier()
@@ -74,13 +82,18 @@ def grid_barrier(counter, ordinal, ctas, tid, coherent_data=False, stripes=1):
         llvm.atomicrmw(llvm.AtomicBinOp.add, _global(mine), raw(fx.Int32(1)), llvm.AtomicOrdering.monotonic,
                        syncscope="agent", alignment=4)
 
+    _if(fx.Int32(tid) == 0, arrive)
+
+
+def grid_wait(counter, ordinal, ctas, tid, coherent_data=True, stripes=1):
+    """Second half of ``grid_barrier`` number ``ordinal``: wait for every CTA's arrival."""
+
     def wait():
         members = (fx.Int32(tid) < ctas % stripes).select(fx.Int32(ctas // stripes + 1), fx.Int32(ctas // stripes))
         _spin_until(_global(counter + fx.Int64(fx.Int32(tid) * (STRIPE_WORDS * 4))), members * (ordinal + 1))
         if not coherent_data:
             llvm.fence(llvm.AtomicOrdering.acquire, syncscope="agent")
 
-    _if(fx.Int32(tid) == 0, arrive)
     _if(fx.Int32(tid) < stripes, wait)
     barrier()
 

@@ -12,12 +12,12 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import range_constexpr, rocdl
 
 from ..config import QWEN38_FLASH_NEXT
-from ._ir import (DPP_XOR1, DPP_XOR2, DROP, FP8_MAX, barrier, bf16_pair, bf16_round, bf16_word, dpp, exp_accurate,
-                  fabs, fmax, fmin, fp8_pack, fp8_to_bf16_words, lds_load, lds_store, load, mfma_bf16, rne_bits, scalar,
-                  scalar_f32, sigmoid, sigmoid_accurate, silu, softplus, sqrt_accurate, store, store_short, wave_max,
-                  wave_sum, words, zeros4)
-from ._phase import (HALF_WAVES, REGION_BYTES, STAGED_WAVES, THREADS, HalfGemm, act_rows, batches, buffer_at, device,
-                     half_region, pipelined)
+from ._ir import (DPP_XOR1, DPP_XOR2, DROP, FP8_MAX, barrier, bf16_pair, bf16_round, bf16_word, bf16x2_f32, dpp,
+                  exp_accurate, f32x2, fabs, fma2, fmax, fmin, fp8_pack, fp8_to_bf16_words, lds_load, lds_store, load,
+                  mfma_bf16, rne_bits, scalar, scalar_f32, sigmoid, sigmoid_accurate, silu, softplus, splat2,
+                  sqrt_accurate, store, store_short, wave_max, wave_sum, words, zeros4)
+from ._phase import (HALF_WAVES, REGION_BYTES, STAGED_WAVES, THREADS, HalfGemm, RoundGemv, act_rows, batches,
+                     buffer_at, device, pipelined)
 from .moe import MAX_ROWS, _bf16x4, _intrinsic, _lds_atomic, _ordered, _readlane, _wave_umax
 
 C, H = QWEN38_FLASH_NEXT.hc_count, QWEN38_FLASH_NEXT.hidden
@@ -85,31 +85,42 @@ def combine_norm(ctx, h_in, y, gain, nw, h_out, hn_out, combine, eps):
             store(hn_out, (row * WIDTH + column) * 2, _pack_bf16(normed), aux=ctx.aux)
 
 
-def _pairs(ctx, items):
-    """Half-item loop bounds: pair ``p`` holds items ``2 p`` (half 0) and ``2 p + 1`` (half 1)."""
-    return ctx.cta, (items + 1) // 2 if isinstance(items, int) else (items + 1) >> 1, ctx.ctas
+class Gemv:
+    """A static-shape GEMV phase on ``RoundGemv``: ``prefetch`` issues round 0's weights (between the
+    grid barrier's arrive and wait), ``run(epilogue, pre)`` the rounds."""
+
+    def __init__(self, ctx, k, tiles, weight, items, ctas, locate, act, ksplit=1):
+        self.ctx = ctx
+        self.gemm = HalfGemm(k, tiles, weight, ksplit)
+        self.engine = RoundGemv(self.gemm, items, ctas)
+        self.locate = locate
+        self.read = act_rows(act, self.gemm.row_bytes, ctx.rows, ctx.lane, ctx.aux)
+
+    def prefetch(self):
+        return self.engine.prefetch(self.ctx, self.locate)
+
+    def run(self, epilogue, pre=None):
+        self.engine.run(self.ctx, self.locate, self.read, epilogue, pre)
+
+
+def hc_down_gemv(ctx, hn, w, tiles, ctas):
+    blocks = DOWN_ROWS // 16
+    return Gemv(ctx, WIDTH, tiles, "bf16", blocks * KSPLIT, ctas, lambda item: (w, item % blocks, item // blocks),
+                hn, KSPLIT)
 
 
 @device
-def hc_down(ctx, hn, w, partial, tiles):
+def hc_down(ctx, hn, w, partial, tiles, ctas, pre=None):
     """``partial[s] = hn[:, K_s] @ [down; inject]^T`` in FP32 for the 16 K splits (half item per
     16-row block and split)."""
-    gemm = HalfGemm(WIDTH, tiles, "bf16", KSPLIT)
-    run, stash, gather = gemm.partial, gemm.stash, gemm.gather  # loops may not call methods of outer locals
+    gemv = hc_down_gemv(ctx, hn, w, tiles, ctas)
+    gather = gemv.gemm.gather
     blocks = DOWN_ROWS // 16
-    items = blocks * KSPLIT
     rows, lane, wave = ctx.rows, ctx.lane, ctx.half_wave
-    read = act_rows(hn, gemm.row_bytes, rows, lane, ctx.aux)
-    first, stop, step = _pairs(ctx, items)
-    for pair_iv in range(first, stop, step):
-        pair = fx.Int32(pair_iv)
-        item = pair * 2 + ctx.half
-        valid = item < items
+
+    def epilogue(item, valid, region):
         block = item % blocks
         split = item // blocks
-        region = half_region(ctx, pair)
-        stash(region, run(read, w, block, split, lane, wave, valid), lane, wave)
-        barrier()
         n0 = block * 16 + (lane >> 4) * 4
         for t in range_constexpr(tiles):
             if wave == t % STAGED_WAVES:
@@ -118,6 +129,8 @@ def hc_down(ctx, hn, w, partial, tiles):
                 live = valid & (token < rows)
                 at = live.select(((split * rows + token) * DOWN_ROWS + n0) * 4, fx.Int32(DROP))
                 store(partial, at, total.bitcast(fx.Int32), aux=ctx.aux)
+
+    gemv.run(epilogue, pre)
 
 
 @device
@@ -144,22 +157,19 @@ def hc_lowrank(ctx, partial, low, gain):
         store(gain, gain_at, gains)
 
 
+def hc_mix_up_gemv(ctx, low, w, tiles, ctas):
+    return Gemv(ctx, LOWRANK, tiles, "bf16", WIDTH // 16, ctas, lambda item: (w, item, 0), low)
+
+
 @device
-def hc_mix_up(ctx, low, w, hn, x, tiles):
+def hc_mix_up(ctx, low, w, hn, x, tiles, ctas, pre=None):
     """Half item per 16 packed up rows: gates of column ``4 block + l // 16`` for its 4 branches, then
     ``x = bf16(sum_g sigmoid(gate_g) hn_g / 4)``."""
-    gemm = HalfGemm(LOWRANK, tiles, "bf16")
-    run, stash, gather = gemm.partial, gemm.stash, gemm.gather
-    items = WIDTH // 16
+    gemv = hc_mix_up_gemv(ctx, low, w, tiles, ctas)
+    gather = gemv.gemm.gather
     rows, lane, wave = ctx.rows, ctx.lane, ctx.half_wave
-    read = act_rows(low, gemm.row_bytes, rows, lane, ctx.aux)
-    first, stop, step = _pairs(ctx, items)
-    for pair_iv in range(first, stop, step):
-        pair = fx.Int32(pair_iv)
-        block = pair * 2 + ctx.half
-        region = half_region(ctx, pair)
-        stash(region, run(read, w, block, 0, lane, wave, block < items), lane, wave)
-        barrier()
+
+    def epilogue(block, valid, region):
         column = block * 4 + (lane >> 4)
         for t in range_constexpr(tiles):
             if wave == t % STAGED_WAVES:
@@ -168,19 +178,23 @@ def hc_mix_up(ctx, low, w, hn, x, tiles):
                 mixed = F32(0.0)
                 for g in range_constexpr(C):
                     mixed = mixed + sigmoid(total[g]) * _half_word(hn, token * WIDTH + g * H + column, ctx.aux)
-                at = (token < rows).select((token * H + column) * 2, fx.Int32(DROP))
+                at = (valid & (token < rows)).select((token * H + column) * 2, fx.Int32(DROP))
                 store_short(x, at, rne_bits(mixed * 0.25).bitcast(fx.Int32) >> 16, aux=ctx.aux)
+
+    gemv.run(epilogue, pre)
 
 
 # ---------------------------------------------------------------- linear helpers
 
 
 @device
-def quant(ctx, src, dst, scales, k):
+def quant(ctx, src, dst, scales, k, wave_id=None, waves=None):
     """Wave item per row: AITER's per-token FP8 quantization (``linear.make_quant_rows``)."""
     chunks = k // 512
     rows, lane = ctx.rows, ctx.lane
-    for row_iv in range(ctx.wave_id, rows, ctx.waves):
+    first = ctx.wave_id if wave_id is None else wave_id
+    step = ctx.waves if waves is None else waves
+    for row_iv in range(first, rows, step):
         row = fx.Int32(row_iv)
         values = []
         for c in range_constexpr(chunks):
@@ -222,76 +236,106 @@ def _store_tile(ctx, out, total, block, t, n_out, epilogue, aux, valid, xs=None,
 # ---------------------------------------------------------------- gated deltanet
 
 
+def ba_gemv(ctx, x, w_ba, ba_blocks, tiles):
+    """``in_proj_ba`` on the first ``(ba_blocks + 1) // 2`` CTAs (one round)."""
+    return Gemv(ctx, H, tiles, "bf16", ba_blocks, (ba_blocks + 1) // 2, lambda item: (w_ba, item, 0), x)
+
+
 @device
-def qkvz_ba(ctx, xq, xs, w, ws, cw, slots, state, qkvz, conv, x, w_ba, ba, n, conv_dim, ba_blocks, ba_out, tiles):
-    """Half items: the ``n // 16`` blocks of ``in_proj_qkvz`` with the conv epilogue
-    (``gdn.make_qkvz_conv``), then the ``ba_blocks`` blocks of the BF16 ``in_proj_ba``."""
-    gemm = HalfGemm(H, tiles, "fp8")
-    gemm_ba = HalfGemm(H, tiles, "bf16")
-    run, run_ba, stash, gather = gemm.partial, gemm_ba.partial, gemm.stash, gemm.gather
+def quant_ba(ctx, x, xq, xs, w_ba, ba, ba_blocks, ba_out, tiles, ctas, pre=None):
+    """The BF16 ``in_proj_ba`` (half items on the first CTAs) next to the per-token quantization of
+    ``x`` (wave items on the other CTAs)."""
+    gemv = ba_gemv(ctx, x, w_ba, ba_blocks, tiles)
+    gather = gemv.gemm.gather
+    lane, wave = ctx.lane, ctx.half_wave
+    ba_ctas = (ba_blocks + 1) // 2
+
+    def epilogue(item, valid, region):
+        for t in range_constexpr(tiles):
+            if wave == t % STAGED_WAVES:
+                _store_tile(ctx, ba, gather(region, t, lane), item, t, ba_out, "bf16", ctx.aux, valid)
+
+    run = gemv.run  # a method call on a local inside the branch would make it an if-result
+    if ctx.cta < ba_ctas:
+        run(epilogue, pre)
+    else:
+        quant(ctx, x, xq, xs, H, ctx.wave * (ctas - ba_ctas) + ctx.cta - ba_ctas, (ctas - ba_ctas) * (THREADS // 64))
+
+
+def qkvz_gemv(ctx, xq, w, n, tiles, ctas):
+    return Gemv(ctx, H, tiles, "fp8", n // 16, ctas, lambda item: (w, item, 0), xq)
+
+
+@device
+def qkvz_conv(ctx, xq, xs, w, ws, cw, slots, state, qkvz, conv, n, conv_dim, tiles, ctas, pre=None):
+    """Half item per 16 rows of ``in_proj_qkvz`` with the conv epilogue (``gdn.make_qkvz_conv``)."""
+    gemv = qkvz_gemv(ctx, xq, w, n, tiles, ctas)
+    gather = gemv.gemm.gather
     rows, lane, wave = ctx.rows, ctx.lane, ctx.half_wave
-    read = act_rows(xq, gemm.row_bytes, rows, lane, ctx.aux)
-    read_x = act_rows(x, gemm_ba.row_bytes, rows, lane, ctx.aux)
-    blocks = n // 16
-    items = blocks + ba_blocks
-    first, stop, step = _pairs(ctx, items)
-    for pair_iv in range(first, stop, step):
-        pair = fx.Int32(pair_iv)
-        item = pair * 2 + ctx.half
-        valid = item < items
-        region = half_region(ctx, pair)
-        # the CTA barrier stays outside the (half-dependent) branches
-        if item < blocks:
-            stash(region, run(read, w, item, 0, lane, wave, valid), lane, wave)
-        else:
-            stash(region, run_ba(read_x, w_ba, item - blocks, 0, lane, wave, valid), lane, wave)
-        barrier()
-        if item < blocks:
-            block = item
-            n0 = block * 16 + (lane >> 4) * 4
-            w_scale = load(ws, n0 * 4).bitcast(F32)
-            for t in range_constexpr(tiles):
-                if wave == t % STAGED_WAVES:
-                    total = gather(region, t, lane)
-                    token = 16 * t + (lane & 15)
-                    live = token < rows
-                    x_scale = load(xs, token * 4, words=1, aux=ctx.aux).bitcast(F32)
-                    xv = [bf16_round(total[i] * x_scale * w_scale[i]) for i in range_constexpr(4)]
-                    store(qkvz, live.select((token * n + n0) * 2, fx.Int32(DROP)), _pack_bf16(xv), aux=ctx.aux)
-                    if block * 16 < conv_dim:
-                        slot = load(slots, live.select(token * 4, fx.Int32(DROP)), words=1)
-                        active = live & (slot >= 0)
-                        offset = active.select((slot * conv_dim + n0) * 6, fx.Int32(DROP))
-                        first_words = load(state, offset, words=4)
-                        second = load(state, offset + 16, words=2)
-                        taps = _bf16_values(first_words) + list(bf16_pair(second[0])) + list(bf16_pair(second[1]))
-                        weights = (_bf16_values(load(cw, n0 * KERNEL * 2))
-                                   + _bf16_values(load(cw, n0 * KERNEL * 2 + 16)))
-                        outs, shifted = [], []
-                        for c in range_constexpr(4):
-                            window = [taps[3 * c], taps[3 * c + 1], taps[3 * c + 2], xv[c]]
-                            total_c = bf16_round(window[0] * weights[KERNEL * c])
-                            for j in range_constexpr(1, KERNEL):
-                                total_c = total_c + bf16_round(window[j] * weights[KERNEL * c + j])
-                            activated = total_c / (1.0 + exp_accurate(F32(0.0) - total_c))
-                            outs.append(active.select(activated, F32(0.0)))
-                            shifted += window[1:]
-                        store(conv, live.select((token * conv_dim + n0) * 2, fx.Int32(DROP)), _pack_bf16(outs),
-                              aux=ctx.aux)
-                        packed = [bf16_word(shifted[2 * i], shifted[2 * i + 1]) for i in range_constexpr(6)]
-                        store(state, offset, words(packed[:4]))
-                        store(state, active.select(offset + 16, fx.Int32(DROP)), words(packed[4:]))
-        else:
-            for t in range_constexpr(tiles):
-                if wave == t % STAGED_WAVES:
-                    _store_tile(ctx, ba, gather(region, t, lane), item - blocks, t, ba_out, "bf16", ctx.aux, valid)
+
+    def epilogue(block, valid, region):
+        n0 = block * 16 + (lane >> 4) * 4
+        w_scale = load(ws, valid.select(n0 * 4, fx.Int32(DROP))).bitcast(F32)
+        for t in range_constexpr(tiles):
+            if wave == t % STAGED_WAVES:
+                total = gather(region, t, lane)
+                token = 16 * t + (lane & 15)
+                live = valid & (token < rows)
+                x_scale = load(xs, token * 4, words=1, aux=ctx.aux).bitcast(F32)
+                xv = [bf16_round(total[i] * x_scale * w_scale[i]) for i in range_constexpr(4)]
+                store(qkvz, live.select((token * n + n0) * 2, fx.Int32(DROP)), _pack_bf16(xv), aux=ctx.aux)
+                if block * 16 < conv_dim:
+                    slot = load(slots, live.select(token * 4, fx.Int32(DROP)), words=1)
+                    active = live & (slot >= 0)
+                    offset = active.select((slot * conv_dim + n0) * 6, fx.Int32(DROP))
+                    first_words = load(state, offset, words=4)
+                    second = load(state, offset + 16, words=2)
+                    taps = _bf16_values(first_words) + list(bf16_pair(second[0])) + list(bf16_pair(second[1]))
+                    weights = (_bf16_values(load(cw, n0 * KERNEL * 2))
+                               + _bf16_values(load(cw, n0 * KERNEL * 2 + 16)))
+                    outs, shifted = [], []
+                    for c in range_constexpr(4):
+                        window = [taps[3 * c], taps[3 * c + 1], taps[3 * c + 2], xv[c]]
+                        total_c = bf16_round(window[0] * weights[KERNEL * c])
+                        for j in range_constexpr(1, KERNEL):
+                            total_c = total_c + bf16_round(window[j] * weights[KERNEL * c + j])
+                        activated = total_c / (1.0 + exp_accurate(F32(0.0) - total_c))
+                        outs.append(active.select(activated, F32(0.0)))
+                        shifted += window[1:]
+                    store(conv, live.select((token * conv_dim + n0) * 2, fx.Int32(DROP)), _pack_bf16(outs),
+                          aux=ctx.aux)
+                    packed = [bf16_word(shifted[2 * i], shifted[2 * i + 1]) for i in range_constexpr(6)]
+                    store(state, offset, words(packed[:4]))
+                    store(state, active.select(offset + 16, fx.Int32(DROP)), words(packed[4:]))
+
+    gemv.run(epilogue, pre)
 
 
 RECURRENT_THREADS = 4  # threads per state row
 
 
+def _state(ctx, slots, ssm_address, v_heads, item, valid):
+    """The slot and this thread's 32 state words of CTA item ``item`` (row, v-head)."""
+    row = item // v_heads
+    head = item % v_heads
+    slot = scalar(load(slots, valid.select(row * 4, fx.Int32(DROP)), words=1))
+    active = valid & (slot >= 0)
+    state_at = fx.Int64(active.select(slot, fx.Int32(0))) * (v_heads * D * D) + fx.Int64(head) * (D * D)
+    ssm = buffer_at(ssm_address + state_at * 4, D * D * 4)
+    span = D // RECURRENT_THREADS
+    row_offset = ((ctx.tid >> 2) * D + (ctx.tid & 3) * span) * 4
+    chunks = [load(ssm, active.select(row_offset + i * 16, fx.Int32(DROP))) for i in range_constexpr(span // 4)]
+    return slot, chunks
+
+
+def recurrent_prefetch(ctx, slots, ssm_address, v_heads):
+    """State of the CTA's first item (inputs of earlier launches only: issue before the grid wait)."""
+    return _state(ctx, slots, ssm_address, v_heads, ctx.cta, ctx.cta < ctx.rows * v_heads)
+
+
 @device
-def recurrent(ctx, conv, qkvz, ba, a_log, dtb, nw, ssm_address, slots, core, y, v_heads, k_heads, conv_dim, eps):
+def recurrent(ctx, conv, qkvz, ba, a_log, dtb, nw, ssm_address, slots, core, y, v_heads, k_heads, conv_dim, eps,
+              pre=None):
     """CTA item (row, v-head) of the gated delta rule: thread ``t`` owns state row ``v = t // 4`` and
     columns ``32 (t % 4) + [0, 32)``; the 4 threads of a row combine their dot products with DPP."""
     rows, lane = ctx.rows, ctx.lane
@@ -308,53 +352,62 @@ def recurrent(ctx, conv, qkvz, ba, a_log, dtb, nw, ssm_address, slots, core, y, 
         value = value + dpp(value, DPP_XOR1)
         return value + dpp(value, DPP_XOR2)
 
-    for item_iv in range(ctx.cta, items, ctx.ctas):
-        item = fx.Int32(item_iv)
+    def body(item, slot, chunks):
         row = item // v_heads
         head = item % v_heads
         kv = head // group
-        slot = scalar(load(slots, row * 4, words=1))
         active = slot >= 0
-        state_at = fx.Int64(active.select(slot, fx.Int32(0))) * (v_heads * D * D) + fx.Int64(head) * (D * D)
-        ssm = buffer_at(ssm_address + state_at * 4, D * D * 4)
-        row_offset = (v * D + quarter * span) * 4
-        chunks = [load(ssm, active.select(row_offset + i * 16, fx.Int32(DROP))) for i in range_constexpr(span // 4)]
         base = row * conv_dim * 2
-        q, k = [], []
+        q_words, k_words = [], []
         for i in range_constexpr(span // 8):
-            q += _bf16_values(load(conv, base + (kv * D + quarter * span) * 2 + i * 16, aux=ctx.aux))
-            k += _bf16_values(load(conv, base + (key_dim + kv * D + quarter * span) * 2 + i * 16, aux=ctx.aux))
+            q_load = load(conv, base + (kv * D + quarter * span) * 2 + i * 16, aux=ctx.aux)
+            k_load = load(conv, base + (key_dim + kv * D + quarter * span) * 2 + i * 16, aux=ctx.aux)
+            q_words += [q_load[j] for j in range_constexpr(4)]
+            k_words += [k_load[j] for j in range_constexpr(4)]
         value = _half_word(conv, row * conv_dim + 2 * key_dim + head * D + v, ctx.aux)
         b = _half_word(ba, row * 2 * v_heads + head, ctx.aux)
         a = _half_word(ba, row * 2 * v_heads + v_heads + head, ctx.aux)
+        z = _half_word(qkvz, row * width + conv_dim + head * D + v, ctx.aux)
+        weight = _half_word(nw, v, 0)
         dt = _half_word(dtb, head, 0)
         a_log_value = load(a_log, head * 4, words=1).bitcast(F32)
-        q_sq, k_sq = F32(0.0), F32(0.0)
-        for i in range_constexpr(span):
-            q_sq = q_sq + q[i] * q[i]
-            k_sq = k_sq + k[i] * k[i]
-        q_den, k_den = sqrt_accurate(quad_sum(q_sq) + L2NORM_EPS), sqrt_accurate(quad_sum(k_sq) + L2NORM_EPS)
-        qn = [q[i] / q_den * scale for i in range_constexpr(span)]
-        kn = [k[i] / k_den for i in range_constexpr(span)]
+        # packed FP32 pairs (v_pk_fma_f32), two accumulators per dot product
+        q = [bf16x2_f32(word) for word in q_words]
+        k = [bf16x2_f32(word) for word in k_words]
+        zero = splat2(F32(0.0))
+        q2, k2 = zero, zero
+        for i in range_constexpr(span // 2):
+            q2 = fma2(q[i], q[i], q2)
+            k2 = fma2(k[i], k[i], k2)
+        q_den = sqrt_accurate(quad_sum(q2[0] + q2[1]) + L2NORM_EPS)
+        k_den = sqrt_accurate(quad_sum(k2[0] + k2[1]) + L2NORM_EPS)
+        q_scale, k_scale = splat2(F32(1.0) / q_den * scale), splat2(F32(1.0) / k_den)
+        qn = [q[i] * q_scale for i in range_constexpr(span // 2)]
+        kn = [k[i] * k_scale for i in range_constexpr(span // 2)]
         beta = bf16_round(sigmoid_accurate(b))
         g = (F32(0.0) - exp_accurate(a_log_value)) * softplus(a + dt)
-        decay = exp_accurate(g)
+        decay = splat2(exp_accurate(g))
         state = []
         for chunk in chunks:
             words4 = chunk.bitcast(F32)
-            state += [words4[j] * decay for j in range_constexpr(4)]
-        ks = F32(0.0)
-        for i in range_constexpr(span):
-            ks = ks + state[i] * kn[i]
-        delta = (value - quad_sum(ks)) * beta
-        state = [state[i] + delta * kn[i] for i in range_constexpr(span)]
-        out = F32(0.0)
-        for i in range_constexpr(span):
-            out = out + state[i] * qn[i]
-        core_value = active.select(bf16_round(quad_sum(out)), F32(0.0))
+            state += [f32x2(words4[0], words4[1]) * decay, f32x2(words4[2], words4[3]) * decay]
+        ks2 = zero
+        for i in range_constexpr(span // 2):
+            ks2 = fma2(state[i], kn[i], ks2)
+        delta = splat2((value - quad_sum(ks2[0] + ks2[1])) * beta)
+        state = [fma2(delta, kn[i], state[i]) for i in range_constexpr(span // 2)]
+        out2 = zero
+        for i in range_constexpr(span // 2):
+            out2 = fma2(state[i], qn[i], out2)
+        core_value = active.select(bf16_round(quad_sum(out2[0] + out2[1])), F32(0.0))
+        state_at = fx.Int64(active.select(slot, fx.Int32(0))) * (v_heads * D * D) + fx.Int64(head) * (D * D)
+        ssm = buffer_at(ssm_address + state_at * 4, D * D * 4)
+        row_offset = (v * D + quarter * span) * 4
         for i in range_constexpr(span // 4):
+            lo, hi = state[2 * i], state[2 * i + 1]
             store(ssm, active.select(row_offset + i * 16, fx.Int32(DROP)),
-                  words([state[4 * i + j] for j in range_constexpr(4)], F32).bitcast(fx.Int32))
+                  words([lo[0], lo[1], hi[0], hi[1]], F32).bitcast(fx.Int32))
+        gate = sigmoid_accurate(z)
         squares = wave_sum((quarter == 0).select(core_value * core_value, F32(0.0)), lane)
         if lane == 0:
             lds_store(ctx.shared + ctx.wave * 4, squares.bitcast(fx.Int32), words=1)
@@ -363,59 +416,58 @@ def recurrent(ctx, conv, qkvz, ba, a_log, dtb, nw, ssm_address, slots, core, y, 
         for w in range_constexpr(1, THREADS // 64):
             total = total + lds_load(ctx.shared + w * 4, words=1).bitcast(F32)
         rstd = F32(rocdl.rsq(F32.ir_type, (total * (1.0 / D) + eps).ir_value()))
-        weight = _half_word(nw, v, 0)
-        z = _half_word(qkvz, row * width + conv_dim + head * D + v, ctx.aux)
-        normed = core_value * rstd * weight * sigmoid_accurate(z)
+        normed = core_value * rstd * weight * gate
         at = (quarter == 0).select((item * D + v) * 2, fx.Int32(DROP))
         store_short(core, at, core_value.bitcast(fx.Int32) >> 16)
         store_short(y, at, bf16_word(normed, normed).bitcast(fx.Int32) & 0xFFFF, aux=ctx.aux)
         barrier()  # the next item reuses the LDS words
 
+    first = recurrent_prefetch(ctx, slots, ssm_address, v_heads) if pre is None else pre
+    for item_iv, carried in range(ctx.cta, items, ctx.ctas, init=[first[0], *first[1]]):
+        item = fx.Int32(item_iv)
+        # the next item's state streams in while this one computes
+        following = item + ctx.ctas
+        next_slot, next_chunks = _state(ctx, slots, ssm_address, v_heads, following, following < items)
+        body(item, fx.Int32(carried[0]), [fx.Vector(c) for c in carried[1:]])
+        results = yield [next_slot, *next_chunks]  # noqa: F841
+
+
+def out_proj_gemv(ctx, yq, w, k, tiles, ctas):
+    return Gemv(ctx, k, tiles, "fp8", H // 16, ctas, lambda item: (w, item, 0), yq)
+
 
 @device
-def out_proj(ctx, yq, ys, w, ws, out, k, tiles):
+def out_proj(ctx, yq, ys, w, ws, out, k, tiles, ctas, pre=None):
     """Half item per 16 output columns of the W8A8 ``out_proj`` (``linear.make_linear``)."""
-    gemm = HalfGemm(k, tiles, "fp8")
-    run, stash, gather = gemm.partial, gemm.stash, gemm.gather
+    gemv = out_proj_gemv(ctx, yq, w, k, tiles, ctas)
+    gather = gemv.gemm.gather
     lane, wave = ctx.lane, ctx.half_wave
-    read = act_rows(yq, gemm.row_bytes, ctx.rows, lane, ctx.aux)
-    items = H // 16
-    first, stop, step = _pairs(ctx, items)
-    for pair_iv in range(first, stop, step):
-        pair = fx.Int32(pair_iv)
-        block = pair * 2 + ctx.half
-        valid = block < items
-        region = half_region(ctx, pair)
-        stash(region, run(read, w, block, 0, lane, wave, valid), lane, wave)
-        barrier()
+
+    def epilogue(block, valid, region):
         for t in range_constexpr(tiles):
             if wave == t % STAGED_WAVES:
                 _store_tile(ctx, out, gather(region, t, lane), block, t, H, "scaled", 0, valid, ys, ws)
+
+    gemv.run(epilogue, pre)
 
 
 # ---------------------------------------------------------------- mixture of experts
 
 
+def router_gemv(ctx, x, w, n_experts, tiles, ctas):
+    """``w``: the router rows then the shared-expert gate padded to 16 rows (``router_shared``)."""
+    return Gemv(ctx, H, tiles, "bf16", n_experts // 16 + 1, ctas, lambda item: (w, item, 0), x)
+
+
 @device
-def router(ctx, x, w_router, w_shared, logits, shared_logit, n_experts, tiles):
+def router(ctx, x, w, logits, shared_logit, n_experts, tiles, ctas, pre=None):
     """Half items: the router blocks (BF16 logits), then the shared-expert gate block (FP32)."""
-    gemm = HalfGemm(H, tiles, "bf16")
-    run, stash, gather = gemm.partial, gemm.stash, gemm.gather
+    gemv = router_gemv(ctx, x, w, n_experts, tiles, ctas)
+    gather = gemv.gemm.gather
     lane, wave = ctx.lane, ctx.half_wave
-    read = act_rows(x, gemm.row_bytes, ctx.rows, lane, ctx.aux)
     blocks = n_experts // 16
-    items = blocks + 1
-    first, stop, step = _pairs(ctx, items)
-    for pair_iv in range(first, stop, step):
-        pair = fx.Int32(pair_iv)
-        item = pair * 2 + ctx.half
-        valid = item < items
-        region = half_region(ctx, pair)
-        if item < blocks:
-            stash(region, run(read, w_router, item, 0, lane, wave, valid), lane, wave)
-        else:
-            stash(region, run(read, w_shared, 0, 0, lane, wave, valid), lane, wave)
-        barrier()
+
+    def epilogue(item, valid, region):
         if item < blocks:
             for t in range_constexpr(tiles):
                 if wave == t % STAGED_WAVES:
@@ -424,6 +476,8 @@ def router(ctx, x, w_router, w_shared, logits, shared_logit, n_experts, tiles):
             for t in range_constexpr(tiles):
                 if wave == t % STAGED_WAVES:
                     _store_tile(ctx, shared_logit, gather(region, t, lane), 0, t, 16, "f32", ctx.aux, valid)
+
+    gemv.run(epilogue, pre)
 
 
 @device
@@ -562,7 +616,7 @@ def moe_up(ctx, x, w_address, ws_address, plan_in, route_row, mid, n_experts, to
     experts = n_experts + 1
     per_wave = H // 64 // STAGED_WAVES
     blocks = inter // 16
-    groups = batches(per_wave, tiles, 2)
+    groups = batches(per_wave, tiles, 2, budget=160)
     lane, wave = ctx.lane, ctx.half_wave
     region = ctx.shared + ctx.half * (2 * REGION_BYTES)  # gate and up partials: 4 x 2 x tiles KiB
     num_active = scalar(load(plan_in, 0, words=1, aux=ctx.aux))

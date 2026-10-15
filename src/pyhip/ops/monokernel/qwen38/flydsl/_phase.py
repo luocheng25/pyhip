@@ -26,7 +26,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import range_constexpr, rocdl
 
-from ._ir import DROP, bf16x4_half, i64_half, lds_base, lds_load, lds_store, load, mfma_bf16, mfma_fp8, scalar, zeros4
+from ._ir import (DROP, barrier, bf16x4_half, i64_half, lds_base, lds_load, lds_store, load, mfma_bf16, mfma_fp8,
+                  scalar, zeros4)
 
 device = ASTRewriter.transform
 THREADS = 512
@@ -69,10 +70,10 @@ class Ctx:
 REGION_BYTES = LDS_WORDS * 4 // 4  # one half's GEMV reduction buffer (two halves x double buffering)
 
 
-def batches(count, tiles, words_per_load=1):
+def batches(count, tiles, words_per_load=1, budget=64):
     """Load batches of a wave's K loop: a batch holds ``words_per_load * (1 + tiles)`` 16-byte words per
-    load step within about 64 registers; two batches are in flight."""
-    size = max(1, 64 // (4 * words_per_load * (1 + tiles)))
+    load step within about ``budget`` registers; two batches are in flight."""
+    size = max(1, budget // (4 * words_per_load * (1 + tiles)))
     return [list(range(start, min(start + size, count))) for start in range(0, count, size)]
 
 
@@ -104,34 +105,6 @@ class HalfGemm:
         self.operand = i64_half if weight == "fp8" else bf16x4_half
         self.groups = batches(self.per_wave, tiles)
 
-    def partial(self, act, w, block, split, lane, wave, valid):
-        """``act(q, t, ok)``: the lane's 16-byte activation word of load ``q``, tile ``t`` (0 unless ``ok``)."""
-        acc = [zeros4() for _ in range_constexpr(self.tiles)]
-
-        def issue(group):
-            weights, acts = [], []
-            for j in group:
-                local = wave + STAGED_WAVES * j
-                ok = valid & (local < self.split_loads)
-                q = split * self.split_loads + local
-                weights.append(load(w, ok.select(block * (16 * self.row_bytes) + q * 1024 + lane * 16,
-                                                 fx.Int32(DROP))))
-            for j in group:
-                local = wave + STAGED_WAVES * j
-                ok = valid & (local < self.split_loads)
-                acts.append([act(split * self.split_loads + local, t, ok) for t in range_constexpr(self.tiles)])
-            return weights, acts
-
-        def consume(group, loaded):
-            weights, acts = loaded
-            for i in range_constexpr(len(group)):
-                for t in range_constexpr(self.tiles):
-                    for h in range_constexpr(2):
-                        acc[t] = self.mfma(self.operand(weights[i], h), self.operand(acts[i][t], h), acc[t])
-
-        pipelined(self.groups, issue, consume)
-        return acc
-
     def stash(self, region, acc, lane, wave):
         for t in range_constexpr(self.tiles):
             lds_store(region + ((wave * self.tiles + t) * 64 + lane) * 16, acc[t].bitcast(fx.Int32))
@@ -142,11 +115,88 @@ class HalfGemm:
             total = total + lds_load(region + ((other * self.tiles + t) * 64 + lane) * 16).bitcast(fx.Float32)
         return total
 
+    # ---- whole-item pieces for RoundGemv
 
-def half_region(ctx, pair):
-    """Double-buffered LDS reduction region of this half for its item of ``pair`` (one barrier per item)."""
-    parity = ((pair - ctx.cta) // ctx.ctas) & 1
-    return ctx.shared + (parity * 2 + ctx.half) * REGION_BYTES
+    def _ok(self, wave, j, valid):
+        local = wave + STAGED_WAVES * j
+        inside = local < self.split_loads
+        return local, (inside if valid is True else valid & inside)
+
+    def weights(self, w, block, split, lane, wave, valid):
+        """All of the wave's weight words of one item (0 past the end or for an invalid item)."""
+        out = []
+        for j in range_constexpr(self.per_wave):
+            local, ok = self._ok(wave, j, valid)
+            q = split * self.split_loads + local
+            out.append(load(w, ok.select(block * (16 * self.row_bytes) + q * 1024 + lane * 16, fx.Int32(DROP))))
+        return out
+
+    def acts(self, act, split, wave, valid, steps=None):
+        out = []
+        for j in (range_constexpr(self.per_wave) if steps is None else steps):
+            local, ok = self._ok(wave, j, valid)
+            out.append([act(split * self.split_loads + local, t, ok) for t in range_constexpr(self.tiles)])
+        return out
+
+    def product(self, weights, act, split, wave, valid, cached=None):
+        """FP32 partials of the wave's loads in order; activations from ``cached`` or loaded in batches."""
+        acc = [zeros4() for _ in range_constexpr(self.tiles)]
+
+        def consume(group, acts):
+            for i in range_constexpr(len(group)):
+                for t in range_constexpr(self.tiles):
+                    for h in range_constexpr(2):
+                        acc[t] = self.mfma(self.operand(weights[group[i]], h), self.operand(acts[i][t], h), acc[t])
+
+        if cached is not None:
+            consume(list(range(self.per_wave)), cached)
+        else:
+            pipelined(self.groups, lambda group: self.acts(act, split, wave, valid, group), consume)
+        return acc
+
+
+class RoundGemv:
+    """Static half-item schedule of a GEMV phase on ``ctas`` resident CTAs: round ``r`` of CTA ``c``
+    holds items ``2 (c + r ctas) + half``. The weights of round ``r + 1`` are issued before the math of
+    round ``r`` (round 0's by ``prefetch``, between the grid barrier's arrive and wait); single-split
+    GEMVs with one token tile load their activations once per phase. Partials go through
+    double-buffered LDS regions, so a round needs one CTA barrier.
+
+    ``locate(item) -> (w, block, split)``; ``epilogue(item, valid, region)`` runs after the barrier
+    (wave ``t % 4`` gathers tile ``t`` with ``gemm.gather``)."""
+
+    def __init__(self, gemm, items, ctas):
+        self.gemm, self.items, self.ctas = gemm, items, ctas
+        self.rounds = -(-((items + 1) // 2) // ctas)
+        self.cache = gemm.split_loads == gemm.loads and gemm.tiles == 1
+
+    def _item(self, ctx, r):
+        item = (ctx.cta + r * self.ctas) * 2 + ctx.half
+        return item, item < self.items
+
+    def prefetch(self, ctx, locate):
+        item, valid = self._item(ctx, 0)
+        w, block, split = locate(item)
+        return self.gemm.weights(w, block, split, ctx.lane, ctx.half_wave, valid)
+
+    def run(self, ctx, locate, read, epilogue, pre=None):
+        gemm, lane, wave = self.gemm, ctx.lane, ctx.half_wave
+        cached = gemm.acts(read, 0, wave, True) if self.cache else None
+        current = self.prefetch(ctx, locate) if pre is None else pre
+        for r in range_constexpr(self.rounds):
+            item, valid = self._item(ctx, r)
+            _, _, split = locate(item)
+            following = self.prefetch_round(ctx, locate, r + 1) if r + 1 < self.rounds else None
+            region = ctx.shared + ((r % 2) * 2 + ctx.half) * REGION_BYTES
+            gemm.stash(region, gemm.product(current, read, split, wave, valid, cached), lane, wave)
+            barrier()
+            epilogue(item, valid, region)
+            current = following
+
+    def prefetch_round(self, ctx, locate, r):
+        item, valid = self._item(ctx, r)
+        w, block, split = locate(item)
+        return self.gemm.weights(w, block, split, ctx.lane, ctx.half_wave, valid)
 
 
 def act_rows(a, row_bytes, rows, lane, aux):
