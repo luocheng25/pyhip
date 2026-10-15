@@ -310,7 +310,7 @@ def pack_layer(served: dict, kind: LayerKind, config: Qwen38Config) -> dict[str,
     packed["router"] = shuffle_16x16(served["router"])
     packed["shared_gate"] = shuffle_16x16(_pad_rows(served["shared_gate"]))
     if kind is LayerKind.LINEAR:
-        packed["gdn_ba"] = shuffle_16x16(served["gdn_ba"])
+        packed["gdn_ba"] = shuffle_16x16(_pad_rows(served["gdn_ba"]))
     else:
         packed["index_qk"] = shuffle_16x16(served["index_qk"])
     return packed

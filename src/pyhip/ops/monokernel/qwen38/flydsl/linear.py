@@ -18,6 +18,7 @@ from functools import cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import range_constexpr
 
 from ._ir import (DROP, FP8_MAX, barrier, bf16_pair, bf16_word, bf16x4_half, buffer, fabs, fmax, fmin, fp8_pack,
@@ -112,12 +113,14 @@ class Gemm:
 
 
 @cache
-def make_linear(n, k, tiles, weight="fp8", epilogue="scaled", ksplit=1):
+def make_linear(n, k, tiles, weight="fp8", epilogue="scaled", ksplit=1, n_out=None):
     """``weight``: "fp8" (W8A8, FP8 activations) or "bf16" (BF16 activations and 16x16-shuffled BF16
     weights). ``epilogue``: "scaled" BF16 ``acc * x_scale * w_scale``, "bf16", or "f32" (with
-    ``ksplit`` > 1 the FP32 partials of K split ``s`` go to ``out[s]``)."""
+    ``ksplit`` > 1 the FP32 partials of K split ``s`` go to ``out[s]``). ``n`` weight rows (a multiple
+    of 16) produce ``n_out`` (a multiple of 4) output columns."""
     gemm = Gemm(k, tiles, weight, ksplit)
-    assert n % 16 == 0
+    n_out = n if n_out is None else n_out
+    assert n % 16 == 0 and n_out % 4 == 0 and n_out <= n
 
     @flyc.kernel(known_block_size=[64 * WAVES, 1, 1])
     def linear(A: fx.Tensor, XS: fx.Tensor, W: fx.Tensor, WS: fx.Tensor, OUT: fx.Tensor, rows: fx.Int32):
@@ -136,17 +139,18 @@ def make_linear(n, k, tiles, weight="fp8", epilogue="scaled", ksplit=1):
             if wave == t % WAVES:
                 total = gemm.gather(shared, t, lane)
                 token = 16 * t + (lane & 15)
+                live = (token < rows) & (n0 < n_out)
                 if fx.const_expr(epilogue == "f32"):
                     # Padding tokens of split s would land in split s + 1: drop them explicitly.
-                    offset = (token < rows).select(((split * rows + token) * n + n0) * 4, fx.Int32(DROP))
-                    store(buffer(OUT, ksplit * rows * n * 4), offset, total.bitcast(fx.Int32))
+                    offset = live.select(((split * rows + token) * n_out + n0) * 4, fx.Int32(DROP))
+                    store(buffer(OUT, ksplit * rows * n_out * 4), offset, total.bitcast(fx.Int32))
                 else:
                     vals = [total[i] for i in range_constexpr(4)]
                     if fx.const_expr(epilogue == "scaled"):
                         xs = load(buffer(XS, rows * 4), token * 4, words=1).bitcast(fx.Float32)
                         ws = load(buffer(WS, n * 4), n0 * 4).bitcast(fx.Float32)
                         vals = [vals[i] * xs * ws[i] for i in range_constexpr(4)]
-                    store(buffer(OUT, rows * n * 2), (token * n + n0) * 2,
+                    store(buffer(OUT, rows * n_out * 2), live.select((token * n_out + n0) * 2, fx.Int32(DROP)),
                           words((bf16_word(vals[0], vals[1]), bf16_word(vals[2], vals[3]))))
 
     @flyc.jit
@@ -167,8 +171,11 @@ def _call(key, builder, args):
     if function is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("warm MonoKernel stages before graph capture")
+        # FlyDSL keys its disk cache on scalar closure values only; parameters held in objects (e.g.
+        # Gemm's K) would let another configuration's kernel load, so the full key goes in a hint.
         # flyc.compile also runs the call once; launching again would repeat in-place state updates.
-        _COMPILED[key] = flyc.compile(builder, *args)
+        with CompilationContext.compile_hints({"monokernel_config": repr(key)}):
+            _COMPILED[key] = flyc.compile(builder, *args)
         return
     function(*args)
 
@@ -199,14 +206,14 @@ def linear_fp8(xq, xs, weight, weight_scale, out):
 
 
 def linear_bf16(x, weight, out, ksplit=1):
-    """x: BF16 [rows, K]; weight: 16x16-shuffled BF16 [N, K]; out: BF16 [rows, N], or FP32
-    [rows, N] / [ksplit, rows, N] partial sums."""
+    """x: BF16 [rows, K]; weight: 16x16-shuffled BF16 [N, K] (N padded to 16); out: BF16 [rows, n_out], or
+    FP32 [rows, n_out] / [ksplit, rows, n_out] partial sums."""
     rows, k = x.shape
-    n = weight.shape[0]
+    n, n_out = weight.shape[0], out.shape[-1]
     tiles = tiles_for(rows)
     epilogue = "f32" if out.dtype == torch.float32 else "bf16"
     stream = torch.cuda.current_stream(x.device)
     args = (x.view(-1), x.view(-1), weight.view(-1), weight.view(-1), out.view(-1), rows, stream)
     with torch.cuda.device(x.device):
-        _call(("linear", x.device, n, k, tiles, "bf16", epilogue, ksplit),
-              make_linear(n, k, tiles, "bf16", epilogue, ksplit), args)
+        _call(("linear", x.device, n, k, tiles, "bf16", epilogue, ksplit, n_out),
+              make_linear(n, k, tiles, "bf16", epilogue, ksplit, n_out), args)

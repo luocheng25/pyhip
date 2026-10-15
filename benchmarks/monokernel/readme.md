@@ -2,7 +2,7 @@
 
 MonoKernel 把 Qwen3.8-Flash-Next（`qwen4_exp`）一个 decode 层合成一次常驻 kernel 启动。本页只维护当前使用说明、最终有效结果和验收状态；修改与优化过程追加到[源码readme](../../src/pyhip/ops/monokernel/qwen38/readme.txt)。
 
-当前阶段为 P0：已有 torch golden、TP 分片、SGLang 服务内权重格式（kernel 直接读取）和与 SGLang 的逐阶段对齐检查；MonoKernel 内核尚未实现，所以还没有性能数据。
+当前阶段为 P1：GDN 层（线性注意力层）的阶段版内核（每个阶段一次启动，两次 all-reduce 之间分三段）已实现，并在 TP2/TP4 真实采集上与 SGLang 对齐；单次启动融合、full attention 层（P2/P3）和服务接入（P4）尚未完成，因此还没有性能结论。
 
 ## 目录和依赖
 
@@ -11,9 +11,13 @@ MonoKernel 把 Qwen3.8-Flash-Next（`qwen4_exp`）一个 decode 层合成一次�
 | 模型几何与 TP 分片 | [config.py](../../src/pyhip/ops/monokernel/qwen38/config.py) |
 | checkpoint 读取、SGLang 一致的分片、SGLang 服务内格式、合成权重 | [weights.py](../../src/pyhip/ops/monokernel/qwen38/weights.py) |
 | decode 层 golden（按阶段拆分） | [reference.py](../../src/pyhip/ops/monokernel/qwen38/reference.py) |
+| 阶段内核（FlyDSL 0.3.2）：量化与线性层、HC、GDN、MoE | [flydsl/](../../src/pyhip/ops/monokernel/qwen38/flydsl/) |
+| 阶段版整层驱动（按 all-reduce 分三段） | [flydsl/layer.py](../../src/pyhip/ops/monokernel/qwen38/flydsl/layer.py) |
 | golden 与权重格式单元测试 | [test_qwen38_reference.py](../../tests/ops/monokernel/test_qwen38_reference.py)、[test_qwen38_weights.py](../../tests/ops/monokernel/test_qwen38_weights.py) |
+| 阶段内核单元测试（对 golden） | [test_qwen38_stages.py](../../tests/ops/monokernel/test_qwen38_stages.py)、[test_qwen38_moe.py](../../tests/ops/monokernel/test_qwen38_moe.py) |
 | SGLang 解码采集（自启服务 + 插件），采完自动检查 | [capture.py](capture.py)、[capture_plugin](capture_plugin/qwen38_capture_plugin.py) |
 | golden 与采集逐阶段比对、阈值 | [check_reference.py](check_reference.py) |
+| 阶段内核与采集比对（逐阶段 + 整层链式） | [check_kernels.py](check_kernels.py) |
 
 目标为 **ROCm gfx942（MI308X）**。验证环境：Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.3.2、SGLang `1d383c5`、AITER `4752a40`。golden 和单元测试只依赖 PyTorch；采集另需 SGLang、AITER 和 `/models/Qwen3.8-Flash-Next-PTPC-FP8`。AITER 固定 `flydsl==0.3.2`，不要在同一环境安装 FlyDSL main：它会让 AITER 的 FlyDSL MoE（生产 decode MoE）无法导入或编译。
 
@@ -26,6 +30,8 @@ MonoKernel 把 Qwen3.8-Flash-Next（`qwen4_exp`）一个 decode 层合成一次�
 ```
 
 使用 16 个专家的合成权重，覆盖 TP2/4/8：各 rank 的 GDN 投影、conv、递推和状态，以及 attention 的 Q/K/V/gate 和稀疏注意力，都与 TP1 结果的对应切片一致（容差 1 个 BF16 ulp）；负槽位输出 0 且不更新状态；整层与 TP1 接近（各 rank 独立做 FP8 再量化，不会逐位相同）；路由并列时选较小的 expert id；HC mix 的近 tie 解析只翻转最接近 tie 的那一个低秩激活。权重格式：16x16 shuffle 与 AITER `shuffle_weight` 逐位相同，E4M3FN→E4M3FNUZ 反量化值不变，TP2/TP4 下 `sglang_format` 覆盖全部 SGLang 参数，padding 行为 0。
+
+阶段内核测试（S=1/5/16/33/64）用 SGLang 服务内格式的权重：逐 token FP8 量化与 golden 逐位相同；W8A8/BF16 线性层、HC mix 与 combine+norm、qkvz+conv（含 conv 状态）、delta rule（含 SSM 状态）与门控 norm、路由 top-k 与分组计划、W8A16 MoE 均与 golden 在 1 个 BF16 ulp 内（判据：≥99.9% 元素 ≤1 ulp、rel_l2 ≤ 1e-3；MoE 中间量与输出放宽到 99.5%）。MoE 用完整 512+1 专家，覆盖 TP2（中间维 320）与 TP4（160 补到 192）。
 
 ## 2. 整体正确性：与 SGLang 对齐
 
@@ -85,6 +91,34 @@ MonoKernel 直接读取 SGLang 加载后的张量，不另存权重。`sglang_fo
 | BF16：HC 四组、`in_proj_ba`、`conv1d`、norm、路由、共享专家门、indexer | 与 checkpoint 相同 | 行主序，未预排；`in_proj_ba` 为 [b; a]；`A_log` 为 FP32 |
 | GDN 状态 | conv [槽位, conv_dim, 3] BF16；temporal [槽位, HV, V, K] FP32 | 连续；槽位由 `mamba_cache_indices` 给出 |
 | attention KV | [token 槽位, KV 头, 256] BF16 | 连续；`req_to_token` 为 int32 [请求, 262148] |
+
+### MonoKernel 阶段内核与 SGLang 对齐
+
+```bash
+.venv/bin/python benchmarks/monokernel/check_kernels.py \
+  --capture <dir>/tp2/capture --output <dir>/tp2/check_kernels.json
+```
+
+读取同一份采集，内核使用 checkpoint 经 `sglang_format` 得到的服务内格式权重（与服务逐位相同）和 `pack_layer` 生成的 BF16 预排副本，目前覆盖 GDN 层（第 0–2 层）。两种模式：
+
+- `kernel.*`：每个内核阶段从 SGLang 采到的输入出发，只衡量该内核。GDN 递推用 SGLang 自己的 conv 输入、门控和 z；out_proj 用 SGLang 的 core 经 golden 门控 norm 后的结果；MoE 用内核自己的路由，只比较专家集合与 SGLang 一致的行。
+- `chain.*`：阶段版整层（`StagedLayer`）在同一进程内跑完所有 rank，从采集的层输入出发，两次 all-reduce 按 rank 顺序求和（同 `golden_allreduce`）。
+
+阈值沿用 `check_reference.py` 中同一物理量的阈值；HC mix 不做近 tie 解析，`ulp1` 下限为 0.995。2026-10-13 结果（`qwen38_mono_p0_20261013_06`，最坏值，TP2 / TP4，均 PASS）：
+
+| 检查 | rel_l2 | ulp1 |
+|---|---:|---:|
+| HC norm / mix / combine（attn、mlp） | ≤ 8.5e-5 / 8.5e-5 | 1.000 / 1.000 |
+| GDN qkvz / ba / conv 状态 / 递推输出 | ≤ 5.3e-5 / 2.9e-5 | 1.000 / 1.000 |
+| GDN ssm 状态 | 2.5e-7 / 4.5e-7 | 1.000 / 1.000 |
+| GDN 输出投影 | 4.1e-3 / 9.1e-5 | 0.987 / 1.000 |
+| 路由 logits / 选择 | 1.1e-4 / 1.0e-4；0 行不同 | 1.000 / 1.000 |
+| MoE | 5.0e-3 / 5.2e-3 | 0.761 / 0.756 |
+| 链式：attention 块 / MoE / 层输出 | 6.3e-3 / 1.0e-2 / 6.3e-3；4.0e-3 / 9.5e-3 / 4.9e-3 | — |
+| 链式：路由 | 39 行 0 行不同；39 行 1 行不同（概率差 3.1%） | — |
+| 链式：conv / ssm 状态 | 1.5e-5 / 4.1e-5；2.9e-5 / 4.8e-5 | — |
+
+与 golden 一样，TP2 输出投影的 4e-3 来自 SGLang 侧 cktile GEMM 的 BF16 截断，MoE 的约 0.5% 来自 AITER 的逐专家 BF16 舍入与 BF16 原子累加；内核与 golden 的差距都在 1 个 BF16 ulp 量级。
 
 ## 3. 集成方法
 

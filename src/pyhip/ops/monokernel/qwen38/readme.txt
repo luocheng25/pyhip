@@ -84,3 +84,34 @@ SGLang 服务内权重格式（MonoKernel 直接读取，不另存权重）
 P4 跳过的层
 - 用户要求 P4 第一步跳过“第一层（有 PLE）”。PLE 权重在 model.language_model.layers.1.ple.*（config.ple_layer_ids=[2] 按 1 起算），
   即 layer_id 1；layer 0 只需把 embedding 复制到 4 个分支（SGLang 在 _prepare_qwen4_exp_attn 中做），可正常替换。
+
+
+== 2026-10-13  P1-1：阶段版 GDN 层内核（每阶段一次启动） ==
+
+内核（src/pyhip/ops/monokernel/qwen38/flydsl/，FlyDSL 0.3.2 低层写法：raw buffer 描述符 + MFMA intrinsic + LDS 地址）
+- linear.py：quant_rows（AITER 公式，逐位）；Gemm（16 行权重块 × 最多 64 行 token，CTA 内 4 个 wave 分 K，LDS 归约）；
+  make_linear：W8A8（直接读 SGLang 的 FP8 shuffle 权重与 scale）、BF16（读 pack_layer 的 shuffle 副本）、FP32 split-K。
+- hc.py：down（split-K=16，附 4 行 inject）→ lowrank（FP32 归约、bf16(silu(t/4))、gain=2·sigmoid）→ up+mix（up 行重排，
+  使一个 lane 持有同一列的 4 个分支）；combine+norm（gr_write 写法：每 (行, 分支) 一个 5-wave CTA）。
+- gdn.py：qkvz GEMM 的 epilogue 内做 causal conv（BF16 舍入的抽头乘积、SiLU）并更新 conv 状态，省去单独的 conv 阶段；
+  delta rule 每 (行, v 头) 一个 CTA，线程对 = 状态一行的两个 K 半段，DPP 交换求和；门控 RMSNorm 同 CTA 完成。
+- moe.py：top-k 与分组计划在一个 1024 线程 CTA 内：每专家 64 位行掩码，路由位置 = 前缀偏移 + popcount（行序确定）；
+  W8A16 up（FP8→BF16 精确转换后 BF16 MFMA，gate/up 成对）；down 每 16 列一个 CTA，4 个 wave 轮流处理活跃专家，
+  按 LDS 每 wave 累加器、固定顺序求和（确定性，无原子）。
+- layer.py：StagedLayer 按两次 all-reduce 分 attention_phase / mlp_phase / finish 三段。
+
+验证
+- 单元测试 76 项（阶段 40、MoE 10 含 512+1 专家 TP2/TP4、GDN 5 等）。check_kernels.py 用真实采集（qwen38_mono_p0_20261013_06）：
+  TP2、TP4 均 PASS，各阶段与 SGLang 的差距与 golden 同级（结果表见 benchmarks/monokernel/readme.md）。
+
+问题与修正
+- split-K 的 f32 输出：token 超出 rows 的填充行写入了下一个 split 的区域（descriptor 只防整体越界），改为显式屏蔽。
+- flyc.compile 本身会执行一次调用，_call 编译后又调用一次，conv/ssm 状态被更新两次；改为编译调用即返回。
+- FlyDSL 0.3.2 的缓存键只含依赖源码、标量闭包值和 compile hints；Gemm 对象里的 K 不在键中，TP4 的 out_proj（K=1536）
+  从磁盘缓存取到了 TP2 的 K=3072 kernel，越界读导致 GPU memory fault（时序相关、加打印即消失，也可能静默算错）。
+  _call 现在把完整配置放进 compile hint。
+- TP4 的 ba 只有 24 行：BF16 线性层支持输出列数为 4 的倍数（权重补零到 16 行，存储按真实列数屏蔽）。
+
+初测（CUDA graph 重放，GPU0，非正式）：qkvz（N=8192,K=2560）S=1 7.5us（2.8TB/s）、S=16 14.9us、S=64 47.6us；
+S 大时每个 16 行块都从 L2 重读整份激活，是下一步优化点（多块共用激活、LDS 暂存）。Python 逐次启动开销约 20us/次，
+计时必须用 graph。
