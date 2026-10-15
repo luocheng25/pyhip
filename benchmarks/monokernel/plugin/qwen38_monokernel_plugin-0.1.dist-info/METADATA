@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: qwen38-monokernel-plugin
+Version: 0.1
+Summary: Qwen3.8 MonoKernel decode hooks for SGLang (PyHIP FlyDSL)

@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+qwen38_monokernel = qwen38_monokernel_plugin:register
