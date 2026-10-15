@@ -5,10 +5,12 @@ weights exceed the 256 MiB MALL, so every layer streams its weights from HBM) an
 buffer sets. One CUDA graph holds 10 layer calls; after 2 warmup replays, 128 timed replays give the
 median time per layer. ``--impl staged``: attention phase, MLP phase with the rank partial standing
 in for the reduced output, finish (one launch per stage). ``--impl fused``: the attention half with
-the combine of the previous layer's output and the MLP half (two persistent launches).
+the combine of the previous layer's output and the MLP half (two persistent launches). ``--impl layer``:
+the whole layer in one launch as served (input norm from the previous layer, final combine and next
+norm inside) with both all-reduces over a single-rank region, i.e. without the cross-GPU exchange.
 ``--profile`` adds a per-kernel breakdown from the torch profiler.
 
-    .venv/bin/python benchmarks/monokernel/bench_layer.py --impl staged fused --tp 2 4 --rows 1 4 16 64
+    .venv/bin/python benchmarks/monokernel/bench_layer.py --impl staged fused layer --tp 2 4 --rows 1 4 16 64
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ from pyhip.ops.monokernel.qwen38.config import QWEN38_FLASH_NEXT, LayerKind, sha
 from pyhip.ops.monokernel.qwen38.flydsl.fused import FusedGdnLayer, FusedWorkspace  # noqa: E402
 from pyhip.ops.monokernel.qwen38.flydsl.hc import hc_combine_norm  # noqa: E402
 from pyhip.ops.monokernel.qwen38.flydsl.layer import LayerWorkspace, StagedLayer  # noqa: E402
+from pyhip.ops.monokernel.qwen38.flydsl.xgmi import region_bytes  # noqa: E402
+from pyhip.ops.monokernel.qwen38.peer import PeerMemory  # noqa: E402
 from pyhip.ops.monokernel.qwen38.weights import CheckpointLayer, pack_layer, sglang_format, shard_layer_weights  # noqa: E402
 
 BUFFERS, WARMUP, SAMPLES = 10, 2, 128
@@ -75,6 +79,15 @@ def bench(layers, rows, device, impl="staged"):
             layer.attention(hs[i % BUFFERS], slots, conv, ssm, part_a, fwork, combine=(ys[i % BUFFERS], gain_prev),
                             h_out=h_cur, gain_out=gain_a)
             layer.mlp(h_cur, part_a, gain_a, h1, gain_m, part_m, fwork)
+    elif impl == "layer":
+        fused = [FusedGdnLayer(layer.shard, layer.served, layer.packed) for layer in layers]
+        fwork = FusedWorkspace(rows, s, device, comm=PeerMemory(region_bytes(1, rows), None, device))
+        norm_next = layers[0].served["hc_attn_norm"]
+
+        def call(i):
+            layer = fused[i % len(fused)]
+            conv, ssm = states[i % len(fused)]
+            layer.layer(hs[i % BUFFERS], slots, conv, ssm, norm_next, out, out_normed, fwork, hn=hns[i % BUFFERS])
     else:
         def call(i):
             layer = layers[i % len(layers)]
@@ -124,7 +137,7 @@ def profile(call, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--impl", nargs="+", default=["staged", "fused"], choices=["staged", "fused"])
+    parser.add_argument("--impl", nargs="+", default=["staged", "fused", "layer"], choices=["staged", "fused", "layer"])
     parser.add_argument("--tp", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64])
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 2, 4, 5, 6, 8])

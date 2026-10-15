@@ -2,19 +2,19 @@
 
 Enabled with ``PYHIP_MONOKERNEL=1`` (plugin ``qwen38_monokernel``, see
 ``benchmarks/monokernel/plugin``). For a normal decode batch (``ForwardMode.DECODE``, at most 64
-rows, no ReplaySSM) every main-model layer other than the PLE layer runs as one launch for a GDN layer
-(attention-branch norm .. ``out_proj``, the attention all-reduce, the MLP half .. MoE down, the MoE
-all-reduce, the combine with the next layer's attention-branch norm) and two for a full-attention layer:
-``prep`` (attention-branch mix .. q/k norm, MRoPE, the KV store, the QSA index queries, the pending index-key
-ring and the compression of completed groups in SGLang's pools, the index logits) and ``rest`` (index top-k,
-sparse attention over the selected positions .. ``o_proj``, the all-reduces and the MLP half as above). The
-all-reduces run inside the launches over XGMI (``flydsl/xgmi.py``, regions in ``peer.PeerMemory``), bit for
-bit AITER's one-stage all-reduce. ``PYHIP_MONOKERNEL_AR=aiter`` splits a layer at the all-reduces instead
-(the attention half / ``prep`` + ``core``, SGLang's attention all-reduce, the MLP half, SGLang's MoE
-all-reduce, ``hc_combine_norm``). With ``PYHIP_MONOKERNEL_ATTENTION=native`` the full-attention layer runs
-the fused mix, then SGLang's own ``self_attention`` (split path). Everything else (prefill, MTP
-verify/draft, the MTP draft layer, layer 1) stays native. The launches are CUDA-graph capturable; kernels
-compile during SGLang's eager warmup.
+rows, no ReplaySSM) every main-model layer other than the PLE layer runs as one launch: the mixer (GDN:
+qkvz/ba projections, causal conv, delta rule, gated norm, ``out_proj``; full attention: qkv, q/k norm,
+MRoPE, the KV store, the QSA index queries, the pending index-key ring and the compression of completed
+groups in SGLang's pools, the index logits and top-k, sparse attention over the selected positions,
+``o_proj``) from the previous layer's attention-branch norm (SGLang's ``residual``), the attention
+all-reduce, the MLP half .. MoE down, the MoE all-reduce, and the combine with the next layer's
+attention-branch norm. The all-reduces run inside the launch over XGMI (``flydsl/xgmi.py``, regions in
+``peer.PeerMemory``), bit for bit AITER's one-stage all-reduce. ``PYHIP_MONOKERNEL_AR=aiter`` splits a
+layer at the all-reduces instead (the GDN attention half / the attention ``prep`` + ``core``, SGLang's
+attention all-reduce, the MLP half, SGLang's MoE all-reduce, ``hc_combine_norm``). With
+``PYHIP_MONOKERNEL_ATTENTION=native`` the full-attention layer runs the fused mix, then SGLang's own
+``self_attention`` (split path). Everything else (prefill, MTP verify/draft, the MTP draft layer, layer 1)
+stays native. The launches are CUDA-graph capturable; kernels compile during SGLang's eager warmup.
 
 ``PYHIP_MONOKERNEL_VALIDATE=1`` (eager batches only) also runs the native layer on the same input
 (and GDN states), logs per-layer metrics against it and keeps the MonoKernel results.
@@ -166,7 +166,6 @@ def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, attention=None,
     h = h.contiguous()
     if hn is not None and (hn.shape != h.shape or not hn.is_contiguous()):
         hn = None
-    rows = h.shape[0]
     work = rt.workspace(mono, h.device)
     weight = hc_consumer.hc_norm.weight if hc_consumer is not None else mono.served["hc_attn_norm"]
     out, normed = torch.empty_like(h), torch.empty_like(h)
