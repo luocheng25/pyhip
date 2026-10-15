@@ -283,6 +283,39 @@ def sglang_format(t: dict, shard: Qwen38Shard, kind: LayerKind) -> dict[str, tor
     return out
 
 
+def _pad_rows(weight: torch.Tensor, multiple: int = 16) -> torch.Tensor:
+    return torch.nn.functional.pad(weight, (0, 0, 0, -weight.shape[0] % multiple))
+
+
+def pack_hc_up(up: torch.Tensor, config: Qwen38Config) -> torch.Tensor:
+    """HC up [hc * hidden, lowrank] with each 16-row block holding columns 4b..4b+3 of all branches
+    (row ``16 b + 4 jj + g`` = branch ``g`` column ``4 b + jj``), 16x16-shuffled."""
+
+    rows = torch.arange(up.shape[0], device=up.device)
+    block, column, branch = rows // 16, rows % 16 // config.hc_count, rows % config.hc_count
+    return shuffle_16x16(up[branch * config.hidden + 4 * block + column].contiguous())
+
+
+def pack_layer(served: dict, kind: LayerKind, config: Qwen38Config) -> dict[str, torch.Tensor]:
+    """MonoKernel-owned BF16 copies of one layer, 16x16-shuffled for the stage kernels.
+
+    ``hc_*_dn`` stacks the low-rank down rows, the 4 inject rows and zero rows to 336.
+    """
+
+    packed = {}
+    for prefix in ("hc_attn", "hc_mlp"):
+        down = torch.cat((served[f"{prefix}_down"], served[f"{prefix}_inject"]))
+        packed[f"{prefix}_dn"] = shuffle_16x16(_pad_rows(down))
+        packed[f"{prefix}_up"] = pack_hc_up(served[f"{prefix}_up"], config)
+    packed["router"] = shuffle_16x16(served["router"])
+    packed["shared_gate"] = shuffle_16x16(_pad_rows(served["shared_gate"]))
+    if kind is LayerKind.LINEAR:
+        packed["gdn_ba"] = shuffle_16x16(served["gdn_ba"])
+    else:
+        packed["index_qk"] = shuffle_16x16(served["index_qk"])
+    return packed
+
+
 def tensor_getter(tensors: dict[str, torch.Tensor]) -> Getter:
     def get(name: str, dim: int | None = None, start: int = 0, stop: int | None = None) -> torch.Tensor:
         tensor = tensors[name]
