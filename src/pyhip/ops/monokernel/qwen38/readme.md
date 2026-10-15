@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next MonoKernel（gfx942）修改与优化记录
 
-只追加，不改写已有条目。当前用法与最终结果见 [benchmarks/monokernel/readme.md](../../../../../benchmarks/monokernel/readme.md)。
+只追加，不改写已有条目。当前用法与最终结果见 [benchmarks/monokernel/readme.md](../../../../../benchmarks/monokernel/readme.md)。从 SGLang 接口到 kernel 的调用链伪代码见文末“调用链伪代码”一节。
 
 ## 2026-10-13 P0：golden、TP 分片与 SGLang 对齐
 
@@ -235,3 +235,632 @@ TP4 C8 输出吞吐 298.4 tok/s，高于 PyHIP QSA 的 273.1 和 MonoKernel 的 
 ### 数据
 
 `mytest/mydata/qwen38_mono_p4_20261013_01`：各运行目录的 `manifest.json` 记录代码版本；`src_3260819`、`src_096b438` 为当时用于服务的 git archive 导出。
+
+## 2026-10-14 调用链伪代码：SGLang 接口 → kernel（cd45202）
+
+本节描述服务路径上一个 decode 层从 SGLang 调用到 GPU kernel 的全过程。服务路径指 `PYHIP_MONOKERNEL=1`，`PYHIP_MONOKERNEL_AR` 与 `PYHIP_MONOKERNEL_ATTENTION` 取默认值，`PYHIP_MONOKERNEL_VALIDATE=0`。
+
+- 常量代入 Qwen3.8-Flash-Next（`config.QWEN38_FLASH_NEXT`）和 MI308X（80 个 CU）。随 TP 变化的量在伪代码里写作 `名字(TP2值|TP4值)`。
+- 伪代码里的每个符号都在下面的表格或伪代码中定义。函数名与源码同名，所在文件写在注释里；路径相对 `src/pyhip/ops/monokernel/qwen38/`，SGLang 路径相对 `python/sglang/srt/`。
+
+### 记号
+
+| 记号 | 含义 | 来源 |
+|---|---|---|
+| `bf16(x)` | FP32 按最近偶数舍入到 BF16 | `flydsl/_ir.py` 的 `bf16_round`、`bf16_word`、`rne_bits` |
+| `fp8(x)` | FP32 按最近偶数转 E4M3FNUZ | `_ir.fp8_pack` |
+| `σ(x)` | 快速 sigmoid：`rcp(1 + exp2(-x·log2e))` | `_ir.sigmoid` |
+| `silu(x)` | `x·σ(x)` | `_ir.silu` |
+| `σ_acc(x)`、`exp_acc`、`sqrt_acc` | 精确版：`1 / (1 + exp_acc(-x))`、LLVM `exp`、`sqrt` | `_ir.sigmoid_accurate`、`exp_accurate`、`sqrt_accurate` |
+| `silu_acc(x)` | `x / (1 + exp_acc(-x))` | `phases.moe_up`、`phases.qkvz_conv` 中的写法 |
+| `softplus(x)` | `F.softplus`（beta 1，threshold 20） | `_ir.softplus` |
+| `rsq(x)` | 硬件倒数平方根 | `rocdl.rsq` |
+| `exp2(x)` | 硬件 2 的幂 | `_ir.exp2` |
+| `gemma(v, w)` | `bf16(v · rsq(Σv²/n + eps) · (1 + w))`，n 为该头或该分支的通道数 | `phases.combine_norm`、`attention.qk_prep`、`attention._gemma_norm2` |
+| `ref(m)` | `m` 为 `-inf` 时取 0，否则取 `m` | `attention._guard` |
+| `wave_sum`、`wave_max` | 64 lane 归约（DPP、swizzle、bpermute），每个 lane 得到结果 | `_ir.wave_reduce` |
+| `load.sc1`、`store.sc1` | aux=16，设备一致的加载、存储（`ctx.aux`） | `_phase.SC1` |
+| `store.sys`、`load.sys` | aux=17，系统一致（sc0、sc1） | `xgmi.SYS` |
+| `Σ_{i=a..b}` | 按写出的顺序做 FP32 累加 | — |
+| `S.名字` | scratch 中的中间量，见下面 scratch 表 | `fused.scratch_layout` |
+| `a("X")` | 第 X 个指针参数，在使用处从 kernarg 段加载 | `fused.KernelArgs` |
+| `W_QKVZ` 等大写名 | 即 `a("W_QKVZ")` 指向的张量 | 见“kernel 参数与来源”表 |
+| `relu(x)` | `max(x, 0)` | `attention.index_logits` |
+
+### 模型常量
+
+| 符号 | 值 | 来源 |
+|---|---|---|
+| H | 2560 | `Qwen38Config.hidden`；`phases.H` |
+| C | 4 | `Qwen38Config.hc_count`；`phases.C` |
+| WIDTH | 10240 | `Qwen38Config.hc_width = C·H`；`phases.WIDTH` |
+| LOWRANK | 320 | `Qwen38Config.hc_lowrank` |
+| eps | 1e-6 | `Qwen38Config.eps`（`FusedLayer.eps`） |
+| D | 128 | `Qwen38Config.gdn_head_dim`；`phases.D` |
+| KERNEL | 4 | `Qwen38Config.conv_kernel` |
+| DA | 256 | `Qwen38Config.head_dim`；`attention.DA` |
+| ROT | 64 | `Qwen38Config.rotary_dim`；`attention.ROT` |
+| IH、ID | 4、128 | `Qwen38Config.index_heads`、`index_head_dim`；`attention.IH`、`attention.ID` |
+| RATIO | 4 | `Qwen38Config.index_compress_ratio` |
+| E | 512 | `Qwen38Config.n_experts`；共享专家 id = 512（`shared_expert`） |
+| TOP_K | 10 | `Qwen38Config.top_k` |
+| MOE_SLOTS | 11 | `Qwen38Config.moe_slots = top_k + 1`（`fused.shard_dims` 第 6 项）；10 个路由专家 + 1 个共享专家 |
+| 层类型 | `(layer_id + 1) % 4 == 0` 为 full attention（第 3、7、…、47 层），其余为 GDN | `Qwen38Config.layer_kind` |
+
+### 每 rank 的量
+
+| 符号 | TP2 | TP4 | 来源 |
+|---|---:|---:|---|
+| tp | 2 | 4 | `work.comm.world`（`PeerMemory.world`） |
+| k_heads | 8 | 4 | `Qwen38Shard.gdn_k_heads = 16 / tp` |
+| v_heads | 24 | 12 | `Qwen38Shard.gdn_v_heads = 48 / tp` |
+| key_dim | 1024 | 512 | `Qwen38Shard.gdn_key_dim = k_heads·D` |
+| value_dim | 3072 | 1536 | `Qwen38Shard.gdn_value_dim = v_heads·D` |
+| conv_dim | 5120 | 2560 | `Qwen38Shard.conv_dim = 2·key_dim + value_dim` |
+| N_QKVZ | 8192 | 4096 | `fused._gdn_steps`：`n_qkvz = conv_dim + value_dim` |
+| GROUP | 3 | 3 | `phases.recurrent`：`group = v_heads // k_heads` |
+| BA_OUT | 48 | 24 | `2·v_heads`（`phases.quant_ba` 的 `ba_out`） |
+| BA_ROWS | 48 | 32 | `packed["gdn_ba"].shape[0]`，`weights.pack_layer` 补到 16 的倍数 |
+| BA_CTAS | 2 | 1 | `phases.quant_ba`：`(BA_ROWS/16 + 1) // 2` |
+| heads | 12 | 6 | `Qwen38Shard.heads = 24 / tp` |
+| kv_heads | 1 | 1 | `Qwen38Shard.kv_heads = max(1, 2 // tp)`（TP4 两两复制） |
+| N_QKV | 6656 | 3584 | `attention.qkv_columns(heads) = (2·heads + 2)·DA` |
+| K_O | 3072 | 1536 | `fused._core_steps`：`k = heads·DA` |
+| INTER_P | 320 | 192 | `weights.moe_inter_padded = ceil(640/tp/64)·64`（`MOE_PADDING = 64`） |
+| REGION_BYTES | 1,318,912 | 2,629,632 | `xgmi.region_bytes(tp, 64) = 8192 + 2·tp·64·H·2` |
+
+### 启动与阶段常量
+
+| 符号 | 值 | 来源 |
+|---|---|---|
+| CTAS | 80 | `fused.ctas_for = multi_processor_count`（MI308X） |
+| THREADS | 512（8 个 wave） | `_phase.THREADS`、`_phase.WAVES` |
+| HALF | 256（4 个 wave） | `_phase.HALF`、`_phase.HALF_WAVES` |
+| 全部 wave 数 | 640 | `Ctx.waves = CTAS·8` |
+| LDS | 64 KiB/CTA | `_phase.LDS_WORDS·4` |
+| HINTS | `{"waves_per_eu": 2}` | `fused.HINTS` |
+| CAPACITY | 64 | `sglang_plugin.CAPACITY` |
+| rows | 1..64 | `hidden_states.shape[0]` |
+| tiles | rows≤16 为 1，≤32 为 2，否则 4 | `linear.tiles_for` |
+| DOWN_ROWS、KSPLIT | 336、16 | `phases.DOWN_ROWS`（320 低秩 + 4 inject + 12 零行）、`phases.KSPLIT` |
+| FP8_MAX | 240 | `_ir.FP8_MAX` |
+| L2NORM_EPS | 1e-6 | `phases.L2NORM_EPS` |
+| TOPK_TOK | 2051 | `attention.TOPK = index_topk + RATIO − 1 = 2048 + 3` |
+| CHUNK、CHUNKS | 16、129 | `attention.CHUNK`、`attention.CHUNKS = ceil(2051/16)` |
+| TOPK_BLK | 512 | `pyhip/ops/qsa/flydsl/indexer_topk.TOPK` |
+| RING | 8 | `attention.RING = 2·RATIO`（SGLang 的 `qsa_ring_slots_per_request`） |
+| INDEX_COLUMNS | 640 | `attention.INDEX_COLUMNS = (IH + 1)·ID` |
+| Q_SCALE | 0.0901684 | `attention.Q_SCALE = DA^-0.5·log2e` |
+| INDEX_SCALE | 0.0883883 | `attention.INDEX_SCALE = ID^-0.5` |
+| MROPE_SECTION | (11, 11, 10) | `attention.MROPE_SECTION` |
+| SEG_CHUNKS（tiles 1/2/4） | 2/4/8 | `attention.group_for` |
+| SEGS（tiles 1/2/4） | 65/33/17 | `attention.segments = ceil(129 / SEG_CHUNKS)` |
+| BLOCK_CHUNKS（tiles 1/2/4） | 2/2/4 | `attention.block_keys / 16`（SGLang decode 的 BLOCK_N 32/32/64） |
+| MAX_BLOCKS | 65552 | `_Runtime.workspace`：`ceil(262148/64)·16`，262148 = `req_to_token.shape[1]` |
+| MAX_RANKS、MAX_CTAS | 8、128 | `peer.MAX_RANKS`、`xgmi.MAX_CTAS` |
+| FLAGS、EPOCHS、RECV | 0、4096、8192 | `xgmi.py`，区域内的字节偏移 |
+
+### kernel 参数与来源
+
+“served”指 SGLang 加载后的参数，原地引用（`_Runtime.layer` 经 `weights.SGLANG_NAMES` 取得）；“packed”指 `weights.pack_layer` 生成的 BF16 16x16 预排副本。形状写作“TP2；TP4”。
+
+| 参数 | 张量与来源 | dtype、形状 |
+|---|---|---|
+| `H_IN` | `h`：`hidden_states`；第 0 层是 embedding，复制成 4 个分支（`_mono_layer`） | BF16 [rows, 10240] |
+| `HN_IN` | `hn`：SGLang 的 `residual`；没有时传 0，启动内先做 norm | BF16 [rows, 10240] |
+| `NORM_A` | served `hc_attn_norm` ← `attn_hyper_connection.hc_norm.weight` | BF16 [10240] |
+| `SCRATCH` | `work.scratch`（`FusedWorkspace`） | uint8，按 `scratch_layout` 分区 |
+| `HC_DN_A`、`HC_UP_A` | packed `hc_attn_dn`（down 320 行 + inject 4 行 + 零行）、`hc_attn_up`（`pack_hc_up` 重排） | BF16 [336, 10240]、[10240, 320] |
+| `W_QKVZ`、`S_QKVZ` | served `gdn_qkvz` ← `linear_attn.in_proj_qkvz.weight`、`.weight_scale` | FP8 [8192；4096, 2560]、FP32 [8192；4096, 1] |
+| `CONV_W` | served `gdn_conv` ← `linear_attn.conv1d.weight` | BF16 [5120；2560, 1, 4] |
+| `SLOTS` | `_gdn_state`：`linear_attn_backend.forward_metadata.mamba_cache_indices` | int32 [rows]，<0 为填充行 |
+| `CONV_STATE` | `_gdn_state`：`req_to_token_pool.mamba2_layer_cache(id).conv[0]` | BF16 [槽位, 5120；2560, 3] |
+| `W_BA` | packed `gdn_ba` ← `linear_attn.in_proj_ba.weight`（[b; a]） | BF16 [48；32, 2560] |
+| `A_LOG`、`DT_BIAS` | served `gdn_a_log`、`gdn_dt_bias` ← `linear_attn.A_log`、`linear_attn.dt_bias` | FP32、BF16 [24；12] |
+| `GDN_NORM` | served `gdn_norm` ← `linear_attn.norm.weight` | BF16 [128] |
+| `SSM` | `_gdn_state`：`mamba2_layer_cache(id).temporal` | FP32 [槽位, 24；12, 128, 128] |
+| `W_OUT`、`S_OUT` | served `gdn_out` ← `linear_attn.out_proj.weight`、`.weight_scale` | FP8 [2560, 3072；1536]、FP32 [2560, 1] |
+| `W_QKV`、`S_QKV` | served `attn_qkv` ← `qkv_proj.weight`、`.weight_scale` | FP8 [6656；3584, 2560]、FP32 [6656；3584, 1] |
+| `Q_NORM`、`K_NORM` | served `attn_q_norm`、`attn_k_norm` ← `q_norm.weight`、`k_norm.weight` | BF16 [256] |
+| `TABLE` | `layer.rotary_emb.cos_sin_cache`（先 `_match_cos_sin_cache_dtype`） | BF16 [位置, 64]：前 32 列 cos，后 32 列 sin |
+| `POSITIONS` | attention 层 forward 的 `positions` | int64 [3, ≥rows]（MRoPE 三个轴），`pos_stride = positions.stride(0)` |
+| `CACHE_LOC` | `forward_batch.out_cache_loc`（转 int64） | int64 [rows] |
+| `K_CACHE`、`V_CACHE` | `get_token_to_kv_pool().get_key_buffer(id)`、`get_value_buffer(id)` | BF16 [token 槽位, 1, 256] |
+| `W_INDEX` | packed `index_qk` ← `indexer.index_qk_proj.weight` | BF16 [640, 2560]：q 头 0–3 各 128 行，然后 k 128 行 |
+| `INDEX_Q_NORM`、`INDEX_K_NORM` | served `index_q_norm`、`index_k_norm` ← `indexer.q_layernorm.weight`、`indexer.k_layernorm.weight` | BF16 [128] |
+| `REQ_POOL`、`SEQ_LENS` | `forward_batch.req_pool_indices`、`forward_batch.seq_lens`（转 int64） | int64 [rows]；seq 含本步新 token |
+| `REQ_TO_TOKEN` | `get_req_to_token_pool().req_to_token` | int32 [请求槽位, 262148] |
+| `RING`、`RING_POS` | `pool.get_qsa_key_state_buffer(id)`、`pool.qsa_rope_position_buffer` | BF16 [请求槽位·8, 1, 128]、int64 [请求槽位·8, 3] |
+| `COMPRESSED` | `pool.get_qsa_compressed_k_buffer(id)` | BF16 [·, 1, 128]，按 token 槽位 // 4 索引 |
+| `W_O`、`S_O` | served `attn_o` ← `o_proj.weight`、`.weight_scale` | FP8 [2560, 3072；1536]、FP32 [2560, 1] |
+| `NORM_M` | served `hc_mlp_norm` ← `mlp_hyper_connection.hc_norm.weight` | BF16 [10240] |
+| `HC_DN_M`、`HC_UP_M` | packed `hc_mlp_dn`、`hc_mlp_up` | 同 `HC_DN_A`、`HC_UP_A` |
+| `W_ROUTER` | packed `router_shared` ← `mlp.gate.weight` [512, 2560] 与 `mlp.shared_expert_gate.weight` 补到 16 行 | BF16 [528, 2560] |
+| `W13`、`S13` | served `moe_w13` ← `mlp.experts.w13_weight`、`w13_weight_scale`（gate、up 两半各补零到 INTER_P） | FP8 [513, 640；384, 2560]、FP32 [513, 640；384, 1] |
+| `W2`、`S2` | served `moe_w2` ← `mlp.experts.w2_weight`、`w2_weight_scale` | FP8 [513, 2560, 320；192]、FP32 [513, 2560, 1] |
+| `NORM_NEXT` | `hc_consumer.hc_norm.weight`：下一层的 `attn_hyper_connection`，第 47 层为 `hyper_connection_mixer`；`hc_consumer` 为 None（第 0 层，下一层带 PLE）时用本层 `hc_attn_norm` | BF16 [10240] |
+| `OUT`、`NORMED` | `_mono_layer` 新分配，返回给 SGLang 作下一层的 `hidden_states`、`residual` | BF16 [rows, 10240] |
+| `COMM` | `work.comm.table`（`PeerMemory.table`：8 个区域基址 + 本 rank 号） | int64 [16] |
+| `TIMELINE` | 0（服务路径不计时） | — |
+| 标量 | GDN：`rows`、`conv_state_bytes = conv_state.numel()·2`；attention：`rows`、`pos_stride`、`table_rows = table.shape[0]`、`rtt_stride = req_to_token.stride(0)`、`rtt_bytes = req_to_token.numel()·4`、`ring_slots = ring.shape[0]`、`compressed_bytes = compressed.numel()·2` | Int32 / Int64 |
+
+### scratch 中间量（`S.名字`）
+
+按 CAPACITY = 64 行分配，每项按 256 字节对齐（`fused.scratch_layout`）。
+
+| 名字 | dtype、形状 | 写入阶段 |
+|---|---|---|
+| `hn` | BF16 [rows, 10240] | norm、mlp_norm |
+| `partial` | FP32 [16, rows, 336] | hc_down |
+| `low` | BF16 [rows, 320] | hc_lowrank |
+| `gain_a`、`gain_m` | FP32 [rows, 4] | attention 分支、MLP 分支的 hc_lowrank |
+| `x` | BF16 [rows, 2560] | hc_mix_up |
+| `xq`、`xs` | FP8 [rows, 2560]、FP32 [rows] | quant_ba、quant_index |
+| `ba` | BF16 [rows, BA_OUT] | quant_ba |
+| `qkvz`、`conv` | BF16 [rows, N_QKVZ]、[rows, conv_dim] | qkvz_conv |
+| `core` | BF16 [rows, value_dim] | recurrent（未归一化的输出，供调试） |
+| `y`、`yq`、`ys` | BF16 [rows, value_dim 或 K_O]、FP8、FP32 [rows] | recurrent 或 combine_gate；quant_y |
+| `index_qk` | BF16 [rows, 640] | quant_index |
+| `qkv` | BF16 [rows, N_QKV] | qkv |
+| `q` | BF16 [rows, heads, 256] | qk_prep |
+| `index_q` | BF16 [rows, 4, 128] | qk_prep（index_prep） |
+| `index_logits` | FP32 [rows, MAX_BLOCKS] | logits |
+| `topk` | int32 [rows, 2051] | topk |
+| `scores`、`chunk_max` | FP32 [rows, 129·16, 16]、[rows, 129, 16] | scores |
+| `part_ml`、`part_acc` | FP32 [records, 16, 2]、[records, heads, 256]，records ≤ 1088 | values |
+| `logits`、`shared` | BF16 [rows, 512]、FP32 [rows, 16] | router |
+| `ids`、`weights` | int32、FP32 [rows, 11] | mlp_topk |
+| `plan` | int32 [1 + 3·513]：`[num_active, expert[513], offset[513], count[513]]` | plan |
+| `route_row`、`route_weight` | int32、FP32 [rows·11] | plan |
+| `mid` | BF16 [rows·11, INTER_P] | moe_up |
+| `h1` | BF16 [rows, 10240] | mlp_norm |
+| `sync` | 两行 128 字节计数器（到达、离开） | grid barrier |
+
+### 1. 接口层：SGLang → 插件
+
+```python
+# SGLang：models/qwen4_exp.py Qwen4ExpModel.forward（只读，未修改）
+hidden_states = embed_tokens(input_ids)                       # BF16 [rows, 2560]
+residual = None                                               # 层间：上一层融合出的本层 hc_norm，或 None
+for i in range(48):
+    hidden_states, residual = layers[i](positions=positions, hidden_states=hidden_states, residual=residual,
+                                        forward_batch=forward_batch, hc_consumer=_hc_consumers[i], ...)
+hidden_states, _ = hyper_connection_mixer.mix(hidden_states, residual)
+
+# 插件加载：SGLANG_PLUGINS=qwen38_monokernel → 入口点 sglang.srt.plugins:qwen38_monokernel
+#   （benchmarks/monokernel/plugin/qwen38_monokernel_plugin.py）→ sglang_plugin.register
+# HookRegistry、AROUND：plugins/hook_registry.py；get_attn_backend、get_token_to_kv_pool、get_req_to_token_pool：
+#   model_executor/forward_context.py；LINEAR、FULL：config.LayerKind；_int64：sglang_plugin._int64（转 int64）
+def register():                                               # sglang_plugin.py
+    if not PYHIP_MONOKERNEL: return
+    _RUNTIME = _Runtime()     # validate = PYHIP_MONOKERNEL_VALIDATE；native_attention = (PYHIP_MONOKERNEL_ATTENTION == "native")
+                              # fused_ar = (PYHIP_MONOKERNEL_AR != "aiter")
+    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpLinearDecoderLayer.forward", gdn_layer_forward, AROUND)
+    HookRegistry.register("sglang.srt.models.qwen4_exp.Qwen4ExpAttentionDecoderLayer.forward",
+                          attention_layer_forward, AROUND)
+
+def gdn_layer_forward(original, layer, hidden_states, residual=None, **kw):          # sglang_plugin.py
+    if not _RUNTIME.accepts(layer, kw["forward_batch"], hidden_states):
+        return original(layer, hidden_states, residual, **kw)                         # 原生层
+    return _mono_layer(_RUNTIME, layer, hidden_states, kw["hc_consumer"], hn=residual)
+
+def attention_layer_forward(original, layer, positions, hidden_states, residual, forward_batch, **kw):
+    if not _RUNTIME.accepts(layer, forward_batch, hidden_states):
+        return original(layer, positions, hidden_states, residual, forward_batch, **kw)
+    return _mono_layer(_RUNTIME, layer, hidden_states, kw["hc_consumer"], (positions, forward_batch), hn=residual)
+# 两个 hook 在 VALIDATE=1 且不在 graph 捕获中时改走 _validated（再跑两次原生层并比较），服务路径不经过
+
+def _Runtime.accepts(layer, batch, hidden_states):                                   # sglang_plugin.py
+    return (batch.forward_mode.is_decode()
+            and layer.layer_id != 1 and layer.ple is None                             # PLE_LAYER = 1
+            and layer.config.num_hidden_layers != 1                                    # MTP draft 模型只有 1 层
+            and 0 < hidden_states.shape[0] <= 64                                       # CAPACITY
+            and get_attn_backend().linear_attn_backend.forward_metadata.replayssm_write_pos is None)
+
+def _mono_layer(rt, layer, hidden_states, hc_consumer, attention=None, hn=None):     # sglang_plugin.py
+    kind = LINEAR if attention is None else FULL
+    mono = rt.layer(layer, kind)                                                      # §2
+    h = hidden_states if hidden_states.shape[-1] == 10240 else cat([hidden_states] * 4, dim=-1)
+    if hn is not None and (hn.shape != h.shape or not hn.is_contiguous()):
+        hn = None
+    work = rt.workspace(mono, h.device)                                               # §2
+    norm_next = hc_consumer.hc_norm.weight if hc_consumer is not None else mono.served["hc_attn_norm"]
+    out, normed = empty_like(h), empty_like(h)                                        # BF16 [rows, 10240]
+    if work.comm is None or (kind == FULL and rt.native_attention):
+        _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention)    # §2 末尾
+    elif kind == LINEAR:
+        slots, conv_state, ssm_state = _gdn_state(layer)
+        mono.layer(h, slots, conv_state, ssm_state, norm_next, out, normed, work, hn=hn)      # FusedGdnLayer.layer
+    else:
+        positions, fb = attention
+        pool, k_cache, v_cache, req_to_token, req_pool, seq_lens = _attention_pools(layer, fb)
+        layer.rotary_emb._match_cos_sin_cache_dtype(h)
+        mono.layer(h, positions, _int64(fb.out_cache_loc), k_cache, v_cache, layer.rotary_emb.cos_sin_cache,
+                   req_pool, seq_lens, req_to_token, pool.get_qsa_key_state_buffer(layer.layer_id),
+                   pool.qsa_rope_position_buffer, pool.get_qsa_compressed_k_buffer(layer.layer_id),
+                   norm_next, out, normed, work, hn=hn)                               # FusedAttentionLayer.layer
+    return out, (normed if hc_consumer is not None else None)                         # 下一层的 (hidden_states, residual)
+
+def _gdn_state(layer):                                                                # sglang_plugin.py
+    backend = get_attn_backend().linear_attn_backend
+    cache = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    return backend.forward_metadata.mamba_cache_indices.to(int32), cache.conv[0], cache.temporal
+
+def _attention_pools(layer, fb):                                                      # sglang_plugin.py
+    pool = get_token_to_kv_pool()
+    return (pool, pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id),
+            get_req_to_token_pool().req_to_token, _int64(fb.req_pool_indices), _int64(fb.seq_lens))
+```
+
+### 2. 宿主层：权重、工作区、启动
+
+```python
+def _Runtime.layer(layer, kind):                    # sglang_plugin.py；每层首次调用时构造并缓存
+    # get_tensor_model_parallel_*、get_tp_group、get_attn_tp_group：SGLang distributed/
+    rank_shard = shard(tp=get_tensor_model_parallel_world_size(), rank=get_tensor_model_parallel_rank())  # config.shard
+    params = dict(layer.named_parameters())
+    served = {name: params[path] for name, path in SGLANG_NAMES[kind].items()}       # weights.SGLANG_NAMES
+    packed = pack_layer(served, kind, QWEN38_FLASH_NEXT)
+    return (FusedGdnLayer if kind == LINEAR else FusedAttentionLayer)(rank_shard, served, packed)
+
+def pack_layer(served, kind, config):               # weights.py；shuffle = shuffle_16x16，pad16 = 行补零到 16 的倍数
+    for p in ("hc_attn", "hc_mlp"):
+        packed[p + "_dn"] = shuffle(pad16(cat(served[p + "_down"], served[p + "_inject"])))   # [320+4 → 336, 10240]
+        packed[p + "_up"] = pack_hc_up(served[p + "_up"])   # 第 16b+4jj+g 行 = 分支 g 第 4b+jj 列；[10240, 320]
+    packed["router_shared"] = cat(shuffle(served["router"]), shuffle(pad16(served["shared_gate"])))  # [528, 2560]
+    if kind == LINEAR: packed["gdn_ba"] = shuffle(pad16(served["gdn_ba"]))         # [BA_ROWS(48|32), 2560]
+    else:              packed["index_qk"] = shuffle(served["index_qk"])            # [640, 2560]
+    # 另有 router、shared_gate 的单独副本，供拆分路径与阶段内核使用
+
+def _Runtime.workspace(mono, device):               # sglang_plugin.py；每设备一次
+    max_blocks = ceil(get_req_to_token_pool().req_to_token.shape[1] / 64) * 16          # 262148 → 65552
+    tp_group = get_tp_group()
+    comm = (PeerMemory(region_bytes(tp, 64), tp_group.cpu_group, device)
+            if fused_ar and get_attn_tp_group().world_size == tp_group.world_size else None)
+    return FusedWorkspace(64, mono.shard, device, max_blocks, comm)
+    # FusedWorkspace（fused.py）：dims = shard_dims(shard, max_blocks)
+    #   = (conv_dim, value_dim, v_heads, INTER_P, 512, 11, heads, 65552)；scratch = zeros(scratch_layout(dims, 64) 字节)
+
+def PeerMemory(size, group, device):                # peer.py；每个 rank 执行
+    local = hipExtMallocWithFlags(size, 0x3)        # hipDeviceMallocUncached
+    hipMemset(local, 0, size)
+    handles = all_gather_object(hipIpcGetMemHandle(local), group)        # 经 TP 的 CPU group
+    bases = [local if r == rank else hipIpcOpenMemHandle(handles[r], 0x1) for r in range(tp)]   # LAZY_PEER_ACCESS
+    table = int64[16]([*bases, 0 补到 8 项, rank, 0 ...])                  # TABLE_WORDS = 16
+    dist.barrier(group)                             # 所有区域清零并映射后才会有 kernel 写入
+
+def FusedGdnLayer.layer(h, slots, conv_state, ssm_state, norm_next, out, normed, work, hn=None):   # fused.py
+    rows = h.shape[0]; tiles = tiles_for(rows); tp = work.comm.world; normed_in = hn is not None
+    all_phases = tuple(range(len(layer_phases(GDN_LAYER_PHASES, normed_in))))      # 18，或 19（含 norm）
+    args = (h, hn or 0, hc_attn_norm, work.scratch, hc_attn_dn, hc_attn_up, gdn_qkvz, gdn_qkvz_scale, gdn_conv,
+            slots, conv_state, packed gdn_ba, gdn_a_log, gdn_dt_bias, gdn_norm, ssm_state, gdn_out, gdn_out_scale,
+            *_tail(norm_next, out, normed, work), 0, rows, conv_state.numel() * 2, current_stream)
+    # _tail = (hc_mlp_norm, hc_mlp_dn, hc_mlp_up, router_shared, moe_w13, moe_w13_scale, moe_w2, moe_w2_scale,
+    #          norm_next, out, normed, work.comm.table)；指针顺序 = GDN_LAYER_ARGS
+    key = ("gdn_layer", device, dims, k_heads, BA_ROWS, tiles, 64, eps, 80, tp, normed_in, all_phases, False)
+    _call(key, make_gdn_layer(dims, k_heads, BA_ROWS, tiles, 64, eps, 80, tp, normed_in, all_phases), args, HINTS)
+
+def FusedAttentionLayer.layer(h, positions, cache_loc, k_cache, v_cache, table, req_pool, seq_lens, req_to_token,
+                              ring, ring_pos, compressed, norm_next, out, normed, work, hn=None):    # fused.py
+    pos_stride = positions.stride(0) if positions.dim() == 2 else 0
+    all_phases = tuple(range(len(layer_phases(ATTN_LAYER_PHASES, normed_in))))     # 24，或 25（含 norm）；rows、tiles、tp、normed_in 同上
+    args = (h, hn or 0, hc_attn_norm, work.scratch, hc_attn_dn, hc_attn_up, attn_qkv, attn_qkv_scale, attn_q_norm,
+            attn_k_norm, table, positions, cache_loc, k_cache, v_cache, packed index_qk, index_q_norm, index_k_norm,
+            req_pool, seq_lens, req_to_token, ring, ring_pos, compressed, attn_o, attn_o_scale,
+            *_tail(norm_next, out, normed, work), 0, rows, pos_stride, table.shape[0], req_to_token.stride(0),
+            req_to_token.numel() * 4, ring.shape[0], compressed.numel() * 2, current_stream)   # 顺序 = ATTN_LAYER_ARGS
+    key = ("attn_layer", device, dims, tiles, 64, eps, 80, tp, normed_in, all_phases, False)
+    _call(key, make_attn_layer(dims, tiles, 64, eps, 80, tp, normed_in, all_phases), args, HINTS)
+
+def _call(key, builder, args, hints):                # linear.py
+    if key not in _COMPILED:                         # SGLang 的 eager warmup 中发生；graph 捕获时首次遇到会报错
+        with CompilationContext.compile_hints({"monokernel_config": repr(key), "waves_per_eu": 2}):
+            _COMPILED[key] = flyc.compile(builder, *args)      # 编译并执行这一次（不再重复启动）
+    else:
+        _COMPILED[key](*args)    # @flyc.jit launch：gdn_layer / attn_layer(...).launch(grid=(80,1,1), block=(512,1,1), stream)
+
+def _split_layer(rt, mono, layer, h, work, norm_next, out, normed, attention):        # 非服务默认路径
+    # PYHIP_MONOKERNEL_AR=aiter，或 attention 层 PYHIP_MONOKERNEL_ATTENTION=native，或 attention TP ≠ TP
+    # gains = FP32 [2, rows, 4]；part_a、part_m、x = BF16 [rows, 2560]；h1 = BF16 [rows, 10240]（均为新分配）
+    if GDN: mono.attention(h, slots, conv, ssm, part_a, work, gain_out=gains[0])      # make_attention：1 次启动
+    elif native_attention: mono.mix(h, x, work, gains[0]); part_a = layer.self_attention(positions, x, fb)
+    else: mono.prep(...); mono.core(..., part_a, work)                                # make_attn_prep、make_attn_core
+    attn = attn_tp_all_reduce(part_a)                                                 # SGLang/AITER
+    mono.mlp(h, attn, gains[0], h1, gains[1], part_m, work)                           # make_mlp
+    moe = tensor_model_parallel_all_reduce(part_m)                                    # SGLang/AITER
+    hc_combine_norm(h1, moe, gains[1], norm_next, out, normed)                        # flydsl/hc.py 单独 kernel
+```
+
+### 3. kernel 骨架
+
+```python
+# fused.make_gdn_layer → @flyc.kernel gdn_layer(<GDN_LAYER_ARGS>, rows, conv_state_bytes)
+# fused.make_attn_layer → @flyc.kernel attn_layer(<ATTN_LAYER_ARGS>, rows, pos_stride, table_rows, rtt_stride,
+#                                                  rtt_bytes, ring_slots, compressed_bytes)
+# 以下为每个线程的视角；80 个 CTA 同时常驻（每 CU 一个），每 CTA 512 线程
+ctx = Ctx(rows, coherent=True)          # _phase.Ctx：tid、lane = tid % 64、wave = tid // 64、cta、
+                                        # wave_id = wave*80 + cta、half = tid // 256、half_wave = wave % 4、
+                                        # aux = SC1、shared = LDS 64 KiB
+comm = Comm(ctx, COMM, tp, 64)          # xgmi.Comm：rank = table[8]，mine = table[rank]
+a = KernelArgs(GDN_LAYER_ARGS or ATTN_LAYER_ARGS)
+
+steps = _mix_steps(H_IN=a("H_IN"), NORM_W=a("NORM_A"), GAIN_OUT=S.gain_a, HC_DN=a("HC_DN_A"), HC_UP=a("HC_UP_A"),
+                   X=S.x, combine=False, hn_in=a("HN_IN") if normed_in else None)
+#   = [norm（仅 normed_in=False）, hc_down, hc_lowrank, hc_mix_up]
+if GDN:
+    steps += _gdn_steps(..., out=None, push=comm.targets(0, rows), finish=comm.handshake)
+    #   = [quant_ba, qkvz_conv, recurrent, quant_y, out_proj]
+else:
+    steps += _prep_steps(...)           # = [quant_index, qkv, qk_prep（含 index_prep）, compress, logits]
+    steps += _core_steps(..., out=None, push=comm.targets(0, rows), finish=comm.handshake)
+    #   = [topk, scores, values, combine_gate, quant_y, o_proj]
+steps += _tail_steps(comm, ...)
+#   = _mlp_steps(H_IN=a("H_IN"), y=Reduced(comm.sources(0, rows)), GAIN_IN=S.gain_a, NORM_W=a("NORM_M"), H_OUT=S.h1,
+#                GAIN_OUT=S.gain_m, HC_DN=a("HC_DN_M"), HC_UP=a("HC_UP_M"), push=comm.targets(1, rows),
+#                finish=comm.handshake)
+#     = [mlp_norm, mlp_hc_down, mlp_hc_lowrank, mlp_hc_mix_up, router, topk, plan, moe_up, moe_down]
+#   + [combine]
+_run(ctx, steps, sync=S.sync, ctas=80)
+
+def _run(ctx, steps, sync, ctas):       # fused.py
+    for i, (prefetch, run) in enumerate(steps):
+        if i: grid_arrive(sync)         # §5
+        pre = prefetch() if prefetch else None      # 本阶段第 0 轮的权重，不依赖前一阶段
+        if i: grid_wait(sync, ordinal=i - 1)
+        run(pre)
+    grid_exit(sync, exits=sync + 128)   # 最后离开的 CTA 把计数器清零，graph 可以重放
+```
+
+阶段序号（`normed_in=True`，即有 `residual` 时；否则在最前面多一个 norm 阶段）：
+
+| 层 | 阶段 |
+|---|---|
+| GDN（18 个） | 0 hc_down、1 hc_lowrank、2 hc_mix_up、3 quant_ba、4 qkvz_conv、5 recurrent、6 quant_y、7 out_proj、8 mlp_norm、9 mlp_hc_down、10 mlp_hc_lowrank、11 mlp_hc_mix_up、12 router、13 topk、14 plan、15 moe_up、16 moe_down、17 combine |
+| full attention（24 个） | 0 hc_down、1 hc_lowrank、2 hc_mix_up、3 quant_index、4 qkv、5 qk_prep、6 compress、7 logits、8 topk、9 scores、10 values、11 combine_gate、12 quant_y、13 o_proj、14–23 同 GDN 层的 8–17 |
+
+### 4. 阶段函数
+
+```python
+# ---- 通用：GEMV 阶段（_phase.RoundGemv + _phase.HalfGemm，phases.Gemv）
+# 权重 W [N, K] 为 16x16 shuffle；N 按 16 行分块，块数 = items。
+# half item：第 r 轮里 CTA c 的 half h 处理 item = 2*(c + 80*r) + h，r < rounds = ceil(ceil(items/2) / 80)。
+# 一个 half（4 个 wave）算一个 16 行块：wave w 取该块 K 方向的第 w, w+4, … 个 1 KiB 权重片（16 行 × 64 字节），
+#   用 MFMA 乘对应的激活，得到 FP32 部分和 [16 输出, 16*tiles token]；4 个 wave 的部分和经 LDS 按 0+1+2+3 相加。
+# 第 r+1 轮的权重在第 r 轮计算前发出；第 0 轮的权重由 prefetch 在 grid_arrive 与 grid_wait 之间发出。
+# 单 split 且 tiles=1 时，激活每阶段只读一次（RoundGemv.cache）。
+# 尾声：token = 16*t + lane%16，n0 = 16*block + 4*(lane//16)，lane 拿到 acc[token][n0 .. n0+3]；由 wave t%4 收集 tile t。
+# acc[token][n] = Σ_k W[n, k] * X[token, k]（FP32；X 为该阶段的激活，token < rows 的结果才写出）。
+
+# ---- norm / mlp_norm / combine（phases.combine_norm）
+# wave item (row, branch)，共 rows*4 个，item 从 wave_id 起、步长 640；lane l 负责分支内的列 col = 8*(l + 64*i) + [0,8)，i < 5
+def combine_norm(H_IN, y, GAIN_IN, NORM_W, H_OUT, HN_OUT, combine):
+    v = H_IN[row, 2560*branch + col]                                     # load.sc1
+    if combine:
+        yv = reduce(y, (row*2560 + col)*2) if y 是 all-reduce 来源 else y[row, col]     # §5
+        v = bf16(v + yv * GAIN_IN[row, branch])
+        H_OUT[row, 2560*branch + col] = v
+    total = Σ_{i=0..4} wave_sum(Σ_{8 列} v²)
+    rstd = rsq(total / 2560 + eps)
+    HN_OUT[row, 2560*branch + col] = bf16(v * rstd * (1 + NORM_W[2560*branch + col]))
+# norm：     combine_norm(a("H_IN"), -, -, a("NORM_A"), -, S.hn, combine=False)
+# mlp_norm： combine_norm(a("H_IN"), comm.sources(0), S.gain_a, a("NORM_M"), S.h1, S.hn, True)
+# combine：  combine_norm(S.h1, comm.sources(1), S.gain_m, a("NORM_NEXT"), a("OUT"), a("NORMED"), True)
+# HN = a("HN_IN")（normed_in）或 S.hn，供 hc_down 与 hc_mix_up 读取
+
+# ---- hc_down（phases.hc_down）：BF16 GEMV，items = 21 块 × 16 split = 336，每 split K = 640，3 轮
+for item: block, split = item % 21, item // 21
+    S.partial[split, token, 16*block + j] = Σ_{k ∈ split} HN[token, k] * HC_DN[16*block + j, k]          # j < 16
+
+# ---- hc_lowrank（phases.hc_lowrank）：wave item (row, third)，共 rows*3 个
+i = 64*third + lane                                                  # 有效：i < 162
+col = 2*i if i < 160 else 320 + 2*(i - 160)
+A, B = (Σ_{s=0..15} S.partial[s, row, col]) * 0.25, (Σ_{s=0..15} S.partial[s, row, col+1]) * 0.25
+if i < 160: S.low[row, col], S.low[row, col+1] = bf16(silu(A)), bf16(silu(B))
+else:       GAIN_OUT[row, col-320], GAIN_OUT[row, col-319] = 2*σ(A), 2*σ(B)     # 4 个分支的 combine 增益
+
+# ---- hc_mix_up（phases.hc_mix_up）：BF16 GEMV，items = 640 块，K = 320，4 轮
+for block: c = 4*block + lane//16                                    # 这个 lane 的 4 个输出 = 列 c 的 4 个分支
+    tot[g] = Σ_k S.low[token, k] * HC_UP[16*block + 4*(lane//16) + g, k]                                # g < 4
+    S.x[token, c] = bf16(0.25 * Σ_{g=0..3} σ(tot[g]) * HN[token, 2560*g + c])
+
+# ---- quant（phases.quant；与 AITER 的逐 token FP8 相同）：wave item 每行
+def quant(src, dst, scale_out, K):   # K = 2560 / value_dim / K_O；lane l 取 8*(l + 64*c) + [0,8)，c < K/512
+    amax = wave_max(max |src[row, :]|)
+    scale = amax * (1/240) if amax > 0 else 1.0
+    dst[row, :] = fp8(clamp(src[row, :] * (1/scale), -240, 240));  scale_out[row] = scale
+
+# ---- quant_ba（phases.quant_ba，GDN）
+if cta < BA_CTAS(2|1):               # ba 投影：BF16 GEMV，items = BA_ROWS/16 (3|2)，在 BA_CTAS 个 CTA 上 1 轮
+    S.ba[token, n] = bf16(Σ_k S.x[token, k] * W_BA[n, k])                                               # n < BA_OUT(48|24)
+else:                                # 其余 CTA 按行量化 x
+    quant(S.x, S.xq, S.xs, 2560)     # 行从 wave*(80-BA_CTAS) + cta - BA_CTAS 开始，步长 (80-BA_CTAS)*8
+
+# ---- qkvz_conv（phases.qkvz_conv）：FP8 GEMV，items = N_QKVZ/16 (512|256)，4|2 轮
+# S.qkvz 的列：[q key_dim | k key_dim | v value_dim | z value_dim]
+for block: n0 = 16*block + 4*(lane//16)
+    xv[c] = bf16(acc[token][n0+c] * S.xs[token] * S_QKVZ[n0+c])                                         # c < 4
+    S.qkvz[token, n0+c] = xv[c]
+    if 16*block < conv_dim(5120|2560):                               # q/k/v 列做 causal conv
+        slot = SLOTS[token]; active = slot >= 0
+        win = [CONV_STATE[slot, n0+c, 0], CONV_STATE[slot, n0+c, 1], CONV_STATE[slot, n0+c, 2], xv[c]]
+        t = Σ_{j=0..3} bf16(win[j] * CONV_W[n0+c, 0, j])
+        S.conv[token, n0+c] = bf16(silu_acc(t)) if active else 0
+        if active: CONV_STATE[slot, n0+c, 0..2] = win[1..3]            # 普通存储（跨启动）
+
+# ---- recurrent（phases.recurrent）：CTA item (row, head)，共 rows*v_heads 个，item 从 cta 起、步长 80
+# 第一个 item 的 SSM 状态由 recurrent_prefetch 在 grid_wait 之前读入；计算时预取下一个 item 的状态
+# 线程 t：状态行 v = t // 4（0..127），列段 seg = [32*(t%4), 32*(t%4) + 32)
+kv = head // GROUP(3)
+q = S.conv[row, 128*kv + seg];  k = S.conv[row, key_dim + 128*kv + seg]
+val = S.conv[row, 2*key_dim + 128*head + v]
+b = S.ba[row, head];  a_ = S.ba[row, v_heads + head];  z = S.qkvz[row, conv_dim + 128*head + v]
+qn = q / sqrt_acc(Σ_{128} q² + 1e-6) * 128^-0.5;  kn = k / sqrt_acc(Σ_{128} k² + 1e-6)   # Σ 经同一行的 4 个线程 DPP 合并
+beta = bf16(σ_acc(b));  g = -exp_acc(A_LOG[head]) * softplus(a_ + DT_BIAS[head])
+St = SSM[slot, head] * exp_acc(g)                                     # FP32 [128, 128]，本线程持有 St[v, seg]
+delta = (val - St[v, :] · kn) * beta;  St[v, :] += delta * kn         # packed FP32 FMA
+o = bf16(St[v, :] · qn) if slot >= 0 else 0
+if slot >= 0: SSM[slot, head][v, seg] = St[v, seg]                    # 普通存储（跨启动）
+rstd = rsq(Σ_{v<128} o² / 128 + eps)                                  # 8 个 wave 经 LDS 合并
+S.y[row, 128*head + v] = bf16(o * rstd * GDN_NORM[v] * σ_acc(z));  S.core[row, 128*head + v] = o
+
+# ---- quant_y：quant(S.y, S.yq, S.ys, value_dim(3072|1536))；attention 层 K = K_O(3072|1536)
+
+# ---- out_proj / o_proj（phases.out_proj）：FP8 GEMV，items = 160，1 轮，K = value_dim 或 K_O
+for block:
+    o4 = bf16(acc[token][n0 .. n0+3] * S.ys[token] * W_SCALE[n0 .. n0+3])        # W_SCALE = S_OUT 或 S_O
+    for r in range(tp): store.sys(comm.targets(0, rows)[r][token, n0 .. n0+3], o4)   # 推送到每个 rank 的 RECV[0][本 rank]
+comm.handshake()                                                       # §5
+
+# ---- quant_index（phases.quant_ba，W = W_INDEX，items = 40，ba_ctas = 20）
+if cta < 20: S.index_qk[token, n] = bf16(Σ_k S.x[token, k] * W_INDEX[n, k])        # n < 640：[q0|q1|q2|q3|k]，各 128
+else:        quant(S.x, S.xq, S.xs, 2560)
+
+# ---- qkv（attention.qkv）：FP8 GEMV，items = N_QKV/16 (416|224)，3|2 轮
+S.qkv[token, n] = bf16(acc[token][n] * S.xs[token] * S_QKV[n])
+# S.qkv 的列：头 j < heads 为 [q_j 256 | gate_j 256]，之后 k 256、v 256
+
+# ---- qk_prep（attention.qk_prep，同一阶段接着执行 attention.index_prep）
+# qk_prep：wave item (row, j)，j < heads+2：j < heads 为 q 头 j，j = heads 为 k，j = heads+1 为 v；lane l 管通道 4l..4l+3
+col = 512*j if j < heads else 512*heads + 256*(j - heads)
+w4 = S.qkv[row, col + 4l .. +4]
+nm = gemma(w4, Q_NORM if j < heads else K_NORM)                      # n = 256；整头 Σ 经 wave_sum
+if lane < 16:                        # 通道 < 64 做交错 MRoPE：pair p = 4*(l%8) + e（e < 4），通道 p 与 p+32 成对
+    axis = 1 if p%3 == 1 and p < 33 else 2 if p%3 == 2 and p < 30 else 0           # MROPE_SECTION
+    pos = POSITIONS[axis, row];  cs, sn = TABLE[pos, p], TABLE[pos, 32 + p]
+    nm[p], nm[p+32] = bf16(bf16(nm[p]*cs) - bf16(nm[p+32]*sn)), bf16(bf16(nm[p+32]*cs) + bf16(nm[p]*sn))
+if j < heads:   S.q[row, j, 4l..] = bf16(nm * Q_SCALE)               # 预乘 256^-0.5·log2e
+elif j == heads: K_CACHE[CACHE_LOC[row], 0, 4l..] = nm               # store.sc1：同一启动内其它 XCD 要读
+else:            V_CACHE[CACHE_LOC[row], 0, 4l..] = w4               # 原值
+# index_prep：wave item (row, j)，j < 5：j < 4 为 index q 头 j，j = 4 为 index key；lane l 管通道 2l、2l+1
+w2 = S.index_qk[row, 128*j + 2l .. +2]
+nm = gemma(w2, INDEX_Q_NORM)                                          # n = 128
+if lane < 32: RoPE（pair p = 2*(l%16) + e，与通道 p+32 成对，位置同上；交换伙伴 lane ^ 16）
+if j < 4: S.index_q[row, j, 2l..] = nm
+else:
+    slot = REQ_POOL[row]*8 + (SEQ_LENS[row] - 1) % 8
+    RING[slot, 0, 2l..] = w2                                          # 原始投影，不做 norm
+    RING_POS[slot, 0..2] = POSITIONS[0..2, row]
+
+# ---- compress（attention.index_compress）：wave item 每行
+seq, req = SEQ_LENS[row], REQ_POOL[row]
+if seq % 4 == 0:                     # 新 token 补齐了一组
+    pooled = bf16(Σ_{m=0..3} RING[req*8 + (seq - 4 + m) % 8] / 4)
+    nm = gemma(pooled, INDEX_K_NORM)
+    first = req*8 + (seq - 4) % 8;  RoPE 位置取 RING_POS[first, axis(p)]
+    COMPRESSED[CACHE_LOC[row] // 4, 0, :] = nm
+
+# ---- logits（attention.index_logits）：每行的页由全部 wave 分摊，一页 = 16 个压缩块
+for row in range(rows):
+    blocks = SEQ_LENS[row] // 4
+    for page in range((wave_id + 61*row) % 640, ceil(blocks / 16), 640):
+        blk = 16*page + lane%16;  kb = COMPRESSED[REQ_TO_TOKEN[req, 4*blk] // 4]           # blk < blocks
+        S.index_logits[row, blk] = 128^-0.5 * Σ_{h=0..3} relu(S.index_q[row, h] · kb)    # MFMA + DPP 求头和
+
+# ---- topk（attention.index_topk，内部用 PyHIP indexer_topk 的 decode 选择）：CTA item 每行，item 从 cta 起、步长 80
+count = SEQ_LENS[row] // 4;  n_blk = min(count, 512)
+if count <= 512: S.topk[row, t] = t，t < 4*count
+else:            S.index_logits[row, :count] 的精确前 512 块（并列取较小块号），按块号升序，块 b 展开为 token 4b..4b+3
+for col in range(4*n_blk, 2051):     # 末尾不满一组的 token，每行共 2051 列
+    o = col - 4*n_blk;  tok = 4*count + o
+    S.topk[row, col] = tok if o < 3 and tok < seq else -1
+
+# ---- scores（attention.attention_scores）：wave item (row, 4 个 chunk)，每行 ceil(129/4) = 33 个
+# 以下 attention 阶段中：req = REQ_POOL[row]，seq = SEQ_LENS[row]；key < 16 为 chunk 内的位置，
+#   slot(key) = REQ_TO_TOKEN[req, S.topk[row, 16c + key]]
+# lane：g = l // 16，r = l % 16（head = r 为本 rank 的 query 头，r < heads 有效）；一个 chunk = 16 个选中位置
+for chunk c:
+    idx = S.topk[row, 16c + key];  ok = 0 <= idx < seq
+    K16[key] = K_CACHE[slot(key)]（ok 时）
+    s[key, head] = K16[key] · S.q[row, head]                         # MFMA：S^T = K Q^T，K = 256
+    S.scores[row, 16c + key, head] = s if ok else -inf
+    S.chunk_max[row, c, head] = max_key S.scores[row, 16c + key, head]
+
+# ---- values（attention.attention_values）：wave item (row, segment, 通道半区)，每行 SEGS*2 个
+# 一个 segment = SEG_CHUNKS 个 chunk；BLOCK_CHUNKS = SGLang decode 一块的 chunk 数
+m = max_{c < 段首} S.chunk_max[row, c, head];  total = 0;  acc = 0       # 段前的运行最大值
+for c in segment:
+    if c % BLOCK_CHUNKS == 0:
+        m_new = max(m, 本块各 chunk 的 chunk_max);  α = exp2(m - ref(m_new));  total *= α;  acc *= α;  m = m_new
+    p[key] = exp2(S.scores[row, 16c + key, head] - ref(m))           # q 已预乘 log2e，故用 exp2
+    total += Σ_key p[key]
+    acc[head, ch] += Σ_key V_CACHE[slot(key), 0, ch] * bf16(p[key])   # ch 为本半区的 128 个通道；MFMA
+record = row*SEGS + segment
+S.part_ml[record, head] = (m, total);  S.part_acc[record, head, ch] = acc
+
+# ---- combine_gate（attention.combine_gate）：wave item (row, head)；lane l 管通道 4l..4l+3
+m_last = S.part_ml[row*SEGS + SEGS-1, head].m
+w_s = exp2(S.part_ml[row*SEGS + s, head].m - ref(m_last))            # s < SEGS
+o = bf16((Σ_s w_s * S.part_acc[row*SEGS + s, head, ch]) / (Σ_s w_s * S.part_ml[row*SEGS + s, head].total))
+S.y[row, head, ch] = bf16(o * σ_acc(S.qkv[row, 512*head + 256 + ch]))          # sigmoid 输出门
+
+# ---- router（phases.router）：BF16 GEMV，items = 33（32 个路由块 + 1 个共享门块），1 轮
+block < 32：S.logits[token, n] = bf16(Σ_k S.x[token, k] * W_ROUTER[n, k])         # n < 512
+block = 32：S.shared[token, j] = Σ_k S.x[token, k] * W_ROUTER[512 + j, k]         # FP32，只用 j = 0
+
+# ---- topk（phases.topk_rows）：wave item 每行；lane l 持有专家 8l..8l+7
+p = softmax(S.logits[row, :512])                                      # FP32，exp_acc，经 wave_max、wave_sum
+key(e) = (有序化(logit 的 BF16 位) << 16) | (0xFFFF - e)               # 有序化 = moe._ordered；相等时较小的 id 胜出
+重复 10 次：e* = argmax key（wave 内 umax），记下 e* 与 p[e*]，再把它移出候选
+S.ids[row, 0..9] = e*；S.weights[row, 0..9] = p[e*] / Σ_{10} p[e*]
+S.ids[row, 10] = 512；S.weights[row, 10] = σ_acc(S.shared[row, 0])             # 共享专家
+
+# ---- plan（phases.plan）：只在 CTA 0，全部数据经 LDS
+routes = rows*11；按 S.ids 统计 count[e]（e < 513）与 64 位行掩码 mask[e]
+offset[e] = Σ_{e' < e} count[e']
+S.plan = [num_active, 活跃专家（按 id 升序）, 对应 offset, 对应 count]
+for 路由 (row, k)，e = S.ids[row, k]：
+    pos = offset[e] + popcount(mask[e] 中低于 row 的位)               # 同一专家内按行号排序
+    S.route_row[pos] = row;  S.route_weight[pos] = S.weights[row, k]
+
+# ---- moe_up（phases.moe_up）：half item = (活跃专家序号 a, 中间维 16 行块 blk)，blk < INTER_P/16 (20|12)
+# items = (INTER_P/16) * num_active；for pair in range(cta, ceil(items/2), 80)：item = 2*pair + half
+e, off, cnt = S.plan 中第 a 个活跃专家的 id、offset、count
+for pos < cnt（pos = 16*t + lane%16）：tok = S.route_row[off + pos]
+    gt[c] = Σ_k bf16(W13[e, 16*blk + c, k]) * S.x[tok, k]                       # FP8 → BF16 精确转换，BF16 MFMA（W8A16）
+    up[c] = Σ_k bf16(W13[e, INTER_P + 16*blk + c, k]) * S.x[tok, k]             # K = 2560 由 4 个 wave 分段，LDS 按 0..3 求和
+    S.mid[off + pos, 16*blk + c] = bf16(silu_acc(gt[c] * S13[e, 16*blk + c]) * (up[c] * S13[e, INTER_P + 16*blk + c]))
+
+# ---- moe_down（phases.moe_down）：half item = 16 列输出块 blk < 160；CTA c 处理 blk = 2c + half
+# half 内 wave w 依次处理活跃专家 a = w, w+4, …，各自在 LDS 中累加 acc_w[row, 16 列]（每个 item 开始时清零）
+# e、off、cnt 同 moe_up（第 a 个活跃专家），pos < cnt，c < 16
+acc = Σ_{k < INTER_P} bf16(W2[e, 16*blk + c, k]) * S.mid[off + pos, k]
+acc_w[S.route_row[off + pos], c] += acc * S2[e, 16*blk + c] * S.route_weight[off + pos]
+res[row, c] = bf16(acc_0[row, c] + acc_1[row, c] + acc_2[row, c] + acc_3[row, c])     # row < rows；按 wave 顺序相加，无原子
+for r in range(tp): store.sys(comm.targets(1, rows)[r][row, 16*blk + c], res)    # 推送 site 1
+comm.handshake()
+```
+
+### 5. grid barrier 与启动内 all-reduce
+
+```python
+# sync.py；sync = S.sync，exits = S.sync + 128 字节
+def grid_arrive(sync):
+    s_waitcnt vmcnt(0); fence(release, workgroup); CTA barrier       # 本 CTA 的存储都已确认
+    if tid == 0: atomic_add(sync, 1)                                  # monotonic，agent 范围
+def grid_wait(sync, ordinal):
+    if tid == 0: while load(sync) < 80*(ordinal + 1): s_sleep(1)      # 计数在一次启动内只增不减
+    CTA barrier
+def grid_exit(sync, exits):
+    if tid == 0 and atomic_add(exits, 1) == 79: sync = 0; exits = 0
+
+# xgmi.py：rank s 的区域 R_s（PeerMemory，uncached，每个 rank 都映射了所有区域）
+#   R.FLAGS  u32 [128][8]，偏移 0：   FLAGS[c][s] = rank s 的 CTA c 最近一次握手写来的 epoch
+#   R.EPOCHS u32 [128]，偏移 4096：   本 rank 的 CTA c 已完成的握手次数（只本 rank 读写）
+#   R.RECV   BF16 [2][tp][64][2560]，偏移 8192：RECV[site][s] = rank s 的分片
+comm.targets(site, rows) = [R_r.RECV[site][rank] for r in range(tp)]  # 产出阶段 store.sys 写入
+comm.sources(site, rows) = [R_rank.RECV[site][s] for s in range(tp)]  # 消费阶段按 rank 顺序读
+def comm.handshake():                 # 每个 CTA 在产出阶段末执行，其后的 grid barrier 保证分片已全部到达
+    s_waitcnt vmcnt(0); CTA barrier
+    if tp > 1:
+        if wave == 0:
+            epoch = R_rank.EPOCHS[cta] + 1
+            lane s（s < tp 且 s != rank）：R_s.FLAGS[cta][rank] = epoch；
+                                           spin until R_rank.FLAGS[cta][s] - epoch >= 0（按 2^32 取模）
+            lane 0：R_rank.EPOCHS[cta] = epoch
+        CTA barrier
+def reduce(sources, at):             # combine_norm 的 y：8 个 BF16
+    v = Σ_{s=0..tp-1} load.sys(sources[s], at)                        # FP32，从 rank 0 起按顺序
+    return v & 0xFFFF0000            # 截断到 BF16（tp > 1），与 AITER one-stage all-reduce 逐位相同
+# site 0（mixer 输出）与 site 1（MoE 输出）交替使用：一个 rank 要到下一次另一 site 的握手后才会再写同一 site，
+# 而任何 peer 都要在本 site 的消费阶段之后的 grid barrier 才会进入那次握手，所以无需清零
+```
