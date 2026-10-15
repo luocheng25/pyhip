@@ -163,8 +163,9 @@ def qk_prep(ctx, qkv_out, q_out, q_norm, k_norm, table, positions, pos_stride, c
         k_row = buffer_at(k_cache + fx.Int64(slot) * (DA * 2), DA * 2)
         v_row = buffer_at(v_cache + fx.Int64(slot) * (DA * 2), DA * 2)
         k_words = words([bf16_word(roped[0], roped[1]), bf16_word(roped[2], roped[3])])
-        store(k_row, is_k.select(lane * 8, fx.Int32(DROP)), k_words)
-        store(v_row, is_v.select(lane * 8, fx.Int32(DROP)), word)
+        # write-through: the sparse attention of a whole-layer launch gathers the new token from other XCDs
+        store(k_row, is_k.select(lane * 8, fx.Int32(DROP)), k_words, aux=ctx.aux)
+        store(v_row, is_v.select(lane * 8, fx.Int32(DROP)), word, aux=ctx.aux)
 
 
 # ---------------------------------------------------------------- sparse attention

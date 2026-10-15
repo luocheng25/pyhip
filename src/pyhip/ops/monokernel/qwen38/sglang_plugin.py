@@ -156,13 +156,16 @@ def _attention_core(rt: _Runtime, mono: FusedAttentionLayer, layer, h, work, gai
     return part
 
 
-def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, attention=None):
-    """One decode layer; ``attention = (positions, forward_batch)`` for a full-attention layer."""
+def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, attention=None, hn=None):
+    """One decode layer; ``attention = (positions, forward_batch)`` for a full-attention layer; ``hn``: the
+    attention-branch norm of ``hidden_states`` from the previous layer (SGLang's ``residual``), if any."""
     mono = rt.layer(layer, LayerKind.LINEAR if attention is None else LayerKind.FULL)
     width = mono.shard.config.hc_width
     h = hidden_states if hidden_states.shape[-1] == width else torch.cat([hidden_states] * mono.shard.config.hc_count,
                                                                          dim=-1)
     h = h.contiguous()
+    if hn is not None and (hn.shape != h.shape or not hn.is_contiguous()):
+        hn = None
     rows = h.shape[0]
     work = rt.workspace(mono, h.device)
     weight = hc_consumer.hc_norm.weight if hc_consumer is not None else mono.served["hc_attn_norm"]
@@ -171,13 +174,16 @@ def _mono_layer(rt: _Runtime, layer, hidden_states, hc_consumer, attention=None)
         _split_layer(rt, mono, layer, h, work, weight, out, normed, attention)
     elif attention is None:
         slots, conv, ssm = _gdn_state(layer)
-        mono.layer(h, slots, conv, ssm, weight, out, normed, work)
+        mono.layer(h, slots, conv, ssm, weight, out, normed, work, hn=hn)
     else:
-        x = torch.empty(rows, mono.shard.config.hidden, dtype=torch.bfloat16, device=h.device)
-        gain = work.view("gain_a", (rows, mono.shard.config.hc_count), torch.float32)
-        pools = _attention_prep(mono, layer, h, x, work, gain, *attention)
-        k_cache, v_cache, req_to_token, req_pool, seq_lens = pools
-        mono.rest(req_to_token, req_pool, seq_lens, k_cache, v_cache, h, weight, out, normed, work)
+        positions, forward_batch = attention
+        pool, k_cache, v_cache, req_to_token, req_pool, seq_lens = _attention_pools(layer, forward_batch)
+        rotary = layer.rotary_emb
+        rotary._match_cos_sin_cache_dtype(h)
+        mono.layer(h, positions, _int64(forward_batch.out_cache_loc), k_cache, v_cache, rotary.cos_sin_cache, req_pool,
+                   seq_lens, req_to_token, pool.get_qsa_key_state_buffer(layer.layer_id),
+                   pool.qsa_rope_position_buffer, pool.get_qsa_compressed_k_buffer(layer.layer_id), weight, out,
+                   normed, work, hn=hn)
     return out, (normed if hc_consumer is not None else None)
 
 
@@ -213,7 +219,7 @@ def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict:
                 ulp1=float((delta <= ulp).float().mean()))
 
 
-def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, attention=None):
+def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, attention=None, hn=None):
     """MonoKernel layer, then the native layer twice from the same input (GDN: and states), compared; the
     second native run (``native_repeat``) measures SGLang's own run-to-run spread (atomic HC mix and MoE
     accumulation, top-k collection order). A full-attention layer's KV, indexer ring and compressed-key
@@ -223,7 +229,7 @@ def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, atte
         slots, conv, ssm = _gdn_state(layer)
         index = slots.long()
         conv_before, ssm_before = conv[index].clone(), ssm[index].clone()
-    out, normed = _mono_layer(rt, layer, hidden_states, hc_consumer, attention)
+    out, normed = _mono_layer(rt, layer, hidden_states, hc_consumer, attention, hn)
     rows = out.shape[0]
     mono = rt.layers[layer.layer_id]
     slots_per_row = mono.shard.config.top_k + 1
@@ -273,8 +279,8 @@ def gdn_layer_forward(original, layer, hidden_states, residual=None, **kwargs):
     consumer = kwargs.get("hc_consumer")
     if rt.validate and not torch.cuda.is_current_stream_capturing():
         return _validated(rt, lambda: original(layer, hidden_states, residual, **kwargs), layer, hidden_states,
-                          consumer)
-    return _mono_layer(rt, layer, hidden_states, consumer)
+                          consumer, hn=residual)
+    return _mono_layer(rt, layer, hidden_states, consumer, hn=residual)
 
 
 def attention_layer_forward(original, layer, positions, hidden_states, residual, forward_batch, **kwargs):
@@ -286,8 +292,8 @@ def attention_layer_forward(original, layer, positions, hidden_states, residual,
     attention = (positions, forward_batch)
     if rt.validate and not torch.cuda.is_current_stream_capturing():
         return _validated(rt, lambda: original(layer, positions, hidden_states, residual, forward_batch, **kwargs),
-                          layer, hidden_states, consumer, attention)
-    return _mono_layer(rt, layer, hidden_states, consumer, attention)
+                          layer, hidden_states, consumer, attention, hn=residual)
+    return _mono_layer(rt, layer, hidden_states, consumer, attention, hn=residual)
 
 
 _HOOKS = {
