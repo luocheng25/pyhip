@@ -778,12 +778,45 @@ def _run(ctx, steps, sync, ctas):       # fused.py
     grid_exit(sync, exits=sync + 128)   # 最后离开的 CTA 把计数器清零，graph 可以重放
 ```
 
-阶段序号（`normed_in=True`，即有 `residual` 时；否则在最前面多一个 norm 阶段）：
+阶段序号按 `normed_in=True`（即有 `residual`）列出；`normed_in=False` 时两类层最前面都多一个 `norm` 阶段，其后序号加 1。阶段名取自 `fused.GDN_LAYER_PHASES` 和 `fused.ATTN_LAYER_PHASES`。MLP 半的阶段名带 `mlp_` 前缀，§4 按函数名写（如 `router`、`topk`）。
 
-| 层 | 阶段 |
-|---|---|
-| GDN（18 个） | 0 hc_down、1 hc_lowrank、2 hc_mix_up、3 quant_ba、4 qkvz_conv、5 recurrent、6 quant_y、7 out_proj、8 mlp_norm、9 mlp_hc_down、10 mlp_hc_lowrank、11 mlp_hc_mix_up、12 router、13 topk、14 plan、15 moe_up、16 moe_down、17 combine |
-| full attention（24 个） | 0 hc_down、1 hc_lowrank、2 hc_mix_up、3 quant_index、4 qkv、5 qk_prep、6 compress、7 logits、8 topk、9 scores、10 values、11 combine_gate、12 quant_y、13 o_proj、14–23 同 GDN 层的 8–17 |
+大类中的 gr_read、gr_write 是 hyper-connection 的两个方向（SGLang `layers/hyperconnection.py` 的 `GatedResidual`）：
+
+- **gr_read**：从 4 个分支读出本模块（mixer 或 MLP）的输入，对应 `GatedResidual.mix`。分 norm、down、lowrank、up 四步。
+- **gr_write**：把模块输出按增益写回 4 个分支，并为下一个模块做 norm，对应 `GatedResidual.combine_and_norm`。
+
+形状中的“a/b”分别是 TP2、TP4 的值。
+
+| GDN 序号 | attention 序号 | 阶段 | 大类 | 内容 |
+|---:|---:|---|---|---|
+| （前置） | （前置） | `norm` | gr_read norm | 仅 `normed_in=False`：每（行，分支）的 2560 列做 Gemma RMSNorm（权重 `hc_attn_norm`）→ `S.hn` |
+| 0 | 0 | `hc_down` | gr_read down | BF16 GEMV：`S.hn` [rows, 10240] 乘 `HC_DN` [336, 10240]（320 个低秩行 + 4 个 inject 行），K 分 16 段 → FP32 部分和 `S.partial` |
+| 1 | 1 | `hc_lowrank` | gr_read lowrank | 16 段部分和相加再乘 0.25；320 个低秩列取 bf16(silu) → `S.low`；4 个 inject 列取 2·sigmoid，即 4 个分支的 combine 增益 → `S.gain_a` |
+| 2 | 2 | `hc_mix_up` | gr_read up | BF16 GEMV：`S.low` 乘 `HC_UP` [10240, 320] 得每个分支的门；x = bf16(Σ_g sigmoid(门_g)·hn_g / 4) → `S.x` [rows, 2560] |
+| 3 | — | `quant_ba` | GDN 输入投影：ba + 量化 | 前 2/1 个 CTA：`in_proj_ba` BF16 GEMV → `S.ba` [rows, 48/24]；其余 CTA：x 逐 token FP8 量化 → `S.xq`、`S.xs`（qkvz 投影的输入） |
+| 4 | — | `qkvz_conv` | GDN 输入投影：qkvz + conv | `in_proj_qkvz` W8A8 GEMV（N = 8192/4096）→ `S.qkvz`；q、k、v 列再做 4 抽头 causal conv1d + SiLU → `S.conv`，并更新 conv 状态 |
+| 5 | — | `recurrent` | GDN 递推 + gated norm | 每（行，v 头）：q、k 做 L2 归一化；β = sigmoid(b)，g = −exp(A_log)·softplus(a + dt_bias)；SSM 状态乘 exp(g) 衰减后做 delta rule 更新，输出 o = S·q；gated RMSNorm（乘 norm 权重与 sigmoid(z)）→ `S.y` |
+| — | 3 | `quant_index` | indexer 投影 + 量化 | 前 20 个 CTA：`index_qk_proj` BF16 GEMV（640 列 = 4 个 q 头 + 1 个 k，各 128）→ `S.index_qk`；其余 CTA：x 逐 token FP8 量化 → `S.xq`、`S.xs`（qkv 投影的输入） |
+| — | 4 | `qkv` | attention 输入投影 | `qkv_proj` W8A8 GEMV（N = 6656/3584：每个 q 头为 [q, gate]，之后是 k、v）→ `S.qkv` |
+| — | 5 | `qk_prep` | attention q/k norm + MRoPE、写 KV；indexer q norm + RoPE、k 入 ring | attention：q、k 做 Gemma RMSNorm 和交错 MRoPE，q 预乘 256^-0.5·log2e → `S.q`，k 与 v 写入 KV cache。indexer：q 做 RMSNorm 和 RoPE → `S.index_q`；k 原值写入 pending ring，同时写位置 |
+| — | 6 | `compress` | indexer k 压缩 + RMSNorm + RoPE | 只处理新 token 补齐 4 个一组的行：ring 中 4 个 key 求均值，做 RMSNorm、RoPE，写入 compressed 池（槽位 = `out_cache_loc // 4`） |
+| — | 7 | `logits` | indexer logits | 每个压缩块：Σ_h relu(q_h·k) / √128 → `S.index_logits` |
+| — | 8 | `topk` | indexer top-k + 展开 | 每行取 logits 最大的 512 块（不足 512 块则全取），按块号升序展开成 token 位置，再补不足一组的尾部 → `S.topk` [rows, 2051] |
+| — | 9 | `scores` | 稀疏注意力：QK | 选中位置的 K 与 q 做点积（MFMA），无效位置为 -inf → `S.scores`；每 16 个 key 取一个最大值 → `S.chunk_max` |
+| — | 10 | `values` | 稀疏注意力：softmax·V | 按 SGLang 的块最大值做在线 softmax（exp2，概率舍入到 BF16），再乘 V → 每段的 (m, sum, acc) |
+| — | 11 | `combine_gate` | 稀疏注意力：合并 + 输出门 | 合并各段，除以总和得注意力输出，乘 sigmoid(gate) → `S.y` |
+| 6 | 12 | `quant_y` | 输出投影的量化 | `S.y` [rows, 3072/1536] 逐 token FP8 量化 → `S.yq`、`S.ys` |
+| 7 | 13 | `out_proj` / `o_proj` | 输出投影 + all-reduce 推送 | W8A8 GEMV（N = 2560）；结果分片写到每个 rank 的 `RECV[0]`，阶段末握手 |
+| 8 | 14 | `mlp_norm` | gr_write（attention 分支）+ gr_read norm（MLP 分支） | 按 rank 顺序归约 `RECV[0]` 得 mixer 输出 a；h1 = bf16(h + a·gain_a) → `S.h1`；h1 做 Gemma RMSNorm（权重 `hc_mlp_norm`）→ `S.hn` |
+| 9 | 15 | `mlp_hc_down` | MLP 分支 gr_read down | 同 `hc_down`，权重 `HC_DN_M` |
+| 10 | 16 | `mlp_hc_lowrank` | MLP 分支 gr_read lowrank | 同 `hc_lowrank`，增益写 `S.gain_m` |
+| 11 | 17 | `mlp_hc_mix_up` | MLP 分支 gr_read up | 同 `hc_mix_up`，权重 `HC_UP_M`；`S.x` 即 MoE 的输入 |
+| 12 | 18 | `mlp_router` | MoE 路由 | BF16 GEMV：512 个路由 logits → `S.logits`；共享专家门 → `S.shared` |
+| 13 | 19 | `mlp_topk` | MoE top-k | softmax 后取前 10 个专家（并列取较小 id），权重按这 10 个归一化；第 11 个是共享专家（id 512，权重 sigmoid(门)）→ `S.ids`、`S.weights` |
+| 14 | 20 | `mlp_plan` | MoE 分组计划 | 只在 CTA 0：按专家统计并排列全部路由（同一专家内按行号）→ `S.plan`、`S.route_row`、`S.route_weight` |
+| 15 | 21 | `mlp_moe_up` | MoE gate/up | 每个活跃专家：W8A16 gate、up GEMV，silu(gate)·up → `S.mid` |
+| 16 | 22 | `mlp_moe_down` | MoE down + all-reduce 推送 | 每 16 列输出：各活跃专家 W8A16 down 乘路由权重，按 wave 顺序求和；结果分片写到每个 rank 的 `RECV[1]`，阶段末握手 |
+| 17 | 23 | `combine` | gr_write（MLP 分支）+ 下一层 gr_read norm | 按 rank 顺序归约 `RECV[1]` 得 MoE 输出 m；OUT = bf16(h1 + m·gain_m)；NORMED = OUT 的 Gemma RMSNorm（权重 `NORM_NEXT`，即下一层 attention 分支的 norm） |
 
 ### 4. 阶段函数
 
