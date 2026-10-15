@@ -19,6 +19,7 @@ from ._ir import (DPP_XOR1, DPP_XOR2, DROP, FP8_MAX, barrier, bf16_pair, bf16_ro
 from ._phase import (HALF_WAVES, REGION_BYTES, STAGED_WAVES, THREADS, HalfGemm, RoundGemv, act_rows, batches,
                      buffer_at, device, pipelined)
 from .moe import MAX_ROWS, _bf16x4, _intrinsic, _lds_atomic, _ordered, _readlane, _wave_umax
+from .xgmi import SYS, reduce
 
 C, H = QWEN38_FLASH_NEXT.hc_count, QWEN38_FLASH_NEXT.hidden
 WIDTH, LOWRANK = C * H, QWEN38_FLASH_NEXT.hc_lowrank
@@ -51,21 +52,29 @@ def _half_word(rsrc, index, aux):
 @device
 def combine_norm(ctx, h_in, y, gain, nw, h_out, hn_out, combine, eps):
     """Wave item (row, branch): ``h' = bf16(h + y * gain)`` if ``combine`` and ``hn' = norm(h')``.
-    Lane ``l`` covers the 8 columns of stage threads ``l + 64 i`` (``i < 5``)."""
+    Lane ``l`` covers the 8 columns of stage threads ``l + 64 i`` (``i < 5``). ``y``: one buffer, or the
+    rank-ordered partials of an in-launch all-reduce (``xgmi.reduce``)."""
     rows, lane = ctx.rows, ctx.lane
+    reduced = isinstance(y, (list, tuple))
     for item_iv in range(ctx.wave_id, rows * C, ctx.waves):
         item = fx.Int32(item_iv)  # induction variables are bare arith values
         row = item >> 2
         branch = item & 3
         values = []
         for i in range_constexpr(5):
-            values.append(_bf16_values(load(h_in, (row * WIDTH + branch * H + (lane + 64 * i) * 8) * 2)))
+            values.append(_bf16_values(load(h_in, (row * WIDTH + branch * H + (lane + 64 * i) * 8) * 2,
+                                            aux=ctx.aux)))
         if fx.const_expr(combine):
-            g = load(gain, (row * C + branch) * 4, words=1).bitcast(F32)
+            g = load(gain, (row * C + branch) * 4, words=1, aux=ctx.aux).bitcast(F32)
             for i in range_constexpr(5):
-                ys = _bf16_values(load(y, (row * H + (lane + 64 * i) * 8) * 2))
+                at = (row * H + (lane + 64 * i) * 8) * 2
+                if fx.const_expr(reduced):
+                    ys = reduce(y, at)
+                else:
+                    ys = _bf16_values(load(y, at))
                 values[i] = [bf16_round(values[i][e] + ys[e] * g) for e in range_constexpr(8)]
-                store(h_out, (row * WIDTH + branch * H + (lane + 64 * i) * 8) * 2, _pack_bf16(values[i]))
+                store(h_out, (row * WIDTH + branch * H + (lane + 64 * i) * 8) * 2, _pack_bf16(values[i]),
+                      aux=ctx.aux)
         sums = []
         for i in range_constexpr(5):
             squares = F32(0.0)
@@ -154,7 +163,7 @@ def hc_lowrank(ctx, partial, low, gain):
         store(low, low_at, bf16_word(silu(a), silu(b)), aux=ctx.aux)
         gains = words((sigmoid(a) * 2.0, sigmoid(b) * 2.0), F32).bitcast(fx.Int32)
         gain_at = (valid & (i >= LOWRANK // 2)).select((row * C + column - LOWRANK) * 4, fx.Int32(DROP))
-        store(gain, gain_at, gains)
+        store(gain, gain_at, gains, aux=ctx.aux)
 
 
 def hc_mix_up_gemv(ctx, low, w, tiles, ctas):
@@ -216,21 +225,27 @@ def quant(ctx, src, dst, scales, k, wave_id=None, waves=None):
         store(scales, (lane == 0).select(row * 4, fx.Int32(DROP)), scale.bitcast(fx.Int32), aux=ctx.aux)
 
 
-def _store_tile(ctx, out, total, block, t, n_out, epilogue, aux, valid, xs=None, ws=None):
-    """Linear epilogues of ``make_linear`` for token tile ``t`` of a 16-row block."""
+def _store_tile(ctx, out, total, block, t, n_out, epilogue, aux, valid, xs=None, ws=None, push=()):
+    """Linear epilogues of ``make_linear`` for token tile ``t`` of a 16-row block; BF16 tiles also go to
+    every buffer of ``push`` (an all-reduce's ``xgmi.Comm.targets``; ``out`` may then be None)."""
     lane = ctx.lane
     n0 = block * 16 + (lane >> 4) * 4
     token = 16 * t + (lane & 15)
     live = valid & (token < ctx.rows) & (n0 < n_out)
-    if fx.const_expr(epilogue == "f32"):
+    if epilogue == "f32":
         store(out, live.select((token * n_out + n0) * 4, fx.Int32(DROP)), total.bitcast(fx.Int32), aux=aux)
     else:
         vals = [total[i] for i in range_constexpr(4)]
-        if fx.const_expr(epilogue == "scaled"):
+        if epilogue == "scaled":
             x_scale = load(xs, token * 4, words=1, aux=ctx.aux).bitcast(F32)
             w_scale = load(ws, n0 * 4).bitcast(F32)
             vals = [vals[i] * x_scale * w_scale[i] for i in range_constexpr(4)]
-        store(out, live.select((token * n_out + n0) * 2, fx.Int32(DROP)), _pack_bf16(vals), aux=aux)
+        at = live.select((token * n_out + n0) * 2, fx.Int32(DROP))
+        packed = _pack_bf16(vals)
+        if out is not None:
+            store(out, at, packed, aux=aux)
+        for target in push:
+            store(target, at, packed, aux=SYS)
 
 
 # ---------------------------------------------------------------- gated deltanet
@@ -437,8 +452,9 @@ def out_proj_gemv(ctx, yq, w, k, tiles, ctas):
 
 
 @device
-def out_proj(ctx, yq, ys, w, ws, out, k, tiles, ctas, pre=None):
-    """Half item per 16 output columns of the W8A8 ``out_proj`` (``linear.make_linear``)."""
+def out_proj(ctx, yq, ys, w, ws, out, k, tiles, ctas, pre=None, push=()):
+    """Half item per 16 output columns of the W8A8 ``out_proj`` (``linear.make_linear``); ``push``: see
+    ``_store_tile``."""
     gemv = out_proj_gemv(ctx, yq, w, k, tiles, ctas)
     gather = gemv.gemm.gather
     lane, wave = ctx.lane, ctx.half_wave
@@ -446,7 +462,7 @@ def out_proj(ctx, yq, ys, w, ws, out, k, tiles, ctas, pre=None):
     def epilogue(block, valid, region):
         for t in range_constexpr(tiles):
             if wave == t % STAGED_WAVES:
-                _store_tile(ctx, out, gather(region, t, lane), block, t, H, "scaled", 0, valid, ys, ws)
+                _store_tile(ctx, out, gather(region, t, lane), block, t, H, "scaled", 0, valid, ys, ws, push)
 
     gemv.run(epilogue, pre)
 
@@ -701,9 +717,9 @@ def moe_up(ctx, x, w_address, ws_address, plan_in, route_row, mid, n_experts, to
 
 @device
 def moe_down(ctx, mid, w_address, ws_address, plan_in, route_row, route_weight, out, n_experts, top_k, inter,
-             tiles):
+             tiles, push=()):
     """Half item per 16 output columns (``moe.make_moe_down``): the half's wave ``w`` walks active
-    experts ``w, w + 4, ...`` into its LDS accumulator, summed in wave order."""
+    experts ``w, w + 4, ...`` into its LDS accumulator, summed in wave order. ``push``: see ``_store_tile``."""
     experts = n_experts + 1
     loads = inter // 64
     acc_words = MAX_ROWS * 16
@@ -758,5 +774,13 @@ def moe_down(ctx, mid, w_address, ws_address, plan_in, route_row, route_weight, 
             for other in range_constexpr(1, HALF_WAVES):
                 total = total + lds_load(region + (other * acc_words + cell) * 4, words=1).bitcast(F32)
             target = (row < rows).select((row * H + block * 16 + col) * 2, fx.Int32(DROP))
-            store_short(out, target, bf16_word(total, total).bitcast(fx.Int32) & 0xFFFF)
+            _store_halves(out, push, target, bf16_word(total, total).bitcast(fx.Int32) & 0xFFFF)
         barrier()  # the next item clears the accumulators
+
+
+def _store_halves(out, push, at, bits):
+    """One BF16 of the MoE output into ``out`` and every buffer of ``push``."""
+    if out is not None:
+        store_short(out, at, bits)
+    for target in push:
+        store_short(target, at, bits, aux=SYS)
