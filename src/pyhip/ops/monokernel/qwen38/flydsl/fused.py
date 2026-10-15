@@ -33,9 +33,11 @@ C, H, WIDTH, LOWRANK = ph.C, ph.H, ph.WIDTH, ph.LOWRANK
 MIX_PHASES = ("norm", "hc_down", "hc_lowrank", "hc_mix_up")
 ATTENTION_PHASES = MIX_PHASES + ("quant_ba", "qkvz_conv", "recurrent", "quant_y", "out_proj")
 MLP_PHASES = MIX_PHASES + ("router", "topk", "plan", "moe_up", "moe_down")
-# Full-attention mixer: ``prep`` before SGLang's QSA indexer (which reads x), ``core`` after it.
-PREP_PHASES = MIX_PHASES + ("quant_x", "qkv", "qk_prep")
-CORE_PHASES = ("scores", "values", "combine_gate", "quant_y", "o_proj")
+# Full-attention mixer: ``prep`` (mix .. QSA index logits), ``core`` (index top-k .. ``o_proj``).
+PREP_PHASES = MIX_PHASES + ("quant_index", "qkv", "qk_prep", "compress", "logits")
+CORE_PHASES = ("topk", "scores", "values", "combine_gate", "quant_y", "o_proj")
+# QSA compressed blocks per request row of the index logits: 262144 positions / 4, padded to 16.
+DEFAULT_MAX_BLOCKS = 65552
 SHARED_LOGITS = 16
 # One resident CTA of 8 waves per CU: 2 waves per SIMD may use 256 registers each.
 HINTS = {"waves_per_eu": 2}
@@ -52,7 +54,7 @@ def _attention_records(capacity: int) -> int:
 
 def scratch_layout(dims: tuple, capacity: int) -> tuple[dict, int]:
     """Byte offset and size of every intermediate for ``capacity`` rows (``dims`` from ``shard_dims``)."""
-    conv_dim, value_dim, v_heads, inter, n_experts, slots, heads = dims
+    conv_dim, value_dim, v_heads, inter, n_experts, slots, heads, max_blocks = dims
     records = _attention_records(capacity)
     y_dim = max(value_dim, heads * att.DA)
     sizes = dict(
@@ -74,6 +76,10 @@ def scratch_layout(dims: tuple, capacity: int) -> tuple[dict, int]:
         scores=capacity * att.CHUNKS * att.CHUNK * 16 * 4,
         chunk_max=capacity * att.CHUNKS * 16 * 4,
         part_ml=records * 16 * 8,
+        index_qk=capacity * att.INDEX_COLUMNS * 2,
+        index_q=capacity * att.IH * att.ID * 2,
+        index_logits=capacity * max_blocks * 4,
+        topk=capacity * att.TOPK * 4,
         part_acc=records * heads * att.DA * 4,
         logits=capacity * n_experts * 2,
         shared=capacity * SHARED_LOGITS * 4,
@@ -92,10 +98,10 @@ def scratch_layout(dims: tuple, capacity: int) -> tuple[dict, int]:
     return layout, at
 
 
-def shard_dims(shard: Qwen38Shard) -> tuple:
+def shard_dims(shard: Qwen38Shard, max_blocks: int = DEFAULT_MAX_BLOCKS) -> tuple:
     c = shard.config
     return (shard.conv_dim, shard.gdn_value_dim, shard.gdn_v_heads, moe_inter_padded(shard), c.n_experts,
-            c.top_k + 1, shard.heads)
+            c.top_k + 1, shard.heads, max_blocks)
 
 
 def _stamp(ctx, timeline, slot, columns):
@@ -182,19 +188,25 @@ def make_mix(dims, tiles, capacity, combine, eps, ctas, selected, timed=False):
 
 @cache
 def make_attn_prep(dims, tiles, capacity, combine, eps, ctas, selected, timed=False):
-    """``PREP_PHASES``: the attention-branch mix into ``X`` (read by SGLang's indexer), the per-token FP8
-    quantization of x, ``qkv_proj``, and the q/k norm + MRoPE with the KV store (``attention.qk_prep``)."""
-    heads = dims[6]
+    """``PREP_PHASES``: the attention-branch mix into ``X``; the per-token FP8 quantization of x next to the BF16
+    ``index_qk_proj`` (``quant_ba``); ``qkv_proj``; the q/k norm + MRoPE with the KV store (``qk_prep``) and the
+    index queries + the index key into the pending ring (``index_prep``); the compression of completed groups;
+    the index logits over every compressed block of each row."""
+    heads, max_blocks = dims[6], dims[7]
     layout, _ = scratch_layout(dims, capacity)
     fused = len(selected) > 1
     n_qkv = att.qkv_columns(heads)
+    index_blocks = att.INDEX_COLUMNS // 16
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def prep(H_IN: fx.Int64, Y_IN: fx.Int64, GAIN_IN: fx.Int64, NORM_W: fx.Int64, H_OUT: fx.Int64,
              GAIN_OUT: fx.Int64, SCRATCH: fx.Int64, HC_DN: fx.Int64, HC_UP: fx.Int64, X: fx.Int64, W_QKV: fx.Int64,
              S_QKV: fx.Int64, Q_NORM: fx.Int64, K_NORM: fx.Int64, TABLE: fx.Int64, POSITIONS: fx.Int64,
-             CACHE_LOC: fx.Int64, K_CACHE: fx.Int64, V_CACHE: fx.Int64, TIMELINE: fx.Int64, rows: fx.Int32,
-             pos_stride: fx.Int32, table_rows: fx.Int32):
+             CACHE_LOC: fx.Int64, K_CACHE: fx.Int64, V_CACHE: fx.Int64, W_INDEX: fx.Int64, INDEX_Q_NORM: fx.Int64,
+             INDEX_K_NORM: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64, REQ_TO_TOKEN: fx.Int64, RING: fx.Int64,
+             RING_POS: fx.Int64, COMPRESSED: fx.Int64, TIMELINE: fx.Int64, rows: fx.Int32, pos_stride: fx.Int32,
+             table_rows: fx.Int32, rtt_stride: fx.Int32, rtt_bytes: fx.Int32, ring_slots: fx.Int32,
+             compressed_bytes: fx.Int32):
         ctx = Ctx(rows, fused)
 
         def at(name, num_bytes):
@@ -203,17 +215,38 @@ def make_attn_prep(dims, tiles, capacity, combine, eps, ctas, selected, timed=Fa
         x = buffer_at(X, rows * H * 2)
         xq, xs = at("xq", rows * H), at("xs", rows * 4)
         qkv = at("qkv", rows * n_qkv * 2)
+        index_qk = at("index_qk", rows * att.INDEX_COLUMNS * 2)
+        index_q = at("index_q", rows * att.IH * att.ID * 2)
         w_qkv = buffer_at(W_QKV, n_qkv * H)
+        w_index = buffer_at(W_INDEX, att.INDEX_COLUMNS * H * 2)
+        table = buffer_at(TABLE, table_rows * att.ROT * 2)
+        positions = buffer_at(POSITIONS, (2 * pos_stride + rows) * 8)
+        cache_loc = buffer_at(CACHE_LOC, rows * 8)
+        req_pool, seq_lens = buffer_at(REQ_POOL, rows * 8), buffer_at(SEQ_LENS, rows * 8)
+        ring = buffer_at(RING, ring_slots * att.ID * 2)
+        ring_pos = buffer_at(RING_POS, ring_slots * 3 * 8)
+        compressed = buffer_at(COMPRESSED, compressed_bytes)
+
+        def qk_and_index(pre):
+            att.qk_prep(ctx, qkv, at("q", rows * heads * att.DA * 2), buffer_at(Q_NORM, att.DA * 2),
+                        buffer_at(K_NORM, att.DA * 2), table, positions, pos_stride, cache_loc, K_CACHE, V_CACHE,
+                        heads, eps)
+            att.index_prep(ctx, index_qk, index_q, buffer_at(INDEX_Q_NORM, att.ID * 2), table, positions, pos_stride,
+                           req_pool, seq_lens, ring, ring_pos, eps)
+
         steps = _mix_steps(ctx, at, rows, H_IN, Y_IN, GAIN_IN, NORM_W, H_OUT, GAIN_OUT, HC_DN, HC_UP, x, combine,
                            eps, tiles, ctas) + [
-            (None, lambda pre: ph.quant(ctx, x, xq, xs, H)),
+            (lambda: ph.ba_gemv(ctx, x, w_index, index_blocks, tiles).prefetch(),
+             lambda pre: ph.quant_ba(ctx, x, xq, xs, w_index, index_qk, index_blocks, att.INDEX_COLUMNS, tiles, ctas,
+                                     pre)),
             (lambda: att.qkv_gemv(ctx, xq, w_qkv, heads, tiles, ctas).prefetch(),
              lambda pre: att.qkv(ctx, xq, xs, w_qkv, buffer_at(S_QKV, n_qkv * 4), qkv, heads, tiles, ctas, pre)),
-            (None, lambda pre: att.qk_prep(ctx, qkv, at("q", rows * heads * att.DA * 2),
-                                           buffer_at(Q_NORM, att.DA * 2), buffer_at(K_NORM, att.DA * 2),
-                                           buffer_at(TABLE, table_rows * att.ROT * 2),
-                                           buffer_at(POSITIONS, (2 * pos_stride + rows) * 8), pos_stride,
-                                           buffer_at(CACHE_LOC, rows * 8), K_CACHE, V_CACHE, heads, eps)),
+            (None, qk_and_index),
+            (None, lambda pre: att.index_compress(ctx, ring, ring_pos, buffer_at(INDEX_K_NORM, att.ID * 2), table,
+                                                  req_pool, seq_lens, cache_loc, compressed, eps)),
+            (None, lambda pre: att.index_logits(ctx, index_q, compressed, buffer_at(REQ_TO_TOKEN, rtt_bytes),
+                                                req_pool, seq_lens, at("index_logits", rows * max_blocks * 4),
+                                                rtt_stride, max_blocks)),
         ]
         _run(ctx, steps, selected, SCRATCH + layout["sync"], ctas, TIMELINE if timed else None)
 
@@ -221,20 +254,25 @@ def make_attn_prep(dims, tiles, capacity, combine, eps, ctas, selected, timed=Fa
     def launch(H_IN: fx.Int64, Y_IN: fx.Int64, GAIN_IN: fx.Int64, NORM_W: fx.Int64, H_OUT: fx.Int64,
                GAIN_OUT: fx.Int64, SCRATCH: fx.Int64, HC_DN: fx.Int64, HC_UP: fx.Int64, X: fx.Int64,
                W_QKV: fx.Int64, S_QKV: fx.Int64, Q_NORM: fx.Int64, K_NORM: fx.Int64, TABLE: fx.Int64,
-               POSITIONS: fx.Int64, CACHE_LOC: fx.Int64, K_CACHE: fx.Int64, V_CACHE: fx.Int64, TIMELINE: fx.Int64,
-               rows: fx.Int32, pos_stride: fx.Int32, table_rows: fx.Int32, stream: fx.Stream):
+               POSITIONS: fx.Int64, CACHE_LOC: fx.Int64, K_CACHE: fx.Int64, V_CACHE: fx.Int64, W_INDEX: fx.Int64,
+               INDEX_Q_NORM: fx.Int64, INDEX_K_NORM: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64,
+               REQ_TO_TOKEN: fx.Int64, RING: fx.Int64, RING_POS: fx.Int64, COMPRESSED: fx.Int64, TIMELINE: fx.Int64,
+               rows: fx.Int32, pos_stride: fx.Int32, table_rows: fx.Int32, rtt_stride: fx.Int32, rtt_bytes: fx.Int32,
+               ring_slots: fx.Int32, compressed_bytes: fx.Int32, stream: fx.Stream):
         prep(H_IN, Y_IN, GAIN_IN, NORM_W, H_OUT, GAIN_OUT, SCRATCH, HC_DN, HC_UP, X, W_QKV, S_QKV, Q_NORM, K_NORM,
-             TABLE, POSITIONS, CACHE_LOC, K_CACHE, V_CACHE, TIMELINE, rows, pos_stride,
-             table_rows).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
+             TABLE, POSITIONS, CACHE_LOC, K_CACHE, V_CACHE, W_INDEX, INDEX_Q_NORM, INDEX_K_NORM, REQ_POOL, SEQ_LENS,
+             REQ_TO_TOKEN, RING, RING_POS, COMPRESSED, TIMELINE, rows, pos_stride, table_rows, rtt_stride, rtt_bytes,
+             ring_slots, compressed_bytes).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch
 
 
 @cache
 def make_attn_core(dims, tiles, capacity, ctas, selected, timed=False):
-    """``CORE_PHASES``: sparse attention over the selected positions, segment merge + output gate, the
-    per-token FP8 quantization and ``o_proj`` (this rank's partial into ``OUT``)."""
-    heads = dims[6]
+    """``CORE_PHASES``: the top-512 blocks of each row expanded to positions (``index_topk``), sparse attention
+    over them, segment merge + output gate, the per-token FP8 quantization and ``o_proj`` (this rank's partial
+    into ``OUT``)."""
+    heads, max_blocks = dims[6], dims[7]
     layout, _ = scratch_layout(dims, capacity)
     fused = len(selected) > 1
     n_qkv = att.qkv_columns(heads)
@@ -242,9 +280,9 @@ def make_attn_core(dims, tiles, capacity, ctas, selected, timed=False):
     records = _attention_records(capacity)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
-    def core(SCRATCH: fx.Int64, TOPK: fx.Int64, REQ_TO_TOKEN: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64,
-             K_CACHE: fx.Int64, V_CACHE: fx.Int64, W_O: fx.Int64, S_O: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64,
-             rows: fx.Int32, rtt_stride: fx.Int32, rtt_bytes: fx.Int32):
+    def core(SCRATCH: fx.Int64, REQ_TO_TOKEN: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64, K_CACHE: fx.Int64,
+             V_CACHE: fx.Int64, W_O: fx.Int64, S_O: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64, rows: fx.Int32,
+             rtt_stride: fx.Int32, rtt_bytes: fx.Int32):
         ctx = Ctx(rows, fused)
 
         def at(name, num_bytes):
@@ -253,13 +291,15 @@ def make_attn_core(dims, tiles, capacity, ctas, selected, timed=False):
         part_ml, part_acc = at("part_ml", records * 16 * 8), at("part_acc", records * heads * att.DA * 4)
         scores = at("scores", rows * att.CHUNKS * att.CHUNK * 16 * 4)
         chunk_max = at("chunk_max", rows * att.CHUNKS * 16 * 4)
-        topk = buffer_at(TOPK, rows * att.TOPK * 4)
+        topk = at("topk", rows * att.TOPK * 4)
         req_to_token = buffer_at(REQ_TO_TOKEN, rtt_bytes)
         req_pool, seq_lens = buffer_at(REQ_POOL, rows * 8), buffer_at(SEQ_LENS, rows * 8)
         qkv = at("qkv", rows * n_qkv * 2)
         y, yq, ys = at("y", rows * k * 2), at("yq", rows * k), at("ys", rows * 4)
         w_o = buffer_at(W_O, H * k)
         steps = [
+            (None, lambda pre: att.index_topk(ctx, at("index_logits", rows * max_blocks * 4), max_blocks, seq_lens,
+                                              SCRATCH + layout["topk"])),
             (None, lambda pre: att.attention_scores(ctx, at("q", rows * heads * att.DA * 2), topk, req_to_token,
                                                     req_pool, seq_lens, K_CACHE, scores, chunk_max, heads,
                                                     rtt_stride)),
@@ -274,18 +314,18 @@ def make_attn_core(dims, tiles, capacity, ctas, selected, timed=False):
         _run(ctx, steps, selected, SCRATCH + layout["sync"], ctas, TIMELINE if timed else None)
 
     @flyc.jit
-    def launch(SCRATCH: fx.Int64, TOPK: fx.Int64, REQ_TO_TOKEN: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64,
-               K_CACHE: fx.Int64, V_CACHE: fx.Int64, W_O: fx.Int64, S_O: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64,
-               rows: fx.Int32, rtt_stride: fx.Int32, rtt_bytes: fx.Int32, stream: fx.Stream):
-        core(SCRATCH, TOPK, REQ_TO_TOKEN, REQ_POOL, SEQ_LENS, K_CACHE, V_CACHE, W_O, S_O, OUT, TIMELINE, rows,
-             rtt_stride, rtt_bytes).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
+    def launch(SCRATCH: fx.Int64, REQ_TO_TOKEN: fx.Int64, REQ_POOL: fx.Int64, SEQ_LENS: fx.Int64, K_CACHE: fx.Int64,
+               V_CACHE: fx.Int64, W_O: fx.Int64, S_O: fx.Int64, OUT: fx.Int64, TIMELINE: fx.Int64, rows: fx.Int32,
+               rtt_stride: fx.Int32, rtt_bytes: fx.Int32, stream: fx.Stream):
+        core(SCRATCH, REQ_TO_TOKEN, REQ_POOL, SEQ_LENS, K_CACHE, V_CACHE, W_O, S_O, OUT, TIMELINE, rows, rtt_stride,
+             rtt_bytes).launch(grid=(ctas, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch
 
 
 @cache
 def make_attention(dims, k_heads, ba_rows, tiles, capacity, combine, eps, ctas, selected, timed=False):
-    conv_dim, value_dim, v_heads, _, _, _, _ = dims
+    conv_dim, value_dim, v_heads, _, _, _, _, _ = dims
     layout, _ = scratch_layout(dims, capacity)
     n_qkvz = conv_dim + value_dim
     fused = len(selected) > 1
@@ -346,7 +386,7 @@ def make_attention(dims, k_heads, ba_rows, tiles, capacity, combine, eps, ctas, 
 
 @cache
 def make_mlp(dims, tiles, capacity, eps, ctas, selected, timed=False):
-    _, _, _, inter, n_experts, slots, _ = dims
+    _, _, _, inter, n_experts, slots, _, _ = dims
     top_k = slots - 1
     layout, _ = scratch_layout(dims, capacity)
     fused = len(selected) > 1
@@ -396,11 +436,13 @@ def make_mlp(dims, tiles, capacity, eps, ctas, selected, timed=False):
 
 
 class FusedWorkspace:
-    """Scratch for ``capacity`` rows; ``view(name, rows, ...)`` exposes an intermediate."""
+    """Scratch for ``capacity`` rows (index logits for ``max_blocks`` compressed blocks per row);
+    ``view(name, rows, ...)`` exposes an intermediate."""
 
-    def __init__(self, capacity: int, shard: Qwen38Shard, device: torch.device):
+    def __init__(self, capacity: int, shard: Qwen38Shard, device: torch.device,
+                 max_blocks: int = DEFAULT_MAX_BLOCKS):
         self.capacity, self.shard, self.device = capacity, shard, device
-        self.dims = shard_dims(shard)
+        self.dims = shard_dims(shard, max_blocks)
         self.layout, size = scratch_layout(self.dims, capacity)
         self.scratch = torch.zeros(size, dtype=torch.uint8, device=device)
 
@@ -495,14 +537,17 @@ class FusedGdnLayer(FusedLayer):
 
 
 class FusedAttentionLayer(FusedLayer):
-    """One rank's full-attention layer: ``prep`` (attention-branch mix .. q/k norm, MRoPE and KV store), the
-    caller's QSA indexer on ``x``, ``core`` (sparse attention .. ``o_proj`` partial) and ``mlp``."""
+    """One rank's full-attention layer: ``prep`` (attention-branch mix .. QSA index logits, with the KV, index
+    ring and compressed-key stores into SGLang's pools), ``core`` (index top-k .. ``o_proj`` partial) and
+    ``mlp``."""
 
-    def prep(self, h, x, positions, cache_loc, k_cache, v_cache, table, work, gain_out, combine=None, h_out=None,
-             selected=None, timeline=None):
+    def prep(self, h, x, positions, cache_loc, k_cache, v_cache, table, work, gain_out, req_pool, seq_lens,
+             req_to_token, ring, ring_pos, compressed, combine=None, h_out=None, selected=None, timeline=None):
         """``positions``: int64 [3, *] MRoPE (or [rows]) positions; ``cache_loc``: int64 [rows] KV slots;
         ``k_cache``/``v_cache``: BF16 [slots, 1, 256] of this layer; ``table``: SGLang's BF16 cos/sin cache
-        [positions, 64]."""
+        [positions, 64]; ``req_pool``/``seq_lens``: int64 [rows]; ``req_to_token``: int32 [requests, stride];
+        ``ring``: BF16 [ring slots, 1, 128] pending index keys; ``ring_pos``: int64 [ring slots, 3];
+        ``compressed``: BF16 [slots, 1, 128] compressed index keys of this layer."""
         w, p = self.served, self.packed
         rows = h.shape[0]
         tiles = tiles_for(rows)
@@ -515,8 +560,10 @@ class FusedAttentionLayer(FusedLayer):
         args = (ptr(h), ptr(y_in), ptr(gain_in), ptr(w["hc_attn_norm"]), ptr(h_out), ptr(gain_out),
                 ptr(work.scratch), ptr(p["hc_attn_dn"]), ptr(p["hc_attn_up"]), ptr(x), ptr(w["attn_qkv"]),
                 ptr(w["attn_qkv_scale"]), ptr(w["attn_q_norm"]), ptr(w["attn_k_norm"]), ptr(table), ptr(positions),
-                ptr(cache_loc), ptr(k_cache), ptr(v_cache), 0 if timeline is None else ptr(timeline), rows,
-                pos_stride, table.shape[0], stream)
+                ptr(cache_loc), ptr(k_cache), ptr(v_cache), ptr(p["index_qk"]), ptr(w["index_q_norm"]),
+                ptr(w["index_k_norm"]), ptr(req_pool), ptr(seq_lens), ptr(req_to_token), ptr(ring), ptr(ring_pos),
+                ptr(compressed), 0 if timeline is None else ptr(timeline), rows, pos_stride, table.shape[0],
+                req_to_token.stride(0), req_to_token.numel() * 4, ring.shape[0], compressed.numel() * 2, stream)
         timed = timeline is not None
         key = ("fused_attn_prep", h.device, work.dims, tiles, work.capacity, combine is not None, self.eps,
                self.ctas, selected, timed)
@@ -525,22 +572,19 @@ class FusedAttentionLayer(FusedLayer):
         with torch.cuda.device(h.device):
             _call(key, builder, args, HINTS)
 
-    def core(self, topk, req_to_token, req_pool, seq_lens, k_cache, v_cache, out, work, selected=None,
-             timeline=None):
-        """``topk``: int32 [rows, 2051] selected logical positions (-1 = none); ``req_to_token``: int32
-        [requests, stride]; ``req_pool``/``seq_lens``: int64 [rows]; ``out``: BF16 [rows, hidden] partial."""
+    def core(self, req_to_token, req_pool, seq_lens, k_cache, v_cache, out, work, selected=None, timeline=None):
+        """``out``: BF16 [rows, hidden] this rank's ``o_proj`` partial; the other inputs as in ``prep``."""
         w = self.served
-        rows = topk.shape[0]
+        rows = out.shape[0]
         tiles = tiles_for(rows)
         selected = tuple(range(len(CORE_PHASES))) if selected is None else tuple(selected)
         ptr = lambda t: t.data_ptr()  # noqa: E731
-        stream = torch.cuda.current_stream(topk.device)
-        args = (ptr(work.scratch), ptr(topk), ptr(req_to_token), ptr(req_pool), ptr(seq_lens), ptr(k_cache),
-                ptr(v_cache), ptr(w["attn_o"]), ptr(w["attn_o_scale"]), ptr(out),
-                0 if timeline is None else ptr(timeline), rows, req_to_token.stride(0),
-                req_to_token.numel() * 4, stream)
+        stream = torch.cuda.current_stream(out.device)
+        args = (ptr(work.scratch), ptr(req_to_token), ptr(req_pool), ptr(seq_lens), ptr(k_cache), ptr(v_cache),
+                ptr(w["attn_o"]), ptr(w["attn_o_scale"]), ptr(out), 0 if timeline is None else ptr(timeline), rows,
+                req_to_token.stride(0), req_to_token.numel() * 4, stream)
         timed = timeline is not None
-        key = ("fused_attn_core", topk.device, work.dims, tiles, work.capacity, self.ctas, selected, timed)
+        key = ("fused_attn_core", out.device, work.dims, tiles, work.capacity, self.ctas, selected, timed)
         builder = make_attn_core(work.dims, tiles, work.capacity, self.ctas, selected, timed)
-        with torch.cuda.device(topk.device):
+        with torch.cuda.device(out.device):
             _call(key, builder, args, HINTS)

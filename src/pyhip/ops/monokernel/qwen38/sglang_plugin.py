@@ -6,9 +6,10 @@ rows, no ReplaySSM) every main-model layer other than the PLE layer runs as: the
 attention all-reduce, the fused MLP half (combine with the reduced mixer output .. MoE partial), SGLang's
 MoE all-reduce, and the combine with the next layer's attention-branch norm when SGLang fuses it
 (``hc_consumer``). The attention half of a GDN layer is one fused launch (attention-branch norm ..
-``out_proj`` partial); a full-attention layer runs the fused ``prep`` launch (attention-branch mix ..
-q/k norm, MRoPE and the KV store into SGLang's pool), SGLang's QSA indexer on the mixed input, and the
-fused ``core`` launch (sparse attention over the selected positions .. ``o_proj`` partial). With
+``out_proj`` partial); a full-attention layer runs the fused ``prep`` launch (attention-branch mix .. q/k
+norm, MRoPE, the KV store, the QSA index queries, the pending index-key ring and the compression of completed
+groups in SGLang's pools, the index logits) and the fused ``core`` launch (index top-k, sparse attention over
+the selected positions .. ``o_proj`` partial). With
 ``PYHIP_MONOKERNEL_ATTENTION=native`` the full-attention layer runs the fused mix, then SGLang's own
 ``self_attention``. Everything else (prefill, MTP verify/draft, the MTP draft layer, layer 1) stays
 native. The launches are CUDA-graph capturable; kernels compile during SGLang's eager warmup.
@@ -80,7 +81,12 @@ class _Runtime:
     def workspace(self, mono: FusedLayer, device) -> FusedWorkspace:
         work = self.workspaces.get(device)
         if work is None:
-            work = FusedWorkspace(CAPACITY, mono.shard, device)
+            from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+
+            # index logits for every compressed block a request row can hold
+            positions = get_req_to_token_pool().req_to_token.shape[1]
+            max_blocks = -(-positions // (4 * 16)) * 16
+            work = FusedWorkspace(CAPACITY, mono.shard, device, max_blocks=max_blocks)
             self.workspaces[device] = work
         return work
 
@@ -102,7 +108,7 @@ def _int64(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _attention_core(rt: _Runtime, mono: FusedAttentionLayer, layer, h, work, gain, positions, forward_batch):
-    """``prep`` launch, SGLang's QSA indexer on the mixed input, ``core`` launch: this rank's ``o_proj``
+    """``prep`` and ``core`` launches (QSA indexer included, its state in SGLang's pool): this rank's ``o_proj``
     partial of a full-attention layer."""
     from sglang.srt.model_executor.forward_context import get_req_to_token_pool, get_token_to_kv_pool
 
@@ -115,12 +121,13 @@ def _attention_core(rt: _Runtime, mono: FusedAttentionLayer, layer, h, work, gai
     k_cache, v_cache = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
     rotary = layer.rotary_emb
     rotary._match_cos_sin_cache_dtype(x)
+    req_to_token = get_req_to_token_pool().req_to_token
+    req_pool, seq_lens = _int64(forward_batch.req_pool_indices), _int64(forward_batch.seq_lens)
     mono.prep(h, x, positions, _int64(forward_batch.out_cache_loc), k_cache, v_cache, rotary.cos_sin_cache, work,
-              gain)
-    topk = layer._compute_qsa_topk_indices(x, positions, forward_batch).to(torch.int32).contiguous()
+              gain, req_pool, seq_lens, req_to_token, pool.get_qsa_key_state_buffer(layer.layer_id),
+              pool.qsa_rope_position_buffer, pool.get_qsa_compressed_k_buffer(layer.layer_id))
     part = torch.empty(rows, hidden, dtype=torch.bfloat16, device=h.device)
-    mono.core(topk, get_req_to_token_pool().req_to_token, _int64(forward_batch.req_pool_indices),
-              _int64(forward_batch.seq_lens), k_cache, v_cache, part, work)
+    mono.core(req_to_token, req_pool, seq_lens, k_cache, v_cache, part, work)
     return part
 
 
@@ -167,9 +174,10 @@ def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict:
 
 
 def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, attention=None):
-    """MonoKernel layer, then the native layer from the same input (GDN: and states), compared. A
-    full-attention layer's KV, indexer ring and compressed-key writes are rewritten by the native run before
-    it reads them, so they need no restore; they end up native."""
+    """MonoKernel layer, then the native layer twice from the same input (GDN: and states), compared; the
+    second native run (``native_repeat``) measures SGLang's own run-to-run spread (atomic HC mix and MoE
+    accumulation, top-k collection order). A full-attention layer's KV, indexer ring and compressed-key
+    writes are rewritten by a native run before it reads them, so they need no restore; they end up native."""
     gdn = attention is None
     if gdn:
         slots, conv, ssm = _gdn_state(layer)
@@ -191,6 +199,9 @@ def _validated(rt: _Runtime, run_native, layer, hidden_states, hc_consumer, atte
     report = dict(layer=layer.layer_id, rows=int(rows), out=_metrics(out, ref_out))
     if gdn:
         report.update(conv=_metrics(conv_mono, conv[index]), ssm=_metrics(ssm_mono, ssm[index]))
+        conv[index], ssm[index] = conv_before, ssm_before
+    repeat_out, _ = run_native()
+    report["native_repeat"] = _metrics(repeat_out, ref_out)
     if normed is not None and ref_normed is not None:
         report["normed"] = _metrics(normed, ref_normed)
     if rt.native_ids is not None and rt.native_ids.shape == ids.shape:

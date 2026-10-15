@@ -160,7 +160,7 @@ def summarize_validation(log_text):
         rows += report["rows"]
         mismatched += report.get("route_mismatch_rows", 0)
         entry = worst.setdefault(report["layer"], {})
-        for key in ("out", "out_same_route", "normed", "conv", "ssm"):
+        for key in ("out", "out_same_route", "native_repeat", "normed", "conv", "ssm"):
             if key in report:
                 values.setdefault(key, []).append(report[key])
                 if report[key]["rel_l2"] > entry.get(key, {}).get("rel_l2", -1.0):

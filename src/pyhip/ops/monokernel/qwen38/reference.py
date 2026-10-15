@@ -421,6 +421,65 @@ def golden_attention(
     return dict(proj, core=core, gated=gated, partial=partial)
 
 
+# --------------------------------------------------------------- QSA indexer
+
+
+def golden_index_q(x: torch.Tensor, t: dict, positions: torch.Tensor, config: Qwen38Config):
+    """SGLang's decode indexer queries (its unfused path once the RoPE table is BF16): the BF16
+    ``index_qk_proj`` ``qk`` [rows, (heads + 1) * d], then Gemma-normalized and RoPE-rotated queries
+    [rows, heads, d] (BF16 per operator)."""
+
+    c = config
+    rows = x.shape[0]
+    qk = bf16_linear(x, t["index_qk"])
+    q = qk[:, : c.index_heads * c.index_head_dim].reshape(rows, c.index_heads, c.index_head_dim)
+    q = bf(gemma_rmsnorm(q, t["index_q_norm"], c.eps))
+    cos, sin = rope_cos_sin(positions, c)
+    return qk, apply_neox_rope(q, cos, sin, c.rotary_dim)
+
+
+def golden_index_compress(members: torch.Tensor, k_norm: torch.Tensor, first_positions: torch.Tensor,
+                          config: Qwen38Config) -> torch.Tensor:
+    """Compressed index keys of complete groups: ``members`` [groups, ratio, d] raw BF16 keys -> the FP32 mean
+    rounded to BF16, Gemma norm, RoPE at the group's first position; [groups, d]."""
+
+    pooled = bf(members.float().mean(1))
+    normed = bf(gemma_rmsnorm(pooled, k_norm, config.eps))
+    cos, sin = rope_cos_sin(first_positions, config)
+    return apply_neox_rope(normed[:, None], cos, sin, config.rotary_dim)[:, 0]
+
+
+def golden_index_logits(q: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    """Decode scores of one row: ``relu(q_h . k)`` summed over the heads, over sqrt(d); q [heads, d],
+    keys [blocks, d] -> FP32 [blocks]."""
+
+    return torch.relu(q.float() @ keys.float().T).sum(0) / q.shape[-1] ** 0.5
+
+
+def golden_index_select(logits: torch.Tensor, block_topk: int) -> torch.Tensor:
+    """The ``block_topk`` best blocks in ascending order; ties keep the lower block (SGLang's ``fast_topk``
+    returns the same set up to ties, in an unspecified order)."""
+
+    if logits.numel() <= block_topk:
+        return torch.arange(logits.numel(), device=logits.device)
+    best = torch.sort(logits, descending=True, stable=True).indices[:block_topk]
+    return best.sort().values
+
+
+def golden_index_expand(blocks: torch.Tensor, seq_len: int, config: Qwen38Config) -> torch.Tensor:
+    """SGLang's ``expand_qsa_block_indices`` for a decode row: the blocks' tokens, then the pending tail of the
+    incomplete group, then -1; int32 [index_topk + ratio - 1]."""
+
+    ratio = config.index_compress_ratio
+    out = torch.full((config.index_topk + ratio - 1,), -1, dtype=torch.int32, device=blocks.device)
+    tokens = (blocks[:, None] * ratio + torch.arange(ratio, device=blocks.device)).reshape(-1)[: config.index_topk]
+    tokens = tokens[tokens < seq_len]
+    tail = torch.arange((seq_len // ratio) * ratio, seq_len, device=blocks.device)
+    out[: tokens.numel()] = tokens.to(torch.int32)
+    out[tokens.numel() : tokens.numel() + tail.numel()] = tail.to(torch.int32)
+    return out
+
+
 # -------------------------------------------------------------------- MoE
 
 

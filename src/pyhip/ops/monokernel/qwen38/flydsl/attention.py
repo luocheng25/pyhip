@@ -27,9 +27,11 @@ from flydsl.expr import range_constexpr, rocdl
 
 from ..config import QWEN38_FLASH_NEXT
 from . import phases as ph
-from ._ir import (DPP_ROR8, DROP, LOG2E, _swap16, _swap32, bf16_pair, bf16_round, bf16_word, bf16x4_half, dpp,
-                  exp2, fmax, lds_load, lds_store, load, mfma_bf16, scalar_f32, sigmoid_accurate, store, wave_sum,
-                  words, zeros4)
+from pyhip.ops.qsa.flydsl import indexer_topk as qtopk
+
+from ._ir import (DPP_ROR8, DPP_XOR1, DPP_XOR2, DROP, LOG2E, _swap16, _swap32, bf16_pair, bf16_round, bf16_word,
+                  bf16x4_half, dpp, exp2, fmax, lds_load, lds_store, load, mfma_bf16, scalar, scalar_f32,
+                  sigmoid_accurate, store, wave_sum, words, zeros4)
 from ._phase import STAGED_WAVES, buffer_at, device, pipelined
 
 _C = QWEN38_FLASH_NEXT
@@ -214,9 +216,10 @@ def attention_scores(ctx, q, topk, req_to_token, req_pool, seq_lens, k_cache, sc
             base = (first + c) * CHUNK
             inside = (base + r) < TOPK
             inside_a.append(inside)
-            idx_a.append(load(topk, inside.select((row * TOPK + base + r) * 4, fx.Int32(DROP)), words=1))
+            idx_a.append(load(topk, inside.select((row * TOPK + base + r) * 4, fx.Int32(DROP)), words=1,
+                              aux=ctx.aux))
             idx4.append(load(topk, ((first + c) < CHUNKS).select((row * TOPK + base + 4 * g) * 4, fx.Int32(DROP)),
-                             words=4))
+                             words=4, aux=ctx.aux))
         ok_a, slot_a = [], []
         for c in range_constexpr(SCORE_CHUNKS):
             ok = inside_a[c] & (idx_a[c] >= 0) & (idx_a[c] < seq)
@@ -303,7 +306,7 @@ def attention_values(ctx, scores, chunk_max, topk, req_to_token, req_pool, seq_l
                 sc[c] = [load(scores, inside.select(((row * CHUNKS * CHUNK + base + 4 * g + i) * 16 + r) * 4,
                                                     fx.Int32(DROP)), words=1, aux=ctx.aux)
                          for i in range_constexpr(4)]
-                idx4[c] = load(topk, inside.select((row * TOPK + base + 4 * g) * 4, fx.Int32(DROP)), words=4)
+                idx4[c] = load(topk, inside.select((row * TOPK + base + 4 * g) * 4, fx.Int32(DROP)), words=4, aux=ctx.aux)
             oks, slots = {}, {}
             for c in batch:
                 chunk = first + c
@@ -408,3 +411,227 @@ def combine_gate(ctx, part_ml, part_acc, qkv_out, y, heads, tiles):
         gated = [out[e] * sigmoid_accurate(gates[e]) for e in range_constexpr(4)]
         store(y, ((row * heads + head) * DA + lane * 4) * 2,
               words([bf16_word(gated[0], gated[1]), bf16_word(gated[2], gated[3])]), aux=ctx.aux)
+
+
+# ---------------------------------------------------------------- QSA indexer
+
+IH = _C.index_heads
+ID = _C.index_head_dim
+RATIO = _C.index_compress_ratio
+RING = 2 * RATIO  # SGLang's qsa_ring_slots_per_request
+INDEX_COLUMNS = (IH + 1) * ID
+INDEX_SCALE = ID ** -0.5
+
+
+def _gemma_norm2(values, gains, lane, eps):
+    """Gemma RMSNorm of a 128-channel head held 2 channels per lane, rounded to BF16."""
+    squares = values[0] * values[0] + values[1] * values[1]
+    total = scalar_f32(wave_sum(squares, lane))
+    rstd = F32(rocdl.rsq(F32.ir_type, (total * (1.0 / ID) + eps).ir_value()))
+    return [bf16_round((values[e] * rstd) * (1.0 + gains[e])) for e in range_constexpr(2)]
+
+
+def _index_rope(normed, lane, table, position_of):
+    """RoPE (BF16 per operator) of a 128-channel head held 2 channels per lane: lane ``l`` has channels
+    ``2 l, 2 l + 1``, so rotary pair ``i`` (channels ``i``, ``i + 32``) sits in lanes ``i // 2`` and ``16 + i // 2``,
+    which swap with ``_swap16``; ``position_of(pair)`` gives the pair's MRoPE coordinate."""
+    low = lane < 16
+    rotary = lane < 32
+    out = []
+    for e in range_constexpr(2):
+        partner = _swap16(normed[e])
+        pair = 2 * (lane & 15) + e
+        position = position_of(pair)
+        cos = ph._half_word(table, position * ROT + pair, 0)
+        sin = ph._half_word(table, position * ROT + ROT // 2 + pair, 0)
+        first = low.select(normed[e], partner)
+        second = low.select(partner, normed[e])
+        rotated_first = bf16_round(bf16_round(first * cos) - bf16_round(second * sin))
+        rotated_second = bf16_round(bf16_round(second * cos) + bf16_round(first * sin))
+        out.append(rotary.select(low.select(rotated_first, rotated_second), normed[e]))
+    return out
+
+
+@device
+def index_prep(ctx, index_qk, q_out, q_norm, table, positions, pos_stride, req_pool, seq_lens, ring, ring_pos, eps):
+    """Wave item (row, j): index query head ``j < 4`` (Gemma norm and RoPE into ``q_out``) or the index key:
+    the raw projection into the request's pending ring slot ``req * 8 + (seq - 1) % 8`` and its MRoPE
+    coordinates into the ring's position rows (SGLang's ``set_qsa_key_state_buffer`` and
+    ``set_qsa_rope_position_buffer``)."""
+    rows, lane = ctx.rows, ctx.lane
+    per_row = IH + 1
+    gains = list(bf16_pair(load(q_norm, lane * 4, words=1)))
+    for item_iv in range(ctx.wave_id, rows * per_row, ctx.waves):
+        item = fx.Int32(item_iv)
+        row = item // per_row
+        j = item % per_row
+        word = load(index_qk, (row * INDEX_COLUMNS + j * ID + lane * 2) * 2, words=1, aux=ctx.aux)
+        normed = _gemma_norm2(list(bf16_pair(word)), gains, lane, eps)
+
+        def position_of(pair):
+            return load(positions, (_mrope_axis(pair) * pos_stride + row) * 8, words=1)
+
+        roped = _index_rope(normed, lane, table, position_of)
+        store(q_out, (j < IH).select(((row * IH + j) * ID + lane * 2) * 2, fx.Int32(DROP)),
+              bf16_word(roped[0], roped[1]), aux=ctx.aux)
+        seq = load(seq_lens, row * 8, words=1)
+        req = load(req_pool, row * 8, words=1)
+        slot = req * RING + (seq - 1) % RING
+        is_key = j == IH
+        store(ring, is_key.select(slot * (ID * 2) + lane * 4, fx.Int32(DROP)), word, aux=ctx.aux)
+        coordinate = load(positions, ((lane & 3) * pos_stride + row) * 8, words=2)
+        store(ring_pos, (is_key & (lane < 3)).select((slot * 3 + lane) * 8, fx.Int32(DROP)), coordinate, aux=ctx.aux)
+
+
+@device
+def index_compress(ctx, ring, ring_pos, k_norm, table, req_pool, seq_lens, cache_loc, compressed, eps):
+    """Wave item per row; a row whose new token completes a group (``seq % 4 == 0``) compresses the group's 4
+    ring members: FP32 mean rounded to BF16, Gemma norm, RoPE at the first member's coordinates, stored at
+    compressed slot ``out_cache_loc // 4`` (SGLang's ``update_key_state_and_compress``)."""
+    rows, lane = ctx.rows, ctx.lane
+    gains = list(bf16_pair(load(k_norm, lane * 4, words=1)))
+    for row_iv in range(ctx.wave_id, rows, ctx.waves):
+        row = fx.Int32(row_iv)
+        seq = load(seq_lens, row * 8, words=1)
+        req = load(req_pool, row * 8, words=1)
+        boundary = (seq % RATIO) == 0
+        total = [F32(0.0), F32(0.0)]
+        for m in range_constexpr(RATIO):
+            slot = req * RING + (seq - RATIO + m) % RING
+            member = list(bf16_pair(load(ring, boundary.select(slot * (ID * 2) + lane * 4, fx.Int32(DROP)), words=1,
+                                         aux=ctx.aux)))
+            total = [total[e] + member[e] for e in range_constexpr(2)]
+        pooled = [bf16_round(total[e] * (1.0 / RATIO)) for e in range_constexpr(2)]
+        normed = _gemma_norm2(pooled, gains, lane, eps)
+        first = req * RING + (seq - RATIO) % RING
+
+        def position_of(pair):
+            return load(ring_pos, boundary.select((first * 3 + _mrope_axis(pair)) * 8, fx.Int32(DROP)), words=1,
+                        aux=ctx.aux)
+
+        roped = _index_rope(normed, lane, table, position_of)
+        target = load(cache_loc, row * 8, words=1) // RATIO
+        store(compressed, boundary.select(target * (ID * 2) + lane * 4, fx.Int32(DROP)), bf16_word(roped[0], roped[1]),
+              aux=ctx.aux)
+
+
+@device
+def index_logits(ctx, q, compressed, req_to_token, req_pool, seq_lens, logits, rtt_stride, max_blocks):
+    """Wave item (row, 16 compressed blocks): ``relu(q_h . k)`` summed over the 4 index heads, over sqrt(128), into
+    ``logits[row, block]`` for the row's ``seq // 4`` blocks. Block ``b``'s key sits at compressed slot
+    ``req_to_token[req, 4 b] // 4``. ``S^T = K Q^T`` on MFMA as in ``attention_scores`` (heads 4..15 read zero);
+    the head sum is a quad reduction."""
+    rows, lane = ctx.rows, ctx.lane
+    g = lane >> 4
+    r = lane & 15
+    head_ok = r < IH
+    for row_iv in range(0, rows, 1):
+        row = fx.Int32(row_iv)
+        seq = load(seq_lens, row * 8, words=1)
+        req = load(req_pool, row * 8, words=1)
+        blocks = seq // RATIO
+        pages = (blocks + 15) // 16
+        qv = [load(q, head_ok.select(((row * IH + r) * ID + 32 * jj + 8 * g) * 2, fx.Int32(DROP)), aux=ctx.aux)
+              for jj in range_constexpr(4)]
+        start = (ctx.wave_id + row * 61) % ctx.waves
+        for page_iv in range(start, pages, ctx.waves):
+            page = fx.Int32(page_iv)
+            block = page * 16 + r
+            ok = block < blocks
+            token_slot = load(req_to_token, ok.select((req * rtt_stride + block * RATIO) * 4, fx.Int32(DROP)),
+                              words=1)
+            base = (token_slot // RATIO) * (ID * 2)
+            kv = [load(compressed, ok.select(base + (32 * jj + 8 * g) * 2, fx.Int32(DROP)), aux=ctx.aux)
+                  for jj in range_constexpr(4)]
+            s = zeros4()
+            for jj in range_constexpr(4):
+                for h in range_constexpr(2):
+                    s = mfma_bf16(bf16x4_half(kv[jj], h), bf16x4_half(qv[jj], h), s)
+            bits = s.bitcast(fx.Int32)
+            relu = [((bits[i] > fx.Int32(0)) & head_ok).select(bits[i], fx.Int32(0)).bitcast(F32)
+                    for i in range_constexpr(4)]
+            summed = []
+            for i in range_constexpr(4):
+                pair_sum = relu[i] + dpp(relu[i], DPP_XOR1)
+                summed.append((pair_sum + dpp(pair_sum, DPP_XOR2)) * INDEX_SCALE)
+            at = (row * max_blocks + page * 16 + 4 * g) * 4
+            store(logits, (r == 0).select(at, fx.Int32(DROP)), words(summed, F32).bitcast(fx.Int32), aux=ctx.aux)
+
+
+def _put(output, index, value, aux):
+    store(output, fx.Int32(index) * 4, fx.Int32(value), aux=aux)
+
+
+def _emit_ascending(output, chosen, merged, split, lane, threads, sync, aux):
+    """``indexer_topk._emit_ascending`` with a cache policy for the token stores."""
+    per = qtopk.TOPK // threads
+    diagonal = lane * per
+    count = fx.Int32(qtopk.TOPK) - split
+    low = qtopk._max(diagonal - count, fx.Int32(0))
+    high = qtopk._min(diagonal, split)
+    for _ in range_constexpr(10):
+        active = low < high
+        mid = (low + high) >> 1
+        a = qtopk._load16(chosen + qtopk._min(mid, fx.Int32(qtopk.TOPK - 1)) * 2)
+        b = qtopk._load16(chosen + qtopk._min(qtopk._max(split + diagonal - mid - 1, fx.Int32(0)),
+                                              fx.Int32(qtopk.TOPK - 1)) * 2)
+        right = a < b
+        low = (active & right).select(mid + 1, low)
+        high = active.select(right.select(high, mid), high)
+    i, j = low, diagonal - low
+    for k in range_constexpr(per):
+        a = (i < split).select(qtopk._load16(chosen + qtopk._min(i, fx.Int32(qtopk.TOPK - 1)) * 2), fx.Int32(1 << 16))
+        b = (j < count).select(qtopk._load16(chosen + qtopk._min(split + j, fx.Int32(qtopk.TOPK - 1)) * 2),
+                               fx.Int32(1 << 16))
+        first = a < b
+        qtopk._store16(merged + (diagonal + k) * 2, first.select(a, b))
+        i = first.select(i + 1, i)
+        j = first.select(j, j + 1)
+    sync()
+    for k in range_constexpr(qtopk.TOPK // threads):
+        index = lane + k * threads
+        value = qtopk._load16(merged + index * 2)
+        tokens = words([value * RATIO + t for t in range_constexpr(RATIO)])
+        store(output, index * (RATIO * 4), tokens, aux=aux)
+
+
+@device
+def _write_row(logits, stride, row, count, visible, length, output, space, aux):
+    """``indexer_topk._write_row`` (decode CTA of 8 waves) over raw buffers: the row's top-512 blocks ascending
+    (ties keep the lower block), 4 tokens each, then the causal tail, then -1."""
+    blocks = count
+    if count <= qtopk.TOPK:
+        for token in range(space.thread, count * RATIO, space.threads):
+            _put(output, token, token, aux)
+    else:
+        blocks = fx.Int32(qtopk.TOPK)
+        base = row * stride * 4
+        low, high, nan = qtopk._bounds(logits, base, count, space, None, row)
+        split = qtopk._select(logits, base, count, space, low, high, nan)
+        qtopk._row_sync(space)
+        _emit_ascending(output, space.chosen, space.merged, split, space.thread, space.threads,
+                        qtopk._sync_of(space), aux)
+    tail_start = visible // RATIO * RATIO
+    tail_count = visible - tail_start
+    for index in range(blocks * RATIO + space.thread, fx.Int32(TOPK), fx.Int32(space.threads)):
+        column = fx.Int32(index)
+        offset = column - blocks * RATIO
+        token = tail_start + offset
+        value = ((offset < RATIO - 1) & (offset < tail_count) & (token < length)).select(token, fx.Int32(-1))
+        _put(output, column, value, aux)
+
+
+@device
+def index_topk(ctx, logits, max_blocks, seq_lens, topk_out):
+    """CTA item per row: SGLang's ``fast_topk`` + ``expand_qsa_block_indices`` (same selection up to ties, in
+    ascending block order) with PyHIP's decode top-k (``indexer_topk``) on the 8-wave CTA."""
+    rows = ctx.rows
+    space = qtopk._space(qtopk.DECODE_WAVES, ctx.wave, ctx.lane, ctx.shared + ctx.wave * qtopk.HIST,
+                         ctx.shared + qtopk.D_CAND, ctx.shared + qtopk.D_CHOSEN, ctx.shared, hist_base=ctx.shared,
+                         red=ctx.shared + qtopk.D_RED)
+    for row_iv in range(ctx.cta, rows, ctx.ctas):
+        row = fx.Int32(row_iv)
+        seq = scalar(load(seq_lens, row * 8, words=1))
+        output = buffer_at(topk_out + fx.Int64(row) * (TOPK * 4), TOPK * 4)
+        _write_row(logits, max_blocks, row, seq // RATIO, seq, seq, output, space, ctx.aux)
+        qtopk._cta_sync()
