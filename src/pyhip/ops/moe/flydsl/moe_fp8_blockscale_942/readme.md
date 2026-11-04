@@ -54,6 +54,8 @@ for kb in K-blocks:                           # 与dense kernel同一stage表
 act = silu(acc[nbl]) * acc[4+nbl]             # lane: token 16mb+r16，列 64wn+16nbl+4g+e
 amax = 每token在本wave 64列上的最大值（shuffle_xor 16/32），与wn^1的wave经LDS交换得到128列最大值
 A2[row, 128jt + 64wn + 16nbl + 4g .. +3] = fp8(act * 240/amax)（v_cvt_pk_fp8_f32，每lane每块1个dword）
+    # 先ds_write_b32进LDS：tile行r在区域r>>5的4 KiB处（避开行最大值），16 B chunk按r&7异或；barrier后
+    # wave w读行32w .. +31（每lane一个ds_read_b128），每条buffer_store_dwordx4写8个完整的128 B行
 A2S[jt, row] = amax/240 * sorted_weight[row]  # wn=0的wave写；amax=0（padding行）时为0
 ```
 
@@ -142,6 +144,8 @@ wave w：输出列 (N/NW)w .. ，每128列一个W2 block scale，4个32列unit�
 | 11-03 | compact M64尾tile（I=256）：64行排序 + 设备端tile表，gate_up/down按tile，行数外的band/wave不发MFMA | TP8单卡4K/8K/16K/32K：648→613、980→938–950、1717→1658–1669、3160–3196→3134–3158 µs | 保留。gate_up尾tile受band→SIMD固定映射限制（1 band仍占1/2时间，3 band不省） |
 | 11-03 | 1-stage M64（`kernels_m64.py`）：gemm1 + requant到LDS + down在同一CTA，W13/W2片段直接进VGPR | A2、Y与2-stage逐位一致；整个MoE 8K/16K/32K：937→965、1684→1783、3149→3425 µs（moe64 1425/2583 vs gate_up+down+tile表 1294/2277） | 保留为实验开关`PYHIP_MOE_DOWN=fused`，不作默认。权重复用只有1/4，每CU 1个CTA；W2预取提前2个unit无变化，已回退 |
 | 11-03 | 1-stage改tingqli式4-wave CTA × 每CU 2个（`NW=4`：两遍gemm1、A2分两半写LDS） | 逐位一致，248 VGPR；moe64 8K/16K/32K：783/1363/2568 → 845/1514/2804 µs；整个MoE 964/1782/3443 → 1042/1883/3557 | 更慢，`PYHIP_MOE_FUSED_WAVES`默认8。L2未命中读翻倍（3.17 → 6.08 GB）、时钟1.22 → 1.13 GHz；LDS补到40 KB（每CU 1个）只慢了3% |
+| 11-04 | gate_up的A2经LDS中转，每条store写完整128 B行（原来每lane 16条dword store，每行分8次写16 B） | 逐位一致；32K单卡交替3轮：1228.7/1230.0/1240.1 → 1227.8/1226.4/1216.7 µs（约−9 µs）；e2e（moers8，141次调用中位数）1350.8 → 1339.3 µs | 保留。消融显示A2写出约占60 µs，但主要是写流量本身的代价，部分行写只占一小部分 |
+| 11-04 | 短K down改8-wave CTA × 512行tile（每CU 1个CTA，W2的DMA与L2→LDS流量减半）；512行tile表与256行表同一次`_tiles_kernel`写出 | 逐位一致；32K单卡交替3轮（随机路由）：976.8 → 965.0 µs（−1.2%），偏斜路由也是−11 µs；但e2e（moers8，真实路由）中位数943.9 → 968.5 µs（+2.6%，排除与另一stream的rocprim排序重叠的调用仍是+25 µs）。只减半W2 DMA（结果错误的消融）为−49 µs | 回退。真实路由下尾tile更多，512行尾tile的CTA常只有1个wave在算却独占整个CU |
 
 ### 4.1 DP2/TP8 DP-attention专项（MoE TP8，每rank I=256）
 
