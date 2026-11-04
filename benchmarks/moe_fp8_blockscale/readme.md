@@ -1024,6 +1024,88 @@ QKV/dense 24.0、aiter AG 10.0、copy/fill 9.3、MoE route/sort 9.2、SWA 6.2、
 
 8卡集合等效230–260 GB/s，4卡组内100–125 GB/s（3条xGMI vs 7条）。swad里77%的通信时间是MoE的AG8 + RS8。
 
+### 4.21 继续减少通信：DFlash投影放到shard上、MoE的top-k sum融进RS8（2026-11-04）
+
+代码在sglang `feat/mimo-dpa-prefill-opt-comm`（`/root/workspace/sglang`，e3ef41b187之后，未commit），配置同4.20最终配置（swad）。
+
+**① DFlash上下文投影在token shard上算。** 原来抓取的5个层输入（第1/12/24/36层 + 末层）各AG4成[16K, 4096]，拼成[16K, 20480]后
+attention-TP组4卡各自对全部16K行算FC（20480→4096）+ hidden_norm。改为各卡在自己的4K行上抓取、拼接、投影，只AG4一次投影后的[16K, 4096]
+（target注册draft的`project_target_hidden`；draft见到4096宽的输入就不再投影）。只在EXTEND且SP生效时走；decode / verify不变。
+每步（rank 0，chunk 1）：AG4 [16K, 4096] 5次4.42 ms → 2次1.77 ms，FC GEMM 5.21 → 1.44 ms，拼接1.59 → 1.19 ms，合计约−7.2 ms/step；
+GSM8K阶段accept len不变（5.15 vs 5.14），GSM8K 0.895，bench 66,142 → 66,847 tok/s（+1.1%）。
+
+**② MoE：PyHIP MoE（gate_up + down_direct）+ 融合的top-k sum / RS8。** 序列并行下MoE每层是AG8 → MoE（全部32K token，本卡I=256切片）→ RS8。
+aiter 1-stage MoE自带top-k求和，没法在它的输出上融合；PyHIP的direct路径本来就先写route行Y再单独求和，所以把求和与RS8合成一个kernel
+（[sum_rs.hip](probes/sum_rs.hip)，在[sum_ar.hip](probes/sum_ar.hip)基础上改）：
+- 常驻grid 96个WG × 512线程。wave 0–3对token（unit u，目的rank s按u轮转）的8个route行做FP32求和、转BF16，写进LDS环（4格）；
+  wave 4–7把每个四分之一行用write-through store推到rank s的inbox[parity][本rank][u]，每个unit结束后在目的rank上置flag（单调epoch，不清零）。
+- reduce阶段：等本rank各行的8×4个flag，按rank顺序FP32求和8个inbox行（绕过L2的load），BF16写出本卡shard。
+- RS阶段从不等别的rank，所以WG全部常驻时不会死锁；对方最多领先一个epoch，inbox按epoch奇偶双缓冲。
+- shard大小可不同（两个DP组token数不同、某组空闲）：unit取最大shard，u超出s的shard就跳过；目的rank的inbox / flag行号为`src × size[s] + u`。
+- 与参考逐位一致：每rank部分和 = BF16(FP32 Σk)，跨rank FP32按rank顺序求和、一次BF16舍入（RCCL的RS是BF16逐跳舍入，这里不比它差）。
+
+8卡kernel（`sum_rs.py`，grid 96，最慢rank中位数，µs）：
+
+| 全局token | shard | sum | RCCL RS | sum+RS | 融合 | 融合/(sum+RS) |
+|---:|---|---:|---:|---:|---:|---:|
+| 16K | 2048×8 | 285 | 473 | 720 | 540 | 0.75 |
+| 32K | 4096×8 | 618 | 842 | 1357 | 1119 | 0.82 |
+| 16K | 2730×4 / 1366×4 | 285 | 713* | 918 | 717 | 0.78 |
+| 32K | 5461×4 / 2731×4 | 617 | 1225* | 1773 | 1407 | 0.79 |
+
+*不等长时RCCL按最大shard补齐再RS。grid越大越慢（16K/32K：96 → 543/1091，128 → 757/1434，304 → 1461/2860 µs）：
+远端写并发太多时xGMI拥塞；只推本卡（不走xGMI）时304 WG最快，所以瓶颈是远端写的并发度。
+
+整层MoE + RS（`moe_rs.py`，8卡同时跑，均匀路由，预量化FP8输入，µs）：
+
+| 全局token | aiter + RCCL RS | PyHIP（含sum）+ RCCL RS | PyHIP + 融合sum/RS | 融合/aiter |
+|---:|---:|---:|---:|---:|
+| 16K | 2419 | 2319 | 2157 | 0.89 |
+| 32K | 4259 | 4019 | 3765 | 0.88 |
+
+与aiter + RCCL的rel_l2为5.7e-3（两套FP8实现之差；各自对FP32参考都是4.0e-3）。
+
+接入sglang：`SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM=1`且`SGLANG_ENABLE_DPA_SP=1`时，MiMo的SP MoE改走
+`layers/moe/pyhip_fp8_blockscale_moe.py`（从cab0421移植tiles / gate_up / inverse / down_direct，与本仓库源码AST一致，只删了dense down和sum；
+融合sum + RS是同文件里的FlyDSL kernel `_sum_rs_kernel`，算法同`sum_rs.hip`，不需要hipcc / tvm-ffi）。对称内存用hipMalloc + IPC handle，
+首次使用时在TP组的device communicator上all-gather交换；容量 = 每DP组chunked prefill / attention TP（这里4096行，每卡512 MiB），
+更大的shard退回aiter + RCCL。层检查（gfx942、FP8 128×128、aiter shuffle、I=256、top-8、TP8、无EP / 共享专家 / clamp / bias）不过也退回。
+8卡核对（`check_pyhip_moe_rs.py`）：与PyHIP kernel + 探针kernel逐位一致（等长、不等长、一组空闲，各3个epoch）。
+
+端到端（rank 0，chunk 0/1/2）：
+
+| 指标 | dfl1（①） | moers2（① + ②，HIP JIT） | moers4（HIP JIT，最终版） | moers5（FlyDSL版） | moers7（FlyDSL，无asm，全buffer） |
+|---|---:|---:|---:|---:|---:|
+| 每步span ms | 382.3 / 422.9 / 573.6 | 328.1 / 378.2 / 445.0 | 326.4 / 375.0 / 424.5 | 320.6 / 387.0 / 440.2 | 346.0 / 423.2 / 424.2（含等另一DP组） |
+| 每步净值 ms | 352.0 / 391.3 / 433.8 | — | 315.8 / 368.5 / 419.3 | 313.8 / 370.2 / 415.3 | — |
+| 每步非通信 ms | 245.4 / 301.6 / 344.3 | 211.9 / 263.1 / 312.6 | 212.7 / 262.0 / 312.1 | — | — |
+| MoE kernel ms/step（chunk 1） | aiter 144.0 | gate_up 65.1 + down 44.5 + tiles/inverse 0.8 = 110.4 | 同左 | 同左 | 同左 |
+| RCCL ms/step（chunk 1） | 104.4（含RS8与等待） | 38.1（RS8没了） | 38.4 | 53.4（AG8等待多） | 92.5（含20 ms等待） |
+| 融合sum + RS ms/step | — | 63.0（含等待） | 60.3 | 57.4 | 60.1（单次中位数1.22 ms） |
+| input tok/s | 66,847 | 70,157（moers3：70,682） | 71,590（+7.1%） | 70,634 | 70,847 |
+| Mean TTFT / TPOT ms | 1763 / 10.17 | 1697 / 8.83 | 1674 / 8.10 | 1685 / 8.73 | 1674 / 9.04 |
+| GSM8K | 0.895 | 0.900 | — | 0.890 | 0.885 |
+
+- MoE + RS每步约210 → 170 ms（−40 ms，约−0.85 ms/层）。相对e3ef41（head）：66,142 → 70.6K–71.6K tok/s（+7%–8%）。
+- 净值 = 非通信kernel + 去掉>5 ms一次性等待的通信（span还含等另一个DP组的时间）。PR描述里chunk 1的389 ms是swad的净值，dfl1同口径391.3 ms。
+- 通信字节数不变：RS8每层仍是每卡发224 MiB（10.28 GiB/step），只是不走RCCL。`comm_volume.py`的“RCCL send total”只算带record_param_comms的
+  RCCL调用（RS8 + A2A，不含AG8和aiter AG），所以从11.27变成0.99 GiB；全部集合通信每卡每步17.6 → 17.3 GiB（只有①省下DFlash的3次AG4）。
+- 第一次e2e（moers1，旧版按需扩容的对称内存）吞吐63,741、TPOT 15.75 ms（ITL全程偏高，accept len正常，最大ITL 41 ms），GSM8K 0.875；
+  第二次（moers2，固定容量）起正常（moers2–4）。按需扩容会在forward里用CPU组做all_gather_object，已改成固定容量 + device组交换。
+- sglang里第一版（HIP，tvm-ffi JIT）融合kernel比探针的同一算法慢7–15%：route行用一个带边界的buffer resource、行偏移在VGPR里算（为让缺失route（−1）越界读0）。
+  交叉计时（各自kernel读对方的Y）确认是kernel本身而不是缓冲区。改回每行一个scalar resource（缺失route给0字节resource，无分支）后，
+  16K/32K为532 / 1155 µs，与探针521 / 1133 µs差≤2%，结果仍逐位一致。
+- 之后改写成FlyDSL（`_sum_rs_kernel`），HIP的.cuh和JIT封装删除；新kernel不用inline asm，向量访存全是buffer指令（ISA里没有`flat_*` / `global_*`）：
+  - 数据：route行`nt`，inbox写`sc0 sc1`（write-through），inbox读`sc0 sc1`；每个resource都在4 GiB内（inbox ≤ 512 MiB，flag区 ≤ 1 MiB）；
+  - flag：读用`llvm.amdgcn.raw.ptr.atomic.buffer.load`（`buffer_load_dword … sc0 sc1`；这个intrinsic对LLVM不是只读，
+    自旋循环每轮都重新读，普通buffer load会被外提成死循环），写用`buffer_atomic_swap … sc1`（每个目的rank一个scalar resource，
+    lane 0依次写8个，shard外的给0字节resource丢弃）；写前`fence release workgroup` + `s_waitcnt vmcnt(0)`，等到后`fence acquire workgroup`，
+    都不产生`buffer_wbl2` / `buffer_inv`；
+  - LDS环的数据用普通LLVM load/store（`ds_read_b128` / `ds_write_b128`），计数器用`workgroup-one-as`域的acquire load / release store
+    （LDS按序执行，编译器没有插lgkmcnt等待）；INV的8个route行一条`s_load_dwordx8`（invariant load）；
+  - 求和循环每次处理两行、两组寄存器乒乓：只用一组时，回边要把新预取的16个向量拷进循环携带寄存器，先`s_waitcnt vmcnt(0)`等它们到齐。
+  与探针逐位一致（15个用例）。交替计时16K / 32K为557 / 1111 µs（探针523 / 1126 µs）；VGPR 142，SGPR 101。
+
 ## 5. 后续工作（固定部署下的优先级）
 
 | 优先级 | 事项 | 预期（32K全局token，每层） |
@@ -1031,10 +1113,10 @@ QKV/dense 24.0、aiter AG 10.0、copy/fill 9.3、MoE route/sort 9.2、SWA 6.2、
 | 0 | ~~启动脚本改为`ROCM_QUICK_REDUCE_QUANTIZATION=FP`、`ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16=0`~~（4.2第6点）：序列并行落地后prefill只剩第0层的2次大AR，收益<0.2 ms/step，未启用（4.17） | 被1取代 |
 | 1 | ~~sglang DP-attention通信改为序列并行+FP8 gather~~：已在`feat/mimo-dpa-prefill-opt`上实现（`SGLANG_DPA_SP_MOE`，4.17），只用于prefill大前向；每层通信3.4–3.8 → 2.73 ms，prefill每步−15.8%（含PyHIP FP8 GEMM），bench吞吐+9.9%，GSM8K不变 | 已完成 |
 | 1b | ~~attention侧RS4/AG4~~：SWA层序列并行 + 其余层A2A o_proj（4.20），每步通信136 → 87–91 ms；另开prefill delayer、dense TP1、embedding复制 | 已完成（−48 ms/step，e2e +35%） |
-| 1d | SP-SWA的临时页打包（cat/index/permute约7 ms/step）融合成一个kernel；DFlash的FC放到shard上算（约−4 ms/step）；FlyDSL冷启动编译（4.17） | −8~−11 ms/step |
+| 1d | SP-SWA的临时页打包（cat/index/permute约7 ms/step）融合成一个kernel；~~DFlash的FC放到shard上算~~（4.21①，−7.2 ms/step）；FlyDSL冷启动编译（4.17） | −8~−11 ms/step |
 | 1c | MoE GEMM1：借鉴45afb765的GateUp LDS kernel（4.19：比PyHIP gate_up快9%–13%），保留compact M64尾块和down_direct | 整个MoE约−5%–6%（估算） |
 | 1e | o_proj BF16 GEMM（M4096 N4096 K8192，hipBLASLt 561T）：调hipBLASLt/aiter tuned GEMM，或写gfx942 BF16 PyHIP kernel（目前没有，4.20） | 到650T约−3 ms/step（估算） |
-| 2 | 把“RS→norm→quant→AG”做成IPC自定义kernel；MoE侧把RS/AR融进sum kernel（4.7：融合sum+AR在32K下0.80x）。接入sglang还需：I=256的TP8 MoE改用PyHIP（目前门槛为I≥512，I=256走aiter）、对称内存分配、CUDA graph下的epoch | MoE后通信 −0.44 ms（AR版已测；整层32K为当前部署的0.82x，4.16）；RS版与attention侧待测 |
+| 2 | 把“RS→norm→quant→AG”做成IPC自定义kernel；~~MoE侧把RS融进sum kernel~~（4.21②：PyHIP MoE + 融合sum/RS8已接入sglang，MoE + RS每步−40 ms，e2e +7.1%） | attention侧待测 |
 | 3 | ~~MoE：compact M64尾块~~（已实现，4.14）：单卡8K/16K/32K为−3%/−3%/−1%，整层（down_ar版）−49/+5/−101 µs | 已完成 |
 | 3c | MoE侧用down + sum + AR单kernel（4.10）代替down + 融合sum_ar；配合int8 Y可能更多 | 整层8K/16K快2–3%，32K持平（4.14）；接入成本与优先级2相同 |
 | 4 | MoE：FP8 gather落地后，PyHIP直接吃FP8输入（已支持transposed scale），去掉入口量化 | 与1合并计算 |
