@@ -1263,9 +1263,10 @@ e2e（sort1）：GSM8K 0.915，75644 tok/s（+1.6%），每步302.7 / 346.6 / 39
 - FlyDSL编译：sglang的`flydsl_pa.py`把`FLYDSL_RUNTIME_ENABLE_CACHE`默认设0，每个进程都重新编译。GEMM一个变体约7 s（key含`xcd`），
   gate_up + down 7.1 s，route sort 0.6–0.8 s。sglang里编译时临时打开磁盘缓存，目录按kernel源码hash（FlyDSL的key不含模块常量）；第二个进程0.6–0.8 s。
 - aiter FlyDSL SWA kernel的Constexpr `NP = K.shape[0]`没用到但在编译key里：SP-SWA临时页数每次不同就重编（约1.6 s）。页缓冲按2的幂分配。
-- MiMo embedding复制让GSM8K稳态慢12–15%，长prefill只省一次AR4，已回退。
-- 结果：GSM8K稳态39.9 / 39.1 s（base 40.9 / 41.8 s），首遍76.8 s（base 74.8 s）。ISL 8K–256K（并发2，OSL 20）平均TTFT −18 / −29 / −28 / −28 / −25 / −20%，
-  输入吞吐 −0.2 / +22 / +16 / +27 / +32 / +24%（吞吐含decode段，受两个DP组相位影响±10%）。
+- MiMo embedding复制已回退（长prefill只省一次AR4，多占0.9 GB）。之前认为它让GSM8K稳态慢12–15%，证据不足：base自己的GSM8K稳态也在40–49 s之间跳。
+- 结果（最终`adbf6bd1ee` vs `6b84c84717`，同一会话）：GSM8K两遍75.9 / 47.4 s vs 74.1 / 48.9 s，准确率0.893 / 0.909 vs 0.892 / 0.898。
+  ISL 8K–256K（并发2，OSL 20）平均TTFT −18 / −29 / −28 / −28 / −25 / −20%，输入吞吐 −0.2 / +22 / +16 / +27 / +32 / +24%（吞吐含decode段，受两个DP组相位影响±10%）。
+  64K每步305.6 / 350.4 / 396.9 vs 469.2 / 511.2 / 560.7 ms（−31.7%）。
 
 ## 5. 后续工作（固定部署下的优先级）
 
