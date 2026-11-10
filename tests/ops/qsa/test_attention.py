@@ -1,5 +1,6 @@
-"""Pytest entry for sparse_prefill_op_test.py (functional and graph cases, groups 12/6/3),
-plus PyHIP's slot-table pools, the per-row pack rule and packed K/V over 2 GiB."""
+"""Pytest entry for sparse_prefill_op_test.py (functional, graph, slot-table and span-limit
+cases, groups 12/6/3), plus PyHIP's slot-table pools, the per-row pack rule and packed K/V
+over 2 GiB."""
 
 from collections import OrderedDict
 import dataclasses
@@ -41,6 +42,19 @@ def test_sparse_prefill(case, group):
 @pytest.mark.parametrize("case", list(op.GRAPH_CASES))
 def test_graph_replay(case, group):
     _run(op.test_qsa_graph_replay, case, group, op.GRAPH_CASES[case][0])
+
+
+@pytest.mark.parametrize("group", GROUPS)
+@pytest.mark.parametrize("case", list(op.SLOT_CASES))
+def test_op_kv_slots(case, group):
+    _run(op.test_qsa_kv_slots, case, group, op.SLOT_CASES[case][0])
+
+
+@pytest.mark.parametrize("case", list(op.SPAN_LIMIT_CASES))
+def test_op_span_limit(case):
+    _gpu()
+    with torch.device("cuda"):
+        op.test_qsa_span_limit(case, 12)
 
 
 @pytest.fixture(params=(None, 0), ids=("default-plan", "always-plan"))

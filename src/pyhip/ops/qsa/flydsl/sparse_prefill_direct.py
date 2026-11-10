@@ -30,19 +30,17 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
 from . import sparse_prefill_direct_packed as packed
-from .indexer_topk import _load as _lds_load
-from .indexer_topk import _store as _lds_store
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     MAX_ROW_PACKED_KV_BYTES,
     _buffer,
     _buffer_words,
     _exp,
+    _lds_load,
+    _lds_store,
     _maximum,
     _mfma,
     _min,
@@ -66,9 +64,11 @@ def _load_key(resource, offset, lane):
 
 
 def _global_words(address):
-    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.Int64(address).ir_value())
-    vector = ir.VectorType.get([4], fx.Int32.ir_type)
-    return fx.Vector(llvm.load(vector, pointer, alignment=16))
+    pointer = fx.inttoptr(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 16),
+        fx.Int64(address),
+    )
+    return fx.Vector(fx.generic_load(pointer, count=4))
 
 
 def _wide_key(base, row, lane, row_bytes):
@@ -185,17 +185,18 @@ def prepare(
     slotted = inputs.kv_slots is not None
     pack_bytes = int(blocks.sum()) * 4 * hk * 1024
     # Pack while PK+PV fit the budget, or while the context has at most pack_tokens_per_row
-    # tokens per query row. Without a slot table the pack kernel addresses all of K/V and
-    # PK/PV with unsigned 32-bit byte offsets; with one each block gets a 64-bit base.
+    # tokens per query row. PK/PV, and without a slot table all of K/V, take unsigned 32-bit
+    # byte offsets in the pack kernel (a slot table gives each source block a 64-bit base).
+    addressed = int(blocks.sum()) * 4
+    if not slotted:
+        addressed = max(addressed, int(lengths.sum()))
     packed = (
         pack_bytes <= config.max_packed_kv_bytes
         or (
             int(blocks.sum()) * 4 <= config.pack_tokens_per_row * int(q_lens.sum())
             and pack_bytes <= MAX_ROW_PACKED_KV_BYTES
         )
-    ) and (
-        slotted or max(int(lengths.sum()), int(blocks.sum()) * 4) * hk * 512 < 2**32
-    )
+    ) and addressed * hk * 512 < 2**32
     waves = 1 if packed else 4
     k_starts, p_starts = np.cumsum(lengths) - lengths, np.cumsum(blocks) - blocks
     counts = -(-q_lens // waves)
@@ -408,7 +409,7 @@ def _body(
     rocdl.s_waitcnt(vmcnt=0)
     tail_start = visible & -4
     if fx.const_expr(SLOTTED):
-        # Map all TOPK IDs to pool blocks up front (a block is four consecutive pool rows)
+        # Map all TOPK IDs to pool blocks up front (a block is four aligned pool rows)
         # through this tile's request rows of the slot table, range-checked: padding IDs and
         # a tail start at the request end read zero. The loop reads chunks 1.. back from
         # this wave's LDS (free until the epilogue) where the plain path loads IDs.

@@ -123,8 +123,8 @@ def _read_packet_g2s(
         base, final, partial, full = resource
         block = rows[packet // 4]
         records = (block == final).select(partial, full)
-        resource = _buffer_at(
-            base + fx.Int64(fx.Uint32(block)) * (4 * hk * D * 2), records
+        resource = rocdl.get_buffer_rsrc(
+            _buffer_at(base + fx.Int64(fx.Uint32(block)) * (4 * hk * D * 2), records)
         )
         soffset = fx.Uint32(0)
     else:

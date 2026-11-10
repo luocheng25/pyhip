@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """QSA sparse prefill on gfx942: BF16 D256 sparse attention over packed K/V.
 
-Public entry for the ``sparse_prefill_*`` kernels in this package. Each call
+Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
 recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
 the union kernel (queries of a tile share one compact block list with exact
 per-query membership) or to the direct kernel (one query per wave over its own
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+
 
 from . import sparse_prefill_direct as direct
 from . import sparse_prefill_prepare as prepare
@@ -74,18 +75,15 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(
-        self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None, wide=None
-    ):
+    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
         sequence = np.repeat(np.arange(len(q_lens)), q_lens)
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
         slotted = kv_slots is not None
-        if wide is None:
-            # Past this pool span raw direct byte offsets no longer reach every row.
-            wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
+        # Past this pool span raw direct byte offsets no longer reach every row.
+        wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
@@ -243,18 +241,19 @@ def attention(
 
     Host query_lens/prefix_lens describe packed requests. For one request they
     default to (M,) and (N-M,). Plans are built and cached per layout. With kv_slots
-    (contiguous int32[N] of at most 2**32 - 2**20 bytes, packed token -> pool row), K/V
-    are a token pool [P,HK,256] read in place: each request's four-token blocks must
-    occupy four consecutive pool rows (pool pages a multiple of four tokens), and the
-    result is the same as for K/V packed by those slots. A pool may exceed 4 GiB (raw
-    direct then uses 64-bit loads); slot values are not validated. Hot calls
-    rebuild the selection: per-layout plans share one private per-stream scratch
-    arena. out is optional and must not alias Q/K/V, indices or kv_slots. Warm the
-    same stream and layout before graph capture. Captured workspaces stay pinned for
-    graph pointer lifetime and share their stream's scratch: do not replay them
-    concurrently with each other or with that stream's calls.
-    Each kernel variant compiles on its first use: a few seconds with empty FlyDSL
-    caches. One GPU per process (TP uses separate workers).
+    (contiguous int32[N] of at most 2**32 - 2**20 bytes, packed token -> pool row),
+    K/V are a token pool [P,HK,256] read in place: each request's four-token blocks,
+    the final partial one included, must occupy four consecutive pool rows starting
+    at a multiple of four (paged pools whose pages are a multiple of four tokens
+    satisfy this), and the result is the same as for K/V packed by those slots. A
+    pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
+    validated. Hot calls rebuild the selection: per-layout plans share one private
+    per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
+    kv_slots. Warm the same stream and layout before graph capture. Captured
+    workspaces stay pinned for graph pointer lifetime and share their stream's
+    scratch: do not replay them concurrently with each other or with that stream's
+    calls. Each kernel variant compiles on its first use: a few seconds with empty
+    FlyDSL caches. One GPU per process (TP uses separate workers).
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -274,8 +273,8 @@ def attention(
         or not kv_slots.is_contiguous()
     ):
         raise ValueError("kv_slots must be a contiguous device int32 [N] tensor")
-    # The kernels read the slot table through unsigned 32-bit buffer offsets and upload each
-    # request's start in it as int32.
+    # The kernels read the slot table at unsigned 32-bit buffer offsets and upload
+    # each request's start in it as int32.
     if kv_slots is not None and kv_slots.numel() * kv_slots.element_size() > _MAX_SPAN:
         raise ValueError("kv_slots requires a byte span <= 2**32 - 2**20")
     keys = k.shape[0] if kv_slots is None else kv_slots.shape[0]
@@ -355,7 +354,8 @@ def attention(
     ):
         raise ValueError("out must be aligned, contiguous and match Q")
     begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    for source in (q, k, v, indices) + (() if kv_slots is None else (kv_slots,)):
+    sources = (q, k, v, indices) + (() if kv_slots is None else (kv_slots,))
+    for source in sources:
         if (
             begin < source.data_ptr() + source.numel() * source.element_size()
             and source.data_ptr() < end

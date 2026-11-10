@@ -26,7 +26,6 @@ from .sparse_prefill_common import (
     _min,
     _pack_bf16,
     _pin,
-    _raw_words,
     _stage_end,
     _target_features,
     _uniform,
@@ -139,14 +138,12 @@ def _pack_block(
         source = valid.select(
             fx.Uint32(token * hk * 512 + dim * 2), fx.Uint32(4 * hk * 512)
         )
-        load = _raw_words
     else:
         # Tokens past a request's end are masked by the direct kernel.
         source = valid.select(
             fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
         )
-        load = _buffer_words
-    key = load(kr, source)
+    key = _buffer_words(kr, source)
     target = (
         fx.Uint32(
             ((block * 4 + dim // 64) * hk + head) * 256
@@ -158,7 +155,7 @@ def _pack_block(
     )
     target = valid.select(target, extent)
     _buffer_store_words(key, pk, target)
-    vector = load(vr, source)
+    vector = _buffer_words(vr, source)
     words = [vector[i] for i in range(4)]
     # Exchange the two token bits with the two register-index bits. Each wave
     # owns all four tokens, so the native DS operations need no CTA barrier.

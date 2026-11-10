@@ -20,26 +20,16 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import rocdl
 
-from pyhip.codegen.flydsl.helpers import rocdl_aux
 
-from .indexer_topk import (
-    _cta_sync,
-    _inclusive_scan,
-    _intrinsic,
-    _lds,
-    _load,
-    _put,
-    _store,
-    _word,
-)
 from .sparse_prefill_common import (
     _buffer,
-    _buffer_at,
+    _buffer_store_words,
     _buffer_words,
+    _lds_load,
+    _lds_pointer,
+    _lds_store,
     _min,
     _uniform,
     get_cu_num,
@@ -325,30 +315,50 @@ MEMBER_BYTES = LDS_BUDGET - SCAN_BYTES - MEMBER
 
 
 def _resource(tensor, size_bytes, offset=None):
-    """Raw buffer resource over tensor from element offset on."""
+    """Byte-addressed buffer over tensor from element offset on."""
     pointer = fx.get_iter(tensor)
     if offset is not None:
         pointer = pointer + offset
-    return _buffer_at(fx.ptrtoint(pointer), size_bytes)
+    return _buffer(fx.make_view(pointer, fx.make_layout(1, 1)), size_bytes)
+
+
+def _word(buffer, offset):
+    return _buffer_words(buffer, offset, 1)[0]
+
+
+def _put(buffer, index, value):
+    words = fx.Vector.from_elements([fx.Int32(value)], fx.Int32)
+    _buffer_store_words(words, buffer, fx.Int32(index) * 4)
+
+
+def _cta_sync():
+    fx.memory_fence(syncscope="workgroup")
+    rocdl.s_barrier()
+    fx.memory_fence(syncscope="workgroup")
+
+
+def _inclusive_scan(value, lane):
+    for offset in (1, 2, 4, 8, 16, 32):
+        source = ((lane - offset) & 63) * 4
+        other = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source, value))
+        value = (lane >= offset).select(value + other, value)
+    return value
 
 
 def _popcount(value):
-    return _intrinsic("llvm.ctpop.i32", fx.Int32, value)
+    return fx.Int32(fx.ctpop(value))
 
 
 def _entry_bytes(wide):
     return 8 if wide else 4
 
 
+def _entry_type(wide):
+    return fx.Int64 if wide else fx.Int32
+
+
 def _or(address, value, wide):
-    llvm.atomicrmw(
-        llvm.AtomicBinOp._or,
-        _lds(address),
-        value.ir_value(),
-        llvm.AtomicOrdering.monotonic,
-        syncscope="workgroup",
-        alignment=_entry_bytes(wide),
-    )
+    fx.atomic_or(_lds_pointer(address, _entry_type(wide)), value, syncscope="workgroup")
 
 
 def _member_bit(row, wide):
@@ -356,29 +366,16 @@ def _member_bit(row, wide):
 
 
 def _load_entry(address, wide):
-    if wide:
-        return fx.Int64(llvm.load(fx.Int64.ir_type, _lds(address), alignment=8))
-    return _load(address)
+    return _lds_load(address, _entry_type(wide))
 
 
 def _store_entry(address, value, wide):
-    if wide:
-        llvm.store(fx.Int64(value).ir_value(), _lds(address), alignment=8)
-    else:
-        _store(address, value)
+    _lds_store(address, value, _entry_type(wide))
 
 
 def _put_entry(members, index, value, wide):
-    if wide:
-        rocdl.raw_ptr_buffer_store(
-            value.ir_value(),
-            members,
-            (index * 8).ir_value(),
-            fx.Int32(0).ir_value(),
-            aux=rocdl_aux(0),
-        )
-    else:
-        _put(members, index, value)
+    words = fx.Vector.from_elements([value], _entry_type(wide)).bitcast(fx.Int32)
+    _buffer_store_words(words, members, index * _entry_bytes(wide))
 
 
 def _zero(wide):
@@ -389,8 +386,8 @@ def _rank(shared, offset):
     """Union index within the window of the present block `offset` blocks into it."""
     word = offset >> 5
     below = (fx.Int32(1) << (offset & 31)) - 1
-    return _load(shared + PREFIX + word * 4) + _popcount(
-        _load(shared + PRESENCE + word * 4) & below
+    return _lds_load(shared + PREFIX + word * 4) + _popcount(
+        _lds_load(shared + PRESENCE + word * 4) & below
     )
 
 
@@ -467,7 +464,7 @@ def _blocks(cta, mode, w0, w1, c0, entries):
 
 def _prefix_base(cta, inclusive, local):
     """(this thread's exclusive prefix over the CTA, CTA total) from the waves' inclusive scans."""
-    totals = [_load(cta.scan + w * 4) for w in range(cta.threads // 64)]
+    totals = [_lds_load(cta.scan + w * 4) for w in range(cta.threads // 64)]
     running = inclusive - local
     for w, total in enumerate(totals):
         running = running + (fx.Int32(w) < cta.wave).select(total, fx.Int32(0))
@@ -481,7 +478,7 @@ def _prefix_base(cta, inclusive, local):
 def _cta_prefix(cta, local):
     inclusive = _inclusive_scan(local, cta.lane)
     if cta.lane == 63:
-        _store(cta.scan + cta.wave * 4, inclusive)
+        _lds_store(cta.scan + cta.wave * 4, inclusive)
     _cta_sync()
     running, present = _prefix_base(cta, inclusive, local)
     return running, present
@@ -509,14 +506,14 @@ def _below(mask):
 
 
 def _count(mask):
-    return fx.Int32(_intrinsic("llvm.ctpop.i64", fx.Int64, mask))
+    return fx.Int32(fx.ctpop(mask))
 
 
 @flyc.jit
 def _wave_bases(cta, total):
     """(this wave's exclusive prefix over the CTA, CTA total) of the waves' uniform totals."""
     if cta.lane == 0:
-        _store(cta.scan + cta.wave * 4, total)
+        _lds_store(cta.scan + cta.wave * 4, total)
     _cta_sync()
     base, present = _prefix_base(cta, fx.Int32(0), fx.Int32(0))
     return base, present
@@ -570,10 +567,10 @@ def _emit_blocks(cta, base, w0, lo, hi):
     # Present blocks of this thread's words in order, from union index base + prefix.
     for index in range(lo, hi, fx.Int32(1)):
         word = fx.Int32(index)
-        bits = _load(cta.shared + PRESENCE + word * 4)
-        union = base + _load(cta.shared + PREFIX + word * 4)
+        bits = _lds_load(cta.shared + PRESENCE + word * 4)
+        union = base + _lds_load(cta.shared + PREFIX + word * 4)
         while bits != 0:
-            bit = _intrinsic("llvm.cttz.i32", fx.Int32, bits, fx.Boolean(True))
+            bit = fx.cttz(bits)
             _put(cta.output, union, w0 + word * 32 + bit)
             union = union + 1
             bits = bits & (bits - 1)
@@ -584,7 +581,7 @@ def _window(cta, w0, w1, count, budget):
     """Union of blocks [w0, w1) appended at `count`; returns (new count, whether over budget)."""
     words = (w1 - w0 + 31) >> 5
     for index in range(cta.tid, words, fx.Int32(cta.threads)):
-        _store(cta.shared + PRESENCE + fx.Int32(index) * 4, 0)
+        _lds_store(cta.shared + PRESENCE + fx.Int32(index) * 4, 0)
     _cta_sync()
     zero = fx.Int32(0)
     _blocks(cta, 1, w0, w1, zero, zero)
@@ -594,12 +591,14 @@ def _window(cta, w0, w1, count, budget):
     lo, hi = _owned(cta, words)
     local = fx.Int32(0)
     for index in range(lo, hi, fx.Int32(1)):
-        local = local + _popcount(_load(cta.shared + PRESENCE + fx.Int32(index) * 4))
+        local = local + _popcount(
+            _lds_load(cta.shared + PRESENCE + fx.Int32(index) * 4)
+        )
     running, present = _cta_prefix(cta, local)
     for index in range(lo, hi, fx.Int32(1)):
         word = fx.Int32(index)
-        _store(cta.shared + PREFIX + word * 4, running)
-        running = running + _popcount(_load(cta.shared + PRESENCE + word * 4))
+        _lds_store(cta.shared + PREFIX + word * 4, running)
+        running = running + _popcount(_lds_load(cta.shared + PRESENCE + word * 4))
     over = _over(count + present, budget)
     if over == 0:
         _emit_blocks(cta, count, w0, lo, hi)
@@ -646,11 +645,11 @@ def _tile(
         fx.SharedAllocator(static=False).allocate(fx.Array[fx.Int8, 16, 16]).peek()
     )
     shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(16, 1)))))
-    tid = fx.Int32(gpu.thread_id("x"))
+    tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
-    program = fx.Int32(gpu.block_id("x"))
+    program = fx.block_idx.x
     # Last tile first: in a causal request it holds the most blocks.
-    tile = gpu.grid_dim.x - 1 - program
+    tile = fx.grid_dim.x - 1 - program
     first_row, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
     position = _uniform(META[tile * 5 + 4])
     # Union pads blocks to N64 steps; one step equals sixteen BN32 direct steps of a row.
@@ -1006,18 +1005,7 @@ def _order(
 
 def _claim(flag, count):
     """Atomically add count to flag[1]; returns the previous value."""
-    address = fx.Int64(fx.ptrtoint(fx.get_iter(flag))) + 4
-    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), address.ir_value())
-    return fx.Int32(
-        llvm.atomicrmw(
-            llvm.AtomicBinOp.add,
-            pointer,
-            fx.Int32(count).ir_value(),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        )
-    )
+    return fx.atomic_add(fx.get_iter(flag) + 1, fx.Int32(count), syncscope="agent")
 
 
 @flyc.jit
@@ -1093,7 +1081,7 @@ def _masks(
     # (group//2)*8 + group%2. One lane owns an (nt, quarter) pair: its four slots are
     # loaded once and shared by every query. Each wave owns one (tile, part); a part
     # takes 16 of every 64 slot groups. With a slot table the same lanes map their
-    # blocks to pool blocks (a four-token block occupies four consecutive pool rows).
+    # blocks to pool blocks (a four-token block occupies four aligned pool rows).
     lane = fx.thread_idx.x & 63
     tile = TILES - 1 - (task >> 2)
     if _uniform(COSTS[tile * 3 + 2]) != 0:

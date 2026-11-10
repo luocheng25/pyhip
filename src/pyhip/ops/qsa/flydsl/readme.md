@@ -60,7 +60,7 @@ attention把query分成两路计算：union让一个tile的BQ行共享这些行�
 | `task_order` | K3 | K5 | union任务的执行顺序 |
 | `score_masks[tiles,CAP/16,BQ,4]` | K3 | K5 | 每N64步、每query要保留的token位（int16） |
 
-#### 1.2.1 公共入口（[attention](attention.py#L219)）
+#### 1.2.1 公共入口（[attention](attention.py#L217)）
 
 ```python
 attention(q[M,H,256], k/v[N,HK,256], indices[M,4T+3], query_lens?, prefix_lens?, softmax_scale?, out?, kv_slots?):
@@ -90,7 +90,7 @@ attention(q[M,H,256], k/v[N,HK,256], indices[M,4T+3], query_lens?, prefix_lens?,
 
 没有首次调用预编译：每个kernel变体在第一次用到时编译（见4.3）。
 
-#### 1.2.2 工作区、scratch与计划（[_Arena](attention.py#L50)、[_Workspace](attention.py#L76)、[allocate_plan](sparse_prefill_prepare.py#L1375)、[direct.prepare](sparse_prefill_direct.py#L171)）
+#### 1.2.2 工作区、scratch与计划（[_Arena](attention.py#L51)、[_Workspace](attention.py#L77)、[allocate_plan](sparse_prefill_prepare.py#L1363)、[direct.prepare](sparse_prefill_direct.py#L171)）
 
 ```python
 class _Workspace:      # 每个新的(device, stream, layout)创建一次
@@ -139,9 +139,9 @@ direct.prepare:
         K3据此加列表CTA；其它情况direct_groups = 0，K3不加
 ```
 
-Platform（[sparse_prefill_common.py](sparse_prefill_common.py#L56)）按gfx型号和CU数取MI308X的标定（路由模型系数、union阈值1.7、建计划的最少行数、打包预算等）；环境变量`AITER_QSA_PLATFORM`可覆盖其中的项（如`union_step=3.0,max_packed_kv_bytes=0`），只用于实验。
+Platform（[sparse_prefill_common.py](sparse_prefill_common.py#L55)）按gfx型号和CU数取MI308X的标定（路由模型系数、union阈值1.7、建计划的最少行数、打包预算等）；环境变量`AITER_QSA_PLATFORM`可覆盖其中的项（如`union_step=3.0,max_packed_kv_bytes=0`），只用于实验。
 
-#### 1.2.3 K1 恢复（[_recover_kernel](sparse_prefill_prepare.py#L251)、[_recover_row](sparse_prefill_prepare.py#L207)）
+#### 1.2.3 K1 恢复（[_recover_kernel](sparse_prefill_prepare.py#L241)、[_recover_row](sparse_prefill_prepare.py#L197)）
 
 ```python
 # 每CTA 4个wave，每个wave一行；从最后一行发起：因果请求里越靠后的行可见块越多，先发最重的行
@@ -158,7 +158,7 @@ block_indices[row, col] = blk[col] if col < C else -1   # K2（并集）和K7（
 
 K1不检查选择布局：组内4个token不连续、块重复、超出因果范围或缺少因果尾时结果错误，不报错；同一stream的工作区共用scratch，错误还可能影响该stream之后的调用。因果尾不由K1读，K2、K3和direct都按位置推出（最后不满4个的token）。名称里的scatter来自AITER，那里K1还把行位写进dense位图；本仓库的K2直接读`block_indices`求并集（10-29），K1不散射。
 
-#### 1.2.4 K2 计数/公式/并集（[_tile](sparse_prefill_prepare.py#L628)、[_dense](sparse_prefill_prepare.py#L534)、[_window](sparse_prefill_prepare.py#L583)、[_blocks](sparse_prefill_prepare.py#L456)、[lds_layout](sparse_prefill_prepare.py#L832)）
+#### 1.2.4 K2 计数/公式/并集（[_tile](sparse_prefill_prepare.py#L627)、[_dense](sparse_prefill_prepare.py#L531)、[_window](sparse_prefill_prepare.py#L580)、[_blocks](sparse_prefill_prepare.py#L453)、[lds_layout](sparse_prefill_prepare.py#L831)）
 
 ```python
 # 每tile一个CTA：BQ≤21时256线程，BQ为32/42时512线程；从最后一个tile发起（因果请求里最后的tile块最多）
@@ -207,7 +207,7 @@ costs[tile] = (direct_tiles, longest, 1 if 未超出预算 else 0)
 # 工作量随选中的块数增长；只有窗口路径每32个块另加一个位图字，1M时每tile最多4个窗口
 ```
 
-#### 1.2.5 K3 路由/排序/mask（[_order_masks_kernel](sparse_prefill_prepare.py#L1146)、[_route](sparse_prefill_prepare.py#L887)、[_route_cost](sparse_prefill_prepare.py#L857)、[_order](sparse_prefill_prepare.py#L950)、[_masks](sparse_prefill_prepare.py#L1076)、[_direct_groups](sparse_prefill_prepare.py#L1024)）
+#### 1.2.5 K3 路由/排序/mask（[_order_masks_kernel](sparse_prefill_prepare.py#L1134)、[_route](sparse_prefill_prepare.py#L886)、[_route_cost](sparse_prefill_prepare.py#L856)、[_order](sparse_prefill_prepare.py#L949)、[_masks](sparse_prefill_prepare.py#L1064)、[_direct_groups](sparse_prefill_prepare.py#L1012)）
 
 K3是一次launch里三类互不依赖、并行执行的CTA：
 
@@ -415,7 +415,7 @@ body(task):
 # 改读请求最后一个token（K被mask屏蔽、V权重为0）；请求不足k+1个token时上限为0，由buffer范围检查返回0
 ```
 
-#### 1.2.7 K6 pack（[_pack_body](sparse_prefill_direct_packed.py#L197)、[_pack_block](sparse_prefill_direct_packed.py#L110)）
+#### 1.2.7 K6 pack（[_pack_body](sparse_prefill_direct_packed.py#L194)、[_pack_block](sparse_prefill_direct_packed.py#L109)）
 
 ```python
 # grid = ceil(packed_blocks·HK/8)，256线程 = 4 wave；每CTA处理8个(块, KV头)对：
@@ -437,7 +437,7 @@ for (block, hkv) in 本组的4对（仅block < packed_blocks）:
 请求最后一块中超出请求长度的token照常拷贝（下一个请求的数据，或越界读到的0）；K7把它们的分数置−inf、V置0
 ```
 
-#### 1.2.8 K7 packed direct与K7′ raw direct（[packed _kernel](sparse_prefill_direct_packed.py#L574)、[packed _body](sparse_prefill_direct_packed.py#L394)、[raw _kernel](sparse_prefill_direct.py#L595)、[raw _body](sparse_prefill_direct.py#L333)）
+#### 1.2.8 K7 packed direct与K7′ raw direct（[packed _kernel](sparse_prefill_direct_packed.py#L571)、[packed _body](sparse_prefill_direct_packed.py#L391)、[raw _kernel](sparse_prefill_direct.py#L596)、[raw _body](sparse_prefill_direct.py#L334)）
 
 ```python
 # packed，gated（有union计划）：grid (BQ·HK, union tiles)，64线程 = 1 wave；tile = blockIdx.y，local = blockIdx.x // HK，hkv = blockIdx.x % HK
@@ -1066,6 +1066,13 @@ PR #62 review修复后用默认FlyDSL缓存跑QSA全套测试，gated raw用例�
   | 999648 | 86.06 → 76.18 s（−11.5%） | 7.43 / 7.45 ms |
 
   decode路径没有改动，TPOT的差别来自两次起服务。[验收与A/B](../../../../../mytest/mydata/qsa_indexer_1m_split_20261101_01/service_summary.json)
+
+### 2026-11-10：同步AITER #6576合并版
+
+AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9c`，与其分支`8df6bdb69`相同；之后main上没有再改这些文件）。PyHIP的`sparse_prefill_*.py`、入口和op test换成合并版，只改import、入口名`attention`和`get_cu_num`/`get_gfx_runtime`（PyHIP不依赖AITER，仍按torch取值）。
+
+- **与同步前（`8027faa`）的差别**：合并版改用FlyDSL 0.4.0的接口（`generic_load`/`generic_store`、`atomic_add`/`atomic_or`、`memory_fence`、`rocdl.make_buffer_ptr`等），把原先从`pyhip.ops.mha`借用的几个helper收进`sparse_prefill_common`；功能上只差一处：带slot表时pack也检查PK/PV的32位字节寻址上限（PR #62第二轮review指出、当时未改的打包预算问题）。11-02为FlyDSL 0.3.2加的`_load_lds`回退随之去掉，attention需要FlyDSL 0.4.0或更新。op test换成合并版，函数用例由10个增至15个（加入1M批次的packed K/V超过4GiB、4GiB − 1MiB边界、HK16超过4096个任务等），另有slot表（7个）与跨度上限（2个）的用例；`test_attention.py`也为后两类加了pytest入口。
+- **验证**：QSA测试161项通过（op test新增5个函数用例×3组、7个slot表用例×3组和2个跨度上限用例）。同一输入下同步前后的输出逐bit相同：op test全部30个布局（含slot表与4GiB以上的池）×H12/H6/H3，共90例。12k基准两轮交替（同步前、后、后、前，每轮新FlyDSL缓存）：整体调用变化−1.9%～0%，union与direct在±0.04%以内；K2、pack与K3这类小kernel慢0.3～0.9µs（+1～3%）。SGLang `test_pyhip_qsa` 8项通过。
 
 ### 评估过但未采用
 

@@ -28,6 +28,15 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
+# ---- Platform calibration and private resource policy ----
+
+# Resource policy; private, not configurable from outside.
+WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never evicted
+ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
+SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
+UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
+MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
+
 
 def get_gfx_runtime():
     """Arch of the current GPU, as aiter.jit.utils.chip_info.get_gfx_runtime."""
@@ -40,16 +49,6 @@ def get_cu_num():
     return torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-
-
-# ---- Platform calibration and private resource policy ----
-
-# Resource policy; private, not configurable from outside.
-WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never evicted
-ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
-SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
-UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
-MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
 
 @dataclasses.dataclass(frozen=True)
@@ -283,28 +282,13 @@ def _buffer(tensor, size_bytes):
 
 
 def _buffer_at(address, size_bytes):
-    """Raw buffer resource at a 64-bit global address; loads at or past size_bytes return zero."""
-    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), fx.Int64(address).ir_value())
-    return rocdl.make_buffer_rsrc(
-        ir.Type.parse("!llvm.ptr<8>"),
-        pointer,
-        fx.Int16(0).ir_value(),
-        fx.Int64(size_bytes).ir_value(),
-        fx.Int32(0x27000).ir_value(),
+    """Byte-addressed buffer pointer at a 16-byte aligned 64-bit global address; loads at or
+    past size_bytes return zero."""
+    pointer = fx.inttoptr(
+        fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 16),
+        fx.Int64(address),
     )
-
-
-def _raw_words(resource, offset):
-    """Four words at byte offset of a raw buffer resource such as _buffer_at's."""
-    return fx.Vector(
-        rocdl.raw_ptr_buffer_load(
-            ir.VectorType.get([4], fx.Int32.ir_type),
-            resource,
-            fx.Int32(offset),
-            fx.Int32(0),
-            0,
-        )
-    )
+    return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
 
 
 def _buffer_words(buffer, offset, words=4):
@@ -318,23 +302,19 @@ def _buffer_words(buffer, offset, words=4):
 
 
 def _buffer_store_words(words, buffer, offset):
-    data = fx.make_rmem_tensor(16, fx.Int8)
-    data.store(fx.Vector(words).bitcast(fx.Int8))
+    words = fx.Vector(words)
+    data = fx.make_rmem_tensor(4 * words.numel, fx.Int8)
+    data.store(words.bitcast(fx.Int8))
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel), fx.Int8),
         data,
-        fx.make_view(buffer + offset, fx.make_layout(16, 1)),
+        fx.make_view(buffer + offset, fx.make_layout(4 * words.numel, 1)),
     )
 
 
 def _load_lds(storage, offset, immediate=0):
     # Volatile keeps the hand-written order; the LDS variable's GEP gives it an alias scope.
     ptr = fx.get_iter(storage) + (fx.Int32(offset) + immediate)
-    if not hasattr(fx, "generic_load"):
-        # FlyDSL before 0.4.0 (AITER qwen38-flash-next-dev pins 0.3.2): the same load in LLVM.
-        vector = ir.VectorType.get([4], fx.Int32.ir_type)
-        ptr = fx.to_llvm_ptr(ptr)
-        return fx.Vector(llvm.load(vector, ptr, alignment=16, volatile_=True))
     ptr = fx.recast_iter(
         fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16), ptr
     )
@@ -347,6 +327,22 @@ def _write_address(address, words):
     data = fx.make_rmem_tensor(4, fx.Int32)
     data.store(fx.Vector(words).bitcast(fx.Int32))
     fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), data, fx.Tensor(lds))
+
+
+def _lds_pointer(address, dtype):
+    ptr_type = fx.PointerType.get(
+        dtype.ir_type, fx.AddressSpace.Shared, dtype.width // 8
+    )
+    return fx.inttoptr(ptr_type, fx.Int32(address))
+
+
+def _lds_load(address, dtype=fx.Int32):
+    """One value at an LDS byte address."""
+    return fx.generic_load(_lds_pointer(address, dtype))
+
+
+def _lds_store(address, value, dtype=fx.Int32):
+    fx.generic_store(_lds_pointer(address, dtype), dtype(value))
 
 
 @flyc.jit
