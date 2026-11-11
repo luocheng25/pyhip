@@ -277,10 +277,44 @@ PyHIP attention的kernel变体在第一次用到时编译（见“目录和依�
 | GSM8K MTP接受长度 | 3.12 / 3.14 / 3.13 | 2.91 / 2.91 / 2.90 | 2.91 / 2.91 |
 
 - 收益是容量：KV池token数增加89%，该配置可接受的最长输入由151034增至285306 token；1M配置（`--mem-fraction-static 0.95`）的KV池由1965312增至3712576 token。
-- 吞吐略低，原因是MTP接受长度下降（GSM8K上−7%，random上−2%到−4%）：每步decode的时间基本不变（ITL与接受长度变化相当）。接受长度的下降来自不带scale的FP8 KV存储：FP8 KV + BF16计算的prefill（`SGLANG_OPT_PYHIP_QSA_FP8_MFMA=0`）在GSM8K上得分0.979、接受长度2.91，与FP8 MFMA相同。GSM8K得分不受影响（各轮差别在±0.3%以内）。
+- 吞吐略低，原因是MTP接受长度下降（GSM8K上−7%，random上−2%到−4%）。下降来自draft层（NEXTN）的FP8 KV，与FP8 MFMA无关（FP8 KV + BF16计算的prefill即`SGLANG_OPT_PYHIP_QSA_FP8_MFMA=0`，在GSM8K上得分0.979、接受长度2.91，与FP8 MFMA相同）；draft层KV保持BF16后与BF16 KV持平，见下一小节。GSM8K得分不受影响（各轮差别在±0.3%以内）。
 - FP8 prefill attention更快（第1节），但只占12k prefill的一小部分：C1 TTFT −0.9%到−1.5%。
 - P_BIAS（`b45a953`）与之前的kernel在同一时段的r4对比：客户负载+0.2%，GSM8K接受长度相同（2.907/2.901）、得分0.981/0.978；贪心random prompt的接受长度低1.8%（C2吞吐低3.4%，其余在1.3%以内）。
 - 数值验收（TEST=1，`b45a953`，1M配置，GPU6、7）：38个请求（12k radix命中、24k、32并发约12k、9、100000、999648 token与1M的radix命中（884736 token命中））全部完成；每个rank 13个QSA层（12个目标层与draft层）各完成attention校验7878次，prefill indexer 606次、decode/verify indexer 5151次每层，日志无异常。FP8 MFMA相对fp8_query参考：各layout平均0.42%（最大1.1%），最差的(行, head)不超过5.8%；相对精确参考平均0.77%（最大2.1%）。P_BIAS之前同一负载在预热的重复token prompt上失败（整层平均5.5%），见源码readme 1.2.10。
+
+#### draft层KV保持BF16，FP8写入融合为一个kernel（11-11续）
+
+诊断：SGLang导出加诊断补丁，在BF16池里把K/V先经E4M3FNUZ舍入再写入，按层范围选择；GSM8K同上（PyHIP `b45a953`）：
+
+| 舍入到FP8的层 | scale | GSM8K得分 | GSM8K接受长度 |
+|---|---|---:|---:|
+| 全部QSA层 | 无 | 0.978 | 2.927 |
+| 全部QSA层 | per token | 0.978 | 3.057 |
+| 只有目标层 | 无 | 0.977 | 3.132 |
+| 只有draft层 | 无 | 0.978 | 2.904 |
+| 无（BF16 KV，上表3轮） | — | 0.976–0.982 | 3.12–3.14 |
+
+接受长度的下降全部来自draft层的FP8 KV。目标层K的amax为4.5–15.8、V为2.4–36.5，没有饱和或NaN，舍入的相对误差不带scale为2.63–2.70%、per token为2.50–2.63%（scale无益）；draft层的K有一个amax约90的离群通道（E4M3在64–128之间的间隔为8）。SGLang已有`--speculative-draft-kv-cache-dtype bf16`：目标层用FP8，draft层用BF16。目标KV池仍为285312 token，draft池（K、V各0.14GB）另从剩余显存分配。
+
+每步开销：FP8池的写入经`HybridLinearKVPool.set_kv_buffer`传入单位scale，MHA池先把K、V除以1.0，再转FP8，最后拷贝，每层5个kernel。Graph重放每层14–19µs，BF16池为3.0µs，12层合计每步约140µs。SGLang `79d260a30`改由QSA backend用一个Triton kernel转换并写入（`store_qsa_kv_fp8`）：4–64 token每层2.7–2.8µs，16384 token为14.0µs（BF16 13.5µs）。写入的字节与torch的转换相同，只有|x| ≥ 248的有限值饱和为±240，torch为NaN。paged GQA读FP8时每层（12k上下文，T=4/16/32）为18.1/39.5/62.5µs，BF16为19.2/38.5/59.4µs。
+
+ABBA（SGLang `79d260a30`，PyHIP `51a3ed7`）：GPU2、3按BF16、FP8、FP8、BF16，GPU0、1按FP8、BF16、BF16、FP8，两组同时运行；协议同上表，但不测GSM8K。8轮的计时窗口内都没有编译和缓存写入，日志无异常（[数据](../../mytest/mydata/qsa_fp8_kv_scale_20261111_01/summary.md)）：
+
+| 指标 | BF16 KV（4轮） | FP8目标KV + BF16 draft KV（4轮） | 变化 |
+|---|---:|---:|---:|
+| KV池容量（token） | 151040 | 285312 | +88.9% |
+| 客户负载输出吞吐（token/s） | 457.6 | 458.7 | +0.25% |
+| 客户负载TTFT / TPOT中位数（ms） | 568.9 / 15.55 | 563.7 / 15.55 | −0.9% / 0.0% |
+| 客户负载MTP接受长度（服务日志） | 2.600 | 2.575 | −1.0% |
+| bench_serving C1/C2/C4/C8（token/s） | 174.2 / 233.1 / 288.7 / 325.7 | 174.1 / 233.6 / 286.6 / 326.4 | −0.1% / +0.2% / −0.7% / +0.2% |
+| random接受长度C1/C2/C4/C8 | 3.51 / 3.53 / 3.56 / 3.56 | 3.47 / 3.47 / 3.48 / 3.50 | −1.1% / −1.6% / −2.3% / −1.7% |
+| 每步时间（ITL中位数 × 接受长度，ms）C1/C8 | 10.44 / 20.13 | 10.33 / 19.86 | −1.0% / −1.3% |
+
+- 吞吐与BF16持平，各项在±0.75%以内（单轮之间BF16客户负载相差±0.1%、FP8 ±0.5%，bench_serving C1 ±1.5%）。FP8每步快约1–2%，抵消了random prompt上低1–2%的接受长度。
+- GSM8K：BF16 0.979/0.979（接受长度3.126/3.132，`41f70748d`），FP8目标KV + BF16 draft KV在`41f70748d`上0.979/0.978（3.131/3.124），最终代码（`79d260a30` + `51a3ed7`）0.981（3.131）。
+- random prompt上接受长度的差别来自目标层K/V的FP8舍入：E4M3只有3位尾数，per token scale不减小相对误差。
+- 加融合写入之前（`41f70748d`，两组GPU顺序相反，各一轮；其中一轮BF16与另一组的1M验收重叠）：客户负载两轮平均−1.0%（各轮−3.9%/+2.0%）。
+- 1M TEST=1（1M配置，FP8目标KV + BF16 draft KV；`41f70748d` + `b45a953`与最终代码各一次）：38个请求全部完成，每个rank 13个QSA层各完成attention校验7878次，日志无异常。最终代码的12个FP8层共14544个layout，FP8 MFMA相对fp8_query参考平均0.41%（最大0.98%），最差的(行, head)不超过5.85%。
 
 ## 4. 外部集成示例
 
@@ -574,7 +608,7 @@ PATH="/opt/lc/pyhip/.venv/bin:$PATH" TP_SIZE=2 CUDA_VISIBLE_DEVICES=0,1 HIP_VISI
 
 MTP对照在上面的launcher命令后追加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`，其余不变。
 
-FP8 KV缓存：启动参数加`--kv-cache-dtype fp8_e4m3`（gfx942上为E4M3FNUZ；SGLang的FP8 KV不带scale）。PyHIP的prefill attention从FP8池经slot表读K/V，默认用FP8 MFMA；`SGLANG_OPT_PYHIP_QSA_FP8_MFMA=0`改为先反量化成BF16再计算。decode/verify的paged GQA kernel读FP8后转成BF16。`SGLANG_TEST_PYHIP_QSA=1`时，FP8 MFMA的输出以`pyhip.testing.qsa_reference.fp8_query`（PyHIP自己的FP8 Q）为参考检查（逐(行, head)范数相对误差，范数以中位数为下限：平均<5%、最差<20%），相对精确参考的误差写进同一行日志。
+FP8 KV缓存：启动参数加`--kv-cache-dtype fp8_e4m3`（gfx942上为E4M3FNUZ；SGLang的FP8 KV不带scale）；带MTP时再加`--speculative-draft-kv-cache-dtype bf16`，draft层的KV保持BF16（draft层用FP8时MTP接受长度低约7%，见第3节）。QSA backend用一个kernel把K/V转成FP8并写入池。PyHIP的prefill attention从FP8池经slot表读K/V，默认用FP8 MFMA；`SGLANG_OPT_PYHIP_QSA_FP8_MFMA=0`改为先反量化成BF16再计算。decode/verify的paged GQA kernel读FP8后转成BF16。`SGLANG_TEST_PYHIP_QSA=1`时，FP8 MFMA的输出以`pyhip.testing.qsa_reference.fp8_query`（PyHIP自己的FP8 Q）为参考检查（逐(行, head)范数相对误差，范数以中位数为下限：平均<5%、最差<20%），相对精确参考的误差写进同一行日志。
 
 服务就绪并完成统一预热后（第3节的表另用同样参数先跑一轮不计时的8请求C8），在另一终端执行。替换输出目录标识以匹配当前TP/实现；每种配置依次测C1/C2/C4/C8：
 

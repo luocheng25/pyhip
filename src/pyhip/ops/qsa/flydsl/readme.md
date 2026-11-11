@@ -878,6 +878,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
 - FP8 K/V的路由系数（`FP8_ROUTES`）只标定了时延模型各项和逐tile阈值2.0，建计划的最少行数沿用BF16。很长的上下文（约1M）里H12/H6不建计划最快：K2逐窗口扫描整段上下文，计划的准备开销（K2/K3约200–650µs）超过union的收益，BF16同样如此；路由只在K2之后逐tile决定，无法避免这部分开销。FP8 pack在有direct行时重排整段上下文，没有打包预算或raw回退。
+- SGLang的FP8 KV不带scale。MTP的draft层K有amax约90的离群通道，draft层用FP8时接受长度低约7%，服务要加`--speculative-draft-kv-cache-dtype bf16`。目标层的FP8使random prompt上的接受长度低1–2%（GSM8K上不变），吞吐靠每步快1–2%与BF16持平（benchmark说明第3节）。
 - compute="fp8"的误差主要来自Q的FP8量化（见1.2.10），模型质量要在服务中验收；精度敏感时用compute="bf16"。P以E4M3FNUZ参与PV：相对行最大值低于约2^-15的权重为0（P_BIAS = 4），2048个key时最坏丢掉约6%的质量。
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。长上下文prefill logits也随buffer位置波动（P245760约±30%）。
 - 1M上下文仍很慢：prefill indexer是O(L²)，上下文末尾16384行的chunk每层约46ms（P245760约9.4ms），其中logits约25.6ms（约4.4 TFLOP，约170 TFLOP/s；写出约18GB FP32 logits）、top-k约20.8ms（直方图与收集两遍读约34GB，约1.6TB/s）（16块1024行的profiler合计，[数据](../../../../../mytest/mydata/qsa_1m_impl_20261029_01/chunk_rows_1m/chunk_rows.json)）。线性外推整条1M prompt的indexer每rank约18秒，各TP rank重复计算；logits块最多约1.1GiB。Decode每层B1/B8约50/197µs，B8以logits（176µs）为主。Attention上下文末尾16384行的chunk每层H12全union约3.4ms、全direct约10.2–10.6ms。
@@ -899,6 +900,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 服务性能与数值验收（TP2/TP4/TP8）：[qsa_aiter_sync_service_20261030_01](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/summary.json)（计时窗口内的编译缓存检查：[cache_writes.json](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/cache_writes.json)）。
 - FP8 K/V（2026-11-11）：kernel对照[bench_b45a953](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_b45a953/summary.json)（P_BIAS之前一轮[bench_1111_0156](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)），P_BIAS的A/B [pbias_ab](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json)，精度仿真[accuracy_peaked.txt](../../../../../mytest/mydata/qsa_fp8_20261110_01/accuracy_peaked.txt)，客户配置服务（BF16与FP8 KV、GSM8K、1M TEST=1）[qsa_fp8_kv_service_20261111_01](../../../../../mytest/mydata/qsa_fp8_kv_service_20261111_01/summary.md)。
 - FP8路由标定（2026-11-11）：分阶段测量[合成](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/measure_syn/samples.jsonl)与[真实选择](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/measure_real/samples.jsonl)，[拟合](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/fit_all.json)，[扫描](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/sweep_v1/sweep.jsonl)，[生产路径A/B](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/ab_bench)。
+- FP8 KV服务吞吐（2026-11-11）：诊断、ABBA与验收[qsa_fp8_kv_scale_20261111_01](../../../../../mytest/mydata/qsa_fp8_kv_scale_20261111_01/summary.md)。
 - MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_ringfix_20261008_01](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)。
 
 ## 5. 优化历史
@@ -1128,7 +1130,7 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 - **对照**（`benchmarks/qsa/bench_attention_fp8.py`，完整调用，GPU7，`b45a953`）：FP8 per tensor相对BF16 K/V在dense2048、m12000、random128k（TP2/4/8）上快1.27–1.36×、1.32–1.38×、1.61–1.65×，per token为1.13–1.20×、1.10–1.18×、1.31–1.34×；SGLang原生Triton（BF16）为PyHIP BF16的0.11–0.36×，AITER #7008的Triton sparse GQA在BF16/FP8时为0.06–0.32×/0.05–0.25×（其FP8比BF16慢约27%）。m12000 TP2的union 938→612µs、direct 1430→1123µs。表格与精度见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第1节，[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_b45a953/summary.json)。
 - **P'下溢（11-11）**：SGLang FP8 KV的1M TEST=1验收中，同一token重复11888次的预热prompt在一层上整个layout平均偏差5.5%，相对kernel自己的FP8 Q参考也一样，所以不是Q量化。原因：rescale后行最大值在P' = 1，E4M3FNUZ最小非零值为2^-10，相对最大值低于2^-11的权重舍成0，l却按FP32累加全部权重；attention sink加平坦长尾时尾部整体丢失（合成例：sink高2^12，平均偏差24.8%）。加`P_BIAS = 4`（rescale后行最大值落在P' = 16）、`LAZY`由6改为7.5（P' ≤ 181）后，合成例降到0.24%。GPU7上交替A/B（B0两次、B4与B5各三次，完整调用按同进程的BF16归一化）：B4使union kernel慢1.0–2.8%，完整调用dense2048/m12000慢0.45–0.87%，random128k不变，随机数据精度不变；寄存器（union 397、direct 252 VGPR，无spill）与hazard扫描不变（[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json)）。
 - **SGLang（`41f70748d`）**：`--kv-cache-dtype fp8_e4m3`时QSA层的池存放不带scale的E4M3FNUZ K/V，原生QSA Triton kernel（decode/verify、带prefix的chunk prefill）在FP8上编译失败。PyHIP prefill在每个chunk（无prefix时也）经slot表读FP8池，scale为1；`SGLANG_OPT_PYHIP_QSA_FP8_MFMA`（默认1）选FP8 MFMA或先反量化成BF16；gfx942 paged GQA decode读FP8后转BF16（BF16池不变）；原生带prefix的回退把取出的FP8 K/V转成BF16。TEST模式以`fp8_query`为参考检查FP8 MFMA。SGLang测试`test_pyhip_qsa`（新增两个FP8池用例）、`test_qsa_sparse_paged_gqa`（FP8池与同值BF16池的输出逐bit相同）、`test_qsa`与`test_qsa_mtp_shared_indexer`通过。
-- **服务（客户配置TP2，[数据](../../../../../mytest/mydata/qsa_fp8_kv_service_20261111_01/summary.md)）**：FP8 KV使KV池容量+89%（151040→285312 token），GSM8K不变（BF16 0.976–0.982，FP8 0.976–0.981），吞吐低1.6%–4.0%：不带scale的FP8 KV存储使MTP接受长度下降（GSM8K上−7%），每步decode时间不变；FP8 prefill使C1 TTFT快约1%。1M TEST=1（`b45a953`）38个请求、每rank每层7878次attention校验通过。表格见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第3节。
+- **服务（客户配置TP2，[数据](../../../../../mytest/mydata/qsa_fp8_kv_service_20261111_01/summary.md)）**：FP8 KV使KV池容量+89%（151040→285312 token），GSM8K不变（BF16 0.976–0.982，FP8 0.976–0.981），吞吐低1.6%–4.0%：不带scale的FP8 KV存储使MTP接受长度下降（GSM8K上−7%），每步decode时间不变；FP8 prefill使C1 TTFT快约1%。1M TEST=1（`b45a953`）38个请求、每rank每层7878次attention校验通过。表格见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第3节。（后续诊断：接受长度的下降全部来自draft层的FP8 KV，每步另有约140µs的写入开销，见11-11（续2）。）
 
 ### 2026-11-11（续）：FP8的union/direct路由标定与pack门控
 
@@ -1139,6 +1141,16 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 - **扫描**（`sweep`，全局路由开，228例，相对FP8沿用BF16系数）：per tensor总体−0.46%（≤32k −0.75%，32k–256k −0.15%，约1M +1.4%，真实12k −0.48%），per token −0.81%（−1.00%、−0.58%、+0.3%、−0.74%）。最好的布局快23%/26%，最差慢4.7%（约1M的H12/H6：union tile变多，K2/K3开销也随阈值增长）。
 - **生产路径A/B**（`bench_attention_fp8.py`，GPU7，旧为`b45a953`、新为工作树，ABBA，各用自己的FlyDSL缓存）：dense2048、m12000、random128k × TP2/4/8，per tensor/per token新旧比0.998–1.001，BF16同样0.998–1.001。这三个代表布局的路由没有变化；dense2048的FP8 pack本来就只有空跑开销（约9.5µs，与BF16门控后相同）。[数据](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/ab_bench)
 - **测试**：`test_attention_fp8.py`新增FP8计划使用FP8系数的用例（全部union时`direct_flag[0]`为0，输出在FP8容差内）；与`test_attention.py`共181项通过。
+
+### 2026-11-11（续2）：FP8 KV的服务吞吐追平BF16（draft层BF16 KV、融合写入）
+
+用户要求FP8 KV的服务吞吐追平BF16（此前客户配置低1.6%–4.0%）。数据、诊断补丁与脚本在[qsa_fp8_kv_scale_20261111_01](../../../../../mytest/mydata/qsa_fp8_kv_scale_20261111_01/summary.md)，表格见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第3节。
+
+- **诊断**：SGLang导出加诊断补丁，在BF16池里把K/V先经E4M3FNUZ舍入再写入，按层范围选择。GSM8K接受长度：全部层2.927（per token scale时3.057）、只有目标层3.132、只有draft层2.904，BF16为3.12–3.14，得分都是0.977–0.978。下降全部来自draft层（NEXTN）：其K有amax约90的离群通道，目标层K/V的amax不超过36.5，没有饱和；per token scale不减小舍入的相对误差（2.50–2.63%对2.63–2.70%）。
+- **draft层BF16**：SGLang已有`--speculative-draft-kv-cache-dtype bf16`。目标KV池仍为285312 token；GSM8K得分0.979/0.978、接受长度3.131/3.124（最终代码0.981、3.131），与BF16（0.979/0.979，3.126/3.132）相同。
+- **融合写入（SGLang `79d260a30`）**：`HybridLinearKVPool.set_kv_buffer`给MHA池传单位scale，FP8池每层要除1.0、转FP8、拷贝共5个kernel，graph重放14–19µs（BF16 3.0µs），12层每步约140µs。QSA backend改用一个Triton kernel（`store_qsa_kv_fp8`）转换并写入：每层2.7–2.8µs，保留`store_cache`跳过slot 0与越界即中止的约定；字节与torch的转换相同，只有|x| ≥ 248的有限值饱和为±240（torch为NaN，65536个BF16值逐一比较）。
+- **ABBA**（SGLang `79d260a30`、PyHIP `51a3ed7`，两组GPU各ABBA/BAAB，共4+4轮）：客户负载+0.25%，bench_serving C1/C2/C4/C8 −0.1%/+0.2%/−0.7%/+0.2%，客户负载TTFT −0.9%；random接受长度低1.1–2.3%，每步时间估计快1.0–2.1%。
+- **验收**：SGLang QSA测试（`test_qsa_sparse_paged_gqa`新增融合写入用例：逐字节对照torch、slot 0、超范围饱和；`test_pyhip_qsa`的FP8池用例改为检查backend自己写入的字节）全部通过；1M TEST=1（FP8目标KV + BF16 draft KV，`41f70748d` + `b45a953`与最终代码`79d260a30` + `51a3ed7`各一次）38个请求、每rank每层7878次attention校验通过，最终代码的FP8 MFMA相对fp8_query参考平均0.41%、最差不超过5.85%。
 
 ### 评估过但未采用
 
