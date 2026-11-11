@@ -11,12 +11,13 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 | indexer共用的MHA helper | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
 | 合成indexer完整调用 | [test_indexer.py](test_indexer.py) |
-| Attention/indexer基本功能 | [test_attention.py](../../tests/ops/qsa/test_attention.py)、[test_indexer.py](../../tests/ops/qsa/test_indexer.py) |
+| FP8 K/V完整调用对照（PyHIP BF16/FP8、SGLang Triton、AITER #7008 Triton） | [bench_attention_fp8.py](bench_attention_fp8.py)（AITER kernel的副本在[_aiter_sparse_gqa.py](../../tests/ops/qsa/_aiter_sparse_gqa.py)） |
+| Attention/indexer基本功能 | [test_attention.py](../../tests/ops/qsa/test_attention.py)、[test_attention_fp8.py](../../tests/ops/qsa/test_attention_fp8.py)（FP8 K/V）、[test_indexer.py](../../tests/ops/qsa/test_indexer.py) |
 | AITER op test：精度与耗时，对照SGLang原生Triton | [sparse_prefill_op_test.py](../../tests/ops/qsa/sparse_prefill_op_test.py) |
 | 当前逐kernel性能 | 随上述两个benchmark默认输出，无独立对照脚本 |
 | 共用数据/参考、记录和JSON/CSV导出 | [_attention.py](../../tests/ops/qsa/_attention.py)、[_indexer.py](../../tests/ops/qsa/_indexer.py)、[_benchmark.py](../../tests/ops/qsa/_benchmark.py) |
 
-目标为 **ROCm gfx942（MI308X）、BF16**。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy和pytest；AITER op test另需AITER（`aiter.test_common`）、pandas和tabulate。当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.4.0、Triton3.8。Attention需要FlyDSL 0.4.0或更新（用到`fx.generic_load`、`fx.atomic_add`等0.4.0的接口）。基础PyHIP安装不会自动安装全部可选GPU依赖。
+目标为 **ROCm gfx942（MI308X）、BF16**（attention的K/V另可为FP8 E4M3FNUZ）。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy和pytest；AITER op test另需AITER（`aiter.test_common`）、pandas和tabulate。当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.4.0、Triton3.8。Attention需要FlyDSL 0.4.0或更新（用到`fx.generic_load`、`fx.atomic_add`等0.4.0的接口）。基础PyHIP安装不会自动安装全部可选GPU依赖。
 
 Attention与AITER [#6576](https://github.com/ROCm/aiter/pull/6576)的合并版（`082468a9c`）相同，沿用其源码结构和kernel名（`sparse_prefill_*`），K1–K3、union和direct全部是FlyDSL；Triton只用于indexer的I1、I2、D0、D0′四个prep kernel。Attention、prefill indexer和decode indexer的计算实现均不依赖SGLang、AITER或experiments/tests/benchmarks。Decode的top-k和token展开使用PyHIP自身的FlyDSL实现，与prefill共享选择核心。测试使用独立tensor夹具和精度参考，不创建模型或临时adapter；只有第5节的服务集成需要SGLang。
 
@@ -61,6 +62,34 @@ Attention完整计时含恢复/构表/分流、必要KV pack及计算，不含�
 原cudaPerf、10独立buffer、2warmup、128samples，保留首尾和慢样本。Attention基本精度`.02/.02`不变，indexer按完整token ABI、FP64 top-k边界`1e-5`及逐bit缓存状态校验；decode返回顺序不要求固定。输出为summary.json/CSV、raw.csv、逐例JSON、源码和地址证据。`complete=false`的数据不能作为有效性能。
 
 Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/CU屏蔽环境变量，也不生成硬件快照；入口、单case、单kernel、采样循环和结束时均无GPU状态门禁。正确性校验与源码一致性检查保留，失败即停止并保留已完成数据。`complete`表示执行和校验是否完成，不证明测量期间设备空闲。TP2/4/8 kernel形状对应单卡H12/H6/H3，不是分布式服务；indexer在rank间复制，不能伪造三份不同TP测量。
+
+### FP8 K/V对照
+
+```bash
+.venv/bin/python benchmarks/qsa/bench_attention_fp8.py --gpu 7 \
+  --output mytest/mydata/qsa_fp8_attention_new          # 默认dense2048、m12000、random128k × TP2/4/8
+```
+
+同一组合成输入（HK1、单请求）上比较完整调用：PyHIP BF16 K/V；PyHIP FP8 K/V的per tensor、per token（`compute="fp8"`）与per token反量化后走BF16（`compute="bf16"`）；SGLang原生QSA extend Triton（BF16，op test中的副本）；AITER [#7008](https://github.com/ROCm/aiter/pull/7008)的Triton sparse paged GQA（BF16与FP8 per token，K/V按64-token页顺序存放）。dense2048为2048行全是完整因果前缀（只走union），m12000与第1节相同（`make_case`，union与direct混合），random128k为128k上下文末尾4096行、各行独立随机选择（direct）。PyHIP计入口检查、计划查找、K1–K3和计算，Triton用预建参数只计launch。原cudaPerf、10组输入buffer、128samples、scope顺序轮转并正反交替；每次计时后逐bit比较实际输出，基准输出对CPU FP32参考行（FP8时用反量化后的K/V）：`.02/.02`，`compute="fp8"`用`test_attention_fp8.py`的范数相对误差上限（平均0.06、最大0.16）。入口检查GPU空闲（use≤5%、VRAM≤20%），采样前和结束时另存硬件快照；PyHIP的三个scope另测逐kernel耗时。
+
+2026-11-11在GPU7（PTL Enabled/VECTOR,F8）实测，中位数µs，括号内为相对PyHIP BF16的加速比（[数据](../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)）：
+
+| 用例 | PyHIP BF16 | FP8 per tensor | FP8 per token | FP8→BF16计算 | SGLang Triton BF16 | AITER BF16 | AITER FP8 per token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dense2048 TP2 | 195 | 142（1.38×） | 160（1.21×） | 221（0.88×） | 953（0.20×） | 2079（0.09×） | 2609（0.07×） |
+| dense2048 TP4 | 134 | 104（1.29×） | 117（1.15×） | 160（0.84×） | 933（0.14×） | 2072（0.06×） | 2605（0.05×） |
+| dense2048 TP8 | 131 | 100（1.31×） | 112（1.17×） | 157（0.83×） | 927（0.14×） | 2066（0.06×） | 2598（0.05×） |
+| m12000 TP2 | 2479 | 1861（1.33×） | 2234（1.11×） | 2580（0.96×） | 9718（0.26×） | 12640（0.20×） | 16076（0.15×） |
+| m12000 TP4 | 1856 | 1326（1.40×） | 1579（1.17×） | 1957（0.95×） | 9377（0.20×） | 12529（0.15×） | 15948（0.12×） |
+| m12000 TP8 | 1067 | 768（1.39×） | 888（1.20×） | 1167（0.91×） | 9349（0.11×） | 12459（0.09×） | 15894（0.07×） |
+| random128k TP2 | 1489 | 929（1.60×） | 1136（1.31×） | 2304（0.65×） | 4185（0.36×） | 4686（0.32×） | 6035（0.25×） |
+| random128k TP4 | 1471 | 902（1.63×） | 1106（1.33×） | 2288（0.64×） | 4143（0.36×） | 4654（0.32×） | 5999（0.25×） |
+| random128k TP8 | 1463 | 887（1.65×） | 1091（1.34×） | 2281（0.64×） | 4140（0.35×） | 4633（0.32×） | 5994（0.24×） |
+
+- 有效TFLOPS（选中(query, token)对数×H×1024/时间）：m12000 TP2的PyHIP BF16/FP8 per tensor为111.5/148.5T，random128k TP2为69.3/111.0T，dense2048 TP2为132.4/182.1T。
+- 逐kernel（m12000 TP2，µs）：union 939 → 595（per tensor）/ 706（per token），direct 1431 → 1123 / 1384，FP8另有Q量化43和整段pack 14；K1–K3约128不变。12k上下文的direct不受带宽限制，FP8收益小于random128k（direct 1350 → 809）。dense2048没有direct行，FP8 pack与gated direct仍各约10–14µs。
+- 精度（各用例取最大，逐(行, head)范数相对误差的平均/最大）：PyHIP BF16 0.23%/0.29%；FP8 per tensor与per token 3.7%/6.8%；FP8→BF16计算0.33%/0.61%；SGLang Triton与AITER BF16 0.28%/0.40%；AITER FP8（kernel内转BF16计算）0.29%/0.43%。
+- AITER #7008的FP8 kernel比其BF16版本慢约27%（FP8→BF16转换和gfx942的FP8 tile）；`compute="bf16"`在入口反量化，random128k多一份128k上下文的BF16 K/V写读，慢于BF16 K/V直接调用。
 
 ## 2. 逐kernel性能
 
