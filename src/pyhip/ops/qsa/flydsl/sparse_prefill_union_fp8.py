@@ -1707,20 +1707,30 @@ def quantize_q(q, q8=None, qs=None):
         q8 = torch.empty(q.shape, dtype=torch.uint8, device=q.device)
     if qs is None:
         qs = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+    launch = quantize_launcher(q)
+    if launch is not None:
+        with torch.cuda.device(q.device):
+            launch(q.view(-1), q8.view(-1), qs.view(-1))
+    return q8, qs
+
+
+def quantize_launcher(q):
+    """launch(q, q8, qs) with flat tensors for Q of q's shape; None for an empty Q."""
     rows = q.shape[0] * q.shape[1]
     if rows == 0:
-        return q8, qs
+        return None
     stream = torch.cuda.current_stream(q.device)
-    args = (q.view(-1), q8.view(-1), qs.view(-1), rows, stream)
     compiled = _Q_COMPILED.get(q.device)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
+        q8 = torch.empty(q.shape, dtype=torch.uint8, device=q.device)
+        qs = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
         with torch.cuda.device(q.device), torch.cuda.stream(stream):
-            compiled = _Q_COMPILED[q.device] = flyc.compile(_quantize_launch, *args)
-    with torch.cuda.device(q.device):
-        compiled(*args)
-    return q8, qs
+            compiled = _Q_COMPILED[q.device] = flyc.compile(
+                _quantize_launch, q.view(-1), q8.view(-1), qs.view(-1), rows, stream
+            )
+    return lambda q, q8, qs: compiled(q, q8, qs, rows, stream)
 
 
 def _args(inputs, plan, out, stream):

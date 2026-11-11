@@ -30,11 +30,11 @@ def _metadata(q, k, v, indices, query_lens, prefix_lens, scale=0.0625):
                            sequence_ids=torch.tensor([s for s, n in enumerate(query_lens) for _ in range(n)], **kw))
 
 
-def _make_case(queries, prefixes, heads, device, seed=17, shared=False):
+def _make_case(queries, prefixes, heads, device, seed=17, shared=False, kv_heads=1):
     rows, total = sum(queries), sum(queries) + sum(prefixes)
     generator = torch.Generator(device=device).manual_seed(seed)
     q = torch.randn((rows, heads, 256), generator=generator, device=device, dtype=torch.bfloat16)
-    k = torch.randn((total, 1, 256), generator=generator, device=device, dtype=q.dtype)
+    k = torch.randn((total, kv_heads, 256), generator=generator, device=device, dtype=q.dtype)
     v = torch.randn(k.shape, generator=generator, device=device, dtype=q.dtype)
     indices = np.full((rows, 2051), -1, dtype=np.int32)
     rng, row = np.random.default_rng(seed), 0

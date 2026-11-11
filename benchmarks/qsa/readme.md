@@ -6,7 +6,7 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 
 | 内容 | 入口 |
 |---|---|
-| 完整attention：恢复/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L217)（入口）及同目录的`sparse_prefill_*.py`（kernel） |
+| 完整attention：恢复/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L317)（入口）及同目录的`sparse_prefill_*.py`（kernel） |
 | prefill indexer、decode indexer（含MTP verify） | [indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py) |
 | indexer共用的MHA helper | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
@@ -246,6 +246,19 @@ v_pool = torch.zeros_like(k_pool)
 k_pool[slots.long()], v_pool[slots.long()] = k, v
 in_place = attention(q, k_pool, v_pool, indices, query_lens=(m,), prefix_lens=(0,), kv_slots=slots)
 assert torch.equal(in_place, out)
+```
+
+K/V可为FP8（`torch.float8_e4m3fnuz`，gfx942的E4M3，最大240），须同为FP8并传FP32的`k_scale`/`v_scale`：同为per tensor `[1]`或同为per token `[N,HK]`（有`kv_slots`时为池的`[P,HK]`），值为`k8.float()*k_scale`；Q/O仍为BF16。默认`compute="fp8"`用FP8 MFMA（Q按(query, head)、概率也量化成FP8），随机数据上逐(行, head)相对误差平均约5%、最大约12%，主要来自Q的量化；要求K/V（或池）不超过4GiB−1MiB。`compute="bf16"`在入口按`kv_slots`取出请求的token、反量化成BF16后走BF16路径，结果与自己反量化后调用逐bit相同。
+
+```python
+# 接上例：per token量化（每token每KV头scale = amax/240）
+def quantize(x):
+    scale = (x.float().abs().amax(-1) / 240).clamp_min(1e-12)
+    return (x.float() / scale[..., None]).to(torch.float8_e4m3fnuz), scale
+
+(k8, k_scale), (v8, v_scale) = quantize(k), quantize(v)
+fp8 = attention(q, k8, v8, indices, query_lens=(m,), prefix_lens=(0,), k_scale=k_scale, v_scale=v_scale)
+exact = attention(q, k8, v8, indices, query_lens=(m,), prefix_lens=(0,), k_scale=k_scale, v_scale=v_scale, compute="bf16")
 ```
 
 ### Indexer接口
