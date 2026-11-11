@@ -11,9 +11,10 @@ scale = row amax / 240. K/V scales are per token and KV head (FP32 [N, HK]; with
 table [P, HK]) or one per tensor ([1]). Softmax runs in log2 units with a lazy max m:
 S'' = S * c - m with c = q_scale * softmax_scale * log2(e) (times k_scale per tensor, per
 key otherwise). Per token, log2(v_scale) joins S'', so the FP8 P' = exp2(S'') carries the
-V scale and stays below 2**6 while l accumulates P' / v_scale; per tensor the output takes
-v_scale. m moves only when some row's S'' exceeds 6 or a row sees its first key; then O, l
-and S'' follow.
+V scale and stays below 2**LAZY while l accumulates P' / v_scale; per tensor the output takes
+v_scale. m moves only when some row's S'' exceeds LAZY or a row sees its first key; then the
+row max lands at S'' = P_BIAS (P' = 2**P_BIAS, so small weights stay above the FP8 underflow)
+and O, l and S'' follow.
 
 Phase t (64-key tile t; K and V^T double-buffered in 64 KiB LDS):
   Part 1  QK(t) [K slot t&1]; after QK MFMA FIX_AT tile t-1 is finished under the issued
@@ -62,7 +63,11 @@ LDS_BYTES = 4 * SLOT  # K slots 0/1, V^T slots 0/1
 V0 = 2 * SLOT
 LOG2E = math.log2(math.e)
 FP8_MAX = 240.0
-LAZY = 6.0  # S'' bound before m moves: P' <= 2**6 fits E4M3FNUZ
+# Lazy max: m moves only when some S'' exceeds LAZY (P' <= 2**7.5 fits E4M3FNUZ), and then puts
+# the row max at S'' = P_BIAS: P' of a key down to 2**-(11 + P_BIAS) of the max stays nonzero
+# (with P' <= 1, attention sinks over long flat tails lost the tail, a quarter of the output).
+LAZY = 7.5
+P_BIAS = 4.0
 NEG_INF = -8388608  # FP32 -inf bits
 # A V scale enters as log2 and reciprocal; the clamp keeps both finite (NaN maps to the floor).
 SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
@@ -601,7 +606,7 @@ def _qk_simple(env, slot):
 
 
 def _first_max(env, s_acc, scales, words):
-    """Tile 0: exact row max m (FLOOR without a visible key) and S''(0); (log2 sv, 1/sv)."""
+    """Tile 0: m = row max - P_BIAS (FLOOR without a visible key) and S''(0); (log2 sv, 1/sv)."""
     terms = [None] * 4
     if env.per_token:
         for b in range(2):
@@ -622,10 +627,11 @@ def _first_max(env, s_acc, scales, words):
     row_max = _maximum(
         _maximum(local, local.shuffle_xor(32, 64)), fx.Float32(_MAX_FLOOR)
     )
-    neg = fx.Float32(0.0) - row_max
+    m_run = (row_max == fx.Float32(_MAX_FLOOR)).select(row_max, row_max - P_BIAS)
+    neg = fx.Float32(0.0) - m_run
     return (
         fx.Vector.from_elements([v + neg for v in vals], fx.Float32),
-        row_max,
+        m_run,
         terms[2:],
     )
 
@@ -1222,8 +1228,9 @@ def _task(
     def rescale(
         o0, o1, o2, o3, o4, o5, o6, o7, row_sum, s_cur, m_run, tile_max, ballot
     ):
-        """Lazy max: m moves by max(S'', 0) when some row's S'' exceeds 6, and a fresh row
-        (m = FLOOR, centered at 0) takes its row max; O, l and S'' follow."""
+        """Lazy max: m moves by max(S'' - P_BIAS, 0) when some row's S'' exceeds LAZY, and a
+        fresh row (m = FLOOR, centered at 0) takes its row max - P_BIAS; O, l and S'' follow.
+        """
         o = [fx.Vector(x) for x in (o0, o1, o2, o3, o4, o5, o6, o7)]
         row_sum, s_cur, m_run = fx.Float32(row_sum), fx.Vector(s_cur), fx.Float32(m_run)
         if fx.Int64(ballot) != fx.Int64(0):
@@ -1231,7 +1238,7 @@ def _task(
             fresh = m_run == fx.Float32(_MAX_FLOOR)
             # A fresh row without a key keeps FLOOR (its S'' stay -inf).
             delta = _maximum(
-                fx.Float32(tile_max),
+                fx.Float32(tile_max) - P_BIAS,
                 fresh.select(fx.Float32(_MAX_FLOOR), fx.Float32(0.0)),
             )
             corr = fresh.select(fx.Float32(0.0), _exp(fx.Float32(0.0) - delta))

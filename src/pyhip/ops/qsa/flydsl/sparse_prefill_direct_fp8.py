@@ -17,8 +17,9 @@ MFMAs. Its key list (complete blocks in block_indices order, then the causal tai
 runs in 32-key chunks of eight blocks: QK(kg) for blocks 8t + 4kg + jj; S lane (head, g)
 holds blocks 8t + g and 8t + 4 + g, which are also its PV K-dim, so P needs no exchange.
 PV MFMA m writes dims 16d + m: a lane (head, g) ends with dims 64g .. 64g + 63. Softmax:
-the union kernel's lazy max (S'' = S c - m, a rescale only when some S'' passes 6 or a
-fresh row sees its first key), uniform per row across its four lanes. Q comes from
+the union kernel's lazy max (S'' = S c - m, a rescale only when some S'' passes LAZY or a
+fresh row sees its first key, the row max then at S'' = P_BIAS), uniform per row across its
+four lanes. Q comes from
 sparse_prefill_union_fp8.quantize_q.
 """
 
@@ -46,6 +47,7 @@ from .sparse_prefill_direct_packed import _enabled
 from .sparse_prefill_prepare import allocate_scratch, upload
 from .sparse_prefill_union_fp8 import (
     LAZY,
+    P_BIAS,
     LOG2E,
     SCALE_MAX,
     SCALE_MIN,
@@ -444,7 +446,9 @@ def _rescale_direct(o, l_run, m_run, vals, local, ballot):
         local = _maximum(local, local.shuffle_xor(32, 64))
         fresh = m_run == fx.Float32(_MAX_FLOOR)
         # A fresh row without a key keeps FLOOR (its S'' stay -inf).
-        delta = _maximum(local, fresh.select(fx.Float32(_MAX_FLOOR), fx.Float32(0.0)))
+        delta = _maximum(
+            local - P_BIAS, fresh.select(fx.Float32(_MAX_FLOOR), fx.Float32(0.0))
+        )
         corr = fresh.select(fx.Float32(0.0), _exp(fx.Float32(0.0) - delta))
         o = o * corr
         l_run = l_run * corr

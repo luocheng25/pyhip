@@ -522,7 +522,8 @@ K/V为E4M3FNUZ（gfx942的FP8，最大240），值为K8·k_scale、V8·v_scale�
 # compute="fp8"（默认）：K1–K3与BF16相同（计划、路由、mask都不看dtype），之后：
 Kq: Q8[M,H,256], qs[M,H] = quantize(Q)   # 每(query, head)一行、16个lane：qs = amax/240，Q8 = RNE(Q·240/amax)；全0行qs = 0
 S''[q,j] = (Q8·K8_j)·qs[q]·ks_j·scale·log2(e)  (+ log2(sv_j)，per token)    # FP32
-m：lazy max，S''超过m+6（LAZY）才移动，所以P' ≤ 2^6；新行（m = FLOOR）以0为中心，第一个可见key触发rescale
+m：lazy max，某行S''超过7.5（LAZY）才移动，移动后行最大值落在S'' = 4（P_BIAS），所以P' ≤ 2^7.5 ≈ 181；首个tile取m = 行最大值 − 4；新行（m = FLOOR）以0为中心，第一个可见key触发rescale
+   # P_BIAS让P'用上FP8 1以上的范围：相对行最大值不低于2^-15的权重不下溢（E4M3FNUZ最小非零值2^-10）
 P'_j = exp2(S''_j − m) → FP8（RNE）；O += P'·V8（FP8 MFMA，FP32累加）
 l += exp2(S''_j − m)·(1/sv_j，per token)    # 用FP8舍入前的FP32值；sv夹到[2^-60, 2^60]，NaN按2^-60
 out = BF16(O·(per tensor时为sv，否则1)/l)
@@ -533,7 +534,7 @@ out = BF16(O·(per tensor时为sv，否则1)/l)
 - **K7 FP8 direct**（rows·HK×64，`waves_per_eu=2`）：每行×KV头一个wave，16×16×32 FP8 MFMA。key表依次为block_indices的完整块、因果尾块，再用块0补齐（屏蔽）。每8块一个chunk，预取下一个chunk；lane本地lazy max，只在rescale分支用shuffle求行max。每个lane输出(head, g)的64个维度。寄存器per tensor 220、per token 252。gated时与BF16 K7相同，只处理非active tile的行。
 - **compute="bf16"**：入口按`kv_slots`取出各请求的FP8 token（及per token scale），BF16 = RNE(FP8·scale)（FP8→BF16精确，乘积只舍入一次），再以不带slot表的BF16 K/V调用BF16路径。结果与调用方自己反量化后调用逐bit相同，代价是一份packed上下文的BF16 K/V临时张量和几个逐元素kernel。
 
-精度（[test_attention_fp8.py](../../../../../tests/ops/qsa/test_attention_fp8.py)的随机用例，K/V每token幅度在2^±1之间）：compute="fp8"相对反量化FP32参考的逐(行, head)范数相对误差平均约4.7%、最大约12%。在PyTorch中只把Q量化成FP8即得平均4.1%、最大11.5%，只量化P约2%，两者都量化与kernel的统计相同：误差主要来自Q的FP8量化（分数误差约为|q||k|的2^-5）。compute="bf16"平均0.4%，与BF16 K/V相同。AITER #7008的Triton sparse GQA在kernel内把FP8 K/V转成BF16、Q保持BF16，精度对应compute="bf16"。
+精度（[test_attention_fp8.py](../../../../../tests/ops/qsa/test_attention_fp8.py)的随机用例，K/V每token幅度在2^±1之间）：compute="fp8"相对反量化FP32参考的逐(行, head)范数相对误差平均约4.7%、最大约12%。在PyTorch中只把Q量化成FP8即得平均4.1%、最大11.5%，只量化P约2%，两者都量化与kernel的统计相同：误差主要来自Q的FP8量化（分数误差约为|q||k|的2^-5）。compute="bf16"平均0.4%，与BF16 K/V相同。分数更尖锐或Q/K有离群通道时个别(行, head)的误差更大：Q放大4/8倍时最大0.42/0.85，4个离群通道时0.88，再放大Q 4倍时2.25；按精确最大值在PyTorch中做同样的Q/P舍入，误差分布与kernel相同（最大0.4233/0.8523/0.8838/2.2513），所以是FP8 Q舍入的固有误差，不是kernel错误。参考的Q用kernel自己的FP8 Q（[fp8_query](../../../testing/qsa_reference.py)：Kq的量化结果，FP32）时只剩FP8概率的误差，范数以中位数为下限，上述用例平均0.2–2.3%、最差不超过5.8%（`test_reference_with_fp8_query`）；在PyTorch中按`q / (amax / 240)`自行量化的Q则因Kq用近似倒数，个别元素落到相邻的FP8值，尖锐分数下最差仍有0.23–0.48，参考Q舍入成BF16时离群通道也会带来0.14–0.43（[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/accuracy_peaked.txt)）。P'的下溢：原来rescale后行最大值落在P' = 1，相对它低于2^-11的权重舍成0，而l按FP32累加全部权重。attention sink加平坦长尾时（2047个key各为sink的2^-12，合占约1/3），尾部在分子中全部丢失，输出平均偏差24.8%（PyTorch中按精确最大值仿真得24.8%）；SGLang服务中同一token重复11888次的prompt上整个layout平均偏差5.5%。P_BIAS = 4后该例为0.24%，`test_fp8_attention_sink`覆盖union与direct、per tensor与per token（旧常量下4例全部失败）。2048个key中丢掉的质量在最坏情况下（全部权重恰在2^-15以下）约6%。SGLang服务的真实激活上，P_BIAS之前相对精确参考各layout平均约0.9%（最大3.3%），最差的(行, head)约15–19%；SGLang的TEST模式以fp8_query为参考检查（平均<5%、最差<20%），相对精确参考的误差只记录（[sink与A/B数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab)）。AITER #7008的Triton sparse GQA在kernel内把FP8 K/V转成BF16、Q保持BF16，精度对应compute="bf16"。
 
 ## 2. Indexer prefill
 
@@ -842,7 +843,7 @@ D2（_select_long）：
 | [indexer_topk.py](indexer_topk.py) | I5/D2：prefill与decode共用的top-512选择、升序归并和token展开；decode长行的D2a/D2b |
 | [indexer_decode.py](indexer_decode.py) | D1 decode logits（按页表读压缩key，长页表时顺带折叠min/max） |
 
-Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`），公共入口仍是`attention.py`的`attention`（SGLang按此导入）。测试：[sparse_prefill_op_test.py](../../../../../tests/ops/qsa/sparse_prefill_op_test.py)是AITER `op_tests/test_flydsl_qsa_sparse_prefill.py`的副本，只改了import，以及graph用例中让arena增长的布局（改为`chunk_1024_ctx_31024_random`：原布局在PyHIP走raw direct、不打包，scratch不比被capture的布局大）；它依赖AITER（`aiter.test_common`）、pandas和tabulate，与SGLang原生Triton实现和torch参考比较精度与耗时。[test_attention.py](../../../../../tests/ops/qsa/test_attention.py)把其中的功能、常量和graph用例按H12/6/3包成pytest，另加slot表（含4GiB以上的池、slot表的大小上限）、按行数打包、packed K/V超过2GiB和整段H6/H3 prefill的BQ21/BQ42等PyHIP用例。[test_attention_fp8.py](../../../../../tests/ops/qsa/test_attention_fp8.py)覆盖FP8 K/V：10种布局（含HK2）× per tensor/per token × 默认/强制建计划对反量化参考，compute="bf16"与BF16路径逐bit相同，K=0时的精确用例，slot表池（多余行与scale为NaN）与packed逐bit相同，graph重放和输入检查。
+Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`），公共入口仍是`attention.py`的`attention`（SGLang按此导入）。测试：[sparse_prefill_op_test.py](../../../../../tests/ops/qsa/sparse_prefill_op_test.py)是AITER `op_tests/test_flydsl_qsa_sparse_prefill.py`的副本，只改了import，以及graph用例中让arena增长的布局（改为`chunk_1024_ctx_31024_random`：原布局在PyHIP走raw direct、不打包，scratch不比被capture的布局大）；它依赖AITER（`aiter.test_common`）、pandas和tabulate，与SGLang原生Triton实现和torch参考比较精度与耗时。[test_attention.py](../../../../../tests/ops/qsa/test_attention.py)把其中的功能、常量和graph用例按H12/6/3包成pytest，另加slot表（含4GiB以上的池、slot表的大小上限）、按行数打包、packed K/V超过2GiB和整段H6/H3 prefill的BQ21/BQ42等PyHIP用例。[test_attention_fp8.py](../../../../../tests/ops/qsa/test_attention_fp8.py)覆盖FP8 K/V：10种布局（含HK2）× per tensor/per token × 默认/强制建计划对反量化参考，compute="bf16"与BF16路径逐bit相同，K=0时的精确用例，slot表池（多余行与scale为NaN）与packed逐bit相同，graph重放、输入检查，以及以kernel自己的FP8 Q为参考的检查（含Q放大8倍的尖锐分数）。
 
 ### 4.2 接口
 
@@ -868,7 +869,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
 - FP8 K/V沿用BF16的路由时延模型，未按FP8 kernel重新标定（FP8 union相对BF16约快1.7–1.8倍，FP8 direct约1.7倍，比例相近）。FP8 pack每次重排整段上下文，与走direct的行数无关，没有打包预算或raw回退。
-- compute="fp8"的误差主要来自Q的FP8量化（见1.2.10），模型质量要在服务中验收；精度敏感时用compute="bf16"。
+- compute="fp8"的误差主要来自Q的FP8量化（见1.2.10），模型质量要在服务中验收；精度敏感时用compute="bf16"。P以E4M3FNUZ参与PV：相对行最大值低于约2^-15的权重为0（P_BIAS = 4），2048个key时最坏丢掉约6%的质量。
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。长上下文prefill logits也随buffer位置波动（P245760约±30%）。
 - 1M上下文仍很慢：prefill indexer是O(L²)，上下文末尾16384行的chunk每层约46ms（P245760约9.4ms），其中logits约25.6ms（约4.4 TFLOP，约170 TFLOP/s；写出约18GB FP32 logits）、top-k约20.8ms（直方图与收集两遍读约34GB，约1.6TB/s）（16块1024行的profiler合计，[数据](../../../../../mytest/mydata/qsa_1m_impl_20261029_01/chunk_rows_1m/chunk_rows.json)）。线性外推整条1M prompt的indexer每rank约18秒，各TP rank重复计算；logits块最多约1.1GiB。Decode每层B1/B8约50/197µs，B8以logits（176µs）为主。Attention上下文末尾16384行的chunk每层H12全union约3.4ms、全direct约10.2–10.6ms。
 - SGLang对带prefix的chunk传该层的K/V池和packed slot表（`qwen_sparse_attn_backend`经`PyHIPAttention.can_read_kv_slots`判断：int32、一维连续、同设备、K/V池连续），不满足时退回`index_select`拷贝。TP2/TP4服务的每层K池约2.49/3.30GiB；TP8在`MEM_FRACTION_STATIC=0.93`时为4.50GiB（同步前4.30GiB），raw direct用WIDE。Raw direct只在上下文超过行数的32倍（或PK+PV超过1GiB）时使用，16384行的chunk为512k以上；合成测试中1M的原地读比拷贝快1.3–1.8ms/层，4.5GiB池的1M分散选择（WIDE）快0.58–1.04ms/层（见benchmark说明第2节）。
@@ -1114,6 +1115,7 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 - **Direct**：BF16 direct（128k随机选择、4096行）H12/H6/H3为71/36/18T，耗时与H无关，受随机读带宽限制。FP8 pack+direct（`40a415d`）per tensor 120T、per token 97.7T（scale合并为每块64B记录后）。随机1KiB gather的微基准：工作集4MB/16MB/64MB/256MB/1GB时6.6/5.5/4.7/4.3/3.6 TB/s，128k上下文的direct上限约115–130T，200T不可达。
 - **入口**：`attention`加`k_scale`、`v_scale`、`compute`；工作区键加FP8模式；compute="bf16"在全部检查之后反量化再递归调用。`test_attention_fp8.py` 69项通过（[精度仿真](../../../../../mytest/mydata/qsa_fp8_20261110_01/accuracy_emulation.txt)），`test_attention.py` 105项通过。
 - **对照**（`benchmarks/qsa/bench_attention_fp8.py`，完整调用，GPU7）：FP8 per tensor相对BF16 K/V在dense2048、m12000、random128k（TP2/4/8）上快1.29–1.38×、1.33–1.40×、1.60–1.65×，per token为1.15–1.21×、1.11–1.20×、1.31–1.34×；SGLang原生Triton（BF16）为PyHIP BF16的0.11–0.36×，AITER #7008的Triton sparse GQA在BF16/FP8时为0.06–0.32×/0.05–0.25×（其FP8比BF16慢约27%）。m12000 TP2的union 939→595µs、direct 1431→1123µs。表格与精度见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第1节，[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)。
+- **P'下溢（11-11）**：SGLang FP8 KV的1M TEST=1验收中，同一token重复11888次的预热prompt在一层上整个layout平均偏差5.5%，相对kernel自己的FP8 Q参考也一样，所以不是Q量化。原因：rescale后行最大值在P' = 1，E4M3FNUZ最小非零值为2^-10，相对最大值低于2^-11的权重舍成0，l却按FP32累加全部权重；attention sink加平坦长尾时尾部整体丢失（合成例：sink高2^12，平均偏差24.8%）。加`P_BIAS = 4`（rescale后行最大值落在P' = 16）、`LAZY`由6改为7.5（P' ≤ 181）后，合成例降到0.24%。GPU7上交替A/B（B0两次、B4与B5各三次，完整调用按同进程的BF16归一化）：B4使union kernel慢1.0–2.8%，完整调用dense2048/m12000慢0.45–0.87%，random128k不变，随机数据精度不变；寄存器（union 397、direct 252 VGPR，无spill）与hazard扫描不变（[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json)）。
 
 ### 评估过但未采用
 
@@ -1121,6 +1123,7 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 |---|---|---|
 | FP8 union H12改BQ32（11-11） | dense +6.4%，混合稀疏12k −2.8%、32k −24% | [笔记](../../../../../mytest/mydata/qsa_fp8_20261110_01/notes.md) |
 | FP8 direct每个query按维度分给2个wave（11-11） | 120T→94T | [笔记](../../../../../mytest/mydata/qsa_fp8_20261110_01/notes.md) |
+| FP8 P_BIAS = 5（LAZY 7.5，11-11） | 窗口2.5，rescale更频繁：union慢8.0–9.7%，完整调用dense2048/m12000慢2.4–7.2%；B4已把sink例降到0.24% | [A/B](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json) |
 | Direct 16×4免转置布局（09-26） | 正确且零spill，但慢79–89% | [16×4](../../../../../mytest/mydata/qsa_direct_16x4_pipeline_20260926_01/README.md) |
 | Direct MFMA/VALU交织冲160T（09-27） | 收益被VMEM等待抵消，短M更慢 | [160T](../../../../../mytest/mydata/qsa_direct_160t_20260927_01/README.md) |
 | 删除raw direct、放开pack预算（10-02） | 256k上下文M64/M512慢71–74%/33–42% | [预算探测](../../../../../mytest/mydata/qsa_cd_20261001_01/pack_probe/result.json) |

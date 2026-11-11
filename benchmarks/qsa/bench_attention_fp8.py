@@ -152,7 +152,7 @@ def _host_hash(tensor):
 
 
 @torch.no_grad()
-def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only=False):
+def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only=False, scopes=SCOPES):
     folder = Path(folder)
     if tp_size not in (2, 4, 8) or buffers != 10 or samples < buffers:
         raise ValueError("Require TP2/4/8, 10 buffers and samples >= 10")
@@ -164,7 +164,9 @@ def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
     def hashes():
         return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
 
-    report = dict(complete=False, raw=[], summary={}, gpu=gpu, tp_size=tp_size, case=case,
+    if "pyhip_bf16" not in scopes:
+        raise ValueError("pyhip_bf16 is the speedup baseline")
+    report = dict(complete=False, raw=[], summary={}, gpu=gpu, tp_size=tp_size, case=case, scopes=list(scopes),
                   buffers=buffers, samples=samples, check_only=check_only, source_sha256=hashes(),
                   hardware={}, accuracy={},
                   scope="full calls; PyHIP via attention() (host checks, plan lookup, K1-K3, compute); "
@@ -194,7 +196,7 @@ def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
             for buffer in range(1 if check_only else buffers):
                 bundle = _inputs(host, quantized, device)
                 bundles.append(bundle)
-                for scope in SCOPES:
+                for scope in scopes:
                     for _ in range(3):
                         bundle.outputs[scope].fill_(float("nan"))
                         output = bundle.calls[scope]()
@@ -218,7 +220,7 @@ def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
                     raise RuntimeError("CUDAPERF disabled timing")
                 for sample in range(samples):
                     buffer = sample % buffers
-                    order = SCOPES[sample % len(SCOPES):] + SCOPES[:sample % len(SCOPES)]
+                    order = scopes[sample % len(scopes):] + scopes[:sample % len(scopes)]
                     for scope in (order if sample % 2 == 0 else order[::-1]):
                         with timer:
                             output = bundles[buffer].calls[scope]()
@@ -227,14 +229,14 @@ def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
                         report["raw"].append(dict(scope=scope, sample=sample, buffer=buffer, us=us))
                         assert torch.equal(output.cpu().view(torch.int16), validated[scope].view(torch.int16)), scope
                 base = statistics.median(r["us"] for r in report["raw"] if r["scope"] == "pyhip_bf16")
-                for scope in SCOPES:
+                for scope in scopes:
                     times = [r["us"] for r in report["raw"] if r["scope"] == scope]
                     median = statistics.median(times)
                     report["summary"][scope] = dict(median_us=median, min_us=min(times), max_us=max(times),
                                                     effective_tflops=work / median / 1e6,
                                                     speedup_vs_pyhip_bf16=base / median)
                 report["kernels"] = {}
-                for scope in KERNEL_SCOPES:
+                for scope in (s for s in KERNEL_SCOPES if s in scopes):
                     kernel_cases = []
                     try:
                         for bundle in bundles:
@@ -264,7 +266,7 @@ def benchmark(case, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
         rows = [(scope, *(report["summary"].get(scope, {}).get(key) for key in
                           ("median_us", "min_us", "max_us", "effective_tflops", "speedup_vs_pyhip_bf16")),
                  report["accuracy"].get(scope, {}).get("mean_rel"), report["accuracy"].get(scope, {}).get("max_rel"))
-                for scope in SCOPES]
+                for scope in scopes]
         print(f"\n{folder.name}: TP{tp_size} ({'complete' if report['complete'] else report.get('error')})\n"
               + format_table(("Scope", "Median_us", "Min_us", "Max_us", "TFLOPS", "vs_bf16", "MeanRel", "MaxRel"),
                              rows), flush=True)
@@ -281,6 +283,7 @@ def main(argv=None):
     parser.add_argument("--tp-sizes", nargs="+", type=int, choices=(2, 4, 8), default=[2, 4, 8])
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--output", type=Path, default=default_output("fp8_attention"))
+    parser.add_argument("--scopes", nargs="+", choices=SCOPES, default=list(SCOPES))
     parser.add_argument("--check-only", action="store_true", help="validate without timing")
     args = parser.parse_args(argv)
     if args.samples < 10 or args.gpu < 0:
@@ -295,7 +298,7 @@ def main(argv=None):
     with recording_matrix(args.output, [name for name, _, _ in jobs], check_only=args.check_only) as reports:
         for name, case, tp in jobs:
             result = benchmark(case, tp, args.output / name, args.gpu, samples=args.samples,
-                               check_only=args.check_only)
+                               check_only=args.check_only, scopes=tuple(args.scopes))
             reports[name] = result
     print(f"Results: {args.output}", flush=True)
 

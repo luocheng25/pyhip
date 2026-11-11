@@ -3,6 +3,7 @@ with FP8 MFMA (compute="fp8") or dequantized to BF16 (compute="bf16"), against t
 the dequantized K/V; slot-table pools, graph replay and input errors."""
 
 from collections import OrderedDict
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -178,6 +179,56 @@ def test_fp8_uniform_exact(queries, prefixes, heads, per_token, monkeypatch):
     rows = _sample_rows(value, 96)
     torch.testing.assert_close(
         output[rows].float(), reference(exact, rows), rtol=0.01, atol=2e-3
+    )
+
+
+@SCALES
+@pytest.mark.parametrize(
+    "queries,prefixes,heads",
+    [
+        pytest.param((1024,), (3000,), 12, id="union-direct"),
+        pytest.param((64,), (70001,), 3, id="direct"),
+    ],
+)
+def test_fp8_attention_sink(queries, prefixes, heads, per_token, monkeypatch):
+    """Every row selects an attention sink (token 0) over a flat tail whose 2047 keys weigh
+    2**-12 of it each (a third of the mass) with similar values: P' of the tail must stay
+    above the FP8 underflow. With the row max at P' = 1 it flushed to zero and the outputs
+    lost a quarter of their norm."""
+    monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    case = _fp8_case(queries, prefixes, heads, per_token=per_token)
+    value = case.value
+    device = value.q.device
+    generator = torch.Generator(device=device).manual_seed(5)
+    direction = torch.randn(256, generator=generator, device=device)
+    direction = direction / direction.norm()
+    value.q = (16 * direction).expand(value.q.shape).to(torch.bfloat16).contiguous()
+    k = 0.1 * torch.randn(value.k.shape, generator=generator, device=device)
+    # Scores in log2 units: q . k * scale * log2(e) = 12 for the sink, ~0 for the tail.
+    k[0, :] = direction * (12 / (16 * value.scale * math.log2(math.e)))
+    v = torch.randn(256, generator=generator, device=device).expand(value.v.shape)
+    v = v + 0.3 * torch.randn(value.v.shape, generator=generator, device=device)
+    case.k8, case.ks = _quantize(k, per_token)
+    case.v8, case.vs = _quantize(v, per_token)
+    blocks = value.indices[:, :2048:4] // 4
+    missing = ~(blocks == 0).any(1) & (value.indices[:, 2047] >= 0)
+    value.indices[missing, :4] = torch.arange(4, dtype=torch.int32, device=device)
+    exact = SimpleNamespace(
+        **{
+            **vars(case.exact),
+            "q": value.q,
+            "indices": value.indices,
+            "k": _dequant(case.k8, case.ks),
+            "v": _dequant(case.v8, case.vs),
+        }
+    )
+    rows = _sample_rows(value)
+    expected = reference(exact, rows)
+    error = (_call_fp8(case)[rows].float() - expected).norm(dim=-1)
+    error = error / expected.norm(dim=-1)
+    assert float(error.mean()) < 0.01 and float(error.max()) < 0.03, (
+        error.mean(),
+        error.max(),
     )
 
 
