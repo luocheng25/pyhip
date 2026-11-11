@@ -263,6 +263,48 @@ def test_fp8_graph_replay(per_token, monkeypatch):
     assert _within_fp8_error(out[rows], reference(exact, rows))
 
 
+def test_reference_with_fp8_query(monkeypatch):
+    """pyhip.testing.qsa_reference with fp8_query's FP32 Q (SGLang's TEST-mode check of
+    compute="fp8") equals the FP32 torch reference on the same Q, and the FP8 output stays
+    within its FP8-probability error of it: norms floored at the median, mean below 5% and
+    worst below 20% also for sharp scores (Q x8), where the exact reference differs far more.
+    """
+    from pyhip.testing.qsa_reference import fp8_query
+    from pyhip.testing.qsa_reference import reference as service_reference
+
+    monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    for gain in (1, 8):
+        case = _fp8_case((480, 1000, 301), (11392, 3, 4001), 12, per_token=True)
+        value = case.value
+        value.q = (value.q.float() * gain).to(torch.bfloat16)
+        q32 = fp8_query(value.q)
+        assert q32.dtype == torch.float32 and q32.shape == value.q.shape
+        exact = case.exact
+        fp8_reference = service_reference(
+            q32,
+            exact.k,
+            exact.v,
+            value.indices,
+            query_lens=value.query_lens,
+            prefix_lens=value.prefix_lens,
+            scale=value.scale,
+        )
+        rows = _sample_rows(value)
+        torch_reference = reference(SimpleNamespace(**{**vars(exact), "q": q32}), rows)
+        torch.testing.assert_close(
+            fp8_reference[rows], torch_reference, rtol=1e-4, atol=1e-4
+        )
+        output = _call_fp8(case).float()
+        norms = fp8_reference.norm(dim=-1)
+        floor = torch.maximum(norms, norms.median())
+        error = (output - fp8_reference).norm(dim=-1) / floor
+        assert float(error.mean()) < 0.05 and float(error.max()) < 0.2, (
+            gain,
+            error.mean(),
+            error.max(),
+        )
+
+
 def test_fp8_input_errors():
     case = _fp8_case((9,), (130,), 3, per_token=True)
     value, ks = case.value, case.ks

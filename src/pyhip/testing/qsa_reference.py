@@ -4,7 +4,9 @@ SGLang's legacy reference rounds Q * scale * log2(e) to BF16 before QK.
 That changes the logits: QSA-T13's legacy result itself fails the original
 .02/.02 tolerance against FP64. Keep Q/K unchanged here, scale FP32 QK,
 and retain FP32 probabilities and PV. No QSA planner or attention helper is
-used, and no runtime output is ever replaced by this reference.
+used, and no runtime output is ever replaced by this reference. fp8_query
+alone runs the FP8 attention's Q quantization: its rounding is part of what
+the FP8 kernels compute.
 """
 
 from itertools import accumulate
@@ -18,7 +20,7 @@ import triton.language as tl
 def _selected_attention_fp32(
     Q, K, V, I, O, CQ, CK, LENS,
     H: tl.constexpr, HK: tl.constexpr, SCALE: tl.constexpr,
-    BN: tl.constexpr,
+    BN: tl.constexpr, Q_FP32: tl.constexpr,
 ):
     row = tl.program_id(0)
     request, hkv = tl.program_id(1) // HK, tl.program_id(1) % HK
@@ -41,7 +43,11 @@ def _selected_attention_fp32(
                        mask=valid[None, :], other=0.)
         values = tl.load(V + ((k0 + selected[:, None]) * HK + hkv) * 256 + dims[None, :],
                          mask=valid[:, None], other=0.).to(tl.float32)
-        scores = tl.dot(query, keys) * (SCALE * 1.4426950408889634)
+        if Q_FP32:
+            scores = tl.dot(query, keys.to(tl.float32), input_precision='ieee')
+        else:
+            scores = tl.dot(query, keys)
+        scores = scores * (SCALE * 1.4426950408889634)
         scores = tl.where(valid[None, :], scores, -float('inf'))
         next_max = tl.maximum(maximum, tl.max(scores, axis=1))
         # Empty selected tiles (padding) must not produce -inf - -inf NaNs.
@@ -56,7 +62,8 @@ def _selected_attention_fp32(
 
 
 def reference(q, k, v, indices, *, query_lens, prefix_lens, scale):
-    """FP32 output for every query/head/channel, using only original inputs."""
+    """FP32 output for every query/head/channel, using only original inputs. Q is BF16 like
+    K/V, or FP32 (K/V BF16 or FP32) for an exact FP32 QK."""
     lengths = tuple(n + p for n, p in zip(query_lens, prefix_lens))
     if (len(query_lens) != len(prefix_lens) or sum(query_lens) != q.shape[0]
             or sum(lengths) != k.shape[0] or k.shape != v.shape
@@ -70,5 +77,15 @@ def reference(q, k, v, indices, *, query_lens, prefix_lens, scale):
     if q.shape[0]:
         _selected_attention_fp32[(max(query_lens), len(query_lens) * k.shape[1])](
             q, k, v, indices, output, cq, ck, lens, q.shape[1], k.shape[1], scale, 32,
-            num_warps=4, num_stages=1, enable_fp_fusion=False)
+            q.dtype == torch.float32, num_warps=4, num_stages=1, enable_fp_fusion=False)
     return output
+
+
+def fp8_query(q):
+    """FP32 Q as PyHIP's FP8 attention (compute="fp8") quantizes BF16 Q[M,H,256]: E4M3FNUZ per
+    query and head times its scale amax / 240. With it the reference leaves the FP8 kernels
+    only their FP8 probabilities, the error that remains bounded on sharp scores."""
+    from pyhip.ops.qsa.flydsl.sparse_prefill_union_fp8 import quantize_q
+
+    q8, qs = quantize_q(q)
+    return q8.view(torch.float8_e4m3fnuz).float() * qs[..., None]
