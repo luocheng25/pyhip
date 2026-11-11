@@ -22,6 +22,11 @@ the union kernel's lazy max (S'' = S c - m, a rescale only when some S'' passes 
 fresh row sees its first key, the row max then at S'' = P_BIAS), uniform per row across its
 four lanes. Q comes from
 sparse_prefill_union_fp8.quantize_q.
+
+Loads: chunk t + 1's K/V words issue at the start of chunk t; its block ids come one chunk
+earlier by scalar loads, so the K/V loads stay in flight (vector loads complete in order).
+Per tensor the loop runs two chunks per iteration, alternating two register sets; waves of
+disabled rows exit at once.
 """
 
 import math
@@ -31,6 +36,7 @@ import flydsl.expr as fx
 import numpy as np
 import torch
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
 from .sparse_prefill_common import (
@@ -285,28 +291,37 @@ def _pack_launch(
 # ---- Direct ----
 
 
-def _slot_base(env, slot):
-    """Packed byte base of key-list slot `slot`: complete blocks in block_indices order, the
-    causal tail block, then padding (block 0, masked)."""
-    index = _min(slot, fx.Int32(env.topk - 1))
-    listed = fx.Int32(
-        _buffer_words(env.gblocks, (env.row * env.topk + index) * 4, 1)[0]
-    )
-    block = (slot < env.complete).select(
-        listed, (slot == env.complete).select(env.tail_block, fx.Int32(0))
-    )
-    return ((env.p_start + block) * env.hk + env.hkv) * BLOCK_BYTES
-
-
-def _chunk_bases(env, t):
-    """(K bases of blocks 8t + jj, 8t + 4 + jj; V/scale bases of blocks 8t + g, 8t + 4 + g)."""
-    first = t * CHUNK
-    return [
-        _slot_base(env, first + env.jj),
-        _slot_base(env, first + 4 + env.jj),
-        _slot_base(env, first + env.g),
-        _slot_base(env, first + 4 + env.g),
+def _chunk_ids(env, t):
+    """Listed block ids of key-list slots 8t .. 8t + 7 by two wave-uniform scalar loads (SMEM,
+    lgkmcnt): they do not wait behind the K/V loads in the in-order vector memory counter.
+    Slots past the row's list read another row's ids or zero (unused)."""
+    offset = env.ids_row + t * CHUNK
+    words = [
+        rocdl.s_buffer_load(env.gblocks, offset + 4 * h, count=4) for h in range(2)
     ]
+    return [_uniform(fx.Vector(w)[i]) for w in words for i in range(4)]
+
+
+def _chunk_bases(env, ids, t):
+    """(K bases of blocks 8t + jj, 8t + 4 + jj; V/scale bases of blocks 8t + g, 8t + 4 + g):
+    complete blocks in block_indices order, the causal tail block, then padding (block 0,
+    masked)."""
+    first = t * CHUNK
+    bases = []
+    for s in range(CHUNK):
+        slot = first + s
+        block = (slot < env.complete).select(
+            fx.Int32(ids[s]), (slot == env.complete).select(env.tail_block, fx.Int32(0))
+        )
+        bases.append(((env.p_start + block) * env.hk + env.hkv) * BLOCK_BYTES)
+
+    def pick(sel, lo):
+        low = (sel & 1) == 1
+        a = low.select(bases[lo + 1], bases[lo])
+        b = low.select(bases[lo + 3], bases[lo + 2])
+        return ((sel & 2) == 2).select(b, a)
+
+    return [pick(env.jj, 0), pick(env.jj, 4), pick(env.g, 0), pick(env.g, 4)]
 
 
 def _chunk_loads(env, bases):
@@ -349,6 +364,11 @@ def _probabilities(vals, sc, per_token):
     for x in terms[1:]:
         total = total + x
     return (_cvt_fp8(p[0:4]), _cvt_fp8(p[4:8])), total
+
+
+def _asm_fence():
+    """Empty asm with a memory clobber: a compiler memory barrier, no instruction."""
+    llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
 
 
 def _pv16(o, v, pw):
@@ -504,10 +524,8 @@ def _direct_kernel(
         c_scale = c_scale * fx.Float32(KS[0])
     env = type("_Env", (), {})()
     env.__dict__.update(
-        row=row,
         hkv=hkv,
         hk=HK,
-        topk=TOPK,
         p_start=p_start,
         complete=complete,
         tail=tail,
@@ -516,9 +534,9 @@ def _direct_kernel(
         g=g,
         per_token=PER_TOKEN,
         c_scale=c_scale,
-        # Q (B operand): head n, dims 32c + 8g .. + 7 for MFMA c.
-        q=[_buffer_words(gq8, q_base + 32 * c, 2) for c in range(8)],
         gblocks=_buffer(BLOCKS, fx.Uint32(ROWS) * TOPK * 4),
+        # Int32 offset of the row's key list (row 0 for a disabled tile, which runs no chunk).
+        ids_row=on.select(row * TOPK, fx.Int32(0)),
         gk=_buffer(PK, extent),
         gv=_buffer(PV, extent),
         gsc=_buffer(PSC, scale_extent),
@@ -527,52 +545,84 @@ def _direct_kernel(
         gout=_buffer(OUT, q_rows * D * 2),
         out_lane=head_ok.select(qrow * (D * 2) + g * 128, fx.Int32(q_rows * D * 2)),
     )
-    zero4 = fx.Vector.filled(4, 0, fx.Int32)
-
-    def loads(bases):
-        return _chunk_words(env, bases, zero4)
-
-    first_k, first_v, first_sc = loads(_chunk_bases(env, fx.Int32(0)))
-    state = (
-        fx.Vector.filled(64, 0.0, fx.Float32),
-        fx.Float32(_MAX_FLOOR),
-        fx.Float32(0.0),
-        first_k,
-        first_v,
-        first_sc,
-        fx.Vector.from_elements(_chunk_bases(env, fx.Int32(1)), fx.Int32),
-    )
 
     @flyc.jit
-    def step(o, m_run, l_run, kw, vw, scw, bases, t):
-        """Chunk t from its prefetched words; issues chunk t + 1's loads first."""
-        bases = fx.Vector(bases)
-        k_next, v_next, sc_next = loads([bases[i] for i in range(4)])
-        bases_next = _chunk_bases(env, fx.Int32(t) + 2)
-        k, v, sc = _split(kw, 8), _split(vw, 8), _split(scw, 6)
-        vals, local, ballot = _scores(env, k, sc, fx.Int32(t), fx.Float32(m_run))
-        o, l_run, m_run, vals = _rescale_direct(o, l_run, m_run, vals, local, ballot)
-        pw, total = _probabilities(vals, sc, PER_TOKEN)
-        l_run = fx.Float32(l_run) + total
-        return (
-            _pv16(o, v, pw),
-            m_run,
-            l_run,
-            k_next,
-            v_next,
-            sc_next,
-            fx.Vector.from_elements(bases_next, fx.Int32),
+    def run():
+        # Q (B operand): head n, dims 32c + 8g .. + 7 for MFMA c.
+        env.q = [_buffer_words(gq8, q_base + 32 * c, 2) for c in range(8)]
+        zero4 = fx.Vector.filled(4, 0, fx.Int32)
+
+        def loads(bases):
+            return _chunk_words(env, bases, zero4)
+
+        ids0 = _chunk_ids(env, fx.Int32(0))
+        first_k, first_v, first_sc = loads(_chunk_bases(env, ids0, fx.Int32(0)))
+        state = (
+            fx.Vector.filled(64, 0.0, fx.Float32),
+            fx.Float32(_MAX_FLOOR),
+            fx.Float32(0.0),
+            first_k,
+            first_v,
+            first_sc,
+            *_chunk_ids(env, fx.Int32(1)),
         )
 
-    for t in range(fx.Int32(0), chunks, fx.Int32(1)):
-        state = step(*state, t)
-    o, l_run = fx.Vector(state[0]), fx.Float32(state[2])
-    total = l_run + l_run.shuffle_xor(16, 64)
-    total = total + total.shuffle_xor(32, 64)
-    inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
-    if fx.const_expr(not PER_TOKEN):
-        inv = inv * fx.Float32(VS[0])
-    _store_o(env, [o[i] for i in range(64)], inv)
+        @flyc.jit
+        def step(o, m_run, l_run, kw, vw, scw, i0, i1, i2, i3, i4, i5, i6, i7, t):
+            """Chunk t from its prefetched words; issues chunk t + 1's loads (block ids from
+            the previous step) and chunk t + 2's id loads first."""
+            t = fx.Int32(t)
+            bases = _chunk_bases(env, (i0, i1, i2, i3, i4, i5, i6, i7), t + 1)
+            k_next, v_next, sc_next = loads(bases)
+            ids_next = _chunk_ids(env, t + 2)
+            if fx.const_expr(not PER_TOKEN):
+                # Memory clobber: MachineSink cannot move the loads above it past the rescale
+                # branch into the block that first uses their words (the next step's); the
+                # scheduling barrier keeps QK(t), which waits for chunk t, after their issue.
+                # Per token the scale records would not fit in registers alongside.
+                _asm_fence()
+                rocdl.sched_barrier(0)
+            k, v, sc = _split(kw, 8), _split(vw, 8), _split(scw, 6)
+            vals, local, ballot = _scores(env, k, sc, t, fx.Float32(m_run))
+            o, l_run, m_run, vals = _rescale_direct(
+                o, l_run, m_run, vals, local, ballot
+            )
+            pw, total = _probabilities(vals, sc, PER_TOKEN)
+            l_run = fx.Float32(l_run) + total
+            return (
+                _pv16(o, v, pw),
+                m_run,
+                l_run,
+                k_next,
+                v_next,
+                sc_next,
+                *ids_next,
+            )
+
+        if fx.const_expr(PER_TOKEN):
+            # The scale records of a second chunk in flight would spill.
+            for t in range(fx.Int32(0), chunks, fx.Int32(1)):
+                state = step(*state, t)
+        else:
+            # Two chunks per iteration: chunk t + 1's words land in the registers chunk
+            # t - 1 used, so the loop carries them without copies (a copy would wait for the
+            # loads at the loop end).
+            for t in range(fx.Int32(0), chunks - 1, fx.Int32(2)):
+                state = step(*state, t)
+                state = step(*state, fx.Int32(t) + 1)
+            if (chunks & 1) == 1:
+                state = step(*state, chunks - 1)
+        o, l_run = fx.Vector(state[0]), fx.Float32(state[2])
+        total = l_run + l_run.shuffle_xor(16, 64)
+        total = total + total.shuffle_xor(32, 64)
+        inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
+        if fx.const_expr(not PER_TOKEN):
+            inv = inv * fx.Float32(VS[0])
+        _store_o(env, [o[i] for i in range(64)], inv)
+
+    # Disabled waves (rows another kernel serves) exit without loads.
+    if chunks > 0:
+        run()
 
 
 @flyc.jit

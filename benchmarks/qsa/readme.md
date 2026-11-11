@@ -91,6 +91,7 @@ Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/
 - 逐kernel（m12000 TP2，µs）：union 938 → 612（per tensor）/ 724（per token），direct 1430 → 1123 / 1383，FP8另有Q量化43和整段pack 14；K1–K3约129不变。12k上下文的direct不受带宽限制，FP8收益小于random128k（direct 1349 → 809）。dense2048没有direct行，FP8 pack与gated direct仍各约10–14µs。
 - 精度（各用例取最大，逐(行, head)范数相对误差的平均/最大）：PyHIP BF16 0.23%/0.29%；FP8 per tensor与per token 3.7%/6.8%；FP8→BF16计算0.33%/0.61%；SGLang Triton与AITER BF16 0.28%/0.40%；AITER FP8（kernel内转BF16计算）0.29%/0.43%。P_BIAS之前的一轮（[bench_1111_0156](../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)）FP8在dense2048与m12000上快0.8–2.0%，random128k相同。
 - AITER #7008的FP8 kernel比其BF16版本慢约27%（FP8→BF16转换和gfx942的FP8 tile）；`compute="bf16"`在入口反量化，random128k多一份128k上下文的BF16 K/V写读，慢于BF16 K/V直接调用。
+- FP8 direct改用标量读块号、每次循环两个chunk之后（源码readme 1.2.10 K7），在GPU6重测PyHIP三个scope（[数据](../../mytest/mydata/qsa_fp8_att_20261111_01/bench_final/summary.json)）：FP8 per tensor在dense2048 TP2/4/8为138/101/96µs、m12000为1816/1333/756µs、random128k为886/861/847µs（相对BF16 1.33–1.73×），per token为156/113/109、2189/1585/880、1083/1057/1041µs；与GPU7上的`51a3ed7`相比快1.7%–4.7%，两次的BF16相差不到0.4%。
 
 ### 路由标定
 
