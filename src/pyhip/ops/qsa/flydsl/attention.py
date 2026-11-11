@@ -43,8 +43,8 @@ FP8 = torch.float8_e4m3fnuz
 _MAX_SPAN = 2**32 - 2**20
 
 
-def _union_min_rows(group):
-    config = platform()
+def _union_min_rows(group, fp8=None):
+    config = platform(fp8)
     return max(config.union_min_rows, config.union_min_rows_per_head * group)
 
 
@@ -113,9 +113,9 @@ class _Workspace:
             **self.metadata,
         )
         self.union = None
-        if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1]):
+        if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1], fp8):
             plan = prepare.allocate_plan(
-                inputs=inputs, query_tile=32, scratch=False, slotted=slotted
+                inputs=inputs, query_tile=32, scratch=False, slotted=slotted, fp8=fp8
             )
             # Union scratch grows with tiles x their block capacity.
             needed = sum(

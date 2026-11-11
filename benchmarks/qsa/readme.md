@@ -11,6 +11,7 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 | indexer共用的MHA helper | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
 | 合成indexer完整调用 | [test_indexer.py](test_indexer.py) |
+| union/direct路由的标定（分阶段计时、拟合Platform系数、阈值扫描） | [calibrate_route.py](calibrate_route.py) |
 | FP8 K/V完整调用对照（PyHIP BF16/FP8、SGLang Triton、AITER #7008 Triton） | [bench_attention_fp8.py](bench_attention_fp8.py)（AITER kernel的副本在[_aiter_sparse_gqa.py](../../tests/ops/qsa/_aiter_sparse_gqa.py)） |
 | Attention/indexer基本功能 | [test_attention.py](../../tests/ops/qsa/test_attention.py)、[test_attention_fp8.py](../../tests/ops/qsa/test_attention_fp8.py)（FP8 K/V）、[test_indexer.py](../../tests/ops/qsa/test_indexer.py) |
 | AITER op test：精度与耗时，对照SGLang原生Triton | [sparse_prefill_op_test.py](../../tests/ops/qsa/sparse_prefill_op_test.py) |
@@ -90,6 +91,24 @@ Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/
 - 逐kernel（m12000 TP2，µs）：union 938 → 612（per tensor）/ 724（per token），direct 1430 → 1123 / 1383，FP8另有Q量化43和整段pack 14；K1–K3约129不变。12k上下文的direct不受带宽限制，FP8收益小于random128k（direct 1349 → 809）。dense2048没有direct行，FP8 pack与gated direct仍各约10–14µs。
 - 精度（各用例取最大，逐(行, head)范数相对误差的平均/最大）：PyHIP BF16 0.23%/0.29%；FP8 per tensor与per token 3.7%/6.8%；FP8→BF16计算0.33%/0.61%；SGLang Triton与AITER BF16 0.28%/0.40%；AITER FP8（kernel内转BF16计算）0.29%/0.43%。P_BIAS之前的一轮（[bench_1111_0156](../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)）FP8在dense2048与m12000上快0.8–2.0%，random128k相同。
 - AITER #7008的FP8 kernel比其BF16版本慢约27%（FP8→BF16转换和gfx942的FP8 tile）；`compute="bf16"`在入口反量化，random128k多一份128k上下文的BF16 K/V写读，慢于BF16 K/V直接调用。
+
+### 路由标定
+
+```bash
+# 1) 分阶段计时：每个布局 × H12/6/3 × 模式，跑不建计划和8个逐tile阈值（全局路由关闭）
+.venv/bin/python benchmarks/qsa/calibrate_route.py measure --gpu 7 --modes bf16 tensor token \
+  --output mytest/mydata/qsa_route_new/measure
+#    另加SGLang导出的真实选择（每层每个chunk一个.pt：TP0的块号[rows,512]，见源码readme 1.2.5）
+.venv/bin/python benchmarks/qsa/calibrate_route.py measure --gpu 7 --sets --dumps <blocks目录> \
+  --output mytest/mydata/qsa_route_new/measure_real
+# 2) 拟合时延模型各项（union、direct），按模式输出系数与中位/p90误差
+.venv/bin/python benchmarks/qsa/calibrate_route.py fit mytest/mydata/qsa_route_new/measure*/samples.jsonl
+# 3) 全局路由开启的完整调用：Platform自身的系数与--model系数×各阈值，逐样本轮换
+.venv/bin/python benchmarks/qsa/calibrate_route.py sweep --gpu 7 --model model.json --ratios 1.7 2.0 2.25 \
+  --output mytest/mydata/qsa_route_new/sweep
+```
+
+`measure`在K1–K3（FP8另加Q量化）之后分别计时union阶段（K5）和direct阶段（K6 pack + K7），并从计划读出模型的特征（最长union tile的N64步数、union总步数、TASK_SHARE、direct步数之和与最长行、打包块数）。布局为`_synthetic.py`的整段prefill、op test的shared/random分块选择，以及可选的SGLang真实选择；K/V取随机值（路由只取决于选择）。`fit`按相对误差加权最小二乘拟合1.2.5的时延模型；`sweep`的`model.json`为各模式的系数（键同Platform）。2026-11-11的FP8标定（`FP8_ROUTES`）见源码readme 1.2.5与第5节。
 
 ## 2. 逐kernel性能
 

@@ -3,8 +3,9 @@
 """gfx942 D256 QSA direct attention over FP8 (E4M3FNUZ) K/V: one query wave over its own
 selected blocks, FP8 MFMAs.
 
-Each call packs every request's K/V into four-token blocks in FP8 MFMA operand order, so
-the direct kernel's loads are whole, coalesced operands (no LDS, no permutes):
+Each call packs every request's K/V into four-token blocks in FP8 MFMA operand order (with a
+union plan only when K3 routes some tile to direct, direct_flag[0]), so the direct kernel's
+loads are whole, coalesced operands (no LDS, no permutes):
   PK[block][i * 256 + (token * 4 + g) * 16 + 0..15]
       = K[token][64i + 8g + 0..7] ++ K[token][64i + 32 + 8g + 0..7]
   PV[block][p * 256 + d * 16 + (m - 4p) * 4 + token] = V[token][16d + m]   (p = m >> 2)
@@ -220,31 +221,22 @@ def _pack_kernel(
     SOURCES: fx.Tensor,
     VALID: fx.Tensor,
     SLOTS: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
+    GATED: fx.Constexpr[bool],
 ):
     pair = fx.Int32(fx.block_idx.x) * 4 + _uniform(fx.Int32(fx.thread_idx.x) >> 6)
-    _pack_body(
-        K,
-        V,
-        KS,
-        VS,
-        PK,
-        PV,
-        PSC,
-        SOURCES,
-        VALID,
-        SLOTS,
-        pair,
-        N,
-        PACKED,
-        HK,
-        PER_TOKEN,
-        SLOTTED,
-    )
+    args = (K, V, KS, VS, PK, PV, PSC, SOURCES, VALID, SLOTS, pair, N, PACKED)
+    if fx.const_expr(GATED):
+        # K3 sets direct_flag[0] when some tile goes direct; otherwise nothing reads PK/PV.
+        if _uniform(fx.Int32(DIRECT_FLAG[0])) != 0:
+            _pack_body(*args, HK, PER_TOKEN, SLOTTED)
+    else:
+        _pack_body(*args, HK, PER_TOKEN, SLOTTED)
 
 
 @flyc.jit
@@ -259,11 +251,13 @@ def _pack_launch(
     SOURCES: fx.Tensor,
     VALID: fx.Tensor,
     SLOTS: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
+    GATED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     _pack_kernel(
@@ -277,11 +271,13 @@ def _pack_launch(
         SOURCES,
         VALID,
         SLOTS,
+        DIRECT_FLAG,
         N,
         PACKED,
         HK,
         PER_TOKEN,
         SLOTTED,
+        GATED,
         value_attrs={"llvm.target_features": _target_features()},
     ).launch(grid=((PACKED * HK + 3) // 4, 1, 1), block=(256, 1, 1), stream=stream)
 
@@ -691,6 +687,7 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
         per_token=per_token,
         slotted=inputs.kv_slots is not None,
         gated=union is not None,
+        direct_flag=standin if union is None else union.direct_flag,
         active=standin if union is None else union.active,
         query_tiles=standin if union is None else union.query_tiles,
         source_blocks=inputs.block_indices,
@@ -716,11 +713,13 @@ def _pack_args(inputs, prepared, stream):
         prepared.pack_sources,
         prepared.pack_valid,
         inputs.kv_slots if prepared.slotted else prepared.pack_sources,
+        prepared.direct_flag,
         inputs.k.shape[0],
         prepared.packed_blocks,
         prepared.hk,
         prepared.per_token,
         prepared.slotted,
+        prepared.gated,
         stream,
     )
 
@@ -768,10 +767,10 @@ def _compiled(inputs, prepared, out, stream):
     device = inputs.q.device
     pack = _pack_args(inputs, prepared, stream)
     direct = _direct_args(inputs, prepared, out, stream)
-    # Specializations: pack (HK, PER_TOKEN, SLOTTED); direct (H, HK, TOPK, GATED, SCALE,
-    # PER_TOKEN).
+    # Specializations: pack (HK, PER_TOKEN, SLOTTED, GATED); direct (H, HK, TOPK, GATED,
+    # SCALE, PER_TOKEN).
     pack_fn = _compile(
-        _PACK, (device, *pack[12:15]), _pack_launch, pack, device, stream
+        _PACK, (device, *pack[13:17]), _pack_launch, pack, device, stream
     )
     key = (device, *direct[12:14], *direct[17:21])
     direct_fn = _compile(_DIRECT, key, _direct_launch, direct, device, stream)

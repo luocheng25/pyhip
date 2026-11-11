@@ -61,7 +61,7 @@ def test_op_span_limit(case):
 def union_min_rows(request, monkeypatch):
     """Run with the production threshold and with union planning forced for small inputs."""
     if request.param is not None:
-        monkeypatch.setattr(_runtime, "_union_min_rows", lambda group: request.param)
+        monkeypatch.setattr(_runtime, "_union_min_rows", lambda group, fp8=None: request.param)
     monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
     return request.param
 
@@ -82,7 +82,7 @@ def _all_union(monkeypatch):
         return plan
 
     monkeypatch.setattr(_runtime.prepare, "allocate_plan", forced)
-    monkeypatch.setattr(_runtime, "_union_min_rows", lambda group: 0)
+    monkeypatch.setattr(_runtime, "_union_min_rows", lambda group, fp8=None: 0)
     monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
 
 

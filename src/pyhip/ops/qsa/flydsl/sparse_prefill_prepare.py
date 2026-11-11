@@ -1361,12 +1361,18 @@ def wide_tile_rows(query_tile: int) -> int:
 
 
 def allocate_plan(
-    *, inputs, query_tile: int, scratch: bool = True, slotted: bool = False
+    *,
+    inputs,
+    query_tile: int,
+    scratch: bool = True,
+    slotted: bool = False,
+    fp8=None,
 ) -> SparsePlan:
+    """fp8 ("tensor" / "token") routes with the FP8 kernels' calibration."""
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
-    config = platform()
+    config = platform(fp8)
     num_cus = get_cu_num()
     # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
     # established tiles for prefix/ragged work and batches too small to fill the persistent grid.

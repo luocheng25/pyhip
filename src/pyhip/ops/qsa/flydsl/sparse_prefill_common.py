@@ -90,11 +90,38 @@ PLATFORMS = {
         pack_tokens_per_row=32,
     ),
 }
+# FP8 K/V (sparse_prefill_*_fp8, by K/V scale layout): route terms fitted on the FP8 kernels'
+# phase timings, synthetic and SGLang-captured selections (benchmarks/qsa/calibrate_route.py,
+# median error 3%); the per-tile ratio is the sweep's best with the global route on. Union
+# and minimum-row thresholds otherwise follow the BF16 entry.
+FP8_ROUTES = {
+    ("gfx942", 80): {
+        "tensor": dict(
+            union_fixed=5.7,
+            union_step=2.072,
+            row_step=1.275,
+            direct_fixed=11.9,
+            pack_block=0.00184,
+            direct_cu_step=0.24,
+            union_ratio=2.0,
+        ),
+        "token": dict(
+            union_fixed=5.14,
+            union_step=2.483,
+            row_step=1.4,
+            direct_fixed=11.87,
+            pack_block=0.00213,
+            direct_cu_step=0.3,
+            union_ratio=2.0,
+        ),
+    },
+}
 OVERRIDE = "AITER_QSA_PLATFORM"
 
 
 @functools.cache
-def platform() -> Platform:
+def platform(fp8=None) -> Platform:
+    """The calibration of this GPU: BF16 K/V, or FP8 K/V with "tensor" / "token" scales."""
     gfx, cus = get_gfx_runtime(), get_cu_num()
     keys = [key for key in PLATFORMS if key[0] == gfx]
     if not keys:
@@ -108,6 +135,8 @@ def platform() -> Platform:
             key[1],
         )
     entry = PLATFORMS[key]
+    if fp8 is not None:
+        entry = dataclasses.replace(entry, **FP8_ROUTES[key][fp8])
     text = os.environ.get(OVERRIDE, "").strip()
     if not text:
         return entry

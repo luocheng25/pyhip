@@ -34,7 +34,7 @@ Attention沿用AITER [#6576](https://github.com/ROCm/aiter/pull/6576)（`2544b29
 
 传入`kv_slots`时K/V是token池（见1.2.9）：launch序列不变，K3另为union tile写池块号和尾行，K5、K6、K7′按池行取址，K1、K2和packed K7不变；池的字节跨度超过`_MAX_SPAN`（4GiB−1MiB）时K7′换成64位global读的WIDE变体。
 
-K/V为FP8（E4M3FNUZ，带FP32 `k_scale`/`v_scale`，见1.2.10）时K1–K3不变。默认`compute="fp8"`在K3之后依次发Kq（`qsa_quantize_q_fp8`，Q按(query, head)量化成FP8）、K5 FP8 union（`sparse_prefill_union_fp8_d256`）、K6 FP8 pack（`sparse_prefill_pack_kv_fp8_d256`）和K7 FP8 direct（`sparse_prefill_direct_fp8_d256`）；FP8没有raw direct和打包预算，K6每次重排整段上下文。`compute="bf16"`在入口反量化成BF16 K/V后走上表的BF16路径。
+K/V为FP8（E4M3FNUZ，带FP32 `k_scale`/`v_scale`，见1.2.10）时K1–K3的kernel不变，路由用FP8 kernel的标定（`FP8_ROUTES`，见1.2.5）。默认`compute="fp8"`在K3之后依次发Kq（`qsa_quantize_q_fp8`，Q按(query, head)量化成FP8）、K5 FP8 union（`sparse_prefill_union_fp8_d256`）、K6 FP8 pack（`sparse_prefill_pack_kv_fp8_d256`）和K7 FP8 direct（`sparse_prefill_direct_fp8_d256`）；FP8没有raw direct和打包预算；有union计划时K6与BF16一样先读`direct_flag[0]`，没有tile走direct就跳过，否则重排整段上下文。`compute="bf16"`在入口反量化成BF16 K/V后走上表的BF16路径。
 
 ### 1.2 伪代码
 
@@ -103,7 +103,7 @@ class _Workspace:      # 每个新的(device, stream, layout)创建一次
     numpy生成query_positions[M] = p_r+i，经pinned内存non_blocking上传（K1、K2读）
     wide = 有kv_slots 且 池字节数 > _MAX_SPAN（4GiB−1MiB，只换raw direct的变体）
     if M ≥ max(384, 64·H/HK):
-        plan = allocate_plan(query_tile=32, slotted)
+        plan = allocate_plan(query_tile=32, slotted, fp8)   # 路由系数取platform(fp8)：BF16，或FP8的"tensor"/"token"
         union = plan if plan的scratch ≤ 4GiB（UNION_SCRATCH_LIMIT）else None
     direct = direct.prepare(union)               # FP8：direct_fp8.prepare(union, per_token)，整段上下文打包、无预算（见1.2.10）
     specs = block_indices[M,T] + union的scratch + direct的PK/PV   # FP8另有Q8[M,H,256]、qs[M,H]和per token的scale记录
@@ -223,7 +223,16 @@ K3是一次launch里三类互不依赖、并行执行的CTA：
 - mask CTA（每tile一个，4个wave各管1/4的N64步）：为提案1的tile生成`score_masks`，即每个N64步、每个query在64个key列里要保留哪些token。mask只依赖K2的输出，不等路由结果；被路由改走direct的tile，其mask不会被K5读取。
 - 列表CTA（direct走raw且有union计划时才有，每256个raw行组一个，每线程一个行组）：与排序CTA一样先算L，再按与`_order`相同的判据检查行组的4行，有一行所在tile不走union就把行组编号写进`direct_list`。K7′的gated grid仍是每个行组一个CTA（×HK），但前`direct_flag[1]`个按列表取行组、其余立即退出，有计算的CTA编号连续（见1.2.8与第5节10-30（续3））。
 
-输入：K2写的`counts`（并集块数U）、`costs`（direct步数和、最长行步数、提案）、`blocks`/`membership`和`meta`。host参数：TASKS = tiles·HK·slices、GRID、排序宽度SIZE、键移位SHIFT/WIDE、排序CTA数、QB（=BQ）、CAP，以及`allocate_plan`按layout算好的三个时延系数：TASK_SHARE = HK·slices/grid，DIRECT_STEP = 0.304·HK/CU，DIRECT_FIXED = 41 + 0.0041·packed块数·HK。下文的各系数（10、3.2、0.7、0.05、41、0.0041、0.304）都取自Platform（见1.2.2）。
+输入：K2写的`counts`（并集块数U）、`costs`（direct步数和、最长行步数、提案）、`blocks`/`membership`和`meta`。host参数：TASKS = tiles·HK·slices、GRID、排序宽度SIZE、键移位SHIFT/WIDE、排序CTA数、QB（=BQ）、CAP，以及`allocate_plan`按layout算好的三个时延系数：TASK_SHARE = HK·slices/grid，DIRECT_STEP = 0.304·HK/CU，DIRECT_FIXED = 41 + 0.0041·packed块数·HK。下文的各系数（10、3.2、0.7、0.05、41、0.0041、0.304）都取自Platform（见1.2.2）。FP8 K/V的计划用FP8 kernel的系数（`FP8_ROUTES`，[calibrate_route.py](../../../../../benchmarks/qsa/calibrate_route.py)按union、direct分阶段计时拟合，中位误差3%）：
+
+| 系数 | BF16 | FP8 per tensor | FP8 per token |
+|---|---:|---:|---:|
+| union：固定 + 每N64步 | 10 + 3.2 | 5.7 + 2.072 | 5.14 + 2.483 |
+| direct：固定 + 每打包块 | 41 + 0.0041 | 11.9 + 0.00184 | 11.87 + 0.00213 |
+| 最长行每BN32步 / 每步·CU（direct_cu_step） | 0.7 / 0.304 | 1.275 / 0.24 | 1.4 / 0.3 |
+| 逐tile阈值（union_ratio） | 1.7 | 2.0 | 2.0 |
+
+FP8 direct的固定开销小（pack在没有direct行时跳过，gated direct的空CTA不计入），union相对direct更便宜：按吞吐，逐tile的平衡点16·direct_cu_step/union_step在BF16为1.52、FP8为1.86/1.94；扫描（全局路由开启）中2.0最快。
 
 **① 全局路由**
 
@@ -519,7 +528,7 @@ SGLang的K/V在按页分配的token池里。传入`kv_slots`时，kernel直接�
 K/V为E4M3FNUZ（gfx942的FP8，最大240），值为K8·k_scale、V8·v_scale。scale是FP32，per tensor `[1]`或per token `[N,HK]`（有slot表时`[P,HK]`，与池同行）。SGLang的`--kv-cache-dtype fp8_e4m3`是per tensor（无checkpoint scale时为1.0）；per token与AITER [#7008](https://github.com/ROCm/aiter/pull/7008)、ATOM的KV缓存相同（每token每KV头amax/240）。
 
 ```python
-# compute="fp8"（默认）：K1–K3与BF16相同（计划、路由、mask都不看dtype），之后：
+# compute="fp8"（默认）：K1–K3的kernel与BF16相同（计划、mask不看dtype），路由系数换成FP8的（见1.2.5），之后：
 Kq: Q8[M,H,256], qs[M,H] = quantize(Q)   # 每(query, head)一行、16个lane：qs = amax/240，Q8 = RNE(Q·240/amax)；全0行qs = 0
 S''[q,j] = (Q8·K8_j)·qs[q]·ks_j·scale·log2(e)  (+ log2(sv_j)，per token)    # FP32
 m：lazy max，某行S''超过7.5（LAZY）才移动，移动后行最大值落在S'' = 4（P_BIAS），所以P' ≤ 2^7.5 ≈ 181；首个tile取m = 行最大值 − 4；新行（m = FLOOR）以0为中心，第一个可见key触发rescale
@@ -530,7 +539,7 @@ out = BF16(O·(per tensor时为sv，否则1)/l)
 ```
 
 - **K5 FP8 union**（min(任务数, CU)×256，64KiB LDS）：与BF16 union用同一计划（`metadata`、`blocks`/`pool_blocks`、`score_masks`、`counts`、`tails`、`active`、`task_order`），任务仍是tile×KV头×128行切片。4个wave各32行（每SIMD一个wave，512个寄存器），32×32×16 FP8 MFMA；O的128个值由inline asm MFMA留在AGPR。每个N64步：Part 1算QK(t)，在第1条QK MFMA之后补完tile t−1的mask、lazy max与rescale；barrier后Part 2算PV(t−1)，穿插P打包和V(t)转置写LDS。K、Vᵀ在LDS里双缓冲。持久循环在输出阶段预取下一任务的Q8、scale和第一个tile；任务解码用标量读，不等输出的store。padding块号设成越界（读0）；slot表中请求最后一个不满块按有效token数限制每次读取（池中多出的行可能是NaN）。
-- **K6 FP8 pack**（⌈packed块·HK/4⌉×256）：每个(块, KV头)一个wave，把整段上下文按块重排成direct的MFMA操作数：PK每块1KiB（`PK[b][i·256+(tok·4+g)·16]` = K[tok][64i+8g..+7] ++ K[tok][64i+32+8g..+7]），PV每块1KiB（`PV[b][p·256+d·16+(m−4p)·4+tok]` = V[tok][16d+m]）；per token时另写每块64B的scale记录（4个k_scale、4个log2 v_scale、4个1/v_scale）。来源块由host上传，有slot表时在pack里查表。1M上下文、HK1时PK/PV共约512MiB，K6约200µs。
+- **K6 FP8 pack**（⌈packed块·HK/4⌉×256）：每个(块, KV头)一个wave，把整段上下文按块重排成direct的MFMA操作数：PK每块1KiB（`PK[b][i·256+(tok·4+g)·16]` = K[tok][64i+8g..+7] ++ K[tok][64i+32+8g..+7]），PV每块1KiB（`PV[b][p·256+d·16+(m−4p)·4+tok]` = V[tok][16d+m]）；per token时另写每块64B的scale记录（4个k_scale、4个log2 v_scale、4个1/v_scale）。来源块由host上传，有slot表时在pack里查表。有union计划时先读K3写的`direct_flag[0]`，为0（全部tile走union）就整个跳过，与BF16的gated pack相同。1M上下文、HK1时PK/PV共约512MiB，K6约200µs。
 - **K7 FP8 direct**（rows·HK×64，`waves_per_eu=2`）：每行×KV头一个wave，16×16×32 FP8 MFMA。key表依次为block_indices的完整块、因果尾块，再用块0补齐（屏蔽）。每8块一个chunk，预取下一个chunk；lane本地lazy max，只在rescale分支用shuffle求行max。每个lane输出(head, g)的64个维度。寄存器per tensor 220、per token 252。gated时与BF16 K7相同，只处理非active tile的行。
 - **compute="bf16"**：入口按`kv_slots`取出各请求的FP8 token（及per token scale），BF16 = RNE(FP8·scale)（FP8→BF16精确，乘积只舍入一次），再以不带slot表的BF16 K/V调用BF16路径。结果与调用方自己反量化后调用逐bit相同，代价是一份packed上下文的BF16 K/V临时张量和几个逐元素kernel。
 
@@ -860,7 +869,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 
 - Graph capture前须在同一stream、同一layout上eager调用一次。工作区只保存layout元数据和计划；scratch来自每个(device, stream)一块按需增长的arena，同stream的各layout共用。Capture时固定当时的缓冲，arena之后增长不影响graph里的指针；同一stream上capture的graph不得彼此并发重放，也不得与该stream上的eager调用并发。
 - 精确长度、任务数、grid和容量，K2的LDS大小和dense上限，K3的排序宽度（五档编译在同一kernel里）、移位量和tile行数都是运行时参数；零任务launcher不发GPU kernel。
-- 各kernel在一组编译期参数第一次出现时编译，capture中遇到未编译的变体会报错：K1按T；K2按成员位宽、CTA档位和T（BQ≤21、BQ32、BQ42三种）；K3按HK、每tile的128行切片数、排序键是否超过31位、是否全局路由、平台系数、成员位宽和是否有slot表；union按H、HK、BQ、补齐后的组宽、scale和是否有slot表；packed与raw direct在同一组（H、HK、是否gated、scale、T、是否有slot表）第一次用到时一起编译，池超过`_MAX_SPAN`时另编WIDE。FP8：Kq每个设备一份；FP8 union按H、HK、BQ、补齐后的组宽、scale、per token与否和是否有slot表；FP8 pack按HK、per token与否和是否有slot表；FP8 direct按H、HK、T、是否gated、scale和per token与否。FlyDSL缓存为空、每种head数一个新进程时：第一次12k prefill（K1–K3、union、gated pack与packed/raw direct）约14–15秒；不建计划的调用约1.7秒；用到新tile行数的带prefix chunk（H6的16行、H3的32行union）约7–12秒（H12与12k prefill同为10行，不再编译）；第一次传slot表的调用约13秒；WIDE约0.8–0.9秒。持久缓存命中时第一次调用0.02–0.4秒（[数据](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/cold_compile)）。
+- 各kernel在一组编译期参数第一次出现时编译，capture中遇到未编译的变体会报错：K1按T；K2按成员位宽、CTA档位和T（BQ≤21、BQ32、BQ42三种）；K3按HK、每tile的128行切片数、排序键是否超过31位、是否全局路由、平台系数、成员位宽和是否有slot表；union按H、HK、BQ、补齐后的组宽、scale和是否有slot表；packed与raw direct在同一组（H、HK、是否gated、scale、T、是否有slot表）第一次用到时一起编译，池超过`_MAX_SPAN`时另编WIDE。FP8：Kq每个设备一份；FP8 union按H、HK、BQ、补齐后的组宽、scale、per token与否和是否有slot表；FP8 pack按HK、per token与否、是否有slot表和是否gated；FP8路由系数（`FP8_ROUTES`）与BF16不同，K3在FP8 per tensor与per token下各另编一份；FP8 direct按H、HK、T、是否gated、scale和per token与否。FlyDSL缓存为空、每种head数一个新进程时：第一次12k prefill（K1–K3、union、gated pack与packed/raw direct）约14–15秒；不建计划的调用约1.7秒；用到新tile行数的带prefix chunk（H6的16行、H3的32行union）约7–12秒（H12与12k prefill同为10行，不再编译）；第一次传slot表的调用约13秒；WIDE约0.8–0.9秒。持久缓存命中时第一次调用0.02–0.4秒（[数据](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/cold_compile)）。
 - Indexer的I1、I2、D0对行数、组数和position stride不做整数特化，各只编译一份；prefill第一次调用即编译logits（即使该批没有行需要logits），decode的三个kernel在第一次decode调用时编译，verify另需的不压缩D0与D0′在第一次verify调用时编译（SGLang在graph capture前的eager预热中）。top-k在各入口第一次调用时编译全部变体（prefill：uint16/int32块号 × 每wave一行/4个wave共一行；decode：uint16/int32 × 是否长行，另加D2a/D2b和D1的FOLD变体），Triton和FlyDSL缓存都为空时第一次prefill/decode约5.7/6.5秒。
 - FlyDSL持久缓存的键只追踪被编译函数的源码，只改嵌套`@flyc.jit`或helper时可能返回旧kernel。修改PyHIP后先清空缓存，或设置新的`FLYDSL_RUNTIME_CACHE_DIR`。以同一模块名导入的包副本（如几个实验变体）共用缓存时，也会互相拿到对方的kernel。
 
@@ -868,7 +877,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
-- FP8 K/V沿用BF16的路由时延模型，未按FP8 kernel重新标定（FP8 union相对BF16约快1.7–1.8倍，FP8 direct约1.7倍，比例相近）。FP8 pack每次重排整段上下文，与走direct的行数无关，没有打包预算或raw回退。
+- FP8 K/V的路由系数（`FP8_ROUTES`）只标定了时延模型各项和逐tile阈值2.0，建计划的最少行数沿用BF16。很长的上下文（约1M）里H12/H6不建计划最快：K2逐窗口扫描整段上下文，计划的准备开销（K2/K3约200–650µs）超过union的收益，BF16同样如此；路由只在K2之后逐tile决定，无法避免这部分开销。FP8 pack在有direct行时重排整段上下文，没有打包预算或raw回退。
 - compute="fp8"的误差主要来自Q的FP8量化（见1.2.10），模型质量要在服务中验收；精度敏感时用compute="bf16"。P以E4M3FNUZ参与PV：相对行最大值低于约2^-15的权重为0（P_BIAS = 4），2048个key时最坏丢掉约6%的质量。
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。长上下文prefill logits也随buffer位置波动（P245760约±30%）。
 - 1M上下文仍很慢：prefill indexer是O(L²)，上下文末尾16384行的chunk每层约46ms（P245760约9.4ms），其中logits约25.6ms（约4.4 TFLOP，约170 TFLOP/s；写出约18GB FP32 logits）、top-k约20.8ms（直方图与收集两遍读约34GB，约1.6TB/s）（16块1024行的profiler合计，[数据](../../../../../mytest/mydata/qsa_1m_impl_20261029_01/chunk_rows_1m/chunk_rows.json)）。线性外推整条1M prompt的indexer每rank约18秒，各TP rank重复计算；logits块最多约1.1GiB。Decode每层B1/B8约50/197µs，B8以logits（176µs）为主。Attention上下文末尾16384行的chunk每层H12全union约3.4ms、全direct约10.2–10.6ms。
@@ -889,6 +898,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 首次调用编译时间：[cold_compile](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/cold_compile)；host下发：[host](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/host/summary.json)。
 - 服务性能与数值验收（TP2/TP4/TP8）：[qsa_aiter_sync_service_20261030_01](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/summary.json)（计时窗口内的编译缓存检查：[cache_writes.json](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/cache_writes.json)）。
 - FP8 K/V（2026-11-11）：kernel对照[bench_b45a953](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_b45a953/summary.json)（P_BIAS之前一轮[bench_1111_0156](../../../../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)），P_BIAS的A/B [pbias_ab](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json)，精度仿真[accuracy_peaked.txt](../../../../../mytest/mydata/qsa_fp8_20261110_01/accuracy_peaked.txt)，客户配置服务（BF16与FP8 KV、GSM8K、1M TEST=1）[qsa_fp8_kv_service_20261111_01](../../../../../mytest/mydata/qsa_fp8_kv_service_20261111_01/summary.md)。
+- FP8路由标定（2026-11-11）：分阶段测量[合成](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/measure_syn/samples.jsonl)与[真实选择](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/measure_real/samples.jsonl)，[拟合](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/fit_all.json)，[扫描](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/sweep_v1/sweep.jsonl)，[生产路径A/B](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/ab_bench)。
 - MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_ringfix_20261008_01](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)。
 
 ## 5. 优化历史
@@ -1120,10 +1130,22 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 - **SGLang（`41f70748d`）**：`--kv-cache-dtype fp8_e4m3`时QSA层的池存放不带scale的E4M3FNUZ K/V，原生QSA Triton kernel（decode/verify、带prefix的chunk prefill）在FP8上编译失败。PyHIP prefill在每个chunk（无prefix时也）经slot表读FP8池，scale为1；`SGLANG_OPT_PYHIP_QSA_FP8_MFMA`（默认1）选FP8 MFMA或先反量化成BF16；gfx942 paged GQA decode读FP8后转BF16（BF16池不变）；原生带prefix的回退把取出的FP8 K/V转成BF16。TEST模式以`fp8_query`为参考检查FP8 MFMA。SGLang测试`test_pyhip_qsa`（新增两个FP8池用例）、`test_qsa_sparse_paged_gqa`（FP8池与同值BF16池的输出逐bit相同）、`test_qsa`与`test_qsa_mtp_shared_indexer`通过。
 - **服务（客户配置TP2，[数据](../../../../../mytest/mydata/qsa_fp8_kv_service_20261111_01/summary.md)）**：FP8 KV使KV池容量+89%（151040→285312 token），GSM8K不变（BF16 0.976–0.982，FP8 0.976–0.981），吞吐低1.6%–4.0%：不带scale的FP8 KV存储使MTP接受长度下降（GSM8K上−7%），每步decode时间不变；FP8 prefill使C1 TTFT快约1%。1M TEST=1（`b45a953`）38个请求、每rank每层7878次attention校验通过。表格见[benchmark说明](../../../../../benchmarks/qsa/readme.md)第3节。
 
+### 2026-11-11（续）：FP8的union/direct路由标定与pack门控
+
+用户要求按FP8重新标定union/direct的分流模型。工具为`benchmarks/qsa/calibrate_route.py`（用法见[benchmark说明](../../../../../benchmarks/qsa/readme.md)“路由标定”），数据在[qsa_fp8_route_20261111_01](../../../../../mytest/mydata/qsa_fp8_route_20261111_01)。
+
+- **测量与拟合**：`measure`按阶段计时（无计划路由，以及全局路由关时逐tile阈值0.7–∞），布局为16个合成/分块布局（1296条）和SGLang服务导出的22个真实选择布局（12k、128k、1M的若干层，1782条）；`fit`用加权最小二乘拟合Platform各项。先在BF16上复核方法：union_step 3.39–3.45、direct_cu_step 0.33–0.34，与现用的3.2/0.304接近；Dmax几乎总是65，direct_fixed与row_step不可辨识。FP8 per tensor/per token：union_fixed 5.7/5.14、union_step 2.072/2.483、row_step 1.275/1.4、direct_fixed 11.9/11.87、pack_block 0.00184/0.00213、direct_cu_step 0.24/0.3，中位误差约3%，各上下文长度的残差无偏。按吞吐算的阈值16·direct_cu_step/union_step：BF16 1.52，FP8 1.86/1.94；扫描后逐tile阈值取2.0（`FP8_ROUTES`）。
+- **Pack门控**：FP8 pack原先不看`direct_flag`，全部tile走union时也运行；现在有计划时按`direct_flag[0]`跳过，无计划时用常1标志。
+- **扫描**（`sweep`，全局路由开，228例，相对FP8沿用BF16系数）：per tensor总体−0.46%（≤32k −0.75%，32k–256k −0.15%，约1M +1.4%，真实12k −0.48%），per token −0.81%（−1.00%、−0.58%、+0.3%、−0.74%）。最好的布局快23%/26%，最差慢4.7%（约1M的H12/H6：union tile变多，K2/K3开销也随阈值增长）。
+- **生产路径A/B**（`bench_attention_fp8.py`，GPU7，旧为`b45a953`、新为工作树，ABBA，各用自己的FlyDSL缓存）：dense2048、m12000、random128k × TP2/4/8，per tensor/per token新旧比0.998–1.001，BF16同样0.998–1.001。这三个代表布局的路由没有变化；dense2048的FP8 pack本来就只有空跑开销（约9.5µs，与BF16门控后相同）。[数据](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/ab_bench)
+- **测试**：`test_attention_fp8.py`新增FP8计划使用FP8系数的用例（全部union时`direct_flag[0]`为0，输出在FP8容差内）；与`test_attention.py`共181项通过。
+
 ### 评估过但未采用
 
 | 方案 | 结论 | 证据 |
 |---|---|---|
+| FP8逐tile阈值2.25（11-11） | ≤32k −0.55%/−0.86%（不如2.0），32k–256k +1.7%/+0.8% | [扫描](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/sweep_v1/sweep.jsonl) |
+| FP8只换时延模型各项、阈值沿用1.7（11-11） | 与沿用BF16系数持平：≤256k在±0.1%以内，约1M +0.4% | [扫描](../../../../../mytest/mydata/qsa_fp8_route_20261111_01/sweep_v1/sweep.jsonl) |
 | FP8 union H12改BQ32（11-11） | dense +6.4%，混合稀疏12k −2.8%、32k −24% | [笔记](../../../../../mytest/mydata/qsa_fp8_20261110_01/notes.md) |
 | FP8 direct每个query按维度分给2个wave（11-11） | 120T→94T | [笔记](../../../../../mytest/mydata/qsa_fp8_20261110_01/notes.md) |
 | FP8 P_BIAS = 5（LAZY 7.5，11-11） | 窗口2.5，rescale更频繁：union慢8.0–9.7%，完整调用dense2048/m12000慢2.4–7.2%；B4已把sink例降到0.24% | [A/B](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab/summary.json) |

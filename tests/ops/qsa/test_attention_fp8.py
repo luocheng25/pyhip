@@ -46,7 +46,9 @@ SCALES = pytest.mark.parametrize("per_token", (False, True), ids=("tensor", "tok
 @pytest.fixture(params=(None, 0), ids=("default-plan", "always-plan"))
 def union_min_rows(request, monkeypatch):
     if request.param is not None:
-        monkeypatch.setattr(_runtime, "_union_min_rows", lambda group: request.param)
+        monkeypatch.setattr(
+            _runtime, "_union_min_rows", lambda group, fp8=None: request.param
+        )
     monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
     return request.param
 
@@ -354,6 +356,28 @@ def test_reference_with_fp8_query(monkeypatch):
             error.mean(),
             error.max(),
         )
+
+
+@SCALES
+def test_fp8_plans_route_with_fp8_terms(per_token, monkeypatch):
+    """FP8 workspaces plan with the FP8 kernels' route terms; when every tile goes union the
+    FP8 pack is skipped (direct_flag[0] == 0) and the output still matches."""
+    monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    mode = "token" if per_token else "tensor"
+    case = _fp8_case((768, 768), (0, 5), 12, True, per_token=per_token)
+    output = _call_fp8(case)
+    plan = next(reversed(_runtime._workspaces.values())).union
+    terms = _runtime.platform(mode)
+    assert plan.union_ratio == terms.union_ratio != _runtime.platform().union_ratio
+    assert plan.route_model == (
+        terms.union_fixed,
+        terms.union_step,
+        terms.row_step,
+        terms.route_margin,
+    )
+    assert bool(plan.active.all()) and int(plan.direct_flag[0]) == 0
+    rows = _sample_rows(case.value)
+    assert _within_fp8_error(output[rows], reference(case.exact, rows))
 
 
 def test_fp8_input_errors():
