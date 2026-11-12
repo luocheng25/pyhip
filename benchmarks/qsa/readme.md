@@ -139,7 +139,7 @@ decode_r1_n12000   1:qsa_indexer_decode_logits            <实测值>    valid/i
 
 Attention为2026-10-30同步AITER #6576并重新应用之后重测：MI308X/gfx942，GPU2，原cudaPerf、10buffers、2warmup、128samples，两轮（每轮新建FlyDSL缓存目录），表中为两轮各自中位数的平均。Indexer源码在同步中未改，数据为10-29在同一GPU、同一协议下的测量。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
 
-Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数）；超出时若上下文token数不超过行数的32倍且PK+PV不超过1GiB仍走packed，否则走raw。逐tile公式之后，sparse_prefill_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，sparse_prefill_recover_scatter逐行排序；PyHIP prefill indexer的升序输出同样排序，只有块号恰为0,1,2,…的完整因果前缀行跳过排序。选择不校验。
+Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数）；超出时若上下文token数不超过行数的32倍且PK+PV不超过1GiB仍走packed，否则走raw。逐tile公式之后，sparse_prefill_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，sparse_prefill_recover_scatter逐行排序；块号已升序的行（完整因果前缀、PyHIP prefill indexer的升序输出）跳过排序，SGLang导出的真实12k选择每层约33µs。选择不校验。
 
 | Kernel | TP2/H12 | TP4/H6 | TP8/H3 |
 |---|---:|---:|---:|

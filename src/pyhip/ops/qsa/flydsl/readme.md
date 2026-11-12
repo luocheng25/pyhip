@@ -155,7 +155,8 @@ vis = query_positions[row] + 1          # 该query在请求内的位置+1 = 因�
 C = min(vis//4, T)                      # 应选的完整块数
 # lane持有第k·64+lane列（每lane T/64列；每次读、写都是64个相邻列），一列对应一个4-token块
 blk[col] = indices[row, 4·col] >> 2 if col < C else INT_MAX      # 只读每组第一个token
-if wave内有col < C使blk[col] ≠ col:   # 块号恰为0,1,2,…（完整因果前缀）时已经有序，免排序
+following = ds_bpermute(lane + 1)取下一列的块号（lane 63取lane 0的下一组列）
+if wave内有col + 1 < C使blk[col] > following:   # 完整列已非降序（完整因果前缀、indexer的升序top-k）时免排序
     经本wave的LDS转置成每lane连续的列 → bitonic排序（补INT_MAX到2的幂）→ 转置回来
     # 调用方的块可以乱序，排序后direct按固定的升序累加，结果与输入顺序无关
 block_indices[row, col] = blk[col] if col < C else -1   # K2（并集）和K7（direct）读的每行块表
