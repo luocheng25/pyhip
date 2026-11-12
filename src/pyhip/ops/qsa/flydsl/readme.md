@@ -910,7 +910,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
-- FP8 union的每个phase约3000周期（64条MFMA下限2048），受VALU发射与依赖限制；每个任务的边界（收尾、输出、下一任务的序幕）约14.5K周期（约8µs），其中下一任务约100KB的加载与64KB的输出在VMEM上排队，寄存器（per token arch VGPR 256）、SGPR（106）与LDS（64KiB）都放不下跨任务的预取。per token比per tensor多约12%（centering每值3条VALU、行和2条）。不改数值时，FP8相对BF16在TP2（H12）的m12000/真实12k约1.42×/1.32×（per tensor/per token），见第5节11-11（续4）。
+- FP8 union的每个phase约3000周期（64条MFMA下限2048），受VALU发射与依赖限制；每个任务的边界（收尾、输出、下一任务的序幕）约14.5K周期（约8µs），其中下一任务约100KB的加载与64KB的输出在VMEM上排队，寄存器（per token arch VGPR 256）、SGPR（106）与LDS（64KiB）都放不下跨任务的预取。per token比per tensor多约12%（centering每值3条VALU、行和2条）。FP8相对BF16（kernel合计）在TP2（H12）的真实12k为1.60×/1.49×、m12000为1.44×/1.35×（per tensor/per token），见第5节11-12（续）。
 - FP8核心/残余（H12、H6）：union部分在合并前多一次BF16舍入（不超过该部分的2^-9），与不拆分不逐bit相同；只拆K2 dense路径的tile（因果范围不超过8168块，约32k token），KV拆分的短prefill与H3不拆。残余direct每行另有固定开销（约3个BN32步）与合并读写，K2按`RESIDUAL_PAIR`/`RESIDUAL_ROW`（SGLang导出的真实12k上拟合）比较代价。
 - FP8的split只在任务数少于CU数时启用；split计划的partial记录（64个slot×2×130KiB）与计数器是union scratch的一部分（约17MiB）。
 - FP8 K/V的路由系数（`FP8_ROUTES`）只标定了时延模型各项和逐tile阈值2.0，建计划的最少行数沿用BF16。很长的上下文（约1M）里H12/H6不建计划最快：K2逐窗口扫描整段上下文，计划的准备开销（K2/K3约200–650µs）超过union的收益，BF16同样如此；路由只在K2之后逐tile决定，无法避免这部分开销。FP8 pack在有direct行时重排整段上下文，没有打包预算或raw回退。
@@ -939,6 +939,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - FP8 KV服务吞吐（2026-11-11）：诊断、ABBA与验收[qsa_fp8_kv_scale_20261111_01](../../../../../mytest/mydata/qsa_fp8_kv_scale_20261111_01/summary.md)。
 - FP8 kernel ATT与direct加载改动（2026-11-11）：[qsa_fp8_att_20261111_01](../../../../../mytest/mydata/qsa_fp8_att_20261111_01/README.md)（ATT、真实12k逐层构成、ABBA、完整调用）。
 - FP8再优化（2026-11-11～12，`6631d9eb`–`7450c454`）：[qsa_fp8_opt2_20261111_01](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/README.md)（逐项ABBA、全矩阵ABBA `bab_*`、完整调用`bench_6535`/`bench_7450`、ATT与任务边界分析、负载均衡与路由扫描）。
+- FP8第1–5项（2026-11-12，`97c0f35a`–`fb7ac47b`）：[qsa_fp8_opt3_20261112_01](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md)（逐项ABBA、θ扫描、两wave原型、Q量化与direct顺序的A/B、BF16/FP8比值`ratio_h*`、完整调用`bench_fb7a`）。
 - MTP（EAGLE 3/1/4）服务性能、数值验收与C1 profile：[qsa_mtp_ringfix_20261008_01](../../../../../mytest/mydata/qsa_mtp_ringfix_20261008_01/analysis.json)。
 
 ## 5. 优化历史
@@ -1215,10 +1216,28 @@ AITER [#6576](https://github.com/ROCm/aiter/pull/6576)于11-04合并（`082468a9
 - **结果**（全矩阵ABBA，kernel合计的FP8/BF16，[7040→57f6](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/bab_57f6)与[6535→7450](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/bab_7450)）：真实12k的12层per tensor H12/H6/H3 1.36/1.48/1.40 → 1.42/1.59/1.51，per token 1.14/1.25/1.21 → 1.32/1.42/1.37；dense2048 per tensor 1.42/1.33/1.35 → 1.45/1.36/1.75，per token 1.26/1.18/1.21 → 1.33/1.28/1.64；m12000 per tensor 1.36/1.39/1.41 → 1.41/1.48/1.51，per token 1.13/1.17/1.21 → 1.32/1.34/1.37；random128k约1.57–1.70。完整调用（bench_attention_fp8，GPU6，[bench_7450](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/bench_7450/summary.json)）见benchmark说明第1节。达到1.5×的有：random128k全部、dense2048 TP8两种、m12000 TP8 per tensor、真实12k H6与H3的per tensor。TP2（H12）的m12000/真实12k仍为约1.42×/1.32×：direct已在gather带宽上（每CU约42B/clk），union受VALU发射限制，per token每值多2–3条VALU；不改数值时没有找到能补足的改动（见下表）。
 - **测试**：`test_attention_fp8.py` 76项、`test_attention.py` 105项、SGLang `test_pyhip_qsa` 10项（29个子测试）通过；split的H3/H6、per tensor与per token相对FP32参考的误差与不拆分相同。SGLang服务（`79d260a30`，FP8目标KV + BF16 draft KV，TP2，GPU1、7）GSM8K 0.976、接受长度3.134（`51a3ed7`为0.981/3.131，BF16 KV各轮0.976–0.982/3.12–3.14）。
 
+### 2026-11-12（续）：K1有序行跳过排序、union核心/残余拆分、direct倒序（第1–5项）
+
+用户要求按第1–5项依次优化；第6项（逐块scale）会改变量化方案，不做；第3项先做原型测收益再决定。数据与工具在[qsa_fp8_opt3_20261112_01](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md)（ABBA：old/new/new/old，每臂单独的FlyDSL缓存，取两臂的较小值）。
+
+- **`97c0f35a` K1跳过已升序行的排序**（1.2.3）：PyHIP indexer给出的块号全部升序，但只有17%的行是0,1,2,…前缀。`_recover_row`在已经读入的列上判断每个完整列不大于下一列（下一列用`ds_bpermute`取lane+1，lane 63取lane 0的下一组），整行没有下降时跳过双调排序；不像10-02的方案那样多读一遍。真实12k的K1每层70→33.4µs（每次调用−2.0%～−2.4%，BF16同样受益）；合成用例的块号是打乱的，不变；逐bit相同。
+- **`0a1ba38b` union tile拆成核心与逐行残余**（1.2.4、1.2.5、1.2.5b、K5–K7）：真实12k的union密度（4-token块粒度）H12/H6/H3只有50%/43%/39%，tile里很多块只被少数行选中。K2对dense路径的tile只保留被至少⌈θ·rows⌉行选中的块和对角块（核心），代价`16·⌈C/16⌉ + ratio·(0.112·P + 3.08·rows) < 16·⌈U/16⌉`时才拆（拟合：一个union步约8.5个BN32 direct步）；K3路由计入残余；K3b（并入K6 pack的launch，每tile一个CTA，LDS位图）把每行的残余块写到block_indices行首；union写每行的lse，direct只算残余块，收尾按lse（log2单位）合并union的输出。θ：H12 0.5（0.4 +0.5%、0.6 +1.7%），H6 0.2（0.15持平、0.25 +1.9%），H3拆分反而变慢、不拆；只用于FP8且split为1的计划。数值：合并前union的输出已舍入为BF16，union部分多至多2^-9的相对误差，相对fp8_query参考的误差不变（2.53%），所以全union的逐bit测试固定`CORE_RATIOS={}`，另加拆分的精确测试。ABBA（对`97c0f35a`，kernel合计）：真实12k H12 per tensor/per token −10.1%/−10.5%，H6 −7.6%/−9.6%；m12000 H12 −0.9%/−1.3%、H6 −4.6%/−6.2%；random128k −0.8%～+0.6%；dense2048在噪声内。过程中的坑：二分查找版K3b受VALU限制（每层70µs），改LDS位图；单独launch K3b多一次launch开销，并入pack；`flyc.compile`会执行launcher，pack和direct编译时要把grid参数置0、launch前判断，否则首个调用K3b跑两遍、结果不确定；RESIDUAL变体改变了direct热循环的调度（random128k per token +3.5%），lse偏移改由out_lane推出、O_u分两半合并之后，热循环与原ISA相同。
+- **第3项 union每SIMD两个wave（原型，未采用）**：[proto_union2w.py](../../../../../mytest/fp8/proto_union2w.py)、[proto_union2w_b.py](../../../../../mytest/fp8/proto_union2w_b.py)用direct的chunk代码搭稳态。A每wave 16行，8个wave各读整步K/V（每CU每步LDS读256KB）；B每wave 32行，同一SIMD的两个wave各算半步key，最后经LDS合并(m, l, O)（LDS读与union相同，128KB）。K的`ds_read_b128`原有2路bank冲突（b128按0–3+20–23等8个lane一组服务），PK写入LDS时字节地址bit5 ^= bit7后无冲突（A 3138→2714ns/步）。kernel计时（400个128行任务×32步，每CU 5个任务）：union 2013ns/步，A 2539、B 2632；去掉每步barrier（结果错误，只看时间）也有2268/2279，仍慢13%。ATT：B的stall中barrier 35%、MFMA 35%，每步的barrier把同一SIMD的两个wave拉成同相位，VALU与MFMA交错不起来。不做完整重写。
+- **第4项 Q量化（未采用）**：K6 launch里的Q量化每层29.5µs（pack 57→27.5µs，只看时间）。改由union读BF16 Q、在任务收尾按`_quantize_part`同一算法量化（逐bit相同）时union每层+35µs（+4.4%：每任务约400条VALU，Q读翻倍且排在下一任务的K/V预取之前），净亏；量化CTA挪到K3的launch末尾时K3 20→44µs、pack −29µs，每层净省5µs（0.3%）。真正省掉它要SGLang的q路径（RoPE）直接输出FP8 Q与行scale，需要改SGLang/AITER的kernel，未做。
+- **`fb7ac47b` direct倒序**（K7 FP8 direct）：PMC（真实L7）L2命中90.5%、L2→L1约5.35TB/s，ATT中VMEM发射stall占70%，chunk内没有便宜的空间；占用率在中段（成段的空CTA）和最后约5%的时间掉到每CU 2–3个wave。CTA倒序对应行，重的行先开始：direct H12 per tensor −2.1%（24个真实层）、per token −2.3%，H6 −4.4%/−4.1%，H3 +0.3µs/层（几乎全是空CTA）；逐bit相同。剩下的尾部要持久化的direct加按工作量排序的紧凑行表，估计1–2%，未做。
+- **结果**（`fb7ac47b`上bf16/tensor/token按ABC CBA各跑两次取较小值，kernel合计的BF16/FP8，[ratio_h12/6/3](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md)；K1的改动BF16同样受益，已计入）：真实12k的12层per tensor H12/H6/H3 1.42/1.59/1.51 → 1.60/1.75/1.54，per token 1.32/1.42/1.37 → 1.49/1.60/1.38；m12000 per tensor 1.44/1.55/1.51、per token 1.35/1.42/1.36；dense2048 1.44/1.38/1.74、1.32/1.27/1.67；random128k 1.68–1.70、1.61–1.65。完整调用（bench_attention_fp8，GPU7，[bench_fb7a](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/bench_fb7a/summary.json)）见benchmark说明第1节：合成用例的块号打乱、共享均匀，m12000只快1.7%–5.5%，random128k与dense2048持平。真实12k上只有H12与H3的per token（1.49×/1.38×）未到1.5×。
+- **测试**：`test_attention_fp8.py` 82项、`test_attention.py` 105项、SGLang `test_pyhip_qsa` 10项（29个子测试）通过。SGLang服务（`79d260a30`，FP8目标KV + BF16 draft KV，TP2，GPU2、3，PyHIP `fb7ac47b`）GSM8K 0.978、接受长度3.133（`7450c454`为0.976/3.134）。
+
 ### 评估过但未采用
 
 | 方案 | 结论 | 证据 |
 |---|---|---|
+| FP8 union每SIMD两个wave（每wave 16行，或32行、两个wave分半步key，11-12） | 原型2539/2632ns/步，union 2013；去掉每步barrier仍慢13% | [原型](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md) |
+| Q量化并入FP8 union（读BF16 Q，任务收尾量化，11-12） | 逐bit相同，但union每层+35µs（+4.4%），超过pack省下的29.5µs | [A/B](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/qf_union_h12) |
+| Q量化CTA挪到K3的launch（11-12） | K3 +24µs、pack −29µs，每层净省5µs（0.3%） | [A/B](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/k3q_h12) |
+| K3b用二分查找残余块（11-12） | 受VALU限制，每层约70µs；改用LDS位图 | 迭代时控制台记录 |
+| K3b单独launch（11-12） | 多一次launch，并入K6 pack的launch | [A/B](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/fold_h12) |
+| 核心阈值θ：H12 0.4/0.6，H6 0.15/0.25，H3拆分（11-12） | +0.5%/+1.7%，持平/+1.9%，H3变慢 | [扫描](../../../../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md) |
 | FP8 exp近似（对数域，T = 8·S''+64后`v_cvt_pk_u8_f32`，11-12） | 未实现：上界实验（exp换成一条VALU）union只快5%，而权重有约6%的系统误差 | [exp_bound](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/exp_bound) |
 | FP8逐tile阈值1.7/2.4（H12真实层，11-12） | 1.7：真实层±0.5%（m12000 −3%）；2.4：慢2–6% | [ratio17_t](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/ratio17_t)、[ratio24_t](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/ratio24_t) |
 | FP8 direct一个wave算相邻两行（共享两行并集的块，11-12） | 相邻direct行两两合并可省17–30%字节，但要约340个寄存器（每SIMD一个wave）；流水化gather微基准每CU 4个wave只有约5.0TB/s（8个wave 6.2–6.8TB/s），省下的字节被带宽损失抵消，未实现 | [pair_share](../../../../../mytest/fp8/pair_share.py)、[gather_pipe](../../../../../mytest/mydata/qsa_fp8_opt2_20261111_01/README.md) |

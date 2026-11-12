@@ -73,22 +73,24 @@ Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/
 
 同一组合成输入（HK1、单请求）上比较完整调用：PyHIP BF16 K/V；PyHIP FP8 K/V的per tensor、per token（`compute="fp8"`）与per token反量化后走BF16（`compute="bf16"`）；SGLang原生QSA extend Triton（BF16，op test中的副本）；AITER [#7008](https://github.com/ROCm/aiter/pull/7008)的Triton sparse paged GQA（BF16与FP8 per token，K/V按64-token页顺序存放）。dense2048为2048行全是完整因果前缀（只走union），m12000与第1节相同（`make_case`，union与direct混合），random128k为128k上下文末尾4096行、各行独立随机选择（direct）。PyHIP计入口检查、计划查找、K1–K3和计算，Triton用预建参数只计launch。原cudaPerf、10组输入buffer、128samples、scope顺序轮转并正反交替；每次计时后逐bit比较实际输出，基准输出对CPU FP32参考行（FP8时用反量化后的K/V）：`.02/.02`，`compute="fp8"`用`test_attention_fp8.py`的范数相对误差上限（平均0.06、最大0.16）。入口检查GPU空闲（use≤5%、VRAM≤20%），采样前和结束时另存硬件快照；PyHIP的三个scope另测逐kernel耗时。
 
-PyHIP `7450c454`，MI308X，中位数µs，括号内为相对PyHIP BF16的加速比。PyHIP三列为11-12在GPU6测（[数据](../../mytest/mydata/qsa_fp8_opt2_20261111_01/bench_7450/summary.json)）；其余四列不经过PyHIP的FP8 kernel（FP8→BF16计算在入口反量化后走BF16路径），取11-11在GPU7同协议的测量（[数据](../../mytest/mydata/qsa_fp8_20261110_01/bench_b45a953/summary.json)），加速比按该次的PyHIP BF16计算（与本表的BF16相差不到0.5%）：
+PyHIP `fb7ac47b`，MI308X，中位数µs，括号内为相对PyHIP BF16的加速比；11-12在GPU7测，七列为同一次运行（[数据](../../mytest/mydata/qsa_fp8_opt3_20261112_01/bench_fb7a/summary.json)）：
 
 | 用例 | PyHIP BF16 | FP8 per tensor | FP8 per token | FP8→BF16计算 | SGLang Triton BF16 | AITER BF16 | AITER FP8 per token |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dense2048 TP2 | 195 | 138（1.41×） | 151（1.29×） | 221（0.88×） | 954（0.20×） | 2078（0.09×） | 2611（0.07×） |
-| dense2048 TP4 | 134 | 101（1.33×） | 109（1.24×） | 160（0.84×） | 933（0.14×） | 2076（0.06×） | 2605（0.05×） |
-| dense2048 TP8 | 131 | 77（1.70×） | 81（1.61×） | 157（0.83×） | 929（0.14×） | 2066（0.06×） | 2600（0.05×） |
-| m12000 TP2 | 2478 | 1751（1.42×） | 1872（1.32×） | 2579（0.96×） | 9729（0.25×） | 12646（0.20×） | 16084（0.15×） |
-| m12000 TP4 | 1856 | 1254（1.48×） | 1387（1.34×） | 1957（0.95×） | 9390（0.20×） | 12522（0.15×） | 15962（0.12×） |
-| m12000 TP8 | 1065 | 712（1.50×） | 785（1.36×） | 1166（0.91×） | 9345（0.11×） | 12439（0.09×） | 15858（0.07×） |
-| random128k TP2 | 1491 | 888（1.68×） | 918（1.63×） | 2305（0.65×） | 4181（0.36×） | 4691（0.32×） | 6012（0.25×） |
-| random128k TP4 | 1476 | 863（1.71×） | 893（1.65×） | 2285（0.64×） | 4149（0.35×） | 4647（0.32×） | 6001（0.24×） |
-| random128k TP8 | 1467 | 850（1.73×） | 879（1.67×） | 2282（0.64×） | 4153（0.35×） | 4642（0.31×） | 5971（0.24×） |
+| dense2048 TP2 | 196 | 141（1.39×） | 152（1.29×） | 222（0.88×） | 954（0.21×） | 2082（0.09×） | 2613（0.07×） |
+| dense2048 TP4 | 135 | 103（1.31×） | 110（1.22×） | 161（0.84×） | 933（0.14×） | 2070（0.07×） | 2605（0.05×） |
+| dense2048 TP8 | 132 | 78（1.69×） | 82（1.61×） | 158（0.84×） | 929（0.14×） | 2069（0.06×） | 2595（0.05×） |
+| m12000 TP2 | 2484 | 1722（1.44×） | 1834（1.35×） | 2583（0.96×） | 9736（0.26×） | 12653（0.20×） | 16105（0.15×） |
+| m12000 TP4 | 1857 | 1200（1.55×） | 1311（1.42×） | 1958（0.95×） | 9384（0.20×） | 12555（0.15×） | 15954（0.12×） |
+| m12000 TP8 | 1070 | 717（1.49×） | 790（1.35×） | 1170（0.91×） | 9345（0.11×） | 12446（0.09×） | 15868（0.07×） |
+| random128k TP2 | 1491 | 891（1.67×） | 921（1.62×） | 2306（0.65×） | 4164（0.36×） | 4694（0.32×） | 6027（0.25×） |
+| random128k TP4 | 1475 | 866（1.70×） | 896（1.65×） | 2290（0.64×） | 4135（0.36×） | 4651（0.32×） | 6006（0.25×） |
+| random128k TP8 | 1462 | 852（1.72×） | 880（1.66×） | 2280（0.64×） | 4149（0.35×） | 4634（0.32×） | 5993（0.24×） |
 
-- 有效TFLOPS（选中(query, token)对数×H×1024/时间，TP2）：PyHIP BF16/FP8 per tensor/FP8 per token在m12000为111.6/157.9/147.7T，random128k为69.2/116.1/112.4T，dense2048为132.3/186.8/171.3T。
-- 逐kernel（TP2，各kernel单独计时的中位数，µs）：m12000的K1–K3（recover_scatter 77、compact 27、order_masks 25）BF16与FP8相同；pack BF16 18，FP8 46（含Q量化）；union BF16 935，FP8 per tensor/per token 669/762；direct 1427 → 942/969。FP8的路由（`FP8_ROUTES`）与BF16不同，union、direct各自的行数不同，只有合计可比。random128k全部走direct：direct 1351 → 766/790，pack 90 → 66/71。dense2048全部走union：union 174 → 111/123，其余kernel BF16合计56、FP8 61（含gated的空direct约10）。
+- 有效TFLOPS（选中(query, token)对数×H×1024/时间，TP2）：PyHIP BF16/FP8 per tensor/FP8 per token在m12000为111.3/160.6/150.7T，random128k为69.2/115.8/112.0T，dense2048为131.6/183.4/169.4T。
+- 逐kernel（TP2，各kernel单独计时的中位数，µs）：m12000的K1–K3（recover_scatter 78、compact 29–31、order_masks 25–26）BF16与FP8相同；pack BF16 18，FP8 65/66（含Q量化与K3b）；union BF16 938，FP8 per tensor/per token 728/815；direct 1431 → 830/855。FP8的路由（`FP8_ROUTES`）与BF16不同，核心/残余拆分又把共享块从direct移到union，只有合计可比。random128k全部走direct：direct 1350 → 767/791，pack 92 → 67/71。dense2048全部走union：union 174 → 110/122，其余kernel BF16合计55、FP8 63（含gated的空direct约11）。
+- 合成用例的块号是打乱的、共享块均匀，K1跳过排序与核心/残余拆分（源码readme第5节11-12（续））在这里几乎不起作用；它们在SGLang导出的真实12k选择上起作用，见下一条。
+- 真实12k层（SGLang导出的TP0选择，n3073–n3084共12层；[ab_driver.py](../../mytest/fp8/ab_driver.py)在rocprofv3下逐kernel计时，取kernel合计；bf16/tensor/token按ABC CBA各跑两次取较小值；[数据](../../mytest/mydata/qsa_fp8_opt3_20261112_01/README.md)）：FP8相对BF16 per tensor H12/H6/H3为1.60×/1.75×/1.54×，per token 1.49×/1.60×/1.38×；12层合计BF16 31.4/21.9/12.5ms，FP8 per tensor 19.6/12.5/8.1ms，per token 21.1/13.7/9.0ms。
 - dense2048 TP8（H3）只有64个union任务，少于80个CU，FP8计划把长任务拆给两个CTA（源码readme 1.2.10 K5 split），所以加速比高于TP2/TP4。
 - 精度（各用例取最大，逐(行, head)范数相对误差的平均/最大）：PyHIP BF16 0.23%/0.29%；FP8 per tensor 3.74%/6.81%，per token 3.71%/6.46%；FP8→BF16计算0.33%/0.61%；SGLang Triton与AITER BF16 0.28%/0.40%；AITER FP8（kernel内转BF16计算）0.29%/0.43%。
 - AITER #7008的FP8 kernel比其BF16版本慢约27%（FP8→BF16转换和gfx942的FP8 tile）；`compute="bf16"`在入口反量化，random128k多一份128k上下文的BF16 K/V写读，慢于BF16 K/V直接调用。
@@ -276,7 +278,7 @@ SGLang `79d260a30`（QSA backend把目标层K/V转成FP8写池，PyHIP prefill�
 
 - 收益是容量：KV池token数增加89%，该配置可接受的最长输入由151034增至285306 token；1M配置（`--mem-fraction-static 0.95`）的KV池由1965312增至3712576 token。
 - 吞吐与BF16持平，各项在±0.75%以内（单轮之间BF16客户负载相差±0.1%、FP8 ±0.5%，bench_serving C1 ±1.5%）。FP8每步快约1–2%，抵消了random prompt上低1–2%的接受长度；接受长度的差别来自目标层K/V的FP8舍入（E4M3只有3位尾数，per token scale不减小相对误差）。FP8 prefill attention更快（第1节），但只占12k prefill的一小部分（客户负载TTFT −0.9%）。
-- GSM8K（1319题5-shot chat、最大16384 token、temperature 0）：BF16 KV 0.979/0.979（接受长度3.126/3.132），FP8目标KV + BF16 draft KV（PyHIP `7450c454`）0.976（3.134）；BF16 KV各次在0.976–0.982之间。
+- GSM8K（1319题5-shot chat、最大16384 token、temperature 0）：BF16 KV 0.979/0.979（接受长度3.126/3.132），FP8目标KV + BF16 draft KV（PyHIP `fb7ac47b`，11-12）0.978（3.133）；BF16 KV各次在0.976–0.982之间。
 - draft层（NEXTN）的KV保持BF16：draft层K有一个amax约90的离群通道（E4M3在64–128之间的间隔为8），draft层KV用FP8时GSM8K的接受长度由3.13降到2.90（−7%），目标层用FP8不影响。draft池（K、V各0.14GB）另从剩余显存分配，目标KV池仍为285312 token。
 - 写入与读取：QSA backend用一个Triton kernel（`store_qsa_kv_fp8`）把K/V转成FP8写池，4–64 token每层2.7–2.8µs，16384 token为14.0µs（BF16池13.5µs）；写入的字节与torch的转换相同，只有|x| ≥ 248的有限值饱和为±240（torch为NaN）。paged GQA读FP8时每层（12k上下文，T=4/16/32）为18.1/39.5/62.5µs，BF16为19.2/38.5/59.4µs。
 - 1M TEST=1（1M配置，FP8目标KV + BF16 draft KV，SGLang `79d260a30` + PyHIP `51a3ed7`）：38个请求（12k radix命中、24k、32并发约12k、9、100000、999648 token与1M的radix命中（884736 token命中））全部完成；每个rank 13个QSA层（12个目标层与draft层）各完成attention校验7878次，每层prefill indexer校验606次、decode/verify indexer 5078次，日志无异常。12个FP8层共14544个layout，FP8 MFMA相对fp8_query参考平均0.41%（最大0.98%），最差的(行, head)不超过5.85%；相对精确参考平均0.79%（最大1.82%）。
