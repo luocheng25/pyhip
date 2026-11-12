@@ -78,6 +78,9 @@ class SparsePlan:
     direct_meta: torch.Tensor | None = None
     direct_list: torch.Tensor | None = None
     direct_groups: int = 0
+    # FP8 plans: each tile's request start in the packed four-token blocks of the FP8 pack
+    # (packed_block_starts), where the FP8 union kernel reads V^T.
+    pack_starts: torch.Tensor | None = None
 
 
 def _ballot(pred):
@@ -1360,6 +1363,15 @@ def wide_tile_rows(query_tile: int) -> int:
     return math.ceil(query_tile * get_cu_num() * platform().wide_tiles_per_cu)
 
 
+def packed_block_starts(query_lens, prefix_lens):
+    """Each request's first block in the FP8 pack's four-token blocks of every request with
+    queries (a request's ceil(length / 4) blocks, in request order)."""
+    q_lens = np.asarray(query_lens, dtype=np.int64)
+    lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
+    blocks = np.where(q_lens > 0, -(-lengths // 4), 0)
+    return np.cumsum(blocks) - blocks
+
+
 def allocate_plan(
     *,
     inputs,
@@ -1464,6 +1476,9 @@ def allocate_plan(
         union_ratio=config.union_ratio,
         slotted=slotted,
     )
+    if fp8 is not None:
+        starts = packed_block_starts(inputs.query_lens, inputs.prefix_lens)
+        plan.pack_starts = upload(starts[request], inputs.q.device)
     if scratch:
         allocate_scratch(plan, scratch_specs(plan), inputs.q.device)
     return plan

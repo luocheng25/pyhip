@@ -18,14 +18,19 @@ and O, l and S'' follow.
 
 Phase t (64-key tile t; K and V^T double-buffered in 64 KiB LDS):
   Part 1  QK(t) [K slot t&1]; after QK MFMA FIX_AT tile t-1 is finished under the issued
-          MFMAs (membership masks unless every row keeps the tile whole, lazy max,
-          rescale), then P'(t-1) = exp2(S''(t-1)) (+ row sums per token); K(t+1) -> K slot
-          (t+1)&1; V(t), ids(t+2) and mask(t) loads; ids of t+1 by ds_bpermute. After QK
-          MFMA BAR_AT: lgkmcnt(0) + barrier, then the first V reads and the FP8 P' of
-          PV(t-1) under the last QK MFMAs.
-  Part 2  PV(t-1) [V slot (t-1)&1] || P' packs, S''(t) (scales, centering, row max),
-          row sums (per tensor), V(t) transpose -> V slot t&1; K(t+2) and scale(t+1) loads;
-          the first K reads of QK(t+1).
+          MFMAs (lazy max, rescale), then P'(t-1) = exp2(S''(t-1)) (+ row sums per token);
+          K(t+1) -> K slot (t+1)&1; V(t), ids(t+2) and mask(t) loads; V block ids of t+1
+          by v_readlane, K and scale ids by ds_bpermute. After QK MFMA BAR_AT: lgkmcnt(0)
+          + barrier, then the first V reads and the FP8 P' of PV(t-1) under the last QK
+          MFMAs.
+  Part 2  PV(t-1) [V slot (t-1)&1] || P' packs, S''(t) (scales, centering), row sums (per
+          tensor); V(t) -> V slot t&1 interleaved with S''(t)'s membership masks (every
+          tile, branch free: whole tiles keep every bit) and its masked row max; K(t+2) and
+          scale(t+1) loads; the first K reads of QK(t+1).
+
+V^T comes from the FP8 pack of the direct plan (sparse_prefill_direct_fp8: four-token
+blocks, V^T per block), so it needs no transpose: a wave loads its four blocks of a tile
+(16 bytes per lane: four dims of a block's four tokens) and writes one 16-byte chunk per dim.
 
 The grid is persistent: a CTA prefetches its next task's ids, masks, Q, K(0..2), V(0) and
 scales under the current task's epilogue and output, and reads the task order with scalar
@@ -59,6 +64,7 @@ __all__ = ["run", "launcher"]
 
 BM, BN, D, THREADS = 128, 64, 256, 256
 SLOT = BN * D  # one FP8 K or V^T tile
+PACK_BLOCK = 4 * D  # one four-token block of one KV head in the FP8 pack (PV)
 LDS_BYTES = 4 * SLOT  # K slots 0/1, V^T slots 0/1
 V0 = 2 * SLOT
 LOG2E = math.log2(math.e)
@@ -74,7 +80,7 @@ SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
 # Pipeline placement (MI308X): K/V LDS reads issued KPRE/VPRE MFMAs ahead, the Part 1 barrier
 # after QK MFMA BAR_AT, VALU steps per Part 1 / Part 2 MFMA (P1 / P2, TAIL after the barrier),
 # MFMAs per K(t+1) write and steps per V(t) write.
-KPRE, VPRE, BAR_AT, P1, TAIL, P2, KW_GAP, SPREAD = 4, 4, 27, 1, 3, 5, 3, 3
+KPRE, VPRE, BAR_AT, P1, TAIL, P2, KW_GAP, SPREAD = 4, 4, 27, 1, 3, 4, 3, 4
 FIX_AT = 1  # Part 1 finishes tile t-1 after this QK MFMA
 K_ORDER = tuple((b, c) for c in range(8) for b in range(2))
 
@@ -263,8 +269,9 @@ def _cvt_fp8(values):
 
 # ---- LDS layouts ----
 # K tile: key-major rows of 256 bytes, 16-byte chunks XOR-swizzled by the key.
-# V^T tile: dim-major rows of 64 key bytes; rows pair-swapped, chunks and 8-byte words
-# swizzled so the b64 transpose writes and the b128 operand reads are conflict free.
+# V^T tile: dim-major rows of 64 key bytes; rows pair-swapped and chunks swizzled so the b128
+# writes (lanes over dims) and the b128 operand reads (lanes over dims) are conflict free.
+# Chunk 2h + q of a dim holds the tokens of blocks 8q + h + 0, 2, 4, 6 (PV K-steps 2q, 2q + 1).
 
 
 def _swz_k(key):
@@ -281,10 +288,6 @@ def _vt_chunk(d, chunk):
     return row * 64 + ((chunk ^ sig) << 4)
 
 
-def _vt_offset(d, chunk, word):
-    return _vt_chunk(d, chunk) + ((word ^ ((d >> 5) & 1)) << 3)
-
-
 def _k_read(env, slot, b, c):
     """K operand words of keys 32b + lane, dims 32c + 16h .. + 15."""
     return _load_lds(env.lds, env.k_addr[c], slot * SLOT + 8192 * b)
@@ -293,16 +296,12 @@ def _k_read(env, slot, b, c):
 def _v_read(env, slot, mb, q):
     """V^T operand of dims 32mb + lane: words of PV K-steps 2q, 2q + 1 in order."""
     if isinstance(slot, int):
-        w = _load_lds(
+        return _load_lds(
             env.lds, env.v_addr[(mb >> 1) & 1][q], V0 + slot * SLOT + 2048 * mb
         )
-    else:
-        w = _load_lds(
-            env.lds, env.v_addr[(mb >> 1) & 1][q] + slot * SLOT, V0 + 2048 * mb
-        )
-    if mb & 1:
-        return fx.Vector.from_elements([w[2], w[3], w[0], w[1]], fx.Int32)
-    return w
+    return _load_lds(
+        env.lds, env.v_addr[(mb >> 1) & 1][q] + slot * SLOT, V0 + 2048 * mb
+    )
 
 
 # ---- Global loads ----
@@ -335,27 +334,6 @@ def _mask_words(env, words):
     return [env.valid.select(fx.Int32(w) >> shift, fx.Int32(-1)) for w in words]
 
 
-def _full_flag(env, words):
-    """1 when every row of the wave keeps all 64 keys of the tile (the phase skips masking)."""
-    ok = (
-        (fx.Int32(words[0]) | env.foreign_bits)
-        & (fx.Int32(words[1]) | env.foreign_bits)
-    ) == -1
-    partial = ~(ok | ~env.valid)
-    ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, partial.ir_value()))
-    return (ballot == fx.Int64(0)).select(fx.Int32(1), fx.Int32(0))
-
-
-def _apply_masks(env, vals, words):
-    ws = _mask_words(env, words)
-    out = [_masked(vals[k], _keep(ws, k // 16, k % 16)) for k in range(32)]
-    level = out
-    while len(level) > 1:
-        level = [_maximum(level[i], level[i + 1]) for i in range(0, len(level), 2)]
-    local = level[0]
-    return fx.Vector.from_elements(out, fx.Float32), local, local.shuffle_xor(32, 64)
-
-
 def _keep(words, b, i):
     """0 / -1 membership of value (b, i) (signed bit extraction)."""
     position = 16 * ((i >> 2) & 1) + 8 * b + (i & 3)
@@ -368,26 +346,39 @@ def _masked(value, keep):
     return _as_f32((bits & keep) | ((~keep) & fx.Int32(NEG_INF)))
 
 
+def _load_lidl(env, t):
+    """Request-local block of slot (lane & 15) of key tile t (with a slot table; otherwise
+    _load_idl already reads request-local blocks)."""
+    return _buffer_words(env.gvids, (_min(t, env.last) * 16 + (env.lane & 15)) * 4, 1)[
+        0
+    ]
+
+
+def _vids(env, lidl):
+    """The wave's V blocks of a key tile, slots vslot + 0, 2, 4, 6 of its request-local ids
+    (lane s holds slot s): v_readlane, so no scalar load shares the LDS counter. Slots past
+    the list read block 0, whose keys every row masks."""
+    return tuple(
+        _uniform(
+            fx.Int32(
+                rocdl.readlane(
+                    fx.Int32.ir_type,
+                    fx.Int32(lidl).ir_value(),
+                    (env.vslot + 2 * j).ir_value(),
+                )
+            )
+        )
+        for j in range(4)
+    )
+
+
 def _gen_v_loads(env, vids, out):
-    """V rows of blocks vj and vj + 2: token rows of 8 bytes, dims 8g .. 8g + 7."""
-    rows = [vids[b] * (4 * env.tok_bytes) + env.g * 8 for b in range(2)]
-    if env.slotted:
-        # The final partial block's later pool rows belong to no token: read 0 (their P' is 0,
-        # but stale bytes may be NaN).
-        limits = [
-            (vids[b] == env.final).select(env.tail_len, fx.Int32(4)) for b in range(2)
-        ]
-    for b in range(2):
-        for tok in range(4):
-            offset = rows[b] + tok * env.tok_bytes
-            if env.slotted and tok > 0:
-                offset = (limits[b] > tok).select(offset, env.kv_oob)
-            out.append(_buffer_words(env.gv, offset, 2))
-            yield
-    # Both block addresses stay live through the loads: a load whose destination reuses an
-    # earlier load's address VGPR waits until that load read its address.
-    for r in rows:
-        llvm.inline_asm(None, [fx.Int32(r).ir_value()], "", "v", has_side_effects=True)
+    """The wave's four V blocks from the FP8 pack (V^T per block, 16 bytes per lane): dims
+    4 * lane .. + 3 of each block's four tokens (tokens past a request's end are 0)."""
+    for vid in vids:
+        offset = (env.pstart + vid) * env.pv_step + env.v_lane
+        out.append(_buffer_words(env.gpv, offset, 4))
+        yield
 
 
 def _gen_k_loads(env, kid, out):
@@ -444,34 +435,12 @@ def _gen_k_writes(env, kdata, slot, gap=1):
             yield
 
 
-def _gen_transpose(w, out):
-    """w[t] holds bytes (d0..d3) of token t; appends o[d] holding bytes (t0..t3)."""
-    x_lo = _perm(w[1], w[0], 0x05010400)
-    yield
-    x_hi = _perm(w[1], w[0], 0x07030602)
-    yield
-    y_lo = _perm(w[3], w[2], 0x05010400)
-    yield
-    y_hi = _perm(w[3], w[2], 0x07030602)
-    yield
-    for lo, hi in ((x_lo, y_lo), (x_hi, y_hi)):
-        out.append(_perm(hi, lo, 0x05040100))
-        yield
-        out.append(_perm(hi, lo, 0x07060302))
-        yield
-
-
 def _gen_v_writes(env, vdata, slot, spread):
-    vt = []
-    for b in range(2):
-        cols = []
-        for half in range(2):
-            yield from _gen_transpose(
-                [vdata[4 * b + tok][half] for tok in range(4)], cols
-            )
-        vt.append(cols)
-    for dd in range(8):
-        _write_lds(env.lds, env.v_wbase[dd] + V0 + slot * SLOT, (vt[0][dd], vt[1][dd]))
+    """V^T rows of the lane's four dims: per dim one 16-byte chunk, the four tokens of each of
+    the wave's blocks (word j of the pack loads holds dim 4 * lane + j)."""
+    for j in range(4):
+        words = [fx.Vector(vdata[b])[j] for b in range(4)]
+        _write_lds(env.lds, env.v_wbase[j] + V0 + slot * SLOT, words)
         for _ in range(spread):
             yield
 
@@ -481,14 +450,15 @@ def _gen_v_writes(env, vdata, slot, spread):
 
 def _gen_part1(env, s_prev, rsv, res):
     """P'(t-1) = exp2(S''(t-1)); per token the row sum of P' / v_scale, a value's term
-    trailing its exp by one step."""
+    trailing its exp by two steps (a DPP instruction reading the previous VALU's result
+    needs two wait states)."""
     p, sums = [None] * 32, [None, None]
     res["p"] = p
-    for i in range(33):
+    for i in range(34 if env.per_token else 33):
         if i < 32:
             p[i] = _exp(s_prev[i])
-        if env.per_token and i > 0:
-            k = i - 1
+        if env.per_token and i > 1:
+            k = i - 2
             term = p[k] * _bcast(rsv[k // 16], k % 16)
             sums[k & 1] = term if sums[k & 1] is None else sums[k & 1] + term
         yield
@@ -519,9 +489,22 @@ def _gen_pack(p, s, pw):
     pw[s] = words
 
 
+def _interleave(*gens):
+    """One step of each generator in turn until all are done."""
+    live = list(gens)
+    while live:
+        for gen in list(live):
+            try:
+                next(gen)
+            except StopIteration:
+                live.remove(gen)
+                continue
+            yield
+
+
 def _gen_part2(env, ctx):
-    """P' K-steps 1-3; S''(t) = S * c - m (speculative, m of t-1) with the scales and mask,
-    its running row max; row sums (per tensor); V(t) -> LDS; the lazy-max ballot."""
+    """P' K-steps 1-3; S''(t) = S * c - m (speculative, m of t-1) with the scales, its
+    membership masks and masked row max; row sums (per tensor); V(t) -> LDS."""
     p, pw = ctx["p"], ctx["pw"]
     c_scale, neg = env.c_scale, ctx["neg"]
     sums = [None, None]
@@ -539,16 +522,35 @@ def _gen_part2(env, ctx):
             yield
 
     def gen_center(lo, hi, vals, part):
+        if env.per_token:
+            # A DPP instruction reading a VGPR the previous VALU wrote needs two wait states
+            # (any VGPR operand): the log2(v_scale) add of a value trails its FMA by one value.
+            xs = {}
+            for k in range(lo, hi + 1):
+                if k < hi:
+                    b, i = divmod(k, 16)
+                    v = ctx["s_acc"][b][i] * _bcast(ctx["sk"][b], i)
+                    xs[k] = _fma(v, c_scale, neg)
+                    yield
+                if k > lo:
+                    kk = k - 1
+                    b, i = divmod(kk, 16)
+                    vals[kk] = xs.pop(kk) + _bcast(terms[b], i)
+                    yield
+            return
         for k in range(lo, hi):
             b, i = divmod(k, 16)
-            v = ctx["s_acc"][b][i]
-            if env.per_token:
-                v = v * _bcast(ctx["sk"][b], i)
-            x = _fma(v, c_scale, neg)
-            if env.per_token:
-                yield
-                x = x + _bcast(terms[b], i)
-            vals[k] = x
+            vals[k] = _fma(ctx["s_acc"][b][i], c_scale, neg)
+            yield
+
+    def gen_mask_max(part):
+        # Membership masks of every tile (whole tiles keep all bits), then the masked row
+        # max: no masked branch at the next phase's fix-up.
+        ws = _mask_words(env, ctx["mask"])
+        yield
+        for k in range(32):
+            b, i = divmod(k, 16)
+            vals[k] = _masked(vals[k], _keep(ws, b, i))
             yield
             if k % 2 == 1:
                 a, c = vals[k - 1], vals[k]
@@ -567,15 +569,17 @@ def _gen_part2(env, ctx):
         yield from gen_sum(0, 16)
     yield from _gen_pack(p, 2, pw)
     yield from gen_center(16, 32, vals, part)
-    local = part[0]
-    other = local.shuffle_xor(32, 64)
-    yield
     if not env.per_token:
         yield from gen_sum(16, 32)
         _hold(*sums)
         yield
     yield from _gen_pack(p, 3, pw)
-    yield from _gen_v_writes(env, ctx["vdata"], ctx["cur"], SPREAD)
+    yield from _interleave(
+        _gen_v_writes(env, ctx["vdata"], ctx["cur"], SPREAD), gen_mask_max(part)
+    )
+    local = part[0]
+    other = local.shuffle_xor(32, 64)
+    yield
     ctx.update(s_cur=vals, local=local, other=other, rsv=terms[2:])
     if not env.per_token:
         ctx["sum"] = sums[0] + sums[1]
@@ -655,13 +659,12 @@ def _part1(env, st, t, cur, prev, fixup):
         yield from kgen
         yield from vgen
         mem["idl2"] = _load_idl(env, t + 2)
+        mem["lidl2"] = _load_lidl(env, t + 2) if env.slotted else fx.Int32(0)
         yield
         mem["mask"] = _load_mask(env, t)
         yield
+        mem["vids"] = _vids(env, st["lidl1"] if env.slotted else st["idl1"])
         idl1 = _fix_ids(env, st["idl1"], t + 1)
-        mem["vids"] = (_bperm(idl1, env.vj),)
-        yield
-        mem["vids"] += (_bperm(idl1, env.vj + 2),)
         yield
         mem["sids"] = (_bperm(idl1, env.sj),)
         yield
@@ -727,6 +730,7 @@ def _part2(env, st, res, s_acc, mem, pw, vreads, t, cur, prev):
         sk=st["sk"],
         sv=st["sv"],
         vdata=mem["vdata"],
+        mask=mem["mask"],
         fresh=fresh,
         neg=fresh.select(fx.Float32(0.0), fx.Float32(0.0) - m_run),
         cur=cur,
@@ -872,9 +876,8 @@ def _lane_env(lds, per_token, slotted, hk):
     tid = fx.Int32(fx.thread_idx.x)
     wave, lane = _uniform(tid >> 6), tid & 63
     n, h = lane & 31, lane >> 5
-    g, pair = tid & 31, tid >> 5
-    vs_, vh = pair >> 1, pair & 1
-    vchunk = vh * 2 + (vs_ >> 1)
+    # V^T writes: wave (q, h) = (wave >> 1, wave & 1) fills chunk 2h + q of every dim.
+    vq, vh = wave >> 1, wave & 1
     key, kpart, flip = tid >> 2, tid & 3, (tid >> 4) & 1
     k_chunks = [((fx.Int32(i) ^ flip) << 2) + kpart for i in range(4)]
     return dict(
@@ -895,14 +898,14 @@ def _lane_env(lds, per_token, slotted, hk):
             [_vt_chunk(n + 64 * hi, 2 * h + q) - 4096 * hi for q in range(2)]
             for hi in range(2)
         ],
-        v_wbase=[_vt_offset(g * 8 + dd, vchunk, vs_ & 1) for dd in range(8)],
+        v_wbase=[_vt_chunk(4 * lane + j, 2 * vh + vq) for j in range(4)],
+        vslot=8 * vq + vh,
+        v_lane=(lane & 3) * 256 + (lane >> 2) * 16,
         k_wbase=[key * 256 + ((k_chunks[i] ^ _swz_k(key)) << 4) for i in range(4)],
         k_goff=[k_chunks[i] * 16 for i in range(4)],
         ktok=key & 3,
         kblk=tid >> 4,
-        vj=vs_ * 4 + vh,
         sj=2 * ((lane & 15) >> 2) + h,
-        g=g,
     )
 
 
@@ -940,10 +943,11 @@ def _task_scalars(T, mapped, enabled, HK, BQ, GP, slotted):
         kv_len=on.select(_sload(T.META, tile_id * 5 + 3), fx.Int32(0)),
         count=on.select(_sload(T.COUNTS, tile_id), fx.Int32(0)),
         tail=_sload(T.TAILS, tile_id) if slotted else fx.Int32(-1),
+        pstart=_sload(T.PSTARTS, tile_id),
     )
 
 
-def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, BQ, GP):
+def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
     """One task's rows, key list and buffers from its scalars."""
     group = H // HK
     tile_id, hkv, row_offset = sc["tile_id"], sc["hkv"], sc["row_offset"]
@@ -963,6 +967,7 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, BQ, GP):
     q_base = fx.Int64(q0) * H + hkv * group
     q8_extent = q_rows * D
     q8_oob = fx.Int32(q8_extent)
+    pv_extent = fx.Uint32(PACKED) * HK * PACK_BLOCK - hkv * PACK_BLOCK
     tok_bytes = lane["tok_bytes"]
     if fx.const_expr(lane["slotted"]):
         kv_extent = fx.Uint32(POOL) * HK * D - hkv * D
@@ -987,6 +992,25 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, BQ, GP):
             fx.make_view(fx.get_iter(T.BLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1)),
             count * 4,
         ),
+        # Without a slot table the block list is already request-local.
+        gvids=(
+            _buffer(
+                fx.make_view(
+                    fx.get_iter(T.LBLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1)
+                ),
+                count * 4,
+            )
+            if lane["slotted"]
+            else None
+        ),
+        gpv=_buffer(
+            fx.make_view(
+                fx.get_iter(T.PV) + hkv * PACK_BLOCK, fx.make_layout(pv_extent, 1)
+            ),
+            pv_extent,
+        ),
+        pstart=sc["pstart"],
+        pv_step=HK * PACK_BLOCK,
         gmask=_buffer(
             fx.make_view(
                 fx.get_iter(T.MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
@@ -1042,15 +1066,18 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, BQ, GP):
         group=group,
         heads=H,
     )
+    if env.gvids is None:
+        env.gvids = env.gblocks
     return env
 
 
 def _prefetch_ids(env):
     """Ids and masks of tiles 0-2, FP8 Q words and the q scale of a task."""
+    idl = [_load_idl(env, fx.Int32(i)) for i in range(3)]
     return dict(
-        idl=[_load_idl(env, fx.Int32(i)) for i in range(3)],
+        idl=idl,
+        lidl=([_load_lidl(env, fx.Int32(i)) for i in range(3)] if env.slotted else idl),
         w0=_load_mask(env, fx.Int32(0)),
-        w1=_load_mask(env, fx.Int32(1)),
         q8=[_buffer_words(env.gq8, env.q8_lane + 32 * c, 4) for c in range(8)],
         qs=_as_f32(_buffer_words(env.gqs, env.qs_lane, 1)[0]),
     )
@@ -1060,8 +1087,8 @@ def _prefetch_kv(env, a):
     """K(0..2), V(0) and scales(0..1) of a task once its ids landed."""
     fixed = [_fix_ids(env, a["idl"][i], fx.Int32(i)) for i in range(3)]
     kids = [_bperm(fixed[i], env.kblk) for i in range(3)]
-    vids0 = (_bperm(fixed[0], env.vj), _bperm(fixed[0], env.vj + 2))
-    vids1 = (_bperm(fixed[1], env.vj), _bperm(fixed[1], env.vj + 2))
+    vids0 = _vids(env, a["lidl"][0])
+    vids1 = _vids(env, a["lidl"][1])
     sids = [(_bperm(fixed[i], env.sj), _bperm(fixed[i], env.sj + 8)) for i in range(2)]
     vdata, k0w, k1w, k2w, sc0, sc1 = [], [], [], [], [], []
     _drain(_gen_v_loads(env, vids0, vdata))
@@ -1075,8 +1102,9 @@ def _prefetch_kv(env, a):
 
 def _pack_pre(a, b):
     """The loop-carried prefetch of the next task as six vectors."""
-    misc = [_as_i32(a["qs"]), *a["w0"], *a["w1"], a["idl"][2], *b["vids1"]]
+    misc = [_as_i32(a["qs"]), *a["w0"], a["idl"][2]]
     misc += [_as_i32(x) for x in b["sc0"] + b["sc1"]]
+    misc += [*b["vids1"], a["lidl"][2]]
     words = [w[j] for w in a["q8"] for j in range(4)]
     return (
         fx.Vector.from_elements([fx.Int32(w) for w in words], fx.Int32),
@@ -1084,7 +1112,7 @@ def _pack_pre(a, b):
         fx.Vector.from_elements(b["k0"], fx.Int32),
         fx.Vector.from_elements(b["k1"], fx.Int32),
         fx.Vector.from_elements(b["k2"], fx.Int32),
-        fx.Vector.from_elements([w[j] for w in b["vdata"] for j in range(2)], fx.Int32),
+        fx.Vector.from_elements([w[j] for w in b["vdata"] for j in range(4)], fx.Int32),
     )
 
 
@@ -1097,17 +1125,17 @@ def _unpack_pre(q8, misc, k0, k1, k2, v0):
         ],
         qs=_as_f32(misc[0]),
         w0=(misc[1], misc[2]),
-        w1=(misc[3], misc[4]),
-        idl2=misc[5],
-        vids1=(misc[6], misc[7]),
-        sc0=[_as_f32(misc[8 + i]) for i in range(4)],
-        sc1=[_as_f32(misc[12 + i]) for i in range(4)],
+        idl2=misc[3],
+        sc0=[_as_f32(misc[4 + i]) for i in range(4)],
+        sc1=[_as_f32(misc[8 + i]) for i in range(4)],
+        vids1=tuple(_uniform(misc[12 + j]) for j in range(4)),
+        lidl2=misc[16],
         k0=[fx.Vector(k0)[i] for i in range(16)],
         k1=[fx.Vector(k1)[i] for i in range(16)],
         k2=fx.Vector(k2),
         vdata=[
-            fx.Vector.from_elements([v0[2 * i], v0[2 * i + 1]], fx.Int32)
-            for i in range(8)
+            fx.Vector.from_elements([v0[4 * i + j] for j in range(4)], fx.Int32)
+            for i in range(4)
         ],
     )
 
@@ -1128,6 +1156,9 @@ def _task(
     TAILS,
     ORDER,
     ACTIVE,
+    PV,
+    LBLOCKS,
+    PSTARTS,
     lds,
     mapped,
     work,
@@ -1144,6 +1175,7 @@ def _task(
     NQ: fx.Int32,
     CAP: fx.Int32,
     POOL: fx.Int32,
+    PACKED: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
     SCALE: fx.Constexpr[float],
@@ -1165,6 +1197,9 @@ def _task(
         MEMBERS=MEMBERS,
         COUNTS=COUNTS,
         TAILS=TAILS,
+        PV=PV,
+        LBLOCKS=LBLOCKS,
+        PSTARTS=PSTARTS,
     )
     lane = _lane_env(lds, PER_TOKEN, SLOTTED, HK)
     env = _task_env(
@@ -1176,6 +1211,7 @@ def _task(
         NQ,
         CAP,
         POOL,
+        PACKED,
         BQ,
         GP,
     )
@@ -1211,15 +1247,12 @@ def _task(
             s_cur,
             ninf,
             ninf,
-            fx.Int32(1),
-            fx.Int32(-1),
-            fx.Int32(-1),
             row_max,
             fx.Float32(0.0),
         )
         + zeros
         + (rsv0[0], rsv0[1], sc1[0], sc1[1], sc1[2], sc1[3])
-        + (pre["k2"], pre["vids1"][0], pre["vids1"][1], pre["idl2"])
+        + (pre["k2"], *pre["vids1"], pre["idl2"], pre["lidl2"])
         + tuple(kpre)
         + tuple(fx.Vector.filled(4, 0, fx.Int32) for _ in range(4 - KPRE))
     )
@@ -1248,101 +1281,12 @@ def _task(
             m_run = fresh.select(fx.Float32(0.0), m_run) + delta
         return (*o, row_sum, s_cur, m_run)
 
-    @flyc.jit
-    def mask_tile(
-        v0,
-        v1,
-        v2,
-        v3,
-        v4,
-        v5,
-        v6,
-        v7,
-        v8,
-        v9,
-        v10,
-        v11,
-        v12,
-        v13,
-        v14,
-        v15,
-        v16,
-        v17,
-        v18,
-        v19,
-        v20,
-        v21,
-        v22,
-        v23,
-        v24,
-        v25,
-        v26,
-        v27,
-        v28,
-        v29,
-        v30,
-        v31,
-        local,
-        other,
-        full,
-        mw0,
-        mw1,
-    ):
-        """Membership masks of a tile some row does not keep whole (wave-uniform branch): the
-        masked S'' and its row max; whole tiles pass through."""
-        vals = [
-            fx.Float32(v)
-            for v in (
-                v0,
-                v1,
-                v2,
-                v3,
-                v4,
-                v5,
-                v6,
-                v7,
-                v8,
-                v9,
-                v10,
-                v11,
-                v12,
-                v13,
-                v14,
-                v15,
-                v16,
-                v17,
-                v18,
-                v19,
-                v20,
-                v21,
-                v22,
-                v23,
-                v24,
-                v25,
-                v26,
-                v27,
-                v28,
-                v29,
-                v30,
-                v31,
-            )
-        ]
-        vec = fx.Vector.from_elements(vals, fx.Float32)
-        local, other = fx.Float32(local), fx.Float32(other)
-        if fx.Int32(full) == 0:
-            vec, local, other = _apply_masks(env, vals, (mw0, mw1))
-        return vec, local, other
-
-    def finish(s_prev, local, other, full, mw0, mw1, m_run, l_run, o):
-        """Tile t-1's membership masks, lazy max and rescale of O, l and its S''."""
-        s_prev = fx.Vector(s_prev)
-        vec, local, other = mask_tile(
-            *[s_prev[i] for i in range(32)], local, other, full, mw0, mw1
-        )
+    def finish(s_prev, local, other, m_run, l_run, o):
+        """Tile t-1's lazy max and rescale of O, l and its S'' (Part 2 masked it)."""
         m_run = fx.Float32(m_run)
-        ballot = _lazy_ballot(vec, local, other, m_run == fx.Float32(_MAX_FLOOR))
+        ballot = _lazy_ballot(s_prev, local, other, m_run == fx.Float32(_MAX_FLOOR))
         *o, l_run, s_prev, m_run = rescale(
-            *o, l_run, fx.Vector(vec), m_run, ballot["tile_max"], ballot["ballot"]
+            *o, l_run, fx.Vector(s_prev), m_run, ballot["tile_max"], ballot["ballot"]
         )
         return dict(o=o, l_run=l_run, s_prev=s_prev, m_run=m_run)
 
@@ -1351,9 +1295,6 @@ def _task(
         s_prev,
         local_prev,
         other_prev,
-        full_prev,
-        mwp0,
-        mwp1,
         m_run,
         l_run,
         o0,
@@ -1373,7 +1314,10 @@ def _task(
         kflat,
         vid0,
         vid1,
+        vid2,
+        vid3,
         idl1,
+        lidl1,
         kp0,
         kp1,
         kp2,
@@ -1389,8 +1333,9 @@ def _task(
             sk=[fx.Float32(skc0), fx.Float32(skc1)],
             sv=[fx.Float32(svc0), fx.Float32(svc1)],
             kdata=[kflat[i] for i in range(16)],
-            vids=(fx.Int32(vid0), fx.Int32(vid1)),
+            vids=tuple(_uniform(fx.Int32(v)) for v in (vid0, vid1, vid2, vid3)),
             idl1=fx.Int32(idl1),
+            lidl1=fx.Int32(lidl1),
             kpre=[fx.Vector(x) for x in (kp0, kp1, kp2, kp3)[:KPRE]],
         )
         t = fx.Int32(t)
@@ -1400,9 +1345,6 @@ def _task(
                 s_prev,
                 local_prev,
                 other_prev,
-                full_prev,
-                mwp0,
-                mwp1,
                 m_run,
                 l_run,
                 o_in,
@@ -1419,9 +1361,6 @@ def _task(
             fx.Vector.from_elements(ctx["s_cur"], fx.Float32),
             ctx["local"],
             ctx["other"],
-            _full_flag(env, mem["mask"]),
-            mem["mask"][0],
-            mem["mask"][1],
             fixed["m_run"],
             row_sum,
             *o,
@@ -1432,9 +1371,9 @@ def _task(
             sc[2],
             sc[3],
             fx.Vector.from_elements(out["kdata"], fx.Int32),
-            mem["vids"][0],
-            mem["vids"][1],
+            *mem["vids"],
             mem["idl2"],
+            mem["lidl2"],
             *kpre,
             *pads,
         )
@@ -1448,15 +1387,15 @@ def _task(
 
     # ---- Epilogue and output; the next slot's loads issue under them ----
     next_scalars = _task_scalars(T, next_mapped, next_enabled, HK, BQ, GP, SLOTTED)
-    nenv = _task_env(lane, T, next_scalars, H, HK, NQ, CAP, POOL, BQ, GP)
+    nenv = _task_env(lane, T, next_scalars, H, HK, NQ, CAP, POOL, PACKED, BQ, GP)
     a = _prefetch_ids(nenv)
-    last = finish(*state[:8], state[8:16])
+    last = finish(*state[:5], state[5:13])
     o, l_run = _epilogue(
         env,
         last["s_prev"],
         last["l_run"],
         last["o"],
-        [fx.Float32(state[16]), fx.Float32(state[17])],
+        [fx.Float32(state[13]), fx.Float32(state[14])],
     )
     b = _prefetch_kv(nenv, a)
     total = l_run + l_run.shuffle_xor(32, 64)
@@ -1486,11 +1425,15 @@ def _kernel(
     TAILS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
+    PV: fx.Tensor,
+    LBLOCKS: fx.Tensor,
+    PSTARTS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
     CAP: fx.Int32,
     POOL: fx.Int32,
+    PACKED: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
@@ -1518,6 +1461,9 @@ def _kernel(
         MEMBERS=MEMBERS,
         COUNTS=COUNTS,
         TAILS=TAILS,
+        PV=PV,
+        LBLOCKS=LBLOCKS,
+        PSTARTS=PSTARTS,
     )
     per_tile = HK * ((BQ * GP + 127) // 128)
     limit = ((TASKS + GRID - 1) // GRID) * GRID
@@ -1532,6 +1478,7 @@ def _kernel(
         NQ,
         CAP,
         POOL,
+        PACKED,
         BQ,
         GP,
     )
@@ -1553,6 +1500,9 @@ def _kernel(
             TAILS,
             ORDER,
             ACTIVE,
+            PV,
+            LBLOCKS,
+            PSTARTS,
             lds,
             mapped,
             work,
@@ -1564,6 +1514,7 @@ def _kernel(
             NQ,
             CAP,
             POOL,
+            PACKED,
             BQ,
             GP,
             SCALE,
@@ -1590,11 +1541,15 @@ def _launch(
     TAILS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
+    PV: fx.Tensor,
+    LBLOCKS: fx.Tensor,
+    PSTARTS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
     CAP: fx.Int32,
     POOL: fx.Int32,
+    PACKED: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
@@ -1620,11 +1575,15 @@ def _launch(
             TAILS,
             ACTIVE,
             ORDER,
+            PV,
+            LBLOCKS,
+            PSTARTS,
             H,
             HK,
             NQ,
             CAP,
             POOL,
+            PACKED,
             BQ,
             GP,
             TASKS,
@@ -1740,8 +1699,9 @@ def quantize_launcher(q):
     return lambda q, q8, qs: compiled(q, q8, qs, rows, stream)
 
 
-def _args(inputs, plan, out, stream):
-    # Slot-table plans read K/V through K3's pool block table, addressed from the pool's base.
+def _args(inputs, plan, packed, out, stream):
+    # Slot-table plans read K through K3's pool block table, addressed from the pool's base;
+    # V^T comes from the FP8 pack of the direct plan (packed), by request-local block ids.
     k_scale, v_scale = inputs.k_scale, inputs.v_scale
     return (
         inputs.q8.view(-1),
@@ -1758,11 +1718,15 @@ def _args(inputs, plan, out, stream):
         plan.tails if plan.slotted else plan.counts,
         plan.active,
         plan.task_order,
+        packed.packed_value,
+        plan.blocks.view(-1),
+        plan.pack_starts,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
         plan.block_capacity,
         inputs.k.shape[0],
+        packed.packed_blocks,
         plan.query_tile,
         plan.group_padded,
         plan.num_tiles
@@ -1779,13 +1743,13 @@ def _args(inputs, plan, out, stream):
 def _compiled(inputs, args, stream):
     key = (
         inputs.q.device,
-        args[14],
-        args[15],
-        args[19],
-        args[20],
+        args[17],
+        args[18],
         args[23],
         args[24],
-        args[25],
+        args[27],
+        args[28],
+        args[29],
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
@@ -1793,30 +1757,31 @@ def _compiled(inputs, args, stream):
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:22], 0, *args[23:26], stream
+                _launch, *args[:26], 0, *args[27:30], stream
             )
     return compiled
 
 
-def run(*, inputs, plan, out):
-    """FP8 union attention. inputs adds k_scale / v_scale (FP32 [N, HK] per token or [1]) and
-    the FP8 Q of quantize_q (inputs.q8 / inputs.qs)."""
+def run(*, inputs, plan, packed, out):
+    """FP8 union attention after the FP8 pack of the direct plan packed (its V^T). inputs adds
+    k_scale / v_scale (FP32 [N, HK] per token or [1]) and the FP8 Q of quantize_q
+    (inputs.q8 / inputs.qs)."""
     if plan.num_tiles == 0:
         return
     stream = torch.cuda.current_stream(inputs.q.device)
-    args = _args(inputs, plan, out, stream)
+    args = _args(inputs, plan, packed, out, stream)
     with torch.cuda.device(inputs.q.device):
         _compiled(inputs, args, stream)(*args)
 
 
-def launcher(*, inputs, plan, out):
+def launcher(*, inputs, plan, packed, out):
     """launch(q8, qs, k, v, out, k_scale, v_scale) with flat Q8/QS/out/scales and unflattened
     K/V; other arguments prebuilt. Valid while the plan's scratch bindings and stream stay.
     """
     if plan.num_tiles == 0:
         return None
     stream = torch.cuda.current_stream(inputs.q.device)
-    args = _args(inputs, plan, out, stream)
+    args = _args(inputs, plan, packed, out, stream)
     compiled = _compiled(inputs, args, stream)
     tail = args[7:]
     return lambda q8, qs, k, v, o, ks, vs: compiled(q8, qs, k, v, ks, vs, o, *tail)

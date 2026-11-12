@@ -224,16 +224,25 @@ class _Hot:
             self.q8, self.qs = inputs.q8.view(-1), inputs.qs.view(-1)
             self.quantize = union_fp8.quantize_launcher(q)
             self.quantize(q.view(-1), self.q8, self.qs)
+            # The FP8 pack precedes the union kernel, which reads its V^T.
+            direct_fp8.run(
+                inputs=inputs, prepared=workspace.direct, out=out, stage="pack"
+            )
             self.union_fp8 = None
             if workspace.union is not None:
-                union_fp8.run(inputs=inputs, plan=workspace.union, out=out)
-                self.union_fp8 = union_fp8.launcher(
-                    inputs=inputs, plan=workspace.union, out=out
+                union_fp8.run(
+                    inputs=inputs, plan=workspace.union, packed=workspace.direct, out=out
                 )
-            direct_fp8.run(inputs=inputs, prepared=workspace.direct, out=out)
-            self.direct_fp8 = direct_fp8.launcher(
+                self.union_fp8 = union_fp8.launcher(
+                    inputs=inputs, plan=workspace.union, packed=workspace.direct, out=out
+                )
+            direct_fp8.run(
+                inputs=inputs, prepared=workspace.direct, out=out, stage="direct"
+            )
+            launches = direct_fp8.launchers(
                 inputs=inputs, prepared=workspace.direct, out=out
             )
+            self.pack_fp8, self.direct_fp8 = launches or (None, None)
             return
         if workspace.union is not None:
             union.run(inputs=inputs, plan=workspace.union, out=out)
@@ -258,10 +267,12 @@ class _Hot:
             self.quantize(q.view(-1), self.q8, self.qs)
             views = (self.q8, self.qs, k, v, out.view(-1))
             scales = (k_scale.view(-1), v_scale.view(-1))
+            if self.pack_fp8 is not None:
+                self.pack_fp8(k, v, *scales, kv_slots)
             if self.union_fp8 is not None:
                 self.union_fp8(*views, *scales)
             if self.direct_fp8 is not None:
-                self.direct_fp8(*views, *scales, kv_slots)
+                self.direct_fp8(self.q8, self.qs, out.view(-1), *scales)
             return
         views = (q.view(-1), k, v, out.view(-1), kv_slots)
         for launch in self.compute:
