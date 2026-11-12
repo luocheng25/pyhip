@@ -170,20 +170,41 @@ def _mfma(a_words, b_words, acc):
     )
 
 
-def _mfma_acc(a_words, b_words, acc):
+def _mfma_acc(a_words, b_words, acc, drained=False):
     """PV MFMA with the accumulator in AGPRs.
 
     LLVM keeps the intrinsic's accumulator in VGPRs; the tied asm pins O to AGPRs. The asm
     hides the MFMA from the hazard recognizer: VALU reads of O follow _mfma_drain and the
-    FP8 operands are produced at least two instructions earlier."""
+    FP8 operands are produced at least two instructions earlier. drained: the asm ends with
+    the drain's wait states, so even register-allocator copies of this O block (an
+    epilogue under register pressure) read it complete."""
+    a = fx.Vector.from_elements(list(a_words), fx.Int32).bitcast(fx.Int64)[0]
+    b = fx.Vector.from_elements(list(b_words), fx.Int32).bitcast(fx.Int64)[0]
+    text = "v_mfma_f32_32x32x16_fp8_fp8 $0, $1, $2, $0"
+    if drained:
+        text += "\ns_nop 7\ns_nop 7\ns_nop 3"
+    return fx.Vector(
+        llvm.inline_asm(
+            ir.VectorType.get([16], fx.Float32.ir_type),
+            [a.ir_value(), b.ir_value(), fx.Vector(acc).ir_value()],
+            text,
+            "=a,v,v,0",
+            has_side_effects=False,
+        )
+    )
+
+
+def _mfma_acc_first(a_words, b_words):
+    """The first PV MFMA of a task's O block: no accumulator input (O starts at 0 without
+    writing 128 AGPRs)."""
     a = fx.Vector.from_elements(list(a_words), fx.Int32).bitcast(fx.Int64)[0]
     b = fx.Vector.from_elements(list(b_words), fx.Int32).bitcast(fx.Int64)[0]
     return fx.Vector(
         llvm.inline_asm(
             ir.VectorType.get([16], fx.Float32.ir_type),
-            [a.ir_value(), b.ir_value(), fx.Vector(acc).ir_value()],
-            "v_mfma_f32_32x32x16_fp8_fp8 $0, $1, $2, $0",
-            "=a,v,v,0",
+            [a.ir_value(), b.ir_value()],
+            "v_mfma_f32_32x32x16_fp8_fp8 $0, $1, $2, 0",
+            "=a,v,v",
             has_side_effects=False,
         )
     )
@@ -716,9 +737,10 @@ def _part1(env, st, t, cur, prev, fixup):
     return s_acc, res, mem, pw, vreads, fixed
 
 
-def _part2(env, st, res, s_acc, mem, pw, vreads, t, cur, prev):
-    """PV(t-1) and S''(t); K(t+2) and scale(t+1) loads; the first K reads of QK(t+1)."""
-    o = list(st["o"])
+def _part2(env, st, res, s_acc, mem, pw, vreads, t, cur, prev, first=False):
+    """PV(t-1) and S''(t); K(t+2) and scale(t+1) loads; the first K reads of QK(t+1). In a
+    task's first phase (first) the K-step 0 MFMAs start O."""
+    o = list(st["o"]) if not first else [None] * 8
     m_run = st["m_run"]
     fresh = m_run == fx.Float32(_MAX_FLOOR)
     ctx = dict(
@@ -770,7 +792,10 @@ def _part2(env, st, res, s_acc, mem, pw, vreads, t, cur, prev):
             _nop("s_nop 1")
         vw = vreads[(q, mb)]
         _pin()
-        o[mb] = _mfma_acc((vw[2 * e], vw[2 * e + 1]), pw[2 * q + e], o[mb])
+        if o[mb] is None:
+            o[mb] = _mfma_acc_first((vw[2 * e], vw[2 * e + 1]), pw[2 * q + e])
+        else:
+            o[mb] = _mfma_acc((vw[2 * e], vw[2 * e + 1]), pw[2 * q + e], o[mb])
         _pin()
         for _ in range(P2):
             _step(valu)
@@ -792,8 +817,13 @@ def _pv_last(env, pw, o):
         for mb in range(8):
             vw = _v_read(env, env.last & 1, mb, q)
             for e in range(2):
-                o[mb] = _mfma_acc((vw[2 * e], vw[2 * e + 1]), pw[2 * q + e], o[mb])
-    _mfma_drain()
+                # A block's last MFMA ends with the drain (the pipe is busy meanwhile).
+                o[mb] = _mfma_acc(
+                    (vw[2 * e], vw[2 * e + 1]),
+                    pw[2 * q + e],
+                    o[mb],
+                    drained=(q, e) == (1, 1),
+                )
     return o
 
 
@@ -806,7 +836,8 @@ def _epilogue(env, s_last, l_run, o, rsv):
     pw = [None] * 4
     for s in range(4):
         _drain(_gen_pack(res["p"], s, pw))
-    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+    # The V(last) writes landed; the next task's id and Q loads stay in flight.
+    rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     o = _pv_last(env, pw, o)
     # Every wave finished its V reads before the output shuffle reuses LDS.
@@ -851,10 +882,9 @@ def _store_out(env, o, inv):
     for i in range(16):
         r, c = 2 * i + (env.lane >> 5), env.lane & 31
         w = _load_lds(env.lds, base + r * 512 + ((c ^ (r & 7)) << 4))
-        swap = ((r >> 3) & 1) == 1
-        words = fx.Vector.from_elements(
-            [swap.select(w[j ^ 2], w[j]) for j in range(4)], fx.Int32
-        )
+        # Bit 3 of r = 2i + (lane >> 5) is bit 2 of i: the half swap is static.
+        swap = (i >> 2) & 1
+        words = fx.Vector.from_elements([w[j ^ (2 * swap)] for j in range(4)], fx.Int32)
         row = env.row_offset + env.wave * 32 + r
         query, head = row // env.gp, row % env.gp
         valid = (query < env.qvalid) & (query < env.bq) & (head < env.group)
@@ -1426,6 +1456,7 @@ def _task(
         t,
         CUR: fx.Constexpr[int],
         PREV: fx.Constexpr[int],
+        FIRST: fx.Constexpr[bool],
     ):
         kflat = fx.Vector(kflat)
         o_in = [fx.Vector(x) for x in (o0, o1, o2, o3, o4, o5, o6, o7)]
@@ -1442,6 +1473,14 @@ def _task(
         t = fx.Int32(t)
 
         def fixup():
+            if fx.const_expr(FIRST):
+                # Tile 0 is final (exact max, masked): no ballot, no rescale, no O yet.
+                return dict(
+                    o=None,
+                    l_run=fx.Float32(l_run),
+                    s_prev=fx.Vector(s_prev),
+                    m_run=fx.Float32(m_run),
+                )
             return finish(
                 s_prev,
                 local_prev,
@@ -1453,7 +1492,9 @@ def _task(
 
         s_acc, res, mem, pw, vreads, fixed = _part1(env, st, t, CUR, PREV, fixup)
         st.update(o=fixed["o"], m_run=fixed["m_run"])
-        o, ctx, out, kpre = _part2(env, st, res, s_acc, mem, pw, vreads, t, CUR, PREV)
+        o, ctx, out, kpre = _part2(
+            env, st, res, s_acc, mem, pw, vreads, t, CUR, PREV, FIRST
+        )
         row_sum = fixed["l_run"] + res["sum"]
         rsv = ctx["rsv"] if PER_TOKEN else [fx.Float32(0.0), fx.Float32(0.0)]
         sc = out["scales"]
@@ -1480,11 +1521,13 @@ def _task(
         )
 
     key_tiles = env.last + 1
-    for t in range(fx.Int32(1), key_tiles - 1, fx.Int32(2)):
-        state = phase(*state, t, 1, 0)
-        state = phase(*state, fx.Int32(t) + 1, 0, 1)
-    if (key_tiles > 1) & ((key_tiles & 1) == 0):
-        state = phase(*state, env.last, 1, 0)
+    if key_tiles > 1:
+        state = phase(*state, fx.Int32(1), 1, 0, True)
+    for t in range(fx.Int32(2), key_tiles - 1, fx.Int32(2)):
+        state = phase(*state, t, 0, 1, False)
+        state = phase(*state, fx.Int32(t) + 1, 1, 0, False)
+    if (key_tiles > 2) & ((key_tiles & 1) == 1):
+        state = phase(*state, env.last, 0, 1, False)
 
     # ---- Epilogue and output; the next slot's loads issue under them ----
     next_scalars = _task_scalars(
