@@ -4,9 +4,11 @@
 selected blocks, FP8 MFMAs.
 
 Each call packs every request's K/V into four-token blocks in FP8 MFMA operand order, so the
-direct kernel's loads are whole, coalesced operands (no LDS, no permutes). With a union plan
-the pack runs before the FP8 union kernel, which reads its V^T (and per token the scale
-records) for every tile; K is packed only when K3 routes some tile to direct (direct_flag[0]):
+direct kernel's loads are whole, coalesced operands (no LDS, no permutes); the same launch's
+CTAs past the blocks quantize Q (sparse_prefill_union_fp8.quantize_rows) for both FP8
+kernels. With a union plan the pack runs before the FP8 union kernel, which reads its V^T
+(and per token the scale records) for every tile; K is packed only when K3 routes some tile
+to direct (direct_flag[0]):
   PK[block][i * 256 + (token * 4 + g) * 16 + 0..15]
       = K[token][64i + 8g + 0..7] ++ K[token][64i + 32 + 8g + 0..7]
   PV[block][p * 256 + d * 16 + (m - 4p) * 4 + token] = V[token][16d + m]   (p = m >> 2)
@@ -21,8 +23,7 @@ holds blocks 8t + g and 8t + 4 + g, which are also its PV K-dim, so P needs no e
 PV MFMA m writes dims 16d + m: a lane (head, g) ends with dims 64g .. 64g + 63. Softmax:
 the union kernel's lazy max (S'' = S c - m, a rescale only when some S'' passes LAZY or a
 fresh row sees its first key, the row max then at S'' = P_BIAS), uniform per row across its
-four lanes. Q comes from
-sparse_prefill_union_fp8.quantize_q.
+four lanes. Q8 and its row scales come from the pack launch.
 
 Loads: chunk t + 1's K/V words issue at the start of chunk t; its block ids come one chunk
 earlier by scalar loads, so the K/V loads stay in flight (vector loads complete in order).
@@ -58,6 +59,7 @@ from .sparse_prefill_union_fp8 import (
     LAZY,
     P_BIAS,
     LOG2E,
+    QROWS,
     SCALE_MAX,
     SCALE_MIN,
     _as_f32,
@@ -66,6 +68,7 @@ from .sparse_prefill_union_fp8 import (
     _cvt_fp8,
     _perm,
     _scaled_bf16,
+    quantize_rows,
 )
 
 __all__ = ["prepare", "scratch_specs", "run", "launchers"]
@@ -233,22 +236,32 @@ def _pack_kernel(
     VALID: fx.Tensor,
     SLOTS: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    Q: fx.Tensor,
+    Q8: fx.Tensor,
+    QS: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
+    ROWS: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     GATED: fx.Constexpr[bool],
 ):
-    pair = fx.Int32(fx.block_idx.x) * 4 + _uniform(fx.Int32(fx.thread_idx.x) >> 6)
-    args = (K, V, KS, VS, PK, PV, PSC, SOURCES, VALID, SLOTS, pair)
-    if fx.const_expr(GATED):
-        # With a union plan the FP8 union kernel reads PV (and the scale records); K3 sets
-        # direct_flag[0] when some tile goes direct, the only reader of PK.
-        with_k = _uniform(fx.Int32(DIRECT_FLAG[0]))
-        _pack_body(*args, with_k, N, PACKED, HK, PER_TOKEN, SLOTTED)
+    cta = fx.Int32(fx.block_idx.x)
+    pack_ctas = (PACKED * HK + 3) // 4
+    if cta >= pack_ctas:
+        # CTAs past the blocks quantize Q for both FP8 kernels (one launch fewer).
+        quantize_rows(Q, Q8, QS, ROWS, cta - pack_ctas)
     else:
-        _pack_body(*args, fx.Int32(1), N, PACKED, HK, PER_TOKEN, SLOTTED)
+        pair = cta * 4 + _uniform(fx.Int32(fx.thread_idx.x) >> 6)
+        args = (K, V, KS, VS, PK, PV, PSC, SOURCES, VALID, SLOTS, pair)
+        if fx.const_expr(GATED):
+            # With a union plan the FP8 union kernel reads PV (and the scale records); K3
+            # sets direct_flag[0] when some tile goes direct, the only reader of PK.
+            with_k = _uniform(fx.Int32(DIRECT_FLAG[0]))
+            _pack_body(*args, with_k, N, PACKED, HK, PER_TOKEN, SLOTTED)
+        else:
+            _pack_body(*args, fx.Int32(1), N, PACKED, HK, PER_TOKEN, SLOTTED)
 
 
 @flyc.jit
@@ -264,8 +277,12 @@ def _pack_launch(
     VALID: fx.Tensor,
     SLOTS: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    Q: fx.Tensor,
+    Q8: fx.Tensor,
+    QS: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
+    ROWS: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
@@ -284,14 +301,22 @@ def _pack_launch(
         VALID,
         SLOTS,
         DIRECT_FLAG,
+        Q,
+        Q8,
+        QS,
         N,
         PACKED,
+        ROWS,
         HK,
         PER_TOKEN,
         SLOTTED,
         GATED,
         value_attrs={"llvm.target_features": _target_features()},
-    ).launch(grid=((PACKED * HK + 3) // 4, 1, 1), block=(256, 1, 1), stream=stream)
+    ).launch(
+        grid=((PACKED * HK + 3) // 4 + (ROWS + QROWS - 1) // QROWS, 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
 
 
 # ---- Direct ----
@@ -780,8 +805,12 @@ def _pack_args(inputs, prepared, stream):
         prepared.pack_valid,
         inputs.kv_slots if prepared.slotted else prepared.pack_sources,
         prepared.direct_flag,
+        inputs.q.view(-1),
+        inputs.q8.view(-1),
+        inputs.qs.view(-1),
         inputs.k.shape[0],
         prepared.packed_blocks,
+        inputs.q.shape[0] * inputs.q.shape[1],
         prepared.hk,
         prepared.per_token,
         prepared.slotted,
@@ -836,7 +865,7 @@ def _compiled(inputs, prepared, out, stream):
     # Specializations: pack (HK, PER_TOKEN, SLOTTED, GATED); direct (H, HK, TOPK, GATED,
     # SCALE, PER_TOKEN).
     pack_fn = _compile(
-        _PACK, (device, *pack[13:17]), _pack_launch, pack, device, stream
+        _PACK, (device, *pack[17:21]), _pack_launch, pack, device, stream
     )
     key = (device, *direct[12:14], *direct[17:21])
     direct_fn = _compile(_DIRECT, key, _direct_launch, direct, device, stream)
@@ -844,9 +873,9 @@ def _compiled(inputs, prepared, out, stream):
 
 
 def run(*, inputs, prepared, out, stage="both"):
-    """Pack the context (stage "pack"; the FP8 union kernel reads its V^T), then the direct
-    waves ("direct"). inputs carries q8/qs (quantize_q) and k_scale/v_scale like the union
-    kernel."""
+    """Pack the context and quantize Q into inputs.q8/qs (stage "pack"; the FP8 union kernel
+    reads its V^T and Q8), then the direct waves ("direct"). inputs carries q8/qs and
+    k_scale/v_scale like the union kernel."""
     if prepared.rows == 0 or prepared.packed_blocks == 0:
         return
     stream = torch.cuda.current_stream(inputs.q.device)
@@ -859,8 +888,9 @@ def run(*, inputs, prepared, out, stage="both"):
 
 
 def launchers(*, inputs, prepared, out):
-    """(pack(k, v, k_scale, v_scale, slots), direct(q8, qs, out, k_scale, v_scale)) with
-    flat Q8/QS/out/scales and unflattened K/V, other arguments prebuilt; None when empty.
+    """(pack(q, k, v, k_scale, v_scale, slots), direct(q8, qs, out, k_scale, v_scale)) with
+    flat Q/Q8/QS/out/scales and unflattened K/V, other arguments prebuilt (the pack writes
+    the bound inputs.q8/qs); None when empty.
     """
     if prepared.rows == 0 or prepared.packed_blocks == 0:
         return None
@@ -868,8 +898,11 @@ def launchers(*, inputs, prepared, out):
     pack, direct, pack_fn, direct_fn = _compiled(inputs, prepared, out, stream)
     slotted = prepared.slotted
 
-    def pack_launch(k, v, ks, vs, slots):
-        pack_fn(k, v, ks, vs, *pack[4:9], slots if slotted else pack[9], *pack[10:])
+    def pack_launch(q, k, v, ks, vs, slots):
+        pack_fn(
+            k, v, ks, vs, *pack[4:9], slots if slotted else pack[9], pack[10], q,
+            *pack[12:],
+        )
 
     def direct_launch(q8, qs, o, ks, vs):
         direct_fn(q8, qs, *direct[2:5], ks, vs, o, *direct[8:])

@@ -133,7 +133,7 @@ class _Workspace:
                 inputs=inputs, union=self.union, per_token=fp8 == "token", scratch=False
             )
             direct_specs = direct_fp8.scratch_specs(self.direct)
-            # FP8 Q of quantize_q, read by both FP8 kernels.
+            # FP8 Q of the pack launch, read by both FP8 kernels.
             self.specs += [
                 (self, "q8", tuple(q.shape), torch.uint8),
                 (self, "qs", tuple(q.shape[:2]), torch.float32),
@@ -222,9 +222,8 @@ class _Hot:
         if self.fp8:
             # Q8/QS stay bound to this hot's scratch views.
             self.q8, self.qs = inputs.q8.view(-1), inputs.qs.view(-1)
-            self.quantize = union_fp8.quantize_launcher(q)
-            self.quantize(q.view(-1), self.q8, self.qs)
-            # The FP8 pack precedes the union kernel, which reads its V^T.
+            # The FP8 pack (and Q quantization in its launch) precedes the union kernel,
+            # which reads its V^T and Q8.
             direct_fp8.run(
                 inputs=inputs, prepared=workspace.direct, out=out, stage="pack"
             )
@@ -264,11 +263,10 @@ class _Hot:
     def compute_call(self, q, k, v, out, kv_slots, k_scale=None, v_scale=None):
         # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
         if self.fp8:
-            self.quantize(q.view(-1), self.q8, self.qs)
             views = (self.q8, self.qs, k, v, out.view(-1))
             scales = (k_scale.view(-1), v_scale.view(-1))
             if self.pack_fp8 is not None:
-                self.pack_fp8(k, v, *scales, kv_slots)
+                self.pack_fp8(q.view(-1), k, v, *scales, kv_slots)
             if self.union_fp8 is not None:
                 self.union_fp8(*views, *scales)
             if self.direct_fp8 is not None:

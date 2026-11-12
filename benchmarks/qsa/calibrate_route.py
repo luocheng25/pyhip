@@ -179,19 +179,26 @@ class Case:
 
     def phases(self, route):
         """(prepare, union, direct) callables of a routing."""
-        v, rt, inputs = self.value, _runtime, route.inputs
+        rt, inputs = _runtime, route.inputs
 
         def prepare():
             rt.prepare.run(inputs=inputs, plan=route.plan)
             if self.fp8:
-                rt.union_fp8.quantize_q(v.q, inputs.q8, inputs.qs)
+                # The FP8 pack (Q quantization in its launch) precedes the union, which reads its V^T.
+                rt.direct_fp8.run(inputs=inputs, prepared=route.direct, out=self.out, stage="pack")
 
         def union():
             if route.plan is not None:
-                (rt.union_fp8 if self.fp8 else rt.union).run(inputs=inputs, plan=route.plan, out=self.out)
+                if self.fp8:
+                    rt.union_fp8.run(inputs=inputs, plan=route.plan, packed=route.direct, out=self.out)
+                else:
+                    rt.union.run(inputs=inputs, plan=route.plan, out=self.out)
 
         def direct():
-            (rt.direct_fp8 if self.fp8 else rt.direct).run(inputs=inputs, prepared=route.direct, out=self.out)
+            if self.fp8:
+                rt.direct_fp8.run(inputs=inputs, prepared=route.direct, out=self.out, stage="direct")
+            else:
+                rt.direct.run(inputs=inputs, prepared=route.direct, out=self.out)
 
         return prepare, union, direct
 

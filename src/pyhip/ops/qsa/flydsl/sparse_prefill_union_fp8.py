@@ -6,9 +6,10 @@ Same plans and tasks as sparse_prefill_union: a task is 128 (query, head) rows o
 tile over its compact block list, with exact per-query membership. Four waves of 32 rows
 (one wave per SIMD) run 32x32x16 FP8 MFMAs, S^T = K Q^T and O^T += V^T P, O in AGPRs.
 
-Numerics. quantize_q (a separate pass) stores Q per (query, head) row as E4M3FNUZ with
-scale = row amax / 240. K/V scales are per token and KV head (FP32 [N, HK]; with a slot
-table [P, HK]) or one per tensor ([1]). Softmax runs in log2 units with a lazy max m:
+Numerics. quantize_rows (in the FP8 pack launch, or quantize_q) stores Q per (query, head)
+row as E4M3FNUZ with scale = row amax / 240. K/V scales are per token and KV head (FP32
+[N, HK]; with a slot table [P, HK]) or one per tensor ([1]). Softmax runs in log2 units with
+a lazy max m:
 S'' = S * c - m with c = q_scale * softmax_scale * log2(e) (times k_scale per tensor, per
 key otherwise). Per token, log2(v_scale) joins S'', so the FP8 P' = exp2(S'') carries the
 V scale and stays below 2**LAZY while l accumulates P' / v_scale; per tensor the output takes
@@ -1577,7 +1578,8 @@ def _launch(
 
 
 # ---- Q quantization (per (query, head) row: scale = amax / 240) ----
-QROWS = 16  # rows per CTA: 16 lanes per row, 16 dims per lane
+QR = 2  # rows per 16-lane group: 16 dims per lane and row, all row loads in flight at once
+QROWS = 16 * QR  # rows per 256-thread CTA
 
 
 def _quantize_part(raw):
@@ -1603,31 +1605,46 @@ def _quantize_part(raw):
     return words, amax * (1.0 / FP8_MAX)
 
 
-@flyc.kernel(name="qsa_quantize_q_fp8", known_block_size=[THREADS, 1, 1])
-def _quantize_kernel(Q: fx.Tensor, Q8: fx.Tensor, QS: fx.Tensor, ROWS: fx.Int32):
+@flyc.jit
+def quantize_rows(Q, Q8, QS, ROWS, cta):
+    """Rows cta * QROWS .. + QROWS - 1 of Q (rows of 256 BF16) for a 256-thread CTA: row
+    r * 16 + (thread >> 4) of the CTA's rows per step r; FP8 rows and their scales. Also run
+    by the FP8 pack kernel's CTAs past its blocks."""
     tid = fx.Int32(fx.thread_idx.x)
-    row = fx.Int32(fx.block_idx.x) * QROWS + (tid >> 4)
-    part = tid & 15
-    ok = row < ROWS
+    group, part = tid >> 4, tid & 15
     extent = fx.Uint32(ROWS) * (D * 2)
     gq = _buffer(Q, extent)
-    offset = ok.select(row * (D * 2) + part * 32, fx.Int32(extent))
-    words, scale = _quantize_part(
-        [_buffer_words(gq, offset + 16 * i, 4) for i in range(2)]
-    )
+    rows = [cta * QROWS + r * 16 + group for r in range(QR)]
+    raws = []
+    for row in rows:
+        offset = (row < ROWS).select(row * (D * 2) + part * 32, fx.Int32(extent))
+        raws.append([_buffer_words(gq, offset + 16 * i, 4) for i in range(2)])
     g8 = _buffer(Q8, fx.Uint32(ROWS) * D)
-    _buffer_store_words(
-        fx.Vector.from_elements(words, fx.Int32),
-        g8,
-        ok.select(row * D + part * 16, fx.Int32(ROWS * D)),
-    )
-    gs = _buffer(QS, fx.Uint32(ROWS) * 4)
-    if part == 0:
+    scales = []
+    for row, raw in zip(rows, raws):
+        words, scale = _quantize_part(raw)
+        scales.append(scale)
         _buffer_store_words(
-            fx.Vector.from_elements([_as_i32(scale)], fx.Int32),
-            gs,
-            ok.select(row * 4, fx.Int32(ROWS * 4)),
+            fx.Vector.from_elements(words, fx.Int32),
+            g8,
+            (row < ROWS).select(row * D + part * 16, fx.Int32(ROWS * D)),
         )
+    # Lane `part` of a group stores the scale of its row step `part`.
+    scale = scales[QR - 1]
+    for r in fx.range_constexpr(QR - 1):
+        scale = (part == r).select(scales[r], scale)
+    row = cta * QROWS + part * 16 + group
+    gs = _buffer(QS, fx.Uint32(ROWS) * 4)
+    _buffer_store_words(
+        fx.Vector.from_elements([_as_i32(scale)], fx.Int32),
+        gs,
+        ((part < QR) & (row < ROWS)).select(row * 4, fx.Int32(ROWS * 4)),
+    )
+
+
+@flyc.kernel(name="qsa_quantize_q_fp8", known_block_size=[THREADS, 1, 1])
+def _quantize_kernel(Q: fx.Tensor, Q8: fx.Tensor, QS: fx.Tensor, ROWS: fx.Int32):
+    quantize_rows(Q, Q8, QS, ROWS, fx.Int32(fx.block_idx.x))
 
 
 @flyc.jit
@@ -1742,8 +1759,8 @@ def _compiled(inputs, args, stream):
 
 def run(*, inputs, plan, packed, out):
     """FP8 union attention after the FP8 pack of the direct plan packed (its V^T). inputs adds
-    k_scale / v_scale (FP32 [N, HK] per token or [1]) and the FP8 Q of quantize_q
-    (inputs.q8 / inputs.qs)."""
+    k_scale / v_scale (FP32 [N, HK] per token or [1]) and the FP8 Q of the pack launch or
+    quantize_q (inputs.q8 / inputs.qs)."""
     if plan.num_tiles == 0:
         return
     stream = torch.cuda.current_stream(inputs.q.device)
