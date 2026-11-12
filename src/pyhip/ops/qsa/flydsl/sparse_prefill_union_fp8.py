@@ -18,15 +18,15 @@ and O, l and S'' follow.
 
 Phase t (64-key tile t; K and V^T double-buffered in 64 KiB LDS):
   Part 1  QK(t) [K slot t&1]; after QK MFMA FIX_AT tile t-1 is finished under the issued
-          MFMAs (lazy max, rescale), then P'(t-1) = exp2(S''(t-1)) (+ row sums per token);
+          MFMAs (lazy max, rescale), then P'(t-1) = exp2(S''(t-1)) and its row sums;
           K(t+1) -> K slot (t+1)&1; V(t), ids(t+2) and mask(t) loads; V block ids of t+1
           by v_readlane, K and scale ids by ds_bpermute. After QK MFMA BAR_AT: lgkmcnt(0)
           + barrier, then the first V reads and the FP8 P' of PV(t-1) under the last QK
           MFMAs.
-  Part 2  PV(t-1) [V slot (t-1)&1] || P' packs, S''(t) (scales, centering), row sums (per
-          tensor); V(t) -> V slot t&1 interleaved with S''(t)'s membership masks (every
-          tile, branch free: whole tiles keep every bit) and its masked row max; K(t+2) and
-          scale(t+1) loads; the first K reads of QK(t+1).
+  Part 2  PV(t-1) [V slot (t-1)&1] || P' packs, S''(t) (scales, centering); V(t) -> V
+          slot t&1 interleaved with S''(t)'s membership masks (every tile, branch free:
+          whole tiles keep every bit) and its masked row max; K(t+2) and scale(t+1) loads;
+          the first K reads of QK(t+1).
 
 V^T comes from the FP8 pack of the direct plan (sparse_prefill_direct_fp8: four-token
 blocks, V^T per block), so it needs no transpose: a wave loads its four blocks of a tile
@@ -449,22 +449,21 @@ def _gen_v_writes(env, vdata, slot, spread):
 
 
 def _gen_part1(env, s_prev, rsv, res):
-    """P'(t-1) = exp2(S''(t-1)); per token the row sum of P' / v_scale, a value's term
-    trailing its exp by two steps (a DPP instruction reading the previous VALU's result
-    needs two wait states)."""
+    """P'(t-1) = exp2(S''(t-1)) and the row sum of P' (per token P' / v_scale) in the issue
+    slack of the exps, a value's term trailing its exp by two steps (a DPP instruction
+    reading the previous VALU's result needs two wait states)."""
     p, sums = [None] * 32, [None, None]
     res["p"] = p
-    for i in range(34 if env.per_token else 33):
+    for i in range(34):
         if i < 32:
             p[i] = _exp(s_prev[i])
-        if env.per_token and i > 1:
+        if i > 1:
             k = i - 2
-            term = p[k] * _bcast(rsv[k // 16], k % 16)
+            term = p[k] * _bcast(rsv[k // 16], k % 16) if env.per_token else p[k]
             sums[k & 1] = term if sums[k & 1] is None else sums[k & 1] + term
         yield
-    if env.per_token:
-        _hold(*sums)
-        res["sum"] = sums[0] + sums[1]
+    _hold(*sums)
+    res["sum"] = sums[0] + sums[1]
 
 
 def _gen_pack(p, s, pw):
@@ -504,10 +503,9 @@ def _interleave(*gens):
 
 def _gen_part2(env, ctx):
     """P' K-steps 1-3; S''(t) = S * c - m (speculative, m of t-1) with the scales, its
-    membership masks and masked row max; row sums (per tensor); V(t) -> LDS."""
+    membership masks and masked row max; V(t) -> LDS."""
     p, pw = ctx["p"], ctx["pw"]
     c_scale, neg = env.c_scale, ctx["neg"]
-    sums = [None, None]
     terms = [None, None, None, None]
 
     def gen_terms():
@@ -515,11 +513,6 @@ def _gen_part2(env, ctx):
             for b in range(2):
                 terms[b], terms[2 + b] = _v_scale_terms(ctx["sv"][b])
                 yield
-
-    def gen_sum(lo, hi):
-        for i in range(lo, hi):
-            sums[i & 1] = p[i] if sums[i & 1] is None else sums[i & 1] + p[i]
-            yield
 
     def gen_center(lo, hi, vals, part):
         if env.per_token:
@@ -565,14 +558,8 @@ def _gen_part2(env, ctx):
         _hold(*terms[2:])
     yield from _gen_pack(p, 1, pw)
     yield from gen_center(0, 16, vals, part)
-    if not env.per_token:
-        yield from gen_sum(0, 16)
     yield from _gen_pack(p, 2, pw)
     yield from gen_center(16, 32, vals, part)
-    if not env.per_token:
-        yield from gen_sum(16, 32)
-        _hold(*sums)
-        yield
     yield from _gen_pack(p, 3, pw)
     yield from _interleave(
         _gen_v_writes(env, ctx["vdata"], ctx["cur"], SPREAD), gen_mask_max(part)
@@ -581,8 +568,6 @@ def _gen_part2(env, ctx):
     other = local.shuffle_xor(32, 64)
     yield
     ctx.update(s_cur=vals, local=local, other=other, rsv=terms[2:])
-    if not env.per_token:
-        ctx["sum"] = sums[0] + sums[1]
 
 
 def _lazy_ballot(vals, local, other, fresh):
@@ -804,14 +789,7 @@ def _epilogue(env, s_last, l_run, o, rsv):
     l_run, o = fx.Float32(l_run), [fx.Vector(x) for x in o]
     res = {}
     _drain(_gen_part1(env, fx.Vector(s_last), rsv, res))
-    if env.per_token:
-        l_run = l_run + res["sum"]
-    else:
-        sums = [None, None]
-        for i in range(32):
-            p = res["p"][i]
-            sums[i & 1] = p if sums[i & 1] is None else sums[i & 1] + p
-        l_run = l_run + (sums[0] + sums[1])
+    l_run = l_run + res["sum"]
     pw = [None] * 4
     for s in range(4):
         _drain(_gen_pack(res["p"], s, pw))
@@ -1353,7 +1331,7 @@ def _task(
         s_acc, res, mem, pw, vreads, fixed = _part1(env, st, t, CUR, PREV, fixup)
         st.update(o=fixed["o"], m_run=fixed["m_run"])
         o, ctx, out, kpre = _part2(env, st, res, s_acc, mem, pw, vreads, t, CUR, PREV)
-        row_sum = fixed["l_run"] + (res["sum"] if PER_TOKEN else ctx["sum"])
+        row_sum = fixed["l_run"] + res["sum"]
         rsv = ctx["rsv"] if PER_TOKEN else [fx.Float32(0.0), fx.Float32(0.0)]
         sc = out["scales"]
         pads = [fx.Vector.filled(4, 0, fx.Int32)] * (4 - KPRE)
