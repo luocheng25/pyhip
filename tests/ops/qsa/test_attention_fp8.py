@@ -158,8 +158,10 @@ def test_fp8_matches_reference(
 )
 def test_fp8_uniform_exact(queries, prefixes, heads, per_token, monkeypatch):
     """K = 0 makes every selected token weigh the same; power-of-two V scales keep the scaled
-    probabilities exact, so the output is the selected tokens' mean V up to rounding."""
+    probabilities exact, so the output is the selected tokens' mean V up to rounding (whole
+    unions; test_fp8_core_residual_uniform covers core/residual tiles)."""
     monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    monkeypatch.setattr(_runtime.prepare, "CORE_RATIOS", {})
     value = _make_case(queries, prefixes, heads, _gpu())
     generator = torch.Generator(device=value.q.device).manual_seed(3)
     tokens = value.k.shape[:2]
@@ -232,6 +234,126 @@ def test_fp8_attention_sink(queries, prefixes, heads, per_token, monkeypatch):
         error.mean(),
         error.max(),
     )
+
+
+def _partial_indices(rows, prefix, seed=23):
+    """Rows choosing 256 of their 512 blocks from a set their group of 32 rows shares and 256 of
+    their own: union tiles hold a core every row selects plus each row's residual blocks."""
+    rng = np.random.default_rng(seed)
+    indices = np.full((rows, 2051), -1, dtype=np.int32)
+    for local in range(rows):
+        visible = prefix + local + 1
+        blocks = visible // 4
+        if local % 32 == 0:
+            shared = rng.choice(prefix // 4, 256, replace=False)
+        own = rng.choice(np.setdiff1d(np.arange(blocks), shared), 256, replace=False)
+        chosen = np.sort(np.concatenate((shared, own)))
+        tokens = np.concatenate(
+            ((chosen[:, None] * 4 + np.arange(4)).reshape(-1), np.arange(blocks * 4, visible))
+        )
+        indices[local, : len(tokens)] = tokens
+    return indices
+
+
+@SCALES
+@pytest.mark.parametrize("heads,rows", ((12, 1024), (6, 2048)))
+def test_fp8_core_residual(heads, rows, per_token, monkeypatch):
+    """Union tiles keep the core their rows share; each row's other blocks run in the direct
+    kernel and merge into the union output by log-sum-exp. Against the fp8_query reference the
+    output stays within the service check's error and as close as without the split."""
+    from pyhip.testing.qsa_reference import fp8_query
+    from pyhip.testing.qsa_reference import reference as service_reference
+
+    case = _fp8_case((rows,), (8000,), heads, per_token=per_token)
+    value = case.value
+    value.indices = torch.from_numpy(_partial_indices(rows, 8000)).to(value.q.device)
+    expected = service_reference(
+        fp8_query(value.q),
+        case.exact.k,
+        case.exact.v,
+        value.indices,
+        query_lens=value.query_lens,
+        prefix_lens=value.prefix_lens,
+        scale=value.scale,
+    )
+    norms = expected.norm(dim=-1)
+    floor = torch.maximum(norms, norms.median())
+    errors = []
+    for core_ratios in (None, {}):
+        if core_ratios is not None:
+            monkeypatch.setattr(_runtime.prepare, "CORE_RATIOS", core_ratios)
+        monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+        output = _call_fp8(case)
+        plan = next(iter(_runtime._workspaces.values())).union
+        split = plan.active.bool() & (plan.residual > 0)
+        assert bool(split.any()) == (core_ratios is None)
+        if core_ratios is None:
+            residual = plan.residual_rows[split[plan.query_tiles.long()]]
+            assert bool((residual > 0).any())
+            again = _call_fp8(case)
+            assert torch.equal(again.view(torch.int16), output.view(torch.int16))
+        error = (output.float() - expected).norm(dim=-1) / floor
+        errors.append((float(error.mean()), float(error.max())))
+    (mean, worst), (whole_mean, _) = errors
+    assert mean < 0.05 and worst < 0.2, errors
+    assert mean < 1.1 * whole_mean, errors
+
+
+@SCALES
+def test_fp8_core_residual_uniform(per_token, monkeypatch):
+    """K = 0 and power-of-two V scales on core/residual tiles: each split row's block_indices
+    lists exactly its complete blocks outside the tile's core, and the output is the union
+    part's mean V (rounded to BF16, as the union writes it) and the residual part's mean merged
+    by their token counts, up to rounding."""
+    monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    rows, prefix = 1024, 8000
+    value = _make_case((rows,), (prefix,), 12, _gpu())
+    value.indices = torch.from_numpy(_partial_indices(rows, prefix)).to(value.q.device)
+    generator = torch.Generator(device=value.q.device).manual_seed(5)
+    shape = value.k.shape[:2] if per_token else (1,)
+    exponent = torch.randint(-3, 2, shape, generator=generator, device=value.q.device)
+    v8 = torch.randn(value.v.shape, generator=generator, device=value.q.device) * 60
+    v8 = v8.clamp(-FP8_MAX, FP8_MAX).to(FP8)
+    vs = torch.exp2(exponent.float()).contiguous()
+    case = SimpleNamespace(
+        value=value,
+        k8=torch.zeros(value.k.shape, dtype=FP8, device=value.q.device),
+        v8=v8,
+        ks=torch.ones(shape, device=value.q.device),
+        vs=vs,
+    )
+    output = _call_fp8(case).float()
+    workspace = next(iter(_runtime._workspaces.values()))
+    plan = workspace.union
+    v = _dequant(v8, vs)[:, 0]
+    indices = value.indices.long()
+    split_rows = 0
+    for row in _sample_rows(value, 96):
+        visible = prefix + row + 1
+        complete = min(visible // 4, 512)
+        blocks = indices[row, : 4 * complete : 4] // 4
+        tail = indices[row, 4 * complete : 4 * complete + visible % 4]
+        tile = int(plan.query_tiles[row])
+        tokens = torch.cat(((blocks[:, None] * 4 + torch.arange(4, device=v.device)).reshape(-1), tail))
+        expected = v[tokens].mean(0)
+        if bool(plan.active[tile]) and int(plan.residual[tile]) > 0:
+            split_rows += 1
+            core = plan.blocks[tile, : int(plan.counts[tile])].long()
+            outside = ~torch.isin(blocks, core)
+            count = int(plan.residual_rows[row])
+            listed = workspace.block_indices[row, :count].long()
+            assert torch.equal(listed, blocks[outside])
+            core_tokens = torch.cat(
+                ((blocks[~outside][:, None] * 4 + torch.arange(4, device=v.device)).reshape(-1), tail)
+            )
+            residual_tokens = (blocks[outside][:, None] * 4 + torch.arange(4, device=v.device)).reshape(-1)
+            n_u, n_d = len(core_tokens), len(residual_tokens)
+            union_part = v[core_tokens].mean(0).to(torch.bfloat16).float()
+            expected = (union_part * n_u + v[residual_tokens].mean(0) * n_d) / (n_u + n_d)
+        torch.testing.assert_close(
+            output[row], expected.expand(output.shape[1], -1), rtol=0.01, atol=2e-3
+        )
+    assert split_rows > 0
 
 
 def _fp8_pools(case, slots_from):

@@ -30,6 +30,12 @@ earlier by scalar loads, so the K/V loads stay in flight (vector loads complete 
 The loop runs two chunks per iteration, alternating two register sets; waves of disabled
 rows exit at once. Per token the 24 scale terms of a 16-lane row's blocks (its g) take two
 dword loads per lane and reach their users by DPP row broadcasts.
+
+Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one K3b CTA per
+union tile (prepare.residual_tile), which moves the residual blocks of each row of an active
+core tile to the front of its block_indices row. Those rows then run here over their residual
+blocks only (no causal tail) and merge into the union output by log-sum-exp (the union kernel
+writes each row's lse).
 """
 
 import math
@@ -54,7 +60,13 @@ from .sparse_prefill_common import (
     _uniform,
 )
 from .sparse_prefill_direct_packed import _enabled
-from .sparse_prefill_prepare import allocate_scratch, packed_block_starts, upload
+from .sparse_prefill_prepare import (
+    RESIDUAL_WORDS,
+    allocate_scratch,
+    packed_block_starts,
+    residual_tile,
+    upload,
+)
 from .sparse_prefill_union_fp8 import (
     LAZY,
     P_BIAS,
@@ -239,17 +251,56 @@ def _pack_kernel(
     Q: fx.Tensor,
     Q8: fx.Tensor,
     QS: fx.Tensor,
+    BLOCK_ROWS: fx.Tensor,
+    TILE_COUNTS: fx.Tensor,
+    TILE_BLOCKS: fx.Tensor,
+    TILE_META: fx.Tensor,
+    TILE_ACTIVE: fx.Tensor,
+    TILE_RESIDUAL: fx.Tensor,
+    RESIDUAL_ROWS: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     ROWS: fx.Int32,
+    CAPACITY: fx.Int32,
+    MAX_BLOCKS: fx.Int32,
+    TILES: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     GATED: fx.Constexpr[bool],
+    RESIDUAL: fx.Constexpr[bool],
+    TOPK: fx.Constexpr[int],
 ):
     cta = fx.Int32(fx.block_idx.x)
     pack_ctas = (PACKED * HK + 3) // 4
-    if cta >= pack_ctas:
+    quant_end = pack_ctas + (ROWS + QROWS - 1) // QROWS
+    if fx.const_expr(RESIDUAL):
+        storage = (
+            fx.SharedAllocator()
+            .allocate(fx.Array[fx.Int32, RESIDUAL_WORDS, 16])
+            .peek()
+        )
+        bits = fx.Int32(
+            fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(RESIDUAL_WORDS, 1))))
+        )
+    if cta >= quant_end:
+        # Then one CTA per union tile lists its rows' residual blocks (K3b).
+        if fx.const_expr(RESIDUAL):
+            residual_tile(
+                BLOCK_ROWS,
+                TILE_COUNTS,
+                TILE_BLOCKS,
+                TILE_META,
+                TILE_ACTIVE,
+                TILE_RESIDUAL,
+                RESIDUAL_ROWS,
+                CAPACITY,
+                MAX_BLOCKS,
+                cta - quant_end,
+                bits,
+                TOPK,
+            )
+    elif cta >= pack_ctas:
         # CTAs past the blocks quantize Q for both FP8 kernels (one launch fewer).
         quantize_rows(Q, Q8, QS, ROWS, cta - pack_ctas)
     else:
@@ -280,43 +331,74 @@ def _pack_launch(
     Q: fx.Tensor,
     Q8: fx.Tensor,
     QS: fx.Tensor,
+    BLOCK_ROWS: fx.Tensor,
+    TILE_COUNTS: fx.Tensor,
+    TILE_BLOCKS: fx.Tensor,
+    TILE_META: fx.Tensor,
+    TILE_ACTIVE: fx.Tensor,
+    TILE_RESIDUAL: fx.Tensor,
+    RESIDUAL_ROWS: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     ROWS: fx.Int32,
+    CAPACITY: fx.Int32,
+    MAX_BLOCKS: fx.Int32,
+    TILES: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     GATED: fx.Constexpr[bool],
+    RESIDUAL: fx.Constexpr[bool],
+    TOPK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _pack_kernel(
-        K,
-        V,
-        KS,
-        VS,
-        PK,
-        PV,
-        PSC,
-        SOURCES,
-        VALID,
-        SLOTS,
-        DIRECT_FLAG,
-        Q,
-        Q8,
-        QS,
-        N,
-        PACKED,
-        ROWS,
-        HK,
-        PER_TOKEN,
-        SLOTTED,
-        GATED,
-        value_attrs={"llvm.target_features": _target_features()},
-    ).launch(
-        grid=((PACKED * HK + 3) // 4 + (ROWS + QROWS - 1) // QROWS, 1, 1),
-        block=(256, 1, 1),
-        stream=stream,
-    )
+    if PACKED > 0:
+        _pack_kernel(
+            K,
+            V,
+            KS,
+            VS,
+            PK,
+            PV,
+            PSC,
+            SOURCES,
+            VALID,
+            SLOTS,
+            DIRECT_FLAG,
+            Q,
+            Q8,
+            QS,
+            BLOCK_ROWS,
+            TILE_COUNTS,
+            TILE_BLOCKS,
+            TILE_META,
+            TILE_ACTIVE,
+            TILE_RESIDUAL,
+            RESIDUAL_ROWS,
+            N,
+            PACKED,
+            ROWS,
+            CAPACITY,
+            MAX_BLOCKS,
+            TILES,
+            HK,
+            PER_TOKEN,
+            SLOTTED,
+            GATED,
+            RESIDUAL,
+            TOPK,
+            value_attrs={"llvm.target_features": _target_features()},
+        ).launch(
+            grid=(
+                (PACKED * HK + 3) // 4
+                + (ROWS + QROWS - 1) // QROWS
+                + (TILES if RESIDUAL else 0),
+                1,
+                1,
+            ),
+            block=(256, 1, 1),
+            stream=stream,
+        )
 
 
 # ---- Direct ----
@@ -441,6 +523,47 @@ def _store_o(env, o, inv):
         )
 
 
+def _merge_o(env, o, inv, m_run, total):
+    """Residual row: O_d = o * inv merged with the row's union output O_u (BF16, already
+    normalized) by their log-sum-exps (log2 units), then stored like _store_o. The LSE offset
+    comes from out_lane (qrow * 512 + g * 128) and O_u is merged a half at a time, so the merge
+    keeps no value of its own live across the chunk loop."""
+    lse_lane = (env.out_lane >> 9) << 2
+    q_rows = fx.Uint32(env.nq) * env.heads
+    lse_u = _as_f32(_buffer_words(_buffer(env.lse, q_rows * 4), lse_lane, 1)[0])
+    lse_d = fx.Float32(m_run) + fx.Float32(rocdl.log(fx.Float32.ir_type, total.ir_value()))
+    top = _maximum(lse_u, lse_d)
+    w_u, w_d = _exp(lse_u - top), _exp(lse_d - top)
+    norm = fx.Float32(rocdl.rcp(fx.Float32.ir_type, (w_u + w_d).ir_value()))
+    w_u, w_d = w_u * norm, w_d * norm * fx.Float32(inv)
+    ones = fx.Vector.from_elements([fx.Float32(1.0), fx.Float32(1.0)], fx.Float32)
+    for half in range(2):
+        union = [
+            _buffer_words(env.gout, env.out_lane + 16 * s, 4)
+            for s in range(4 * half, 4 * half + 4)
+        ]
+        words = []
+        for r in range(2 * half, 2 * half + 2):
+            for k in range(4):
+                values = []
+                for j in range(4):
+                    m = 4 * k + j
+                    # Dim 16r + m: BF16 half m & 1 of word 8r + m // 2.
+                    w = 8 * r + m // 2 - 16 * half
+                    bits = fx.Int32(fx.Vector(union[w // 4])[w % 4])
+                    bits = (bits & fx.Int32(-65536)) if m & 1 else (bits << 16)
+                    values.append(
+                        fx.Float32(fx.fma(o[4 * m + r], w_d, _as_f32(bits) * w_u))
+                    )
+                words += _scaled_bf16(values, ones)
+        for s in range(4):
+            _buffer_store_words(
+                fx.Vector.from_elements(words[4 * s : 4 * s + 4], fx.Int32),
+                env.gout,
+                env.out_lane + 16 * (4 * half + s),
+            )
+
+
 def _flatten(vectors, dtype=fx.Int32):
     return fx.Vector.from_elements([v[i] for v in vectors for i in range(4)], dtype)
 
@@ -528,6 +651,8 @@ def _direct_kernel(
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
+    RES_ROWS: fx.Tensor,
+    LSE: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -537,6 +662,7 @@ def _direct_kernel(
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     PER_TOKEN: fx.Constexpr[bool],
+    RESIDUAL: fx.Constexpr[bool],
 ):
     group = H // HK
     work = fx.Int32(fx.block_idx.x)
@@ -547,8 +673,18 @@ def _direct_kernel(
     lane = fx.Int32(fx.thread_idx.x) & 63
     n, g = lane & 15, lane >> 4
     visible = position + 1
+    residual = fx.Boolean(False)
+    if fx.const_expr(RESIDUAL):
+        # A row of an active union tile with residual blocks: its block_indices row lists them
+        # (complete, wholly visible blocks), as if `count` blocks were visible (no tail; the
+        # masked tail slot reads block count of the request); the union output gets merged in.
+        count = _uniform(RES_ROWS[row])
+        residual = ~on & (count > 0)
+        on = on | residual
+        visible = residual.select(count * 4, visible)
     complete = _min(visible >> 2, fx.Int32(TOPK))
     tail = visible & 3
+    tail_block = visible >> 2
     blocks = complete + (tail != 0).select(fx.Int32(1), fx.Int32(0))
     chunks = on.select((blocks + CHUNK - 1) // CHUNK, fx.Int32(0))
     q_rows = fx.Uint32(NQ) * H
@@ -570,7 +706,8 @@ def _direct_kernel(
         p_start=p_start,
         complete=complete,
         tail=tail,
-        tail_block=visible >> 2,
+        tail_block=tail_block,
+        residual=residual,
         jj=(lane >> 2) & 3,
         g=g,
         per_token=PER_TOKEN,
@@ -590,6 +727,9 @@ def _direct_kernel(
         sc_up=(1 + ((n & 7) >> 2)) * 16 + (n & 3) * 4,
         gout=_buffer(OUT, q_rows * D * 2),
         out_lane=head_ok.select(qrow * (D * 2) + g * 128, fx.Int32(q_rows * D * 2)),
+        lse=LSE,
+        nq=NQ,
+        heads=H,
     )
 
     @flyc.jit
@@ -658,7 +798,13 @@ def _direct_kernel(
         inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
         if fx.const_expr(not PER_TOKEN):
             inv = inv * fx.Float32(VS[0])
-        _store_o(env, [o[i] for i in range(64)], inv)
+        if fx.const_expr(RESIDUAL):
+            if env.residual:
+                _merge_o(env, [o[i] for i in range(64)], inv, state[1], total)
+            else:
+                _store_o(env, [o[i] for i in range(64)], inv)
+        else:
+            _store_o(env, [o[i] for i in range(64)], inv)
 
     # Disabled waves (rows another kernel serves) exit without loads.
     if chunks > 0:
@@ -679,6 +825,8 @@ def _direct_launch(
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
+    RES_ROWS: fx.Tensor,
+    LSE: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -688,36 +836,41 @@ def _direct_launch(
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     PER_TOKEN: fx.Constexpr[bool],
+    RESIDUAL: fx.Constexpr[bool],
     GRID: fx.Int32,
     stream: fx.Stream,
 ):
-    _direct_kernel(
-        Q8,
-        QS,
-        PK,
-        PV,
-        PSC,
-        KS,
-        VS,
-        OUT,
-        BLOCKS,
-        META,
-        ACTIVE,
-        QUERY_TILES,
-        H,
-        HK,
-        NQ,
-        ROWS,
-        PACKED,
-        TOPK,
-        GATED,
-        SCALE,
-        PER_TOKEN,
-        value_attrs={
-            "rocdl.waves_per_eu": 2,
-            "llvm.target_features": _target_features(),
-        },
-    ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
+    if GRID > 0:
+        _direct_kernel(
+            Q8,
+            QS,
+            PK,
+            PV,
+            PSC,
+            KS,
+            VS,
+            OUT,
+            BLOCKS,
+            META,
+            ACTIVE,
+            QUERY_TILES,
+            RES_ROWS,
+            LSE,
+            H,
+            HK,
+            NQ,
+            ROWS,
+            PACKED,
+            TOPK,
+            GATED,
+            SCALE,
+            PER_TOKEN,
+            RESIDUAL,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "llvm.target_features": _target_features(),
+            },
+        ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 # ---- Host ----
@@ -782,6 +935,9 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
         active=standin if union is None else union.active,
         query_tiles=standin if union is None else union.query_tiles,
         source_blocks=inputs.block_indices,
+        # Core/residual union plans: residual rows (union.residual_rows, union.lse) merge.
+        union=union,
+        residual=union is not None and union.core_ratio > 0,
     )
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
@@ -793,6 +949,8 @@ _PACK, _DIRECT = {}, {}
 
 def _pack_args(inputs, prepared, stream):
     empty = prepared.packed_key[:4].view(torch.float32)
+    union, residual = prepared.union, prepared.residual
+    standin = prepared.pack_valid
     return (
         inputs.k,
         inputs.v,
@@ -808,13 +966,26 @@ def _pack_args(inputs, prepared, stream):
         inputs.q.view(-1),
         inputs.q8.view(-1),
         inputs.qs.view(-1),
+        # K3b CTAs of a core/residual union plan (stand-ins otherwise).
+        inputs.block_indices.view(-1) if residual else standin,
+        union.counts if residual else standin,
+        union.blocks.view(-1) if residual else standin,
+        union.metadata.view(-1) if residual else standin,
+        union.active if residual else standin,
+        union.residual if residual else standin,
+        union.residual_rows if residual else standin,
         inputs.k.shape[0],
         prepared.packed_blocks,
         inputs.q.shape[0] * inputs.q.shape[1],
+        union.block_capacity if residual else 0,
+        union.max_blocks if residual else 0,
+        union.num_tiles if residual else 0,
         prepared.hk,
         prepared.per_token,
         prepared.slotted,
         prepared.gated,
+        residual,
+        inputs.topk if residual else 0,
         stream,
     )
 
@@ -834,6 +1005,8 @@ def _direct_args(inputs, prepared, out, stream):
         prepared.metadata.view(-1),
         prepared.active,
         prepared.query_tiles,
+        prepared.union.residual_rows if prepared.residual else prepared.query_tiles,
+        prepared.union.lse.view(-1) if prepared.residual else empty,
         inputs.q.shape[1],
         prepared.hk,
         inputs.q.shape[0],
@@ -843,16 +1016,22 @@ def _direct_args(inputs, prepared, out, stream):
         prepared.gated,
         inputs.scale,
         prepared.per_token,
+        prepared.residual,
         prepared.rows * prepared.hk,
         stream,
     )
 
 
-def _compile(cache, key, launch, args, device, stream):
+def _compile(cache, key, launch, args, empty, device, stream):
+    """Compile once per specialization. Compiling runs the launcher, so args[empty] (the pack's
+    block count, the direct grid) is 0 and it launches nothing: neither kernel is idempotent
+    (the pack's K3b CTAs compact block_indices in place, residual rows merge into out)."""
     compiled = cache.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
+        args = list(args)
+        args[empty] = 0
         with torch.cuda.device(device), torch.cuda.stream(stream):
             compiled = cache[key] = flyc.compile(launch, *args)
     return compiled
@@ -862,13 +1041,13 @@ def _compiled(inputs, prepared, out, stream):
     device = inputs.q.device
     pack = _pack_args(inputs, prepared, stream)
     direct = _direct_args(inputs, prepared, out, stream)
-    # Specializations: pack (HK, PER_TOKEN, SLOTTED, GATED); direct (H, HK, TOPK, GATED,
-    # SCALE, PER_TOKEN).
+    # Specializations: pack (HK, PER_TOKEN, SLOTTED, GATED, RESIDUAL, TOPK); direct (H, HK,
+    # TOPK, GATED, SCALE, PER_TOKEN, RESIDUAL).
     pack_fn = _compile(
-        _PACK, (device, *pack[17:21]), _pack_launch, pack, device, stream
+        _PACK, (device, *pack[27:33]), _pack_launch, pack, 22, device, stream
     )
-    key = (device, *direct[12:14], *direct[17:21])
-    direct_fn = _compile(_DIRECT, key, _direct_launch, direct, device, stream)
+    key = (device, *direct[14:16], *direct[19:24])
+    direct_fn = _compile(_DIRECT, key, _direct_launch, direct, 24, device, stream)
     return pack, direct, pack_fn, direct_fn
 
 

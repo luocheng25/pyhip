@@ -892,11 +892,20 @@ def _store_out(env, o, inv):
         _buffer_store_words(words, env.gout, valid.select(offset, env.q_oob))
 
 
-def _store_whole(env, o, l_run, v_scale):
+def _store_whole(env, o, l_run, v_scale, m_run=None):
+    """O / l (times the V scale) as BF16; with m_run also the rows' log-sum-exp
+    m + log2(l) of S * c (log2 units), which the residual direct merges with."""
     total = l_run + l_run.shuffle_xor(32, 64)
     inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     if v_scale is not None:
         inv = inv * v_scale
+    if m_run is not None:
+        lse = fx.Float32(m_run) + fx.Float32(
+            rocdl.log(fx.Float32.ir_type, total.ir_value())
+        )
+        _buffer_store_words(
+            fx.Vector.from_elements([_as_i32(lse)], fx.Int32), env.glse, env.lse_lane
+        )
     _store_out(env, o, inv)
 
 
@@ -1151,6 +1160,12 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
             q_rows * 4,
         ),
         qs_lane=valid.select((query * H + head) * 4, fx.Int32(q_rows * 4)),
+        # Row log-sum-exp for the residual direct merge (QS layout), from the first half.
+        glse=_buffer(
+            fx.make_view(fx.get_iter(T.LSE) + q_base, fx.make_layout(q_rows, 1)),
+            q_rows * 4,
+        ),
+        lse_lane=(valid & (h == 0)).select((query * H + head) * 4, fx.Int32(q_rows * 4)),
         gout=_buffer(
             fx.make_view(fx.get_iter(T.OUT) + q_base * D, fx.make_layout(q8_extent, 1)),
             q8_extent * 2,
@@ -1285,6 +1300,7 @@ def _task(
     PSTARTS,
     PARTIALS,
     COUNTERS,
+    LSE,
     lds,
     mapped,
     work,
@@ -1308,6 +1324,7 @@ def _task(
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
+    RESIDUAL: fx.Constexpr[bool],
 ):
     """One task (128 (query, head) rows of a union tile over its compact key list, or one key
     range of it) from its prefetched first tiles; prefetches the next slot's under its
@@ -1329,6 +1346,7 @@ def _task(
         LBLOCKS=LBLOCKS,
         PSTARTS=PSTARTS,
         PARTIALS=PARTIALS,
+        LSE=LSE,
     )
     lane = _lane_env(lds, PER_TOKEN, SLOTTED, HK)
     env = _task_env(
@@ -1566,7 +1584,7 @@ def _task(
         else:
             _store_whole(env, o, l_run, v_scale)
     else:
-        _store_whole(env, o, l_run, v_scale)
+        _store_whole(env, o, l_run, v_scale, last["m_run"] if RESIDUAL else None)
     # The next task's K/V writes reuse the LDS of every wave's output shuffle.
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
@@ -1594,6 +1612,7 @@ def _kernel(
     PSTARTS: fx.Tensor,
     PARTIALS: fx.Tensor,
     COUNTERS: fx.Tensor,
+    LSE: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -1608,6 +1627,7 @@ def _kernel(
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
+    RESIDUAL: fx.Constexpr[bool],
 ):
     allocator = fx.SharedAllocator()
     lds = (
@@ -1632,6 +1652,7 @@ def _kernel(
         LBLOCKS=LBLOCKS,
         PSTARTS=PSTARTS,
         PARTIALS=PARTIALS,
+        LSE=LSE,
     )
     per_tile = HK * ((BQ * GP + 127) // 128)
     limit = ((TASKS + GRID - 1) // GRID) * GRID
@@ -1673,6 +1694,7 @@ def _kernel(
             PSTARTS,
             PARTIALS,
             COUNTERS,
+            LSE,
             lds,
             mapped,
             work,
@@ -1691,6 +1713,7 @@ def _kernel(
             PER_TOKEN,
             SLOTTED,
             SPLIT,
+            RESIDUAL,
         )
         work = work + GRID
         mapped, enabled, pre = result[0], result[1], result[2:]
@@ -1717,6 +1740,7 @@ def _launch(
     PSTARTS: fx.Tensor,
     PARTIALS: fx.Tensor,
     COUNTERS: fx.Tensor,
+    LSE: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -1731,6 +1755,7 @@ def _launch(
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
+    RESIDUAL: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if GRID > 0:
@@ -1754,6 +1779,7 @@ def _launch(
             PSTARTS,
             PARTIALS,
             COUNTERS,
+            LSE,
             H,
             HK,
             NQ,
@@ -1768,6 +1794,7 @@ def _launch(
             PER_TOKEN,
             SLOTTED,
             SPLIT,
+            RESIDUAL,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
                 "llvm.target_features": _target_features(),
@@ -1916,6 +1943,7 @@ def _args(inputs, plan, packed, out, stream):
         plan.pack_starts,
         plan.partials.view(-1) if plan.split > 1 else plan.counts,
         plan.split_counters if plan.split > 1 else plan.counts,
+        plan.lse.view(-1) if plan.core_ratio > 0 else plan.counts,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
@@ -1934,20 +1962,21 @@ def _args(inputs, plan, packed, out, stream):
         k_scale.numel() > 1,
         plan.slotted,
         plan.split,
+        plan.core_ratio > 0,
         stream,
     )
 
 
 def _compiled(inputs, args, stream):
-    # Specialization: H, HK, BQ, GP, SCALE, PER_TOKEN, SLOTTED, SPLIT.
-    key = (inputs.q.device, *args[19:21], *args[25:27], *args[29:33])
+    # Specialization: H, HK, BQ, GP, SCALE, PER_TOKEN, SLOTTED, SPLIT, RESIDUAL.
+    key = (inputs.q.device, *args[20:22], *args[26:28], *args[30:35])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:28], 0, *args[29:33], stream
+                _launch, *args[:29], 0, *args[30:35], stream
             )
     return compiled
 

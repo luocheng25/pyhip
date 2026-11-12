@@ -182,15 +182,22 @@ budget = 1.7·direct_tiles                       # 超过它就走direct，不�
 # tile的块 = 各行block_indices里的块（K1已升序，-1跳过）+ 各行的因果尾块vis_j//4（vis_j%4 ≠ 0时）
 # _blocks按元素顺序遍历rows·T个元素：线程t一次发16个读（元素t + k·threads），同一wave的lane读连续元素
 # lds_layout（host）：全批最长范围MAXB每块一个成员字（4B，BQ>32时8B）放得进32KiB（LDS_BUDGET，每CU两个CTA）时
-#   LDS按它分配，dense_limit = MAXB；否则LDS = 32KiB，dense_limit = 8184块（64位成员时4092），更长的tile走窗口
+#   LDS按它分配，dense_limit = MAXB；否则LDS = 32KiB，dense_limit = 8168块（64位成员时4084），更长的tile走窗口
 if end ≤ dense_limit:                           # _dense：LDS中每块一个成员字
     word[0:end] = 0；barrier
     for 第j行的每个块b: atomic_or(word[b], 1 << j)            # LDS原子或
     barrier
-    每个wave分到连续的一段字，每轮64个：先数ballot(字≠0)的位数 → 各wave的个数经LDS求前缀 → 并集大小U
-    if 16·ceil(U/16) ≤ budget:
-        再扫一遍：非0的字b写到 位置 = wave起点 + mbcnt(ballot)：blocks[tile, 位置] = b，membership[tile, 位置] = word[b]
-    count = U
+    # 核心字：成员数 ≥ thr = max(1, ceil(core_ratio·rows))，或块号 ≥ (pos0+1)//4（对角，含各行的尾块）；
+    # core_ratio：FP8计划按每KV头的Q头数取CORE_RATIOS（H12 0.5、H6 0.2），其余（BF16、H3、KV拆分计划）为0即整个并集
+    每个wave分到连续的一段字，每轮64个：数ballot(字≠0)（并集U）、ballot(核心字)（核心C）、非核心字的成员数之和（残余对P）
+        → 各wave的三个数经LDS（扫描区每wave三个字）求前缀与总和
+    residual = 0.112·P + 3.08·rows               # 各行残余块的direct工作量，按BN32步（实测拟合）
+    split = P > 0 且 16·ceil(C/16) + r·residual < 16·ceil(U/16)
+    cost = 16·ceil(C/16) + r·residual if split else 16·ceil(U/16)
+    if cost ≤ budget:
+        再扫一遍：保留的字（split时为核心字，否则非0的字）写到 位置 = wave起点 + mbcnt(ballot)：
+            blocks[tile, 位置] = b，membership[tile, 位置] = word[b]
+    count = C if split else U；残余步数 = round(residual) if split else 0
 else:                                           # _window：每次65536个块，超出预算即停
     count = 0
     for w0 in 0, 65536, … < end:
@@ -200,7 +207,7 @@ else:                                           # _window：每次65536个块，
         每个线程一段连续的字：位数之和 → CTA前缀和 → prefix[字] = 窗口内在它之前的存在块数；present = 窗口内并集块数
         if 16·ceil((count+present)/16) > budget: 提案0，停止
         各线程按字顺序把存在的块写到blocks[tile, count + prefix[字] + 字内序号]
-        for 并集序号每4088个一段（64位成员时2044个；LDS里位图和前缀之后的全部空间，16KiB−32B）[c0, c0+chunk):
+        for 并集序号每4072个一段（64位成员时2036个；LDS里位图和前缀之后的全部空间，16KiB−96B）[c0, c0+chunk):
             member[0:min(chunk, present−c0)] = 0；barrier
             for 第j行在窗口内的每个块b:                              # 再遍历一遍tile的块
                 i = rank(b) − c0             # rank = prefix[字] + popcount(字内低于b的位)
@@ -210,6 +217,7 @@ else:                                           # _window：每次65536个块，
 # 超出预算的tile走direct，count不完整，之后只读提案为1的tile的count
 counts[tile] = count
 costs[tile] = (direct_tiles, longest, 1 if 未超出预算 else 0)
+residual[tile] = 残余步数 if 未超出预算 else 0   # 窗口路径的tile不拆分
 # 工作量随选中的块数增长；只有窗口路径每32个块另加一个位图字，1M时每tile最多4个窗口
 ```
 
@@ -219,7 +227,7 @@ K3是一次launch里三类互不依赖、并行执行的CTA：
 
 - 排序CTA（`task_order`长度不超过4096时只有1个）：
   1. 全局路由：算出一个步数阈值L，union只保留N64步数不超过L的提案1 tile，更长的改走direct。只有union受最长任务限制时L才会小于最长步数（降级最长的一批，最多全部改走direct），否则保留全部提案1 tile。
-  2. 发布结果：`active[tile]`（1 = 走union）；有任一tile走direct时`direct_flag[0]` = 1，K6/K7据此决定是否执行（raw的K7′看列表CTA写的`direct_flag[1]`）。
+  2. 发布结果：`active[tile]`（1 = 走union）；有任一tile走direct，或走union的tile带残余块（K2的`residual[tile]` > 0）时`direct_flag[0]` = 1，K6/K7据此决定是否执行（raw的K7′看列表CTA写的`direct_flag[1]`）。
   3. 给union任务排序：任务 = (tile, KV头, 128行切片)，按N64步数从长到短排，再蛇形分给持久grid的各CTA，写入`task_order`。FP8计划的任务数少于CU数时（`split = 2`，grid为CU数），先按“各active任务步数加6步、除以CU数”的平均负载给更长的任务两个项（前ceil(steps/2)步与其余步，按任务顺序前64个分到slot），按项的步数排序；项写成`(task << 8) | (slot << 2) | (part << 1) | 1`，同时清零64个slot计数器（见1.2.10 K5 split）。
 - mask CTA（每tile一个，4个wave各管1/4的N64步）：为提案1的tile生成`score_masks`，即每个N64步、每个query在64个key列里要保留哪些token。mask只依赖K2的输出，不等路由结果；被路由改走direct的tile，其mask不会被K5读取。
 - 列表CTA（direct走raw且有union计划时才有，每256个raw行组一个，每线程一个行组）：与排序CTA一样先算L，再按与`_order`相同的判据检查行组的4行，有一行所在tile不走union就把行组编号写进`direct_list`。K7′的gated grid仍是每个行组一个CTA（×HK），但前`direct_flag[1]`个按列表取行组、其余立即退出，有计算的CTA编号连续（见1.2.8与第5节10-30（续3））。
@@ -329,8 +337,8 @@ _route():      # 每个排序CTA各算一遍（结果相同），省一次全局
     L_k = [M, int(M·2^(−1/2)), …, int(M·2^(−6/2)), −1]，k = 0..7
     for tile in 全部tile:                         # 第二遍：8档一起累计
         s = ceil(counts[tile]/16)；d, r, p = costs[tile]       # direct步数和、最长行步数、提案
-        对每档k：p==1且s ≤ L_k → k_sum_k += s，k_max_k = max(k_max_k, s)
-                 否则 → d_sum_k += d，d_max_k = max(d_max_k, r)
+        对每档k：p==1且s ≤ L_k → k_sum_k += s，k_max_k = max(k_max_k, s)，d_sum_k += residual[tile]
+                 否则 → d_sum_k += d，d_max_k = max(d_max_k, r)       # 保留的核心tile，其残余块在direct阶段
     cost_k = [k_sum_k>0]·(10 + 3.2·max(k_max_k, k_sum_k·TASK_SHARE))
            + [d_sum_k>0]·(DIRECT_FIXED + max(0.7·d_max_k, DIRECT_STEP·d_sum_k))
     cost_0 ×= 0.95                                # 其它档须快5%以上
@@ -342,7 +350,7 @@ _order(pid, L):
     active = costs[tile].p == 1 and ceil(counts[tile]/16) ≤ L
     if rank < TASKS/HK and rank % slices == 0:    # 每个tile由KV头0的切片0发布
         active_out[tile] = active
-        if not active: direct_flag[0] = 1         # K2的program 0已清0
+        if not active or residual[tile] > 0: direct_flag[0] = 1   # K2的program 0已清0
     cost = active ? ceil(counts[tile]/16) : 0     # 不走union的任务排到最后
     key = (cost << SHIFT) + (TASKS−1−rank)；rank ≥ TASKS的位置为−1；WIDE时用int64
     sorted = sort(key, 降序)                       # 每个排序CTA只排自己的SIZE个rank
@@ -372,6 +380,28 @@ _masks(cta):                                      # 每CTA 4个wave，每个wave
             nib_g = (q < rows 且 member_g的第q位) ? (1 << clamp(vis − 4·block_g, 0, 4)) − 1 : 0
             score_masks[tile, nt, q, quarter] = nib_0 | nib_1 << 4 | nib_2 << 8 | nib_3 << 12   # int16
 ```
+
+#### 1.2.5b K3b 残余块（[residual_tile](sparse_prefill_prepare.py#L1567)、[_residual_row](sparse_prefill_prepare.py#L1546)）
+
+核心/残余计划（`core_ratio` > 0）时作为K6 FP8 pack launch的一部分：pack块的CTA、Q量化的CTA之后，每tile再加一个CTA（256线程，静态LDS 1KiB = 256个位图字，覆盖dense路径最长的8168块）。pack在K3之后（要用`active`），省一次launch（dense2048 H12每次调用约4µs）：
+
+```python
+residual_tile(tile):
+    if active[tile] and residual[tile] > 0:
+        words = ceil(min(MAXB, ceil((pos0+rows)/4)) / 32)          # K2的dense范围，核心块都在其中
+        bits[0:words] = 0；barrier
+        for 核心表blocks[tile, 0:counts[tile]]的每个块b（每线程4个读同时在途）: atomic_or(bits[b>>5], 1 << (b&31))
+        barrier
+        for 第r行（每个wave轮流取行）:
+            ids = block_indices[row, k·64 + lane]（k = 0..T/64−1，K1已升序）；C = min(vis//4, T)
+            keep_k = (k·64 + lane < C) and bit(ids_k)为0             # 每块一次LDS读
+            for k: mask = ballot(keep_k)；block_indices[row, base + mbcnt(mask)] = ids_k（keep_k时）；base += popcount(mask)
+            residual_rows[row] = base                               # 残余块升序排在行首，只往前移，读在写之前
+    elif active[tile]:
+        residual_rows[tile的各行] = 0
+```
+
+K7里所在tile为active、`residual_rows` > 0的行只处理行首这些残余块（都是完整可见的块，不带因果尾块），再与union的输出合并（1.2.10）。被全局路由改走direct的tile不进入这个kernel，其行的`block_indices`保持K1的结果。
 
 #### 1.2.6 K5 union（[_kernel](sparse_prefill_union.py#L585)、[_body](sparse_prefill_union.py#L219)、[_read_packet_g2s](sparse_prefill_union.py#L80)）
 
@@ -541,8 +571,9 @@ out = BF16(O·(per tensor时为sv，否则1)/l)
 
 - **K5 FP8 union**（min(任务数, CU)×256，64KiB LDS；split计划为CU数）：与BF16 union用同一计划（`metadata`、`blocks`/`pool_blocks`、`score_masks`、`counts`、`tails`、`active`、`task_order`），任务仍是tile×KV头×128行切片。4个wave各32行（每SIMD一个wave，512个寄存器：per tensor 244+128 AGPR，per token 256+128），32×32×16 FP8 MFMA；O的128个值由inline asm MFMA留在AGPR。每个N64步：Part 1算QK(t)，在第1条QK MFMA之后补完tile t−1的lazy max与rescale，接着P'(t−1)的exp与行和（两种scale都在Part 1求和）；barrier后Part 2算PV(t−1)，穿插P打包、S''(t)的centering、每个tile都做的无分支membership mask（whole tile保留全部位）与masked行max，以及V(t)写LDS。Vᵀ取自K6的FP8 pack（每块已转置，每lane一次16B读、按维度写16B），V块号用`v_readlane`从lane持有的块号取得（不与LDS共用lgkmcnt）。K、Vᵀ在LDS里双缓冲。任务的第一个phase是单独的实例：tile 0在首个精确max后已完成（不做fix-up），K-step 0的PV MFMA不带累加输入开始O（不写128个AGPR零）。持久循环在输出阶段预取下一任务的Q8、scale和第一个tile；任务解码用标量读，不等输出的store。收尾每个O块最后一条PV MFMA的asm自带排空的wait state：split计划的收尾寄存器紧，寄存器分配会在asm MFMA后3–12个wait state就拷贝O块，LLVM看不到这个hazard（7450c454之前的split kernel有29处）。padding块号设成越界（读0）；slot表中请求最后一个不满块按有效token数限制每次读取（池中多出的行可能是NaN）。
 - **K5 split（短prefill）**：任务数少于CU数时（如dense2048 H3：64个任务对80个CU，最长任务32个N64步），K3给超过平均负载（各任务步数加6步任务开销，除以CU数）的任务两个order项：前ceil(steps/2)步与其余步（每次调用最多64个任务，slot号与part编码在order项里，K3每次调用清零64个slot计数器）。两部分各把Oᵀ片段、m、l用system scope的store（sc0 sc1，直写过L2）写进partial记录（130KiB），`vmcnt(0)`与barrier之后由一个线程在slot计数器上做agent scope的atomic加1；后到的一方用system scope的load（不命中本CU的L1和本XCD的L2）读另一方的记录，与自己寄存器里的O合并（part 0在前，两边算出的结果相同：O = Σ O_p·2^(m_p−m)，l同理），按未拆分任务的方式输出。split行与未拆分行只差不同m下FP8 P'的舍入，相对FP32参考的误差相同。每CU一个以上任务时不拆（dense2048 H6实测+1%：拆出的部分只能与别的任务配对，背后约10µs的任务开销抵消了最长任务的缩短）。
-- **K6 FP8 pack**（⌈packed块·HK/4⌉×256）：每个(块, KV头)一个wave，把整段上下文按块重排成direct的MFMA操作数：PK每块1KiB（`PK[b][i·256+(tok·4+g)·16]` = K[tok][64i+8g..+7] ++ K[tok][64i+32+8g..+7]），PV每块1KiB（`PV[b][p·256+d·16+(m−4p)·4+tok]` = V[tok][16d+m]）；per token时另写每块64B的scale记录（4个k_scale、4个log2 v_scale、4个1/v_scale）。来源块由host上传，有slot表时在pack里查表。有union计划时总写PV（及per token的scale记录，union也读），PK只在K3写的`direct_flag[0]`为1（有tile走direct）时写。块之后的CTA量化Q（`quantize_rows`，见上），所以FP8路径比BF16多的只有Q的读写，没有多一次launch。1M上下文、HK1时PK/PV共约512MiB，K6约200µs。
-- **K7 FP8 direct**（rows·HK×64，`waves_per_eu=2`）：每行×KV头一个wave，16×16×32 FP8 MFMA。key表依次为block_indices的完整块、因果尾块，再用块0补齐（屏蔽）。每8块一个chunk，chunk t开始时先发chunk t+1的16条K/V加载；块号提前一个chunk用两条标量读（`s_buffer_load_dwordx4`，lgkmcnt）取得，向量读按序完成，块号若与K/V同在vmcnt上就会连带等下一chunk的数据。一次循环跑两个chunk、两套寄存器交替，下一chunk的数据直接落在下一轮使用的寄存器里（没有回边拷贝）；加载之后的内存clobber asm与sched_barrier使MachineSink不会把加载移到rescale分支之后、QK(t)也不会提到加载之前。per token时一个16-lane行（g相同）所需的24个scale项用每lane两个dword读取（值n与16+n），再由DPP行广播送到用处，代替原来每块64B记录的6条b128读，于是也放得下第二套寄存器。lane本地lazy max，只在rescale分支用shuffle求行max。每个lane输出(head, g)的64个维度。寄存器per tensor 240、per token 248。gated时与BF16 K7相同，只处理非active tile的行；不处理的wave直接退出（不发加载）。
+- **K5/K7 核心与残余（core/residual）**：SGLang导出的真实12k选择里，union tile算的(行, token)只有39%–50%被选中（4-token块粒度，H3–H12）；H12时还有约一半tile因为并集太大整行走direct。FP8计划（`core_ratio` > 0，H12取0.5、H6取0.2，H3、KV拆分计划与窗口路径的tile不拆）里K2只把核心（至少ceil(ratio·rows)行选中的块与对角）放进union，各行的其余完整块由K3b排到`block_indices`的行首，K7对这些行只处理残余块。union写每行的lse = m + log2(l)（log2单位，[NQ, H]，与QS同布局）；K7的残余行收尾时读union写好的BF16输出O_u和lse_u，lse_d = m + log2(l)，w_u = 2^(lse_u − top)、w_d = 2^(lse_d − top)归一化后O = w_u·O_u + w_d·O_d，再按BF16写回。O_u在合并前已舍入到BF16，残余块的FP8 P'按自己的max舍入，所以输出与不拆分不逐bit相同；相对fp8_query参考的误差不变（真实12k L7/L39：2.53%/2.53%，不拆分2.53%/2.53%）。K7的合并在收尾：lse的偏移由已有的out_lane推出（qrow = out_lane >> 9），O_u每次合并一半；合并代码若在chunk循环外多留活跃值，LLVM会改排循环内的块地址计算与K/V加载，per token的random128k direct慢3.5%。direct与pack的编译不发射kernel（编译会执行launcher，K3b的原地压缩与残余行的合并都不能执行两次）。
+- **K6 FP8 pack**（⌈packed块·HK/4⌉×256，另加Q量化与核心/残余计划的K3b CTA）：每个(块, KV头)一个wave，把整段上下文按块重排成direct的MFMA操作数：PK每块1KiB（`PK[b][i·256+(tok·4+g)·16]` = K[tok][64i+8g..+7] ++ K[tok][64i+32+8g..+7]），PV每块1KiB（`PV[b][p·256+d·16+(m−4p)·4+tok]` = V[tok][16d+m]）；per token时另写每块64B的scale记录（4个k_scale、4个log2 v_scale、4个1/v_scale）。来源块由host上传，有slot表时在pack里查表。有union计划时总写PV（及per token的scale记录，union也读），PK只在K3写的`direct_flag[0]`为1（有tile走direct）时写。块之后的CTA量化Q（`quantize_rows`，见上），所以FP8路径比BF16多的只有Q的读写，没有多一次launch。1M上下文、HK1时PK/PV共约512MiB，K6约200µs。
+- **K7 FP8 direct**（rows·HK×64，`waves_per_eu=2`）：每行×KV头一个wave，16×16×32 FP8 MFMA。key表依次为block_indices的完整块、因果尾块，再用块0补齐（屏蔽）。每8块一个chunk，chunk t开始时先发chunk t+1的16条K/V加载；块号提前一个chunk用两条标量读（`s_buffer_load_dwordx4`，lgkmcnt）取得，向量读按序完成，块号若与K/V同在vmcnt上就会连带等下一chunk的数据。一次循环跑两个chunk、两套寄存器交替，下一chunk的数据直接落在下一轮使用的寄存器里（没有回边拷贝）；加载之后的内存clobber asm与sched_barrier使MachineSink不会把加载移到rescale分支之后、QK(t)也不会提到加载之前。per token时一个16-lane行（g相同）所需的24个scale项用每lane两个dword读取（值n与16+n），再由DPP行广播送到用处，代替原来每块64B记录的6条b128读，于是也放得下第二套寄存器。lane本地lazy max，只在rescale分支用shuffle求行max。每个lane输出(head, g)的64个维度。寄存器per tensor 240、per token 248。gated时与BF16 K7相同，只处理非active tile的行；核心/残余计划另外处理active tile中`residual_rows` > 0的行（只读行首的残余块，没有因果尾块，收尾合并union的输出，见上一条）；不处理的wave直接退出（不发加载）。
 - **compute="bf16"**：入口按`kv_slots`取出各请求的FP8 token（及per token scale），BF16 = RNE(FP8·scale)（FP8→BF16精确，乘积只舍入一次），再以不带slot表的BF16 K/V调用BF16路径。结果与调用方自己反量化后调用逐bit相同，代价是一份packed上下文的BF16 K/V临时张量和几个逐元素kernel。
 
 精度（[test_attention_fp8.py](../../../../../tests/ops/qsa/test_attention_fp8.py)的随机用例，K/V每token幅度在2^±1之间）：compute="fp8"相对反量化FP32参考的逐(行, head)范数相对误差平均约4.7%、最大约12%。在PyTorch中只把Q量化成FP8即得平均4.1%、最大11.5%，只量化P约2%，两者都量化与kernel的统计相同：误差主要来自Q的FP8量化（分数误差约为|q||k|的2^-5）。compute="bf16"平均0.4%，与BF16 K/V相同。分数更尖锐或Q/K有离群通道时个别(行, head)的误差更大：Q放大4/8倍时最大0.42/0.85，4个离群通道时0.88，再放大Q 4倍时2.25；按精确最大值在PyTorch中做同样的Q/P舍入，误差分布与kernel相同（最大0.4233/0.8523/0.8838/2.2513），所以是FP8 Q舍入的固有误差，不是kernel错误。参考的Q用kernel自己的FP8 Q（[fp8_query](../../../testing/qsa_reference.py)：Kq的量化结果，FP32）时只剩FP8概率的误差，范数以中位数为下限，上述用例平均0.2–2.3%、最差不超过5.8%（`test_reference_with_fp8_query`）；在PyTorch中按`q / (amax / 240)`自行量化的Q则因Kq用近似倒数，个别元素落到相邻的FP8值，尖锐分数下最差仍有0.23–0.48，参考Q舍入成BF16时离群通道也会带来0.14–0.43（[数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/accuracy_peaked.txt)）。P'的下溢：原来rescale后行最大值落在P' = 1，相对它低于2^-11的权重舍成0，而l按FP32累加全部权重。attention sink加平坦长尾时（2047个key各为sink的2^-12，合占约1/3），尾部在分子中全部丢失，输出平均偏差24.8%（PyTorch中按精确最大值仿真得24.8%）；SGLang服务中同一token重复11888次的prompt上整个layout平均偏差5.5%。P_BIAS = 4后该例为0.24%，`test_fp8_attention_sink`覆盖union与direct、per tensor与per token（旧常量下4例全部失败）。2048个key中丢掉的质量在最坏情况下（全部权重恰在2^-15以下）约6%。SGLang服务的真实激活上（FP8 KV、1M TEST=1，两个rank共15756个layout）：相对fp8_query参考，各layout平均0.42%（最大1.1%），最差的(行, head)不超过5.8%；相对精确参考平均0.77%（最大2.1%），最差的(行, head) p99为11%、最大17%（来自Q的FP8量化）。P_BIAS之前相对fp8_query参考最大平均3.2%、最差16%，同一token重复的prompt整层平均5.5%。SGLang的TEST模式以fp8_query为参考检查（平均<5%、最差<20%），相对精确参考的误差只记录（[sink与A/B数据](../../../../../mytest/mydata/qsa_fp8_20261110_01/pbias_ab)）。AITER #7008的Triton sparse GQA在kernel内把FP8 K/V转成BF16、Q保持BF16，精度对应compute="bf16"。
@@ -880,6 +911,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 路由时延模型由MI308X分阶段计时拟合（union中位误差4.4%、p90 13.2%；direct中位误差1.4%），不保证每个布局都选到最快的路径。Union不受最长任务限制时总是全部保留：模型低估raw direct的代价，去掉这一条件后long_high M4096慢37.6%。
 - 删除dense后，完整因果前缀prompt 384–2051行比原dense慢0–27%（10-02测，12层合计不超过约0.33ms）；删除候选提升后，少数TP2高共享、P0 4k随机选择和TP4分块布局的attention慢8–21%（10-04测）。真实12k单请求和服务布局不受影响。
 - FP8 union的每个phase约3000周期（64条MFMA下限2048），受VALU发射与依赖限制；每个任务的边界（收尾、输出、下一任务的序幕）约14.5K周期（约8µs），其中下一任务约100KB的加载与64KB的输出在VMEM上排队，寄存器（per token arch VGPR 256）、SGPR（106）与LDS（64KiB）都放不下跨任务的预取。per token比per tensor多约12%（centering每值3条VALU、行和2条）。不改数值时，FP8相对BF16在TP2（H12）的m12000/真实12k约1.42×/1.32×（per tensor/per token），见第5节11-11（续4）。
+- FP8核心/残余（H12、H6）：union部分在合并前多一次BF16舍入（不超过该部分的2^-9），与不拆分不逐bit相同；只拆K2 dense路径的tile（因果范围不超过8168块，约32k token），KV拆分的短prefill与H3不拆。残余direct每行另有固定开销（约3个BN32步）与合并读写，K2按`RESIDUAL_PAIR`/`RESIDUAL_ROW`（SGLang导出的真实12k上拟合）比较代价。
 - FP8的split只在任务数少于CU数时启用；split计划的partial记录（64个slot×2×130KiB）与计数器是union scratch的一部分（约17MiB）。
 - FP8 K/V的路由系数（`FP8_ROUTES`）只标定了时延模型各项和逐tile阈值2.0，建计划的最少行数沿用BF16。很长的上下文（约1M）里H12/H6不建计划最快：K2逐窗口扫描整段上下文，计划的准备开销（K2/K3约200–650µs）超过union的收益，BF16同样如此；路由只在K2之后逐tile决定，无法避免这部分开销。FP8 pack在有direct行时重排整段上下文，没有打包预算或raw回退。
 - SGLang的FP8 KV不带scale。MTP的draft层K有amax约90的离群通道，draft层用FP8时接受长度低约7%，服务要加`--speculative-draft-kv-cache-dtype bf16`。目标层的FP8使random prompt上的接受长度低1–2%（GSM8K上不变），吞吐靠每步快1–2%与BF16持平（benchmark说明第3节）。
@@ -887,7 +919,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。长上下文prefill logits也随buffer位置波动（P245760约±30%）。
 - 1M上下文仍很慢：prefill indexer是O(L²)，上下文末尾16384行的chunk每层约46ms（P245760约9.4ms），其中logits约25.6ms（约4.4 TFLOP，约170 TFLOP/s；写出约18GB FP32 logits）、top-k约20.8ms（直方图与收集两遍读约34GB，约1.6TB/s）（16块1024行的profiler合计，[数据](../../../../../mytest/mydata/qsa_1m_impl_20261029_01/chunk_rows_1m/chunk_rows.json)）。线性外推整条1M prompt的indexer每rank约18秒，各TP rank重复计算；logits块最多约1.1GiB。Decode每层B1/B8约50/197µs，B8以logits（176µs）为主。Attention上下文末尾16384行的chunk每层H12全union约3.4ms、全direct约10.2–10.6ms。
 - SGLang对带prefix的chunk传该层的K/V池和packed slot表（`qwen_sparse_attn_backend`经`PyHIPAttention.can_read_kv_slots`判断：int32、一维连续、同设备、K/V池连续），不满足时退回`index_select`拷贝。TP2/TP4服务的每层K池约2.49/3.30GiB；TP8在`MEM_FRACTION_STATIC=0.93`时为4.50GiB（同步前4.30GiB），raw direct用WIDE。Raw direct只在上下文超过行数的32倍（或PK+PV超过1GiB）时使用，16384行的chunk为512k以上；合成测试中1M的原地读比拷贝快1.3–1.8ms/层，4.5GiB池的1M分散选择（WIDE）快0.58–1.04ms/层（见benchmark说明第2节）。
-- K2的LDS按每CU两个CTA的32KiB预算分配：tile的最长因果范围超过8184块（BQ42用64位成员时4092块，约32k/16k token）时走按65536块窗口的多遍路径。16k–32k上下文的K2因此比AITER的dense K2慢（热缓存32k H3 117 vs 27µs），K1不再散射dense位图而快（311→202µs），整次调用热缓存时持平或更快（32k H3/H6/H12 −0.6%/−0.5%/−0.03%）；AITER op test自己的计时协议下32k仍慢0.4–1.2%。预算加大到64KiB或成员窗口加到32KiB时每CU只能放一个CTA，256k/1M的K2慢50–80%，未采用。
+- K2的LDS按每CU两个CTA的32KiB预算分配：tile的最长因果范围超过8168块（BQ42用64位成员时4084块，约32k/16k token）时走按65536块窗口的多遍路径。16k–32k上下文的K2因此比AITER的dense K2慢（热缓存32k H3 117 vs 27µs），K1不再散射dense位图而快（311→202µs），整次调用热缓存时持平或更快（32k H3/H6/H12 −0.6%/−0.5%/−0.03%）；AITER op test自己的计时协议下32k仍慢0.4–1.2%。预算加大到64KiB或成员窗口加到32KiB时每CU只能放一个CTA，256k/1M的K2慢50–80%，未采用。
 - 选择不校验（原K1的逐行校验与trap随AITER结构删除）：上游选择出错时只得到错误结果，进程不会中止。
 - 各变体第一次用到才编译（同AITER，不再有首次调用的整体预编译）：缓存为空时，服务中第一个建union计划的prefill（如12k）约12–15秒，第一个带prefix的chunk（slot表变体）约13秒，H6/H3第一次出现16/32行tile的chunk另需7–12秒，池超过4GiB时的WIDE约1秒，都落在触发它的请求上（10-30冷缓存服务中第一条11888 token请求TP2/TP4为17.1/12.8秒，缓存命中时约1.1秒）。SGLang自带的预热请求很短，只编译不建计划的变体；服务应保留FlyDSL持久缓存（命中时0.02–0.4秒），或在预热中覆盖实际会出现的布局（本页服务协议的11888/12000 token预热覆盖12k prefill，覆盖不到带prefix的chunk）。
 - SGLang的`pyhip_backend._supports_decode`已改为按`MAX_COMPRESSED_KEYS`判断页表宽度（10-29），1M的graph decode走PyHIP。模型配置`max_position_embeddings=262144`；服务验收最长测到100000 token的请求（10-29），1M的服务级验收尚未做。
