@@ -6,7 +6,7 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 
 | 内容 | 入口 |
 |---|---|
-| 完整attention：恢复/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L317)（入口）及同目录的`sparse_prefill_*.py`（kernel） |
+| 完整attention：恢复/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L326)（入口）及同目录的`sparse_prefill_*.py`（kernel） |
 | prefill indexer、decode indexer（含MTP verify） | [indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py) |
 | indexer共用的MHA helper | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
@@ -92,6 +92,15 @@ Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/
 - 精度（各用例取最大，逐(行, head)范数相对误差的平均/最大）：PyHIP BF16 0.23%/0.29%；FP8 per tensor与per token 3.7%/6.8%；FP8→BF16计算0.33%/0.61%；SGLang Triton与AITER BF16 0.28%/0.40%；AITER FP8（kernel内转BF16计算）0.29%/0.43%。P_BIAS之前的一轮（[bench_1111_0156](../../mytest/mydata/qsa_fp8_20261110_01/bench_1111_0156/summary.json)）FP8在dense2048与m12000上快0.8–2.0%，random128k相同。
 - AITER #7008的FP8 kernel比其BF16版本慢约27%（FP8→BF16转换和gfx942的FP8 tile）；`compute="bf16"`在入口反量化，random128k多一份128k上下文的BF16 K/V写读，慢于BF16 K/V直接调用。
 - FP8 direct改用标量读块号、每次循环两个chunk之后（源码readme 1.2.10 K7），在GPU6重测PyHIP三个scope（[数据](../../mytest/mydata/qsa_fp8_att_20261111_01/bench_final/summary.json)）：FP8 per tensor在dense2048 TP2/4/8为138/101/96µs、m12000为1816/1333/756µs、random128k为886/861/847µs（相对BF16 1.33–1.73×），per token为156/113/109、2189/1585/880、1083/1057/1041µs；与GPU7上的`51a3ed7`相比快1.7%–4.7%，两次的BF16相差不到0.4%。
+- 11-12在GPU6按PyHIP `7450c454`重测三个scope（union的Vᵀ读FP8 pack、Q量化并入pack、任务数少于CU数时split、任务边界精简，见源码readme第5节“2026-11-11（续4）”；[数据](../../mytest/mydata/qsa_fp8_opt2_20261111_01/bench_7450/summary.json)，`6535bd8d`的同一组见[bench_6535](../../mytest/mydata/qsa_fp8_opt2_20261111_01/bench_6535/summary.json)），中位数µs（相对PyHIP BF16）：
+
+  | 用例 | PyHIP BF16 | FP8 per tensor | FP8 per token |
+  |---|---:|---:|---:|
+  | dense2048 TP2/4/8 | 195 / 134 / 131 | 138 / 101 / 77（1.41× / 1.33× / 1.70×） | 151 / 109 / 81（1.29× / 1.24× / 1.61×） |
+  | m12000 TP2/4/8 | 2478 / 1856 / 1065 | 1751 / 1254 / 712（1.42× / 1.48× / 1.50×） | 1872 / 1387 / 785（1.32× / 1.34× / 1.36×） |
+  | random128k TP2/4/8 | 1491 / 1476 / 1467 | 888 / 863 / 850（1.68× / 1.71× / 1.73×） | 918 / 893 / 879（1.63× / 1.65× / 1.67×） |
+
+  dense2048 TP8（H3，64个任务）由split从98.5/107.5µs降到77.2/81.2µs；其余用例与`6535bd8d`相差−2.9%～+0.5%。m12000 TP2的FP8 per tensor有效TFLOPS为158T（BF16 112T）。
 
 ### 路由标定
 
@@ -312,7 +321,7 @@ ABBA（SGLang `79d260a30`，PyHIP `51a3ed7`）：GPU2、3按BF16、FP8、FP8、B
 | 每步时间（ITL中位数 × 接受长度，ms）C1/C8 | 10.44 / 20.13 | 10.33 / 19.86 | −1.0% / −1.3% |
 
 - 吞吐与BF16持平，各项在±0.75%以内（单轮之间BF16客户负载相差±0.1%、FP8 ±0.5%，bench_serving C1 ±1.5%）。FP8每步快约1–2%，抵消了random prompt上低1–2%的接受长度。
-- GSM8K：BF16 0.979/0.979（接受长度3.126/3.132，`41f70748d`），FP8目标KV + BF16 draft KV在`41f70748d`上0.979/0.978（3.131/3.124），最终代码（`79d260a30` + `51a3ed7`）0.981（3.131）。
+- GSM8K：BF16 0.979/0.979（接受长度3.126/3.132，`41f70748d`），FP8目标KV + BF16 draft KV在`41f70748d`上0.979/0.978（3.131/3.124），最终代码（`79d260a30` + `51a3ed7`）0.981（3.131）。PyHIP `7450c454`（源码readme第5节“2026-11-11（续4）”）0.976（3.134）。
 - random prompt上接受长度的差别来自目标层K/V的FP8舍入：E4M3只有3位尾数，per token scale不减小相对误差。
 - 加融合写入之前（`41f70748d`，两组GPU顺序相反，各一轮；其中一轮BF16与另一组的1M验收重叠）：客户负载两轮平均−1.0%（各轮−3.9%/+2.0%）。
 - 1M TEST=1（1M配置，FP8目标KV + BF16 draft KV；`41f70748d` + `b45a953`与最终代码各一次）：38个请求全部完成，每个rank 13个QSA层各完成attention校验7878次，日志无异常。最终代码的12个FP8层共14544个layout，FP8 MFMA相对fp8_query参考平均0.41%（最大0.98%），最差的(行, head)不超过5.85%。
