@@ -665,7 +665,9 @@ def _direct_kernel(
     RESIDUAL: fx.Constexpr[bool],
 ):
     group = H // HK
-    work = fx.Int32(fx.block_idx.x)
+    # Rows run in reverse: later rows list the most blocks (causal-prefix rows the fewest), so
+    # the heaviest waves start first and the light or empty ones fill the tail.
+    work = ROWS * HK - 1 - fx.Int32(fx.block_idx.x)
     tile, hkv = work // HK, work % HK
     row = _uniform(META[tile * 5])
     p_start, position = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 4])
