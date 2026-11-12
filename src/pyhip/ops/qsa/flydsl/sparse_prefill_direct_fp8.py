@@ -26,8 +26,9 @@ sparse_prefill_union_fp8.quantize_q.
 
 Loads: chunk t + 1's K/V words issue at the start of chunk t; its block ids come one chunk
 earlier by scalar loads, so the K/V loads stay in flight (vector loads complete in order).
-Per tensor the loop runs two chunks per iteration, alternating two register sets; waves of
-disabled rows exit at once.
+The loop runs two chunks per iteration, alternating two register sets; waves of disabled
+rows exit at once. Per token the 24 scale terms of a 16-lane row's blocks (its g) take two
+dword loads per lane and reach their users by DPP row broadcasts.
 """
 
 import math
@@ -61,6 +62,7 @@ from .sparse_prefill_union_fp8 import (
     SCALE_MIN,
     _as_f32,
     _as_i32,
+    _bcast,
     _cvt_fp8,
     _perm,
     _scaled_bf16,
@@ -342,27 +344,37 @@ def _chunk_loads(env, bases):
     ]
     scales = []
     if env.per_token:
-        # Records of blocks 8t + g, 8t + 4 + g: k_scale, log2(v_scale), 1 / v_scale.
-        for part in range(3):
-            for b in range(2):
-                scales.append(
-                    _buffer_words(env.gsc, (bases[2 + b] >> 10) * 64 + 16 * part, 4)
-                )
+        # The 24 scale terms of the row's blocks 8t + g, 8t + 4 + g (records: k_scale,
+        # log2(v_scale), 1 / v_scale of four tokens) spread over its 16 lanes: two dword
+        # loads instead of six 16-byte loads per lane.
+        rec = [(bases[2 + b] >> 10) * 64 for b in range(2)]
+        scales = [
+            _buffer_words(env.gsc, env.sc_hi.select(rec[1], rec[0]) + env.sc_lo, 1)[0],
+            _buffer_words(env.gsc, rec[1] + env.sc_up, 1)[0],
+        ]
     return k, v, scales
 
 
 def _chunk_words(env, bases, zero4):
     k, v, sc = _chunk_loads(env, bases)
     if not env.per_token:
-        sc = [zero4] * 6
-    return _flatten(k), _flatten(v), _flatten(sc)
+        sc = [zero4[0], zero4[0]]
+    return _flatten(k), _flatten(v), fx.Vector.from_elements(sc, fx.Int32)
+
+
+def _scale_term(sc, b, field, r):
+    """Per-token scale term (field 0 k_scale, 1 log2(v_scale), 2 1 / v_scale) of token r of
+    the lane's block b: value 12b + 4 field + r of its 16-lane row (g), word 0 holding values
+    0..15 and word 1 values 16..23 in lanes 0..7, read by a DPP row broadcast."""
+    v = 12 * b + 4 * field + r
+    return _bcast(_as_f32(sc[v >> 4]), v & 15)
 
 
 def _probabilities(vals, sc, per_token):
     """FP8 P' words of the lane's 8 keys and its row-sum term (P' / v_scale per token)."""
     p = [_exp(vals[i]) for i in range(8)]
     terms = (
-        [p[i] * _as_f32(sc[4 + i // 4][i % 4]) for i in range(8)] if per_token else p
+        [p[i] * _scale_term(sc, i // 4, 2, i % 4) for i in range(8)] if per_token else p
     )
     total = terms[0]
     for x in terms[1:]:
@@ -435,10 +447,10 @@ def _scores(env, k, sc, t, m_run):
         for r in range(4):
             x = s[b][r]
             if env.per_token:
-                x = x * _as_f32(sc[b][r])
+                x = x * _scale_term(sc, b, 0, r)
             x = fx.Float32(fx.fma(x, env.c_scale, neg))
             if env.per_token:
-                x = x + _as_f32(sc[2 + b][r])
+                x = x + _scale_term(sc, b, 1, r)
             keep = (slot < env.complete) | (
                 (slot == env.complete) & (fx.Int32(r) < env.tail)
             )
@@ -546,6 +558,11 @@ def _direct_kernel(
         gsc=_buffer(PSC, scale_extent),
         k_lane=((lane & 3) * 4 + g) * 16,
         v_lane=n * 16,
+        # Scale value n (word 0: block n >= 12, field (n % 12) // 4) and 16 + n (word 1,
+        # lanes 0..7: block 1, field 1 + n // 4), token n % 4.
+        sc_hi=n >= 12,
+        sc_lo=((n % 12) >> 2) * 16 + (n & 3) * 4,
+        sc_up=(1 + ((n & 7) >> 2)) * 16 + (n & 3) * 4,
         gout=_buffer(OUT, q_rows * D * 2),
         out_lane=head_ok.select(qrow * (D * 2) + g * 128, fx.Int32(q_rows * D * 2)),
     )
@@ -579,14 +596,13 @@ def _direct_kernel(
             bases = _chunk_bases(env, (i0, i1, i2, i3, i4, i5, i6, i7), t + 1)
             k_next, v_next, sc_next = loads(bases)
             ids_next = _chunk_ids(env, t + 2)
-            if fx.const_expr(not PER_TOKEN):
-                # Memory clobber: MachineSink cannot move the loads above it past the rescale
-                # branch into the block that first uses their words (the next step's); the
-                # scheduling barrier keeps QK(t), which waits for chunk t, after their issue.
-                # Per token the scale records would not fit in registers alongside.
-                _asm_fence()
-                rocdl.sched_barrier(0)
-            k, v, sc = _split(kw, 8), _split(vw, 8), _split(scw, 6)
+            # Memory clobber: MachineSink cannot move the loads above it past the rescale
+            # branch into the block that first uses their words (the next step's); the
+            # scheduling barrier keeps QK(t), which waits for chunk t, after their issue.
+            _asm_fence()
+            rocdl.sched_barrier(0)
+            k, v = _split(kw, 8), _split(vw, 8)
+            sc = [fx.Vector(scw)[0], fx.Vector(scw)[1]]
             vals, local, ballot = _scores(env, k, sc, t, fx.Float32(m_run))
             o, l_run, m_run, vals = _rescale_direct(
                 o, l_run, m_run, vals, local, ballot
@@ -603,19 +619,14 @@ def _direct_kernel(
                 *ids_next,
             )
 
-        if fx.const_expr(PER_TOKEN):
-            # The scale records of a second chunk in flight would spill.
-            for t in range(fx.Int32(0), chunks, fx.Int32(1)):
-                state = step(*state, t)
-        else:
-            # Two chunks per iteration: chunk t + 1's words land in the registers chunk
-            # t - 1 used, so the loop carries them without copies (a copy would wait for the
-            # loads at the loop end).
-            for t in range(fx.Int32(0), chunks - 1, fx.Int32(2)):
-                state = step(*state, t)
-                state = step(*state, fx.Int32(t) + 1)
-            if (chunks & 1) == 1:
-                state = step(*state, chunks - 1)
+        # Two chunks per iteration: chunk t + 1's words land in the registers chunk t - 1
+        # used, so the loop carries them without copies (a copy would wait for the loads at
+        # the loop end).
+        for t in range(fx.Int32(0), chunks - 1, fx.Int32(2)):
+            state = step(*state, t)
+            state = step(*state, fx.Int32(t) + 1)
+        if (chunks & 1) == 1:
+            state = step(*state, chunks - 1)
         o, l_run = fx.Vector(state[0]), fx.Float32(state[2])
         total = l_run + l_run.shuffle_xor(16, 64)
         total = total + total.shuffle_xor(32, 64)
@@ -849,7 +860,8 @@ def run(*, inputs, prepared, out, stage="both"):
 
 def launchers(*, inputs, prepared, out):
     """(pack(k, v, k_scale, v_scale, slots), direct(q8, qs, out, k_scale, v_scale)) with
-    flat Q8/QS/out/scales and unflattened K/V, other arguments prebuilt; None when empty."""
+    flat Q8/QS/out/scales and unflattened K/V, other arguments prebuilt; None when empty.
+    """
     if prepared.rows == 0 or prepared.packed_blocks == 0:
         return None
     stream = torch.cuda.current_stream(inputs.q.device)
