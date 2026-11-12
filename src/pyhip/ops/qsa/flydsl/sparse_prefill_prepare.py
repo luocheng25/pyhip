@@ -44,6 +44,21 @@ LIMITS = 8  # union step limits the route compares: max * 2**(-j/2) for j < 7, t
 SORT_WIDTHS = (1, 2, 4, 8, 16)
 EXCHANGE_WORDS = 1024  # K3 LDS: one cross-wave sort exchange round, then route partials
 ORDER_WORDS = EXCHANGE_WORDS + 4 * (2 + 4 * LIMITS)
+# FP8 union plans of fewer tasks than CUs (a short prefill leaves CUs idle while its longest
+# causal tiles run): K3 splits a task of more N64 steps than the even load (steps +
+# SPLIT_OVERHEAD per task over the CUs) into SPLIT_PARTS key ranges, run as separate CTA slots,
+# for at most SPLIT_SLOTS tasks; the part finishing last merges their partial O / m / l records
+# (PARTIAL_FLOATS each: 128 rows x 256 FP32, then m and l of 256 lanes). With a task per CU
+# or more the parts only pair with other tasks behind the ~10 us task overhead, which costs
+# what the shorter longest task saves (dense2048 H6: +1%).
+SPLIT_PARTS = 2
+SPLIT_SLOTS = 64
+SPLIT_OVERHEAD = 6.0
+PARTIAL_FLOATS = 128 * 256 + 2 * 256
+# K3 LDS past ORDER_WORDS for the split policy: reduction / scan partials, then the slot of
+# each task (so at most SPLIT_TASKS tasks per split-capable plan).
+SPLIT_TASKS = 1024
+SPLIT_WORDS = 8 + SPLIT_TASKS
 
 
 @dataclass(kw_only=True)
@@ -81,6 +96,12 @@ class SparsePlan:
     # FP8 plans: each tile's request start in the packed four-token blocks of the FP8 pack
     # (packed_block_starts), where the FP8 union kernel reads V^T.
     pack_starts: torch.Tensor | None = None
+    # Key-range parts per task (SPLIT_PARTS for a split-capable FP8 plan, else 1); with
+    # split > 1 task_order entries encode (task, slot, part, split) and the union kernel
+    # writes / merges partial records (partials, split_counters).
+    split: int = 1
+    partials: torch.Tensor | None = None
+    split_counters: torch.Tensor | None = None
 
 
 def _ballot(pred):
@@ -955,6 +976,7 @@ def _order(
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    COUNTERS: fx.Tensor,
     scratch,
     program,
     threshold,
@@ -966,44 +988,123 @@ def _order(
     SLICES: fx.Constexpr[int],
     WIDE: fx.Constexpr[bool],
     WIDTH: fx.Constexpr[int],
+    SPLIT: fx.Constexpr[int],
 ):
     key = fx.Int64 if WIDE else fx.Int32
     tid = fx.thread_idx.x
+    lane, wave = tid & 63, _uniform(tid >> 6)
     per_head = TASKS // HK
-    keys = []
+    # Entry rank r: task r % TASKS (hkv-major), key-range part r // TASKS.
+    entries = TASKS * SPLIT
+    info = []
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
-        valid = (position < SIZE) & (rank < TASKS)
-        tile = (rank % per_head) // SLICES
+        valid = (position < SIZE) & (rank < entries)
+        task, part = rank, fx.Int32(0)
+        if fx.const_expr(SPLIT > 1):
+            task, part = rank % TASKS, rank // TASKS
+        tile = (task % per_head) // SLICES
         steps = (valid.select(COUNTS[tile], fx.Int32(0)) + 15) >> 4
         union = valid.select(COSTS[tile * 3 + 2], fx.Int32(0)) == 1
         active = union & (steps <= threshold)
         # The first head's first slice of each tile publishes the route; any direct tile
         # raises the flag compact cleared, which gated pack/direct launches read.
-        if valid & (rank < per_head) & (rank % SLICES == 0):
+        if valid & (part == 0) & (task < per_head) & (task % SLICES == 0):
             ACTIVE[tile] = active.select(fx.Int32(1), fx.Int32(0))
             if ~active:
                 DIRECT_FLAG[0] = 1
-        cost = key(active.select(steps, fx.Int32(0)))
-        rank_key = (cost << key(SHIFT)) + key(TASKS - 1 - rank)
+        info.append((rank, valid, task, part, steps, active))
+    split = [fx.Int32(0)] * WIDTH
+    slot = [fx.Int32(0)] * WIDTH
+    if fx.const_expr(SPLIT > 1):
+        # Even per-CTA load of the active tasks (steps plus a task overhead), then the tasks
+        # above it take a slot (task order, at most SPLIT_SLOTS) and SPLIT key ranges.
+        base = ORDER_WORDS
+        table = ORDER_WORDS + 8
+        zero = fx.Int32(0)
+        total, count = zero, zero
+        for rank, valid, task, part, steps, active in info:
+            first = valid & (part == 0) & active
+            total = total + first.select(steps, zero)
+            count = count + first.select(fx.Int32(1), zero)
+        total, count = _block_reduce(
+            [total, count], [operator.add, operator.add], scratch, base, wave
+        )
+        even = (
+            total.to(fx.Float32) + fx.Float32(SPLIT_OVERHEAD) * count.to(fx.Float32)
+        ) / GRID.to(fx.Float32)
+        wanted = []
+        for rank, valid, task, part, steps, active in info:
+            wanted.append(
+                valid
+                & (part == 0)
+                & active
+                & (steps >= 2)
+                & (steps.to(fx.Float32) > even)
+            )
+        local = zero
+        for w in wanted:
+            local = local + w.select(fx.Int32(1), zero)
+        fx.gpu.barrier()
+        inclusive = _inclusive_scan(local, lane)
+        if lane == 63:
+            scratch[base + wave] = inclusive
+        fx.gpu.barrier()
+        running = inclusive - local
+        for w in fx.range_constexpr(THREADS // 64):
+            running = running + (fx.Int32(w) < wave).select(scratch[base + w], zero)
+        for e in fx.range_constexpr(WIDTH):
+            rank, valid, task, part, steps, active = info[e]
+            taken = wanted[e] & (running < SPLIT_SLOTS)
+            if valid & (part == 0):
+                scratch[table + task] = taken.select(running, fx.Int32(-1))
+            running = running + wanted[e].select(fx.Int32(1), zero)
+        fx.gpu.barrier()
+        for e in fx.range_constexpr(WIDTH):
+            rank, valid, task, part, steps, active = info[e]
+            owner = valid.select(scratch[table + task], fx.Int32(-1))
+            split[e] = (owner >= 0).select(fx.Int32(1), zero)
+            slot[e] = (owner >= 0).select(owner, zero)
+        if tid < SPLIT_SLOTS:
+            COUNTERS[tid] = 0
+    keys = []
+    for e in fx.range_constexpr(WIDTH):
+        rank, valid, task, part, steps, active = info[e]
+        cost = active.select(steps, fx.Int32(0))
+        if fx.const_expr(SPLIT > 1):
+            # Part 0 of a split task runs the first ceil(steps / 2) N64 steps.
+            cost = (split[e] != 0).select((steps + 1 - part) >> 1, cost)
+            valid = valid & ((part == 0) | (split[e] != 0))
+        rank_key = (key(cost) << key(SHIFT)) + key(entries - 1 - rank)
         keys.append(valid.select(rank_key, key(-1)))
-    cta = (scratch, tid, _uniform(tid >> 6), WIDE)
+    cta = (scratch, tid, wave, WIDE)
     keys = _bitonic(keys, tid & 63, True, cta)
     # Sort hkv-major (tie order), publish the tile-major task the union kernel runs.
     mask = (key(1) << key(SHIFT)) - 1
-    rounded = (TASKS + GRID - 1) // GRID * GRID
+    rounded = (entries + GRID - 1) // GRID * GRID
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
-        task = TASKS - 1 - fx.Int32(keys[e] & mask)
-        task = (keys[e] >= 0).select(
-            (task % per_head) * HK + task // per_head, fx.Int32(-1)
-        )
+        entry = entries - 1 - fx.Int32(keys[e] & mask)
+        task = entry
+        if fx.const_expr(SPLIT > 1):
+            task = entry % TASKS
+        value = (task % per_head) * HK + task // per_head
+        if fx.const_expr(SPLIT > 1):
+            # (task, slot, part, split): the slot table outlived the sort's exchange rounds.
+            owner = scratch[ORDER_WORDS + 8 + _min(task, fx.Int32(SPLIT_TASKS - 1))]
+            value = (
+                (value << 8)
+                | ((owner >= 0).select(owner, fx.Int32(0)) << 2)
+                | ((entry // TASKS) << 1)
+                | (owner >= 0).select(fx.Int32(1), fx.Int32(0))
+            )
+        value = (keys[e] >= 0).select(value, fx.Int32(-1))
         row, column = rank // GRID, rank % GRID
         destination = row * GRID + ((row & 1) == 0).select(column, GRID - 1 - column)
         if (position < SIZE) & (destination < rounded):
-            ORDER[destination] = task
+            ORDER[destination] = value
 
 
 def _claim(flag, count):
@@ -1150,6 +1251,7 @@ def _order_masks_kernel(
     QUERY_TILES: fx.Tensor,
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    COUNTERS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1168,12 +1270,14 @@ def _order_masks_kernel(
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
 ):
+    words = ORDER_WORDS + (SPLIT_WORDS if SPLIT > 1 else 0)
     scratch = (
         fx.SharedAllocator()
-        .allocate(fx.Array[fx.Int32, ORDER_WORDS, 16])
+        .allocate(fx.Array[fx.Int32, words, 16])
         .peek()
-        .view(fx.make_layout(ORDER_WORDS, 1))
+        .view(fx.make_layout(words, 1))
     )
     program = fx.block_idx.x
     # Order CTAs, then one mask CTA per tile, then the raw direct group-list CTAs.
@@ -1201,6 +1305,7 @@ def _order_masks_kernel(
                         ACTIVE,
                         ORDER,
                         DIRECT_FLAG,
+                        COUNTERS,
                         scratch,
                         program,
                         threshold,
@@ -1212,6 +1317,7 @@ def _order_masks_kernel(
                         SLICES,
                         WIDE,
                         width,
+                        SPLIT,
                     )
         else:
             _direct_groups(
@@ -1264,6 +1370,7 @@ def _order_masks_launch(
     QUERY_TILES: fx.Tensor,
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    COUNTERS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1282,6 +1389,7 @@ def _order_masks_launch(
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TILES > 0:
@@ -1301,6 +1409,7 @@ def _order_masks_launch(
             QUERY_TILES,
             GROUP_META,
             GROUP_LIST,
+            COUNTERS,
             TASKS,
             GRID,
             SIZE,
@@ -1319,6 +1428,7 @@ def _order_masks_launch(
             ROUTE,
             ROUTE_MODEL,
             SLOTTED,
+            SPLIT,
         ).launch(
             grid=(ORDER_CTAS + TILES + (GROUPS + THREADS - 1) // THREADS, 1, 1),
             block=(THREADS, 1, 1),
@@ -1349,6 +1459,11 @@ def scratch_specs(plan: SparsePlan) -> list:
         specs += [
             ("pool_blocks", (tiles, capacity), torch.int32),
             ("tails", (tiles,), torch.int32),
+        ]
+    if plan.split > 1:
+        specs += [
+            ("partials", (SPLIT_SLOTS * SPLIT_PARTS, PARTIAL_FLOATS), torch.float32),
+            ("split_counters", (SPLIT_SLOTS,), torch.int32),
         ]
     return specs
 
@@ -1441,8 +1556,16 @@ def allocate_plan(
     tasks = tiles * hk * slices
     # A union CTA (8 waves, 64 KiB LDS) fills a CU: a larger grid only adds dispatch rounds.
     grid = min(tasks, num_cus)
+    split = (
+        SPLIT_PARTS
+        if fp8 is not None
+        and 0 < tasks < min(num_cus, SPLIT_TASKS)
+        and tasks * SPLIT_PARTS <= THREADS * SORT_WIDTHS[-1]
+        else 1
+    )
     packed = int((-(-lengths // 4))[q_lens > 0].sum())
     # Per-layout terms of the route model: union step share per tile, direct cost per step, fixed direct cost.
+    launch_grid = num_cus if split > 1 else grid
     route_costs = (
         hk * slices / grid if grid else 0.0,
         config.direct_cu_step * hk / num_cus,
@@ -1457,7 +1580,10 @@ def allocate_plan(
         counts=torch.empty(tiles, **kwargs),
         costs=torch.empty((tiles, 3), **kwargs),
         active=torch.empty(tiles, **kwargs),
-        task_order=torch.empty(_cdiv(tasks, grid) * grid if grid else 0, **kwargs),
+        # Split plans run every CU (parts of a task are separate slots).
+        task_order=torch.empty(
+            _cdiv(tasks * split, launch_grid) * launch_grid if grid else 0, **kwargs
+        ),
         direct_flag=torch.empty(2, **kwargs),
         query_tiles=upload(np.repeat(np.arange(tiles), sizes), inputs.q.device),
         query_tile=query_tile,
@@ -1465,7 +1591,7 @@ def allocate_plan(
         block_capacity=capacity,
         max_blocks=max_blocks,
         num_tiles=tiles,
-        grid=grid,
+        grid=launch_grid,
         route_costs=route_costs,
         route_model=(
             config.union_fixed,
@@ -1475,6 +1601,7 @@ def allocate_plan(
         ),
         union_ratio=config.union_ratio,
         slotted=slotted,
+        split=split,
     )
     if fp8 is not None:
         starts = packed_block_starts(inputs.query_lens, inputs.prefix_lens)
@@ -1544,11 +1671,13 @@ def _launches(inputs, plan, stream):
     hk = inputs.k.shape[1]
     slices = _cdiv(plan.query_tile * plan.group_padded, 128)
     tasks = plan.num_tiles * hk * slices
+    entries = tasks * plan.split
     numel = plan.task_order.numel()
-    # One order CTA sorts the whole task order up to the widest variant, else chunks of it.
+    # One order CTA sorts the whole task order up to the widest variant, else chunks of it
+    # (a split plan always fits one).
     size = min(THREADS * SORT_WIDTHS[-1], numel)
-    shift = max(1, (tasks - 1).bit_length())
-    wide = ((plan.block_capacity // 16) << shift) + tasks - 1 >= 2**31
+    shift = max(1, (entries - 1).bit_length())
+    wide = ((plan.block_capacity // 16) << shift) + entries - 1 >= 2**31
     standin = plan.counts  # slot-table tensors K3 does not read without a slot table
     args = (
         inputs.kv_slots if plan.slotted else standin,
@@ -1566,6 +1695,7 @@ def _launches(inputs, plan, stream):
         plan.query_tiles,
         plan.direct_meta.view(-1) if plan.direct_groups else standin,
         plan.direct_list if plan.direct_groups else standin,
+        plan.split_counters if plan.split > 1 else standin,
         tasks,
         plan.grid,
         size,
@@ -1582,6 +1712,7 @@ def _launches(inputs, plan, stream):
         plan.routing,
         plan.route_model,
         plan.slotted,
+        plan.split,
         stream,
     )
     constants = (
@@ -1592,8 +1723,9 @@ def _launches(inputs, plan, stream):
         plan.route_model,
         members64,
         plan.slotted,
+        plan.split,
     )
-    yield _compiled(_order_masks_launch, args, 22, constants), args
+    yield _compiled(_order_masks_launch, args, 23, constants), args
 
 
 def run(*, inputs, plan):

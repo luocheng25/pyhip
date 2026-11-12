@@ -320,22 +320,28 @@ def _buffer_at(address, size_bytes):
     return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
 
 
-def _buffer_words(buffer, offset, words=4):
+# gfx942 buffer cache policy (aux bits: sc0 = 1, nt = 2, sc1 = 16): sc0 | sc1 is system scope,
+# so stores write through and loads read past the CU's L1 and this XCD's L2 (coherent between
+# CTAs of one launch on any XCD).
+SC_SYSTEM = 17
+
+
+def _buffer_words(buffer, offset, words=4, cache=0):
     data = fx.make_rmem_tensor(4 * words, fx.Int8)
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words, cache), fx.Int8),
         fx.make_view(buffer + offset, fx.make_layout(4 * words, 1)),
         data,
     )
     return fx.Vector(data.load()).bitcast(fx.Int32)
 
 
-def _buffer_store_words(words, buffer, offset):
+def _buffer_store_words(words, buffer, offset, cache=0):
     words = fx.Vector(words)
     data = fx.make_rmem_tensor(4 * words.numel, fx.Int8)
     data.store(words.bitcast(fx.Int8))
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel, cache), fx.Int8),
         data,
         fx.make_view(buffer + offset, fx.make_layout(4 * words.numel, 1)),
     )

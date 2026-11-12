@@ -36,6 +36,12 @@ blocks, V^T per block), so it needs no transpose: a wave loads its four blocks o
 The grid is persistent: a CTA prefetches its next task's ids, masks, Q, K(0..2), V(0) and
 scales under the current task's epilogue and output, and reads the task order with scalar
 loads, which do not wait behind the output stores.
+
+Split plans (fewer tasks than CUs, sparse_prefill_prepare.SPLIT_PARTS): K3 gives a long task two
+order entries, its first ceil(steps / 2) and remaining N64 steps. Each part stores its O^T
+fragments, m and l (system-scope stores, any XCD may merge) and counts on the task's slot; the
+part counting last merges both records, part 0 first (O = sum O_p * 2^(m_p - m), l likewise),
+and writes the rows like an unsplit task.
 """
 
 import math
@@ -49,6 +55,7 @@ from flydsl.expr import rocdl
 
 from .sparse_prefill_common import (
     _MAX_FLOOR,
+    SC_SYSTEM,
     _buffer,
     _buffer_store_words,
     _buffer_words,
@@ -60,6 +67,7 @@ from .sparse_prefill_common import (
     _target_features,
     _uniform,
 )
+from .sparse_prefill_prepare import PARTIAL_FLOATS, SPLIT_PARTS, SPLIT_SLOTS
 
 __all__ = ["run", "launcher"]
 
@@ -83,6 +91,10 @@ SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
 # MFMAs per K(t+1) write and steps per V(t) write.
 KPRE, VPRE, BAR_AT, P1, TAIL, P2, KW_GAP, SPREAD = 4, 4, 27, 1, 3, 4, 3, 4
 FIX_AT = 1  # Part 1 finishes tile t-1 after this QK MFMA
+# A split part's record (sparse_prefill_prepare.PARTIAL_FLOATS): O^T fragments in MFMA order
+# (wave, block mb, register quad k: 16 bytes per lane), then m and the lane's l per wave.
+PARTIAL_BYTES = PARTIAL_FLOATS * 4
+PARTIAL_ML = 128 * D * 4
 K_ORDER = tuple((b, c) for c in range(8) for b in range(2))
 
 
@@ -850,6 +862,81 @@ def _store_out(env, o, inv):
         _buffer_store_words(words, env.gout, valid.select(offset, env.q_oob))
 
 
+def _store_whole(env, o, l_run, v_scale):
+    total = l_run + l_run.shuffle_xor(32, 64)
+    inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
+    if v_scale is not None:
+        inv = inv * v_scale
+    _store_out(env, o, inv)
+
+
+def _partial_offset(env, part):
+    return (env.slot * SPLIT_PARTS + part) * PARTIAL_BYTES
+
+
+def _store_partial(env, o, m_run, l_run):
+    """This part's O^T fragments, m and the lane's l (device-scope stores: the merging CTA may
+    run on another XCD)."""
+    base = _partial_offset(env, env.part)
+    lane_o = base + env.wave * (64 * 128 * 4) + env.lane * 16
+    for mb in range(8):
+        for k in range(4):
+            words = [_as_i32(o[mb][4 * k + r]) for r in range(4)]
+            _buffer_store_words(
+                fx.Vector.from_elements(words, fx.Int32),
+                env.gpart,
+                lane_o + (4 * mb + k) * 1024,
+                SC_SYSTEM,
+            )
+    lane_ml = base + PARTIAL_ML + env.wave * 512 + env.lane * 4
+    for i, value in enumerate((m_run, l_run)):
+        _buffer_store_words(
+            fx.Vector.from_elements([_as_i32(value)], fx.Int32),
+            env.gpart,
+            lane_ml + 256 * i,
+            SC_SYSTEM,
+        )
+
+
+def _merge_out(env, o, m_run, l_run, v_scale):
+    """The part counting last: its O, m and l in registers, the other part's record loaded
+    (all loads in flight at once). O = O0 * 2^(m0 - m) + O1 * 2^(m1 - m) with m the larger
+    (part 0 first, so either part computes the same output), l likewise; then the output of
+    an unsplit task."""
+    other = SPLIT_PARTS - 1 - env.part
+    base = _partial_offset(env, other)
+    lane_ml = base + PARTIAL_ML + env.wave * 512 + env.lane * 4
+    lane_o = base + env.wave * (64 * 128 * 4) + env.lane * 16
+    loaded = [
+        _buffer_words(env.gpart, lane_o + (4 * mb + k) * 1024, 4, SC_SYSTEM)
+        for mb in range(8)
+        for k in range(4)
+    ]
+    m_other = _as_f32(_buffer_words(env.gpart, lane_ml, 1, SC_SYSTEM)[0])
+    l_other = _as_f32(_buffer_words(env.gpart, lane_ml + 256, 1, SC_SYSTEM)[0])
+    first = env.part == 0
+    m0, m1 = first.select(m_run, m_other), first.select(m_other, m_run)
+    top = _maximum(m0, m1)
+    # A part without a key of the row has m = FLOOR: weight 0 (both: 1, l = 0, output 0).
+    w0, w1 = _exp(m0 - top), _exp(m1 - top)
+    l0, l1 = first.select(l_run, l_other), first.select(l_other, l_run)
+    l_sum = _fma(l1, w1, l0 * w0)
+    total = l_sum + l_sum.shuffle_xor(32, 64)
+    inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
+    if v_scale is not None:
+        inv = inv * v_scale
+    merged = []
+    for mb in range(8):
+        values = []
+        for i in range(16):
+            mine = fx.Float32(fx.Vector(o[mb])[i])
+            theirs = _as_f32(loaded[4 * mb + i // 4][i % 4])
+            a, b = first.select(mine, theirs), first.select(theirs, mine)
+            values.append(_fma(b, w1, a * w0))
+        merged.append(fx.Vector.from_elements(values, fx.Float32))
+    _store_out(env, merged, inv)
+
+
 def _lane_env(lds, per_token, slotted, hk):
     """Per-lane constants every task shares."""
     tid = fx.Int32(fx.thread_idx.x)
@@ -896,23 +983,28 @@ def _sload(tensor, index):
     return _uniform(rocdl.s_buffer_load(_buffer(tensor, 0x7FFFFFFF), index))
 
 
-def _decode(ORDER, ACTIVE, work, limit, per_tile):
-    """Task of a persistent slot and whether it runs; past the order or routed direct: idle.
-    K3 orders each CTA's slots by decreasing cost, so its runnable tasks come first."""
+def _decode(ORDER, ACTIVE, work, limit, per_tile, split=1):
+    """Order entry of a persistent slot and whether it runs; past the order or routed direct:
+    idle. K3 orders each CTA's slots by decreasing cost, so its runnable tasks come first.
+    With split > 1 an entry is (task << 8) | (slot << 2) | (part << 1) | split."""
     inside = work < limit
     mapped = inside.select(_sload(ORDER, _min(work, limit - 1)), fx.Int32(-1))
-    tile = (mapped >= 0).select(mapped // per_tile, fx.Int32(0))
+    task = mapped >> 8 if split > 1 else mapped
+    tile = (mapped >= 0).select(task // per_tile, fx.Int32(0))
     return mapped, (mapped >= 0).select(_sload(ACTIVE, tile), fx.Int32(0))
 
 
-def _task_scalars(T, mapped, enabled, HK, BQ, GP, slotted):
+def _task_scalars(T, mapped, enabled, HK, BQ, GP, slotted, split=1):
     """A task's tile, KV head, row slice and plan entries (scalar loads); an idle slot (enabled
-    0) gets no rows and no keys, so its loads read nothing."""
+    0) gets no rows and no keys, so its loads read nothing. A part of a split task keeps its
+    key range: N64 steps [first, end) of the tile's list, part 0 the first ceil(steps / 2).
+    """
     slices = (BQ * GP + 127) // 128
-    task = (mapped >= 0).select(mapped, fx.Int32(0))
+    raw = (mapped >= 0).select(mapped, fx.Int32(0))
+    task = raw >> 8 if split > 1 else raw
     on = enabled != 0
     tile_id = task // (HK * slices)
-    return dict(
+    sc = dict(
         tile_id=tile_id,
         hkv=task % HK,
         row_offset=((task // HK) % slices) * 128,
@@ -923,7 +1015,23 @@ def _task_scalars(T, mapped, enabled, HK, BQ, GP, slotted):
         count=on.select(_sload(T.COUNTS, tile_id), fx.Int32(0)),
         tail=_sload(T.TAILS, tile_id) if slotted else fx.Int32(-1),
         pstart=_sload(T.PSTARTS, tile_id),
+        first=fx.Int32(0),
     )
+    if split > 1:
+        parted = (raw & 1) != 0
+        part = (raw >> 1) & 1
+        steps = (sc["count"] + 15) >> 4
+        half = (steps + 1) >> 1
+        first = (parted & (part == 1)).select(half, fx.Int32(0))
+        end = (parted & (part == 0)).select(half, steps)
+        sc.update(
+            count=_min(sc["count"], end * 16) - first * 16,
+            first=first,
+            split=parted.select(fx.Int32(1), fx.Int32(0)),
+            slot=(raw >> 2) & (SPLIT_SLOTS - 1),
+            part=part,
+        )
+    return sc
 
 
 def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
@@ -968,14 +1076,18 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
         final=final,
         tail_len=kv_len & 3,
         gblocks=_buffer(
-            fx.make_view(fx.get_iter(T.BLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1)),
+            fx.make_view(
+                fx.get_iter(T.BLOCKS) + tile_id * CAP + sc["first"] * 16,
+                fx.make_layout(CAP, 1),
+            ),
             count * 4,
         ),
         # Without a slot table the block list is already request-local.
         gvids=(
             _buffer(
                 fx.make_view(
-                    fx.get_iter(T.LBLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1)
+                    fx.get_iter(T.LBLOCKS) + tile_id * CAP + sc["first"] * 16,
+                    fx.make_layout(CAP, 1),
                 ),
                 count * 4,
             )
@@ -992,10 +1104,10 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
         pv_step=HK * PACK_BLOCK,
         gmask=_buffer(
             fx.make_view(
-                fx.get_iter(T.MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
+                fx.get_iter(T.MEMBERS) + (tile_id * (CAP // 16) + sc["first"]) * BQ * 4,
                 fx.make_layout((CAP // 16) * BQ * 4, 1),
             ),
-            (CAP // 16) * BQ * 8,
+            (CAP // 16 - sc["first"]) * BQ * 8,
         ),
         mask_lane=_min(query, fx.Int32(BQ - 1)) * 8,
         mask_step=BQ * 8,
@@ -1047,6 +1159,9 @@ def _task_env(lane, T, sc, H, HK, NQ, CAP, POOL, PACKED, BQ, GP):
     )
     if env.gvids is None:
         env.gvids = env.gblocks
+    if "split" in sc:
+        env.split, env.slot, env.part = sc["split"], sc["slot"], sc["part"]
+        env.gpart = _buffer(T.PARTIALS, SPLIT_SLOTS * SPLIT_PARTS * PARTIAL_BYTES)
     return env
 
 
@@ -1138,6 +1253,8 @@ def _task(
     PV,
     LBLOCKS,
     PSTARTS,
+    PARTIALS,
+    COUNTERS,
     lds,
     mapped,
     work,
@@ -1160,9 +1277,11 @@ def _task(
     SCALE: fx.Constexpr[float],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
 ):
-    """One task (128 (query, head) rows of a union tile over its compact key list) from its
-    prefetched first tiles; prefetches the next slot's under its epilogue and output."""
+    """One task (128 (query, head) rows of a union tile over its compact key list, or one key
+    range of it) from its prefetched first tiles; prefetches the next slot's under its
+    epilogue and output."""
     T = _Env(
         Q8=Q8,
         QS=QS,
@@ -1179,12 +1298,13 @@ def _task(
         PV=PV,
         LBLOCKS=LBLOCKS,
         PSTARTS=PSTARTS,
+        PARTIALS=PARTIALS,
     )
     lane = _lane_env(lds, PER_TOKEN, SLOTTED, HK)
     env = _task_env(
         lane,
         T,
-        _task_scalars(T, mapped, fx.Int32(1), HK, BQ, GP, SLOTTED),
+        _task_scalars(T, mapped, fx.Int32(1), HK, BQ, GP, SLOTTED, SPLIT),
         H,
         HK,
         NQ,
@@ -1209,7 +1329,9 @@ def _task(
     s_acc0 = _qk_simple(env, 0)
     # The next slot's task (scalar loads) resolves under QK(0) and the first max.
     per_tile = HK * ((BQ * GP + 127) // 128)
-    next_mapped, next_enabled = _decode(ORDER, ACTIVE, work + grid, limit, per_tile)
+    next_mapped, next_enabled = _decode(
+        ORDER, ACTIVE, work + grid, limit, per_tile, SPLIT
+    )
     s_cur, row_max, rsv0 = _first_max(env, s_acc0, pre["sc0"], pre["w0"])
     # Every wave read K(0) before phase 1 writes K(2) over it.
     rocdl.s_waitcnt(lgkmcnt=0)
@@ -1365,7 +1487,9 @@ def _task(
         state = phase(*state, env.last, 1, 0)
 
     # ---- Epilogue and output; the next slot's loads issue under them ----
-    next_scalars = _task_scalars(T, next_mapped, next_enabled, HK, BQ, GP, SLOTTED)
+    next_scalars = _task_scalars(
+        T, next_mapped, next_enabled, HK, BQ, GP, SLOTTED, SPLIT
+    )
     nenv = _task_env(lane, T, next_scalars, H, HK, NQ, CAP, POOL, PACKED, BQ, GP)
     a = _prefetch_ids(nenv)
     last = finish(*state[:5], state[5:13])
@@ -1377,11 +1501,29 @@ def _task(
         [fx.Float32(state[13]), fx.Float32(state[14])],
     )
     b = _prefetch_kv(nenv, a)
-    total = l_run + l_run.shuffle_xor(32, 64)
-    inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
-    if fx.const_expr(not PER_TOKEN):
-        inv = inv * fx.Float32(VS[0])
-    _store_out(env, o, inv)
+    v_scale = None if PER_TOKEN else fx.Float32(VS[0])
+    if fx.const_expr(SPLIT > 1):
+        if env.split != 0:
+            # Both parts store their records; the one counting last merges them.
+            _store_partial(env, o, last["m_run"], l_run)
+            rocdl.s_waitcnt(vmcnt=0)
+            _stage_end()
+            if fx.Int32(fx.thread_idx.x) == 0:
+                done = fx.atomic_add(
+                    fx.get_iter(COUNTERS) + env.slot, fx.Int32(1), syncscope="agent"
+                )
+                _write_lds(env.lds, 0, (done, done))
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _stage_end()
+            done = _uniform(fx.Int32(_load_lds(env.lds, 0)[0]))
+            # Every wave read the count before the output shuffle reuses LDS.
+            _stage_end()
+            if done == SPLIT_PARTS - 1:
+                _merge_out(env, o, last["m_run"], l_run, v_scale)
+        else:
+            _store_whole(env, o, l_run, v_scale)
+    else:
+        _store_whole(env, o, l_run, v_scale)
     # The next task's K/V writes reuse the LDS of every wave's output shuffle.
     rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
@@ -1407,6 +1549,8 @@ def _kernel(
     PV: fx.Tensor,
     LBLOCKS: fx.Tensor,
     PSTARTS: fx.Tensor,
+    PARTIALS: fx.Tensor,
+    COUNTERS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -1420,6 +1564,7 @@ def _kernel(
     SCALE: fx.Constexpr[float],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
 ):
     allocator = fx.SharedAllocator()
     lds = (
@@ -1443,15 +1588,16 @@ def _kernel(
         PV=PV,
         LBLOCKS=LBLOCKS,
         PSTARTS=PSTARTS,
+        PARTIALS=PARTIALS,
     )
     per_tile = HK * ((BQ * GP + 127) // 128)
     limit = ((TASKS + GRID - 1) // GRID) * GRID
     work = fx.Int32(fx.block_idx.x)
-    mapped, enabled = _decode(ORDER, ACTIVE, work, limit, per_tile)
+    mapped, enabled = _decode(ORDER, ACTIVE, work, limit, per_tile, SPLIT)
     first = _task_env(
         _lane_env(lds, PER_TOKEN, SLOTTED, HK),
         T,
-        _task_scalars(T, mapped, enabled, HK, BQ, GP, SLOTTED),
+        _task_scalars(T, mapped, enabled, HK, BQ, GP, SLOTTED, SPLIT),
         H,
         HK,
         NQ,
@@ -1482,6 +1628,8 @@ def _kernel(
             PV,
             LBLOCKS,
             PSTARTS,
+            PARTIALS,
+            COUNTERS,
             lds,
             mapped,
             work,
@@ -1499,6 +1647,7 @@ def _kernel(
             SCALE,
             PER_TOKEN,
             SLOTTED,
+            SPLIT,
         )
         work = work + GRID
         mapped, enabled, pre = result[0], result[1], result[2:]
@@ -1523,6 +1672,8 @@ def _launch(
     PV: fx.Tensor,
     LBLOCKS: fx.Tensor,
     PSTARTS: fx.Tensor,
+    PARTIALS: fx.Tensor,
+    COUNTERS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -1536,6 +1687,7 @@ def _launch(
     SCALE: fx.Constexpr[float],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
+    SPLIT: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if GRID > 0:
@@ -1557,6 +1709,8 @@ def _launch(
             PV,
             LBLOCKS,
             PSTARTS,
+            PARTIALS,
+            COUNTERS,
             H,
             HK,
             NQ,
@@ -1570,6 +1724,7 @@ def _launch(
             SCALE,
             PER_TOKEN,
             SLOTTED,
+            SPLIT,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
                 "llvm.target_features": _target_features(),
@@ -1716,6 +1871,8 @@ def _args(inputs, plan, packed, out, stream):
         packed.packed_value,
         plan.blocks.view(-1),
         plan.pack_starts,
+        plan.partials.view(-1) if plan.split > 1 else plan.counts,
+        plan.split_counters if plan.split > 1 else plan.counts,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
@@ -1724,35 +1881,30 @@ def _args(inputs, plan, packed, out, stream):
         packed.packed_blocks,
         plan.query_tile,
         plan.group_padded,
+        # Order entries (tasks times key-range parts).
         plan.num_tiles
         * inputs.k.shape[1]
-        * ((plan.query_tile * plan.group_padded + 127) // 128),
+        * ((plan.query_tile * plan.group_padded + 127) // 128)
+        * plan.split,
         plan.grid,
         inputs.scale,
         k_scale.numel() > 1,
         plan.slotted,
+        plan.split,
         stream,
     )
 
 
 def _compiled(inputs, args, stream):
-    key = (
-        inputs.q.device,
-        args[17],
-        args[18],
-        args[23],
-        args[24],
-        args[27],
-        args[28],
-        args[29],
-    )
+    # Specialization: H, HK, BQ, GP, SCALE, PER_TOKEN, SLOTTED, SPLIT.
+    key = (inputs.q.device, *args[19:21], *args[25:27], *args[29:33])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:26], 0, *args[27:30], stream
+                _launch, *args[:28], 0, *args[29:33], stream
             )
     return compiled
 

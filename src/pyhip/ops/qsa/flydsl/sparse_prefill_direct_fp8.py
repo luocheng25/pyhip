@@ -900,7 +900,14 @@ def launchers(*, inputs, prepared, out):
 
     def pack_launch(q, k, v, ks, vs, slots):
         pack_fn(
-            k, v, ks, vs, *pack[4:9], slots if slotted else pack[9], pack[10], q,
+            k,
+            v,
+            ks,
+            vs,
+            *pack[4:9],
+            slots if slotted else pack[9],
+            pack[10],
+            q,
             *pack[12:],
         )
 
