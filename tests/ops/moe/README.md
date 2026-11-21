@@ -142,14 +142,24 @@ ptpc 路径。每个 T 经 `make_moe_runner` 固定使用
 BF16，prefill 两级输入按 token 量化成 FP8）。容差沿用上游 aiter `op_tests/test_flydsl_moe_gfx942.py`：
 逐元素偏差不超过该 token 参考值的 1 个 RMS、`logits_diff`（与 `calc_diff` 同一公式）< 1e-3、
 最差 token 的相对 L2 误差 < 0.2，比上面的 `calc_diff <= 0.02` 严。T 覆盖
-1/8/16/32/128/256/257/1024/2000/8192，TP4 另加 8200（配置表中 8192 以上的 compact Down）；
+1/8/16/32/128/129/256/257/1024/2000/8192/65536，TP4 另加 8200（配置表中 8192 以上的 compact Down）；
 decode 的三种配置另在 CUDA graph 中 replay 新输入。用例还断言 tuned_moe 的两次 `compile_gemm`
 都被 `moe_gemm_2stage/gemm.py` 分流到上游 gfx9_fp8 实现，而不是 `*_legacy`。
 只在 gfx942 上运行，配置表由 [bench_moe_a8w4_ptpc.py](../../../benchmarks/moe/bench_moe_a8w4_ptpc.py)
-`--sweep` 实测选出。
+`--sweep` 实测选出。[a8w4_ptpc/test_moe_gemm_2stage_upstream.py](a8w4_ptpc/test_moe_gemm_2stage_upstream.py)
+只构建 launcher 或编译小 kernel，测 `gemm.py` 的上游 / legacy 分流与适配。
+
+A8W4（mxfp4 权重）的 W4A16 decode 档：[a8w4_ptpc/test_a8w4_decode.py](a8w4_ptpc/test_a8w4_decode.py)
+测 `prepare_weights` 的逐位格式（CPU 小形状）、TP2 / TP4 × decode 档 T ∈ {1, 8, 16, 32, 128}
+对 FP32 参考（mxfp4 精确反量化、BF16 激活，容差同上）、三种 decode 配置的 CUDA graph replay，
+以及 prefill 档（T=129）报 `NotImplementedError`；[a8w4_ptpc/test_a8w4_decode_edges.py](a8w4_ptpc/test_a8w4_decode_edges.py)
+补入口的输入检查、T=0、各档下界 T=2 / 17、配置表以外的 tile 与编译缓存。随机 mxfp4 权重与参考在
+[moe_a8w4_mxfp4](../../../src/pyhip/testing/moe_a8w4_mxfp4.py)。
 
 ```bash
 python3 -m pytest tests/ops/moe/a8w4_ptpc -q
+# 只跑 A8W4 decode（约 30 s）
+python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_decode.py tests/ops/moe/a8w4_ptpc/test_a8w4_decode_edges.py -q
 ```
 
 ## 旧用例迁移

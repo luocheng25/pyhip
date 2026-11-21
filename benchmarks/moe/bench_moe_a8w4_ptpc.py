@@ -1,28 +1,31 @@
-"""Qwen3.8-Flash-Next 单卡分片的 per-token FP8（ptpc）MoE 延迟：tuned_moe FlyDSL 对照 Aiter。
+"""Qwen3.8-Flash-Next 单卡分片的 MoE 延迟：A8W4（mxfp4 权重）对照 FP8 ptpc（tuned_moe FlyDSL 与 Aiter）。
 
 Case：TP2（I=320）/ TP4（I=160，补零到 192，见 pyhip.testing.moe_a8w4_ptpc）
 × T ∈ {1, 8, 16, 32, 128, 1024, 8192, 65536}，共 16 个；H=2560，E=512，top-10，SiLU，
 均匀随机路由、固定种子。
 
-实现（``--impl`` 逗号分隔，第一个是指标）：
-  fly_ptpc    tuned_moe 的 FlyDSL ptpc 候选，经 ``make_moe_runner`` 固定为
+实现（``--impl`` 逗号分隔，默认 ``a8w4,fly_ptpc,aiter_ptpc``，第一个是指标）：
+  a8w4        ``pyhip.ops.moe.flydsl.a8w4_ptpc.fused_moe``，mxfp4 权重（``moe_a8w4_mxfp4`` 生成，
+              加载时 ``prepare_weights``）；M1 只有 decode 档（配置表当前 T<=128），prefill 档的 case
+              跳过它（不输出 MF_METRIC、不算失败），其余实现照常计时
+  fly_ptpc    tuned_moe 的 FlyDSL FP8 ptpc 候选（M0 路径），经 ``make_moe_runner`` 固定为
               ``moe_a8w4_ptpc.FLY_CONFIGS`` 中的配置（不调优、不回退）
   aiter_ptpc  ``aiter.fused_moe.fused_moe(quant_type=per_Token)``，由 Aiter 自选 kernel；
-              TP4 与 fly_ptpc 使用同一份补零到 I=192 的权重
+              TP4 与 fly_ptpc 使用同一份补零到 I=192 的 FP8 权重
 
-计时协议：每个实现用同样的权重和输入。权重 ``--sets``（>=4）组；输入轮换至少 ``--sets`` 组，
-小 T 再加组数，让两次复用之间触达的专家权重 >= 512 MiB，先从 L2/MALL 中挤出。先跑
-``--warmup``（>=2）轮，再连续跑 ``--warmup-seconds`` 让频率稳定；之后取 ``--iters``（>=20）个样本，
-每个样本是下一组输入上的一次调用，前面放一个 sleep kernel（把主机下发时间挡在计时窗口外），
-用 GPU event 计时并同步，报告中位数。decode（T<=32）每组输入捕获一个 CUDA graph 并按 replay 计时；
-prefill 为 eager。
+计时协议：同一 case 的各实现用同样的输入；FP8 与 mxfp4 权重各 ``--sets``（>=4）组。输入轮换至少
+``--sets`` 组，小 T 再加组数，让两次复用之间触达的专家权重 >= 512 MiB（按最小的权重字节数算，有 a8w4 时
+按 mxfp4），先从 L2/MALL 中挤出。先跑 ``--warmup``（>=2）轮，再连续跑 ``--warmup-seconds`` 让频率稳定；
+之后取 ``--iters``（>=20）个样本，每个样本是下一组输入上的一次调用，前面放一个 sleep kernel（把主机下发
+时间挡在计时窗口外），用 GPU event 计时并同步，报告中位数。decode 档（按 a8w4 配置表，当前 T<=128）
+每组输入捕获一个 CUDA graph 并按 replay 计时；prefill 为 eager。
 
 ``--check`` 与 ``--sweep`` 还会记下 tuned_moe 的两次 compile_gemm 被 gemm.py 分流到 upstream 还是 legacy。
 
 ``--mf`` 对第一个实现输出 ``MF_METRIC case=<tp2|tp4>_t<T> value=<us> unit=us``，其余实现输出
-``REF impl=<名> case=<...> value=<us>``；否则打印表格。``--check`` 先用 FP32 参考检查每个实现
-（T=65536 每 16 个 token 取一个）。``--sweep`` 不计指标，而是对每个 case 计时 tuned_moe 生成的
-全部 FlyDSL 候选，按中位数排序输出，用于更新 ``FLY_CONFIGS``。
+``REF impl=<名> case=<...> value=<us>``；否则打印表格（含 a8w4 / fly_ptpc 的耗时比）。``--check`` 先用
+FP32 参考检查每个实现（T=65536 每 16 个 token 取一个；a8w4 对 mxfp4 参考）。``--sweep`` 不计指标，而是
+对每个 case 计时 tuned_moe 生成的全部 FlyDSL 候选，按中位数排序输出，用于更新 ``FLY_CONFIGS``。
 """
 
 import argparse
@@ -34,9 +37,9 @@ import time
 
 from pyhip.testing import moe_a8w4_ptpc as M
 
-IMPLS = ("fly_ptpc", "aiter_ptpc")
+IMPLS = ("a8w4", "fly_ptpc", "aiter_ptpc")
+FP8_IMPLS = ("fly_ptpc", "aiter_ptpc")
 CASES = [(tp, tokens) for tp in (2, 4) for tokens in M.BENCH_TOKENS]
-GRAPH_MAX_TOKENS = 32
 EVICT_BYTES = 512 << 20
 MAX_INPUT_SETS = 64
 CHECK_STEP = {65536: 16}
@@ -45,7 +48,7 @@ CHECK_STEP = {65536: 16}
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--impl", default="fly_ptpc,aiter_ptpc",
+    parser.add_argument("--impl", default="a8w4,fly_ptpc,aiter_ptpc",
                         help="逗号分隔的实现，第一个是指标")
     parser.add_argument("--cases", default="all", help="逗号分隔的 case 名，如 tp2_t1（默认全部 16 个）")
     parser.add_argument("--mf", action="store_true", help="输出 MF_METRIC / REF 行")
@@ -113,8 +116,30 @@ def make_weight_sets(tp, count, seed, keep_raw):
     return sets
 
 
-def input_set_count(tp, tokens, minimum):
-    touched = M.touched_experts(tokens) * 3 * M.KERNEL_INTER[tp] * M.H
+def make_mxfp4_sets(tp, count, seed, keep_raw):
+    """``count`` 组 mxfp4 权重 ``(raw, prepared)``；只有第一组保留 raw（参考用）。"""
+    import torch
+
+    from pyhip.testing import moe_a8w4_mxfp4 as X
+
+    sets = []
+    for index in range(count):
+        raw, prepared = X.make_mxfp4_weights(tp, seed=seed * 1000 + tp * 100 + 50 + index)
+        sets.append((raw if keep_raw and index == 0 else None, prepared))
+        del raw
+    torch.cuda.synchronize()
+    return sets
+
+
+def decode_tier(tokens):
+    """按 a8w4 的配置表，``tokens`` 是否在 decode 档（当前 T<=128）。"""
+    from pyhip.ops.moe.flydsl import a8w4_ptpc
+
+    return a8w4_ptpc.select_config(tokens)["path"] == "decode"
+
+
+def input_set_count(tp, tokens, minimum, weight_bytes=1.0):
+    touched = M.touched_experts(tokens) * 3 * M.KERNEL_INTER[tp] * M.H * weight_bytes
     return max(minimum, min(MAX_INPUT_SETS, math.ceil(EVICT_BYTES / touched)))
 
 
@@ -129,8 +154,12 @@ def make_inputs(tokens, count, seed):
 
 
 def make_call(impl, kernel, inputs, config):
-    """返回在一组输入上运行 ``impl`` 的无参函数。"""
+    """返回在一组输入上运行 ``impl`` 的无参函数；a8w4 的 ``kernel`` 是 prepare 后的 mxfp4 权重。"""
     hidden, weight, ids, output = inputs
+    if impl == "a8w4":
+        from pyhip.ops.moe.flydsl import a8w4_ptpc
+
+        return lambda: a8w4_ptpc.fused_moe(hidden, kernel, weight, ids, output=output)
     if impl == "fly_ptpc":
         runner = M.fly_runner(config)
         call = M.moe_call(kernel, hidden, weight, ids, output)
@@ -189,9 +218,12 @@ def time_impl(calls, *, graph, warmup, iters, sleeper, warmup_seconds):
 
 
 class Reference:
-    """按数据流缓存一组输入的 FP32 参考；大 T 只比较等间隔抽取的 token。"""
+    """按数据流缓存一组输入的 FP32 参考；大 T 只比较等间隔抽取的 token。
 
-    def __init__(self, raw, inputs):
+    ``kind``：False / True 为 FP8 权重的 decode / prefill 数据流（``act_quant``），"mxfp4" 为 a8w4 的参考。
+    """
+
+    def __init__(self, raw, inputs, raw_mxfp4=None):
         import torch
 
         hidden, weight, ids, _ = inputs
@@ -199,13 +231,20 @@ class Reference:
         step = CHECK_STEP.get(tokens, 1)
         self.rows = torch.cat([torch.arange(0, tokens - 1, step, device=hidden.device),
                                torch.tensor([tokens - 1], device=hidden.device)])
-        self.args = (hidden[self.rows], raw, weight[self.rows], ids[self.rows])
+        self.inputs = (hidden[self.rows], weight[self.rows], ids[self.rows])
+        self.raw, self.raw_mxfp4 = raw, raw_mxfp4
         self.cache = {}
 
-    def errors(self, output, act_quant):
-        if act_quant not in self.cache:
-            self.cache[act_quant] = M.reference_moe(*self.args, act_quant=act_quant)
-        return M.output_errors(self.cache[act_quant], output[self.rows])
+    def errors(self, output, kind):
+        if kind not in self.cache:
+            hidden, weight, ids = self.inputs
+            if kind == "mxfp4":
+                from pyhip.testing import moe_a8w4_mxfp4 as X
+
+                self.cache[kind] = X.reference_moe(hidden, self.raw_mxfp4, weight, ids)
+            else:
+                self.cache[kind] = M.reference_moe(hidden, self.raw, weight, ids, act_quant=kind)
+        return M.output_errors(self.cache[kind], output[self.rows])
 
 
 def gemm_routes(run):
@@ -227,7 +266,9 @@ def gemm_routes(run):
 
 
 def check_impl(impl, call, reference, config):
-    # Aiter 的 ptpc kernel 对两级输入都按 token 量化。
+    # Aiter 的 ptpc kernel 对两级输入都按 token 量化；a8w4 对 mxfp4 参考。
+    if impl == "a8w4":
+        return reference.errors(call(), "mxfp4")
     act_quant = True if impl == "aiter_ptpc" else M.act_quant(config)
     return reference.errors(call(), act_quant)
 
@@ -243,27 +284,41 @@ def run(args):
     torch.cuda.set_device(0)
     sleeper = Sleeper()
     results = {}
+    keep_raw = args.check or args.sweep
+    use_fp8 = args.sweep or any(impl in FP8_IMPLS for impl in args.impl)
+    use_mxfp4 = not args.sweep and "a8w4" in args.impl
     for tp in sorted({tp for tp, _ in args.cases}):
-        weight_sets = make_weight_sets(tp, args.sets, args.seed, keep_raw=args.check or args.sweep)
+        weight_sets = make_weight_sets(tp, args.sets, args.seed, keep_raw) if use_fp8 else None
+        mxfp4_sets = make_mxfp4_sets(tp, args.sets, args.seed, keep_raw) if use_mxfp4 else None
         for case_tp, tokens in args.cases:
             if case_tp != tp:
                 continue
             case = M.case_name(tp, tokens)
-            count = input_set_count(tp, tokens, args.sets)
+            count = input_set_count(tp, tokens, args.sets, 0.5 if use_mxfp4 else 1.0)
             inputs = make_inputs(tokens, count, args.seed)
-            kernels = [weight_sets[index % len(weight_sets)][1] for index in range(count)]
-            reference = (Reference(weight_sets[0][0], inputs[0])
-                         if args.check or args.sweep else None)
-            timing = dict(graph=tokens <= GRAPH_MAX_TOKENS, warmup=args.warmup, iters=args.iters,
+            kernels = {}
+            if weight_sets:
+                for impl in FP8_IMPLS:
+                    kernels[impl] = [weight_sets[index % len(weight_sets)][1] for index in range(count)]
+            if mxfp4_sets:
+                kernels["a8w4"] = [mxfp4_sets[index % len(mxfp4_sets)][1] for index in range(count)]
+            reference = (Reference(weight_sets[0][0] if weight_sets else None, inputs[0],
+                                   mxfp4_sets[0][0] if mxfp4_sets else None)
+                         if keep_raw else None)
+            timing = dict(graph=decode_tier(tokens), warmup=args.warmup, iters=args.iters,
                           sleeper=sleeper, warmup_seconds=args.warmup_seconds)
             if args.sweep:
-                results[case] = sweep_case(case, kernels, inputs, reference, timing)
+                results[case] = sweep_case(case, kernels["fly_ptpc"], inputs, reference, timing)
             else:
                 config = M.fly_config(tp, tokens)
                 row = results.setdefault(case, {"config": M.describe(config), "input_sets": count})
                 for impl in args.impl:
+                    if impl == "a8w4" and not decode_tier(tokens):
+                        row[impl] = None  # 不计时、不算失败
+                        note(f"a8w4 {case} skipped: the prefill tier comes in M2")
+                        continue
                     try:
-                        calls = [make_call(impl, kernels[index], inputs[index], config)
+                        calls = [make_call(impl, kernels[impl][index], inputs[index], config)
                                  for index in range(count)]
                         if args.check:
                             row[f"{impl}_err"], route = gemm_routes(
@@ -280,7 +335,7 @@ def run(args):
                     emit(args, case, impl, row)
             del inputs, kernels, reference
             torch.cuda.empty_cache()
-        del weight_sets
+        del weight_sets, mxfp4_sets
         torch.cuda.empty_cache()
     return results
 
@@ -315,13 +370,18 @@ def sweep_case(case, kernels, inputs, reference, timing):
 
 
 def emit(args, case, impl, row):
-    if not args.mf:
-        return
     value = row[impl]
+    if not args.mf or value is None:
+        return
     if impl == args.impl[0]:
         print(f"MF_METRIC case={case} value={value:.3f} unit=us", flush=True)
     else:
         print(f"REF impl={impl} case={case} value={value:.3f}", flush=True)
+
+
+def _ratio(row, num, den):
+    a, b = row.get(num), row.get(den)
+    return math.nan if a is None or b is None else a / b
 
 
 def print_table(args, results):
@@ -331,18 +391,18 @@ def print_table(args, results):
             for us, config, _, route in rows[:5]:
                 print(f"  {us:10.2f} us  {route:<17} {M.describe(config)}")
         return
-    speedup = args.impl[:2] == ["fly_ptpc", "aiter_ptpc"]
+    ratios = [(num, den) for num, den in (("a8w4", "fly_ptpc"), ("aiter_ptpc", "fly_ptpc"))
+              if num in args.impl and den in args.impl]
     header = f"{'case':<10} {'fly_ptpc config [gemm.py 分流]':<84} {'sets':>4} "
     header += " ".join(f"{impl + '(us)':>16}" for impl in args.impl)
-    if speedup:
-        header += f" {'aiter/fly':>9}"
+    header += "".join(f" {num.split('_')[0] + '/fly':>10}" for num, _ in ratios)
     print(header)
     for case, row in results.items():
         config = f"{row['config']} [{row['route']}]" if "route" in row else row["config"]
         line = f"{case:<10} {config:<84} {row['input_sets']:>4} "
-        line += " ".join(f"{row.get(impl, math.nan):>16.2f}" for impl in args.impl)
-        if speedup:
-            line += f" {row['aiter_ptpc'] / row['fly_ptpc']:>8.3f}x"
+        values = [math.nan if row.get(impl) is None else row[impl] for impl in args.impl]
+        line += " ".join(f"{value:>16.2f}" for value in values)
+        line += "".join(f" {_ratio(row, num, den):>9.3f}x" for num, den in ratios)
         print(line)
         for impl in args.impl:
             if f"{impl}_err" in row:
@@ -361,7 +421,8 @@ def main(argv=None):
         print_table(args, results)
     if args.sweep:
         return 0 if all(results.values()) else 1
-    failed = [case for case, row in results.items() if math.isnan(row[args.impl[0]])]
+    failed = [case for case, row in results.items()
+              if row[args.impl[0]] is not None and math.isnan(row[args.impl[0]])]
     return 1 if failed else 0
 
 
