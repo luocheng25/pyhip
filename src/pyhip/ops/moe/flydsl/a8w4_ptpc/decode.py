@@ -13,8 +13,15 @@
 # unchanged _cvt_fp8_bf16 widens to BF16. The kernels take p_w_delta after p_w_scale, and p_w_scale is
 # the per-channel factor (the ptpc epilogue is unchanged). Only SiLU and the ptpc scale path are kept;
 # batch1 drops has_num_local_tokens and its launchers take the batch size instead of batch * TOPK.
+# Added (not upstream): gemv_splitk and the gemv kernels, batch1's grid and weight reads with the
+# products on the VALU (v_cvt_pk_f32_fp8 + v_pk_fma_f32) instead of BF16 MFMA.
 
-"""W4A16 decode kernels (batch1 / split-K) for mxfp4 MoE weights: BF16 activations, BF16 MFMA."""
+"""W4A16 decode kernels for mxfp4 MoE weights and BF16 activations, FP32 accumulation.
+
+batch1 / split-K multiply with BF16 MFMA; gemv (one CTA group per route, like batch1) uses packed f32
+FMAs on the VALU, because a batch-1 MFMA uses one of its 16 columns and sustained BF16 MFMA issue
+throttles the MI308X clock.
+"""
 
 import functools
 
@@ -51,6 +58,22 @@ def _decode_fp4x8(raw, lo, hi):
     even = ((raw << 4) & fx.Uint32(0x80808080)) | _perm(hi, lo, raw & fx.Uint32(0x07070707))
     odd = (raw & fx.Uint32(0x80808080)) | _perm(hi, lo, (raw >> 4) & fx.Uint32(0x07070707))
     return even, odd
+
+
+def _fp8_words(raw, dwords, rep_sel):
+    """Per N repeat: broadcast the row's delta byte, shift the |E2M1| -> FP8 table by it, and decode the
+    16 nibbles (two dwords of ``raw``) into four FP8 dwords (k0..3, 4..7, 8..11, 12..15)."""
+    words = []
+    for n in range_constexpr(len(rep_sel)):
+        slot, sel = rep_sel[n]
+        d = _perm(dwords[slot], dwords[slot], sel)
+        lo = (fx.Uint32(_LUT_LO) - d) & fx.Uint32(0xFFFFFF00)
+        hi = fx.Uint32(_LUT_HI) - d
+        for v in range_constexpr(2):
+            even, odd = _decode_fp4x8(fx.Uint32(raw[2 * n + v]), lo, hi)
+            words.append(even)
+            words.append(odd)
+    return words
 
 
 def _u32_ptr(p, align):
@@ -232,20 +255,8 @@ def _make_fp4_gemm_splitk(K, BLOCK_TILE_SIZE_M, TOPK):
                 d_frag[buf][s] = delta_buf[delta_bases[s] + k_idx * delta_step]
 
         def _decode_b(buf):
-            # Per N repeat: broadcast the row's delta byte, shift the |E2M1| -> FP8 table by it, and
-            # decode the 16 nibbles into the four FP8 dwords of the FP8 path (k0..3, 4..7, 8..11, 12..15).
-            raw = b_raw[buf].load()
-            dwords = d_frag[buf].load()
-            words = []
-            for n in range_constexpr(n_rep):
-                slot, sel = rep_sel[n]
-                d = _perm(dwords[slot], dwords[slot], sel)
-                lo = (fx.Uint32(_LUT_LO) - d) & fx.Uint32(0xFFFFFF00)
-                hi = fx.Uint32(_LUT_HI) - d
-                for v in range_constexpr(2):
-                    even, odd = _decode_fp4x8(fx.Uint32(raw[2 * n + v]), lo, hi)
-                    words.append(even)
-                    words.append(odd)
+            # The four FP8 dwords of the FP8 path per N repeat, widened to BF16.
+            words = _fp8_words(b_raw[buf].load(), d_frag[buf].load(), rep_sel)
             fp8_frag.store(Vec.from_elements(words, fx.Uint32))
             _cvt_fp8_bf16(fp8_frag, b_frag[buf])
 
@@ -393,12 +404,135 @@ def _make_fp4_gemm_splitk(K, BLOCK_TILE_SIZE_M, TOPK):
 
         return c_frag_reduce
 
-    return TensorWithIndex, _read_sorted_index, gemm_splitk
+    @flyc.jit
+    def gemv_splitk(
+        TILE_N,
+        TILE_K,
+        blk_n: int,
+        arg_p_input: fx.Tensor,
+        x_row: fx.Tensor,
+        arg_p_weight: fx.Tensor,
+        delta,
+        x_lds: fx.Tensor,
+        splitk_waves=4,
+    ):
+        """Batch-1 product of the CTA's TILE_N weight rows with one BF16 row on the VALU (no MFMA).
+
+        The lanes read the same weight bytes and delta dwords as gemm_splitk; ``x_row`` is a dword view of
+        the K BF16 activations, widened once per CTA into the f32 LDS view ``x_lds`` (K elements). Each
+        FP8 dword is widened to two f32 pairs (v_cvt_pk_f32_fp8) and accumulated with packed f32 FMAs.
+        Returns the lane's sums for rows 16 * n + lane % 16 over the wave's K slices, reduced over the
+        wave's four 16-lane groups (all four hold the same sums).
+        """
+        tid = gpu.thread_idx.x
+        tile_k_per_wg = TILE_K * splitk_waves
+        assert K % tile_k_per_wg == 0, (K, tile_k_per_wg)
+        # Only the B partition of gemm_splitk's MMA is used: it fixes the rows and K each lane reads.
+        rep_k_per_lane = 4
+        k_perm = fx.make_tile(
+            None,
+            None,
+            fx.make_layout(
+                (4, 4 * splitk_waves, rep_k_per_lane), (1, 4 * rep_k_per_lane, 4)
+            ),
+        )
+        tiled_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            fx.make_layout((1, 1, splitk_waves), (0, 0, 1)),
+            k_perm,
+        )
+        b_cp_atom_r, b_tensor_thr, _, b_raw = _setup_b_operand(
+            arg_p_weight, arg_p_input, tiled_mma, blk_n, TILE_N, tile_k_per_wg, tid
+        )
+        n_rep = TILE_N // 16
+        delta_buf, delta_bases, rep_sel = delta
+        n_slots = len(delta_bases)
+        delta_step = tile_k_per_wg // 32 * 16
+        d_frag = [fx.make_rmem_tensor(n_slots, fx.Uint32), fx.make_rmem_tensor(n_slots, fx.Uint32)]
+        num_k_iters = K // tile_k_per_wg
+        # Widen the row to f32 once per CTA (x_lds[k] = x[k]) rather than per lane and K tile.
+        x_buf = fx.rocdl.make_buffer_tensor(x_row, max_size=False)
+        n_threads = 64 * splitk_waves
+        for r in range_constexpr((K // 2 + n_threads - 1) // n_threads):
+            i = tid + r * n_threads
+            if i < K // 2:
+                u = Vec.from_elements([x_buf[i]], fx.Uint32)
+                x_lds[2 * i] = (u << 16).bitcast(fx.Float32)[0]
+                x_lds[2 * i + 1] = (u & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32)[0]
+        gpu.barrier()
+        # Lane (wave w, group q = lane // 16) holds K [tile_k_per_wg * k + 64 w + 16 q, +16) of its rows.
+        x_lane = (tid // 64) * 64 + (tid % 64) // 16 * 16
+        x_cp = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+
+        def _prefetch(k_idx, buf):
+            fx.copy(b_cp_atom_r, b_tensor_thr[None, None, None, k_idx], b_raw[buf])
+            for s in range_constexpr(n_slots):
+                d_frag[buf][s] = delta_buf[delta_bases[s] + k_idx * delta_step]
+
+        def _x_pairs(k_idx):
+            # f32 pair i of the lane's 16 K is k 2i, 2i+1.
+            vals = []
+            for j in range_constexpr(4):
+                frag = fx.make_rmem_tensor(4, fx.Float32)
+                src = fx.make_view(
+                    fx.get_iter(x_lds) + (k_idx * tile_k_per_wg + x_lane + 4 * j),
+                    fx.make_layout(4, 1),
+                )
+                fx.copy(x_cp, src, frag)
+                v = frag.load()
+                vals += [v[e] for e in range_constexpr(4)]
+            return [Vec.from_elements([vals[2 * i], vals[2 * i + 1]], fx.Float32) for i in range_constexpr(8)]
+
+        def _fma(buf, acc, k_idx):
+            # FP8 dword v of an N repeat holds k 4v..4v+3.
+            xp = _x_pairs(k_idx)
+            words = _fp8_words(b_raw[buf].load(), d_frag[buf].load(), rep_sel)
+            out = []
+            for n in range_constexpr(n_rep):
+                a = Vec.from_elements([acc[2 * n], acc[2 * n + 1]], fx.Float32)
+                for v in range_constexpr(4):
+                    for h in range_constexpr(2):
+                        w = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, words[4 * n + v], word_sel=h == 1))
+                        a = fx.fma(w, xp[2 * v + h], a)
+                out.append(a[0])
+                out.append(a[1])
+            return Vec.from_elements(out, fx.Float32)
+
+        _prefetch(fx.Int32(0), 0)
+        acc_init = Vec.filled(2 * n_rep, 0.0, fx.Float32)
+        rocdl.sched_barrier(0)
+
+        results = acc_init
+        for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
+            k_base = fx.Int32(k2 * 2)
+            _prefetch(k_base + 1, 1)
+            rocdl.sched_barrier(0)
+            acc = _fma(0, state[0], k_base)
+            rocdl.sched_barrier(0)
+            _prefetch(k_base + 2, 0)
+            rocdl.sched_barrier(0)
+            acc = _fma(1, acc, k_base + 1)
+            rocdl.sched_barrier(0)
+            results = yield [acc]
+        acc = results
+        if const_expr(num_k_iters % 2 == 1):
+            acc = _fma(0, acc, fx.Int32(num_k_iters - 1))
+
+        sums = []
+        for n in range_constexpr(n_rep):
+            s = acc[2 * n] + acc[2 * n + 1]
+            s = s + s.shuffle_xor(fx.Int32(16), fx.Int32(64))
+            s = s + s.shuffle_xor(fx.Int32(32), fx.Int32(64))
+            sums.append(s)
+        return sums
+
+    return TensorWithIndex, _read_sorted_index, gemm_splitk, gemv_splitk
 
 
 def _build_gateup(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
-    """Gate/Up (N = 2I rows: gate then up, K = H): split-K over sorted rows, or batch1 per route."""
-    assert alg in ("splitk", "batch1"), alg
+    """Gate/Up (N = 2I rows: gate then up, K = H): split-K over sorted rows, or one CTA group per route
+    (batch1 with MFMA, gemv on the VALU)."""
+    assert alg in ("splitk", "batch1", "gemv"), alg
     assert K % 256 == 0 and (N // 2) % 64 == 0, (N, K)
     assert BLOCK_TILE_SIZE_N in (32, 64, 128), BLOCK_TILE_SIZE_N
     c_reduce_lds_size = 16 * 64 * 4
@@ -410,13 +544,20 @@ def _build_gateup(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
             sorted_lds: fx.Array[fx.Int32, 256, 16]
             c_reduce_lds: fx.Array[fx.Float32, c_reduce_lds_size, 16]
 
+    elif alg == "gemv":
+
+        @fx.struct
+        class SharedStorage:
+            red_lds: fx.Array[fx.Float32, 4 * BLOCK_TILE_SIZE_N, 16]
+            x_lds: fx.Array[fx.Float32, K, 16]
+
     else:
 
         @fx.struct
         class SharedStorage:
             c_reduce_lds: fx.Array[fx.Float32, c_reduce_lds_size, 16]
 
-    TensorWithIndex, _read_sorted_index, gemm_splitk = _make_fp4_gemm_splitk(
+    TensorWithIndex, _read_sorted_index, gemm_splitk, gemv_splitk = _make_fp4_gemm_splitk(
         K, BLOCK_TILE_SIZE_M, TOPK
     )
 
@@ -700,6 +841,10 @@ def _build_gateup(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
 
             fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
 
+        _clear_output_row(p_clear_output, blk_n, e_idx, batch_idx, tid)
+
+    @flyc.jit
+    def _clear_output_row(p_clear_output, blk_n, e_idx, batch_idx, tid):
         # Zero this token's output row for the Down atomics (same stream, after this kernel).
         clear_blocks = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
         clear_threads = clear_blocks * 256
@@ -720,6 +865,81 @@ def _build_gateup(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
                     clear_frag,
                     clear_output,
                 )
+
+    @flyc.kernel
+    def moe_a8w4_gateup_gemv(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_topk_ids: fx.Pointer,
+        p_clear_output: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_w_delta: fx.Pointer,
+    ):
+        # batch1's grid and weight reads, but the products run on the VALU (gemv_splitk): BF16 MFMA
+        # would use one of its 16 columns, and its issue rate is what throttles the clock on MI308X.
+        tid = gpu.thread_idx.x
+        blk_n = gpu.block_idx.x
+        e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
+
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx) * K,
+            fx.make_layout((1, K), (K, 1)),
+        )
+        x_row = fx.make_view(
+            _u32_ptr(p_input, 16) + fx.Int64(batch_idx) * (K // 2),
+            fx.make_layout(K // 2, 1),
+        )
+        arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
+        expert_id = arg_p_expert_ids[route_idx]
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
+
+        # Routing gives pad rows expert -1, which sorting would drop.
+        if expert_id >= 0:
+            arg_p_weight, delta = _weight_and_delta(
+                p_weight, p_w_delta, expert_id, blk_n, contiguous_n
+            )
+            sums = gemv_splitk(
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                x_row,
+                arg_p_weight,
+                delta,
+                fx.make_view(lds.x_lds.ptr, fx.make_layout(K, 1)),
+                splitk_waves=4,
+            )
+            # Tile row r < contiguous_n is gate row blk_n * contiguous_n + r, row contiguous_n + r the
+            # matching up row; sum the four waves' K slices through LDS.
+            red = fx.make_view(lds.red_lds.ptr, fx.make_layout(4 * BLOCK_TILE_SIZE_N, 1))
+            lane = tid % 64
+            if lane < 16:
+                for n in range_constexpr(BLOCK_TILE_SIZE_N // 16):
+                    red[(tid // 64) * BLOCK_TILE_SIZE_N + 16 * n + lane] = sums[n]
+            gpu.barrier()
+            if tid < contiguous_n:
+                gate = red[tid]
+                up = red[tid + contiguous_n]
+                for w in range_constexpr(1, 4):
+                    gate = gate + red[w * BLOCK_TILE_SIZE_N + tid]
+                    up = up + red[w * BLOCK_TILE_SIZE_N + contiguous_n + tid]
+                scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_w_scale))
+                col = blk_n * contiguous_n + tid
+                gate = gate * scale[expert_id * N + col]
+                up = up * scale[expert_id * N + N // 2 + col]
+                tmp = rocdl.exp2(T.f32, _raw(gate * -1.4426950408889634))
+                act = (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
+                out = fx.make_view(
+                    fxh._as_ptr(p_output) + fx.Int64(route_idx) * (N // 2),
+                    fx.make_layout(N // 2, 1),
+                )
+                out[col] = _f32_to_bf16(Vec.from_elements([act], fx.Float32))[0]
+
+        _clear_output_row(p_clear_output, blk_n, e_idx, batch_idx, tid)
 
     @flyc.jit
     def launch_splitk(
@@ -785,12 +1005,40 @@ def _build_gateup(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
             stream=stream,
         )
 
-    return launch_batch1 if alg == "batch1" else launch_splitk
+    @flyc.jit
+    def launch_gemv(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_topk_ids: fx.Pointer,
+        p_clear_output: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        batch: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        moe_a8w4_gateup_gemv(
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_clear_output,
+            p_w_scale,
+            p_w_delta,
+        ).launch(
+            grid=(num_n_blocks, TOPK, batch),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    return {"batch1": launch_batch1, "gemv": launch_gemv, "splitk": launch_splitk}[alg]
 
 
 def _build_down(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
     """Down (N = H rows, K = I): one wave per CTA, atomic BF16 add into the output."""
-    assert alg in ("splitk", "batch1"), alg
+    assert alg in ("splitk", "batch1", "gemv"), alg
     assert K % TILE_K == 0 and N % BLOCK_TILE_SIZE_N == 0, (N, K)
     assert BLOCK_TILE_SIZE_N in (64, 128), BLOCK_TILE_SIZE_N
 
@@ -798,7 +1046,11 @@ def _build_down(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
     class SharedStorage:
         sorted_lds: fx.Array[fx.Int32, 256, 16]
 
-    TensorWithIndex, _read_sorted_index, gemm_splitk = _make_fp4_gemm_splitk(
+    @fx.struct
+    class GemvStorage:
+        x_lds: fx.Array[fx.Float32, K, 16]
+
+    TensorWithIndex, _read_sorted_index, gemm_splitk, gemv_splitk = _make_fp4_gemm_splitk(
         K, BLOCK_TILE_SIZE_M, TOPK
     )
 
@@ -1038,6 +1290,70 @@ def _build_down(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
                         ptr_base = fx.get_iter(c_dst[None, m, n, 0])
                         fxh.atomic_add_bf16(ptr_base, reg_vec)
 
+    @flyc.kernel
+    def moe_a8w4_down_gemv(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_topk_ids: fx.Pointer,
+        p_topk_weights: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_w_delta: fx.Pointer,
+    ):
+        # batch1's grid and weight reads with the products on the VALU (see moe_a8w4_gateup_gemv).
+        tid = gpu.thread_idx.x
+        blk_n = gpu.block_idx.x
+        e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
+
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(route_idx) * K,
+            fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
+        )
+        x_row = fx.make_view(
+            _u32_ptr(p_input, 16) + fx.Int64(route_idx) * (K // 2),
+            fx.make_layout(K // 2, 1),
+        )
+        arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
+        arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
+        expert_id = arg_p_topk_ids[route_idx]
+        topk_weight = arg_p_topk_weights[route_idx]
+        # Routing gives pad rows expert -1, which sorting would drop.
+        if expert_id >= 0:
+            arg_p_weight, delta = _weight_and_delta(p_weight, p_w_delta, expert_id, blk_n)
+            lds = fx.SharedAllocator().allocate(GemvStorage).peek()
+            sums = gemv_splitk(
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                x_row,
+                arg_p_weight,
+                delta,
+                fx.make_view(lds.x_lds.ptr, fx.make_layout(K, 1)),
+                splitk_waves=1,
+            )
+            # Lane l takes tile row 64 * j + l (row 16 * n + l % 16 is in sums[n] of every lane), and the
+            # even lanes add the BF16 pair of rows (l, l + 1).
+            group = tid // 16
+            scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_w_scale))
+            for j in range_constexpr(BLOCK_TILE_SIZE_N // 64):
+                value = sums[4 * j]
+                for i in range_constexpr(1, 4):
+                    value = (group == i).select(sums[4 * j + i], value)
+                row = blk_n * BLOCK_TILE_SIZE_N + 64 * j + tid
+                value = value * scale[expert_id * N + row] * topk_weight
+                pair = _f32_to_bf16(
+                    Vec.from_elements(
+                        [value, value.shuffle_xor(fx.Int32(1), fx.Int32(64))], fx.Float32
+                    )
+                )
+                if tid % 2 == 0:
+                    fxh.atomic_add_bf16(
+                        fxh._as_ptr(p_output) + (fx.Int64(batch_idx) * N + fx.Int64(row)), pair
+                    )
+
     @flyc.jit
     def launch_splitk(
         p_input: fx.Pointer,
@@ -1102,7 +1418,35 @@ def _build_down(N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, alg, E):
             stream=stream,
         )
 
-    return launch_batch1 if alg == "batch1" else launch_splitk
+    @flyc.jit
+    def launch_gemv(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_topk_ids: fx.Pointer,
+        p_topk_weights: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        batch: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        moe_a8w4_down_gemv(
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_topk_weights,
+            p_w_scale,
+            p_w_delta,
+        ).launch(
+            grid=(num_n_blocks, TOPK, batch),
+            block=(64, 1, 1),
+            stream=stream,
+        )
+
+    return {"batch1": launch_batch1, "gemv": launch_gemv, "splitk": launch_splitk}[alg]
 
 
 @functools.cache
@@ -1116,9 +1460,9 @@ def compile_decode_gemm(*, stage, N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE
     """Launcher of one W4A16 decode stage, cached per device (like ``moe_gemm_2stage.gemm``).
 
     split-K: ``(input, weight, output, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    w_factor, w_delta, M, task_num, stream)``; batch1 Gate/Up: ``(input, weight, mid, topk_ids,
-    output_to_clear, w_factor, w_delta, batch, stream)``; batch1 Down: ``(mid, weight, output, topk_ids,
-    topk_weights, w_factor, w_delta, batch, stream)``.
+    w_factor, w_delta, M, task_num, stream)``; batch1 / gemv Gate/Up: ``(input, weight, mid, topk_ids,
+    output_to_clear, w_factor, w_delta, batch, stream)``; batch1 / gemv Down: ``(mid, weight, output,
+    topk_ids, topk_weights, w_factor, w_delta, batch, stream)``.
     """
     assert stage in ("gateup", "down"), stage
     assert BLOCK_TILE_SIZE_M == 16, "the decode kernels use one 16-row MFMA tile"

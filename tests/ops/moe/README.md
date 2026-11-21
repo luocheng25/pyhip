@@ -154,7 +154,11 @@ A8W4（mxfp4 权重）的 W4A16 decode 档：[a8w4_ptpc/test_a8w4_decode.py](a8w
 对 FP32 参考（mxfp4 精确反量化、BF16 激活，容差同上）、三种 decode 配置的 CUDA graph replay；
 [a8w4_ptpc/test_a8w4_decode_edges.py](a8w4_ptpc/test_a8w4_decode_edges.py)
 补入口的输入检查、T=0、各档下界 T=2 / 17、配置表以外的 tile 与编译缓存。随机 mxfp4 权重与参考在
-[moe_a8w4_mxfp4](../../../src/pyhip/testing/moe_a8w4_mxfp4.py)。
+[moe_a8w4_mxfp4](../../../src/pyhip/testing/moe_a8w4_mxfp4.py)。M4 起配置表 T≤16 的 decode 行是 `alg="gemv"`
+（VALU 上 f32 乘加），上面两个文件里 T≤16 的用例测的就是 gemv；
+[a8w4_ptpc/test_a8w4_decode_gemv.py](a8w4_ptpc/test_a8w4_decode_gemv.py) 补 `config=` 指定的 gemv tile
+（Gate/Up gn64、Down dn128），以及同一输入下 gemv 与 batch1 都满足容差、每个 token 只留一条路由时逐元素差
+不超过 1 个 BF16 ulp。
 
 A8W4 的 prefill 档（M2）：[a8w4_ptpc/test_a8w4_prefill.py](a8w4_ptpc/test_a8w4_prefill.py) 测 prefill 另存的
 delta 排列（`w1_pdelta` / `w2_pdelta`）逐字节（CPU）、TP2 / TP4 × T ∈ {129（交界）, 1024, 8192, 65536}
@@ -171,6 +175,8 @@ M3 的 [a8w4_ptpc/test_a8w4_prefill_m3.py](a8w4_ptpc/test_a8w4_prefill_m3.py) �
 python3 -m pytest tests/ops/moe/a8w4_ptpc -q
 # 只跑 A8W4 decode（约 30 s）
 python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_decode.py tests/ops/moe/a8w4_ptpc/test_a8w4_decode_edges.py -q
+# 只跑 M4 补充的 gemv 用例（约 10 s）
+python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_decode_gemv.py -q
 # 只跑 A8W4 prefill（约 35 s）
 python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_prefill.py tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_edges.py -q
 # 只跑 M3 新增的 prefill 逻辑（约 25 s）

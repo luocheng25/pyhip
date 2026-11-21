@@ -1,7 +1,8 @@
 """A8W4 MoE 的入口：mxfp4 权重（``prepare_weights`` 的结果）+ BF16 激活，按配置表分档。
 
-- decode 档：W4A16，权重在寄存器里精确展开成 BF16，与 BF16 激活做 BF16 MFMA（``decode.py``）。
-  T 很小时 batch1（不排序，每条路由一组 CTA，Gate/Up 顺带清零输出）；否则 split-K（先排序）。
+- decode 档：W4A16，权重在寄存器里精确展开（``decode.py``），与 BF16 激活做 FP32 累加的乘加。
+  T 很小时每条路由一组 CTA、不排序（Gate/Up 顺带清零输出）：gemv 在 VALU 上做 f32 FMA，batch1 做 BF16 MFMA；
+  否则 split-K（先排序，BF16 MFMA）。
 - prefill 档：A8W4，数据流与 M0 FP8 ptpc 的 prefill 相同（``prefill.py``）：按 M64 排序，输入按 token 量化成
   FP8，Gate/Up（1x4）写 BF16 中间结果，中间结果再按 (token, k) 量化成 FP8，Down（1x4，M64xN256）每个排序行
   写一行，最后按 token 把 top-k 行相加；权重在寄存器里精确解码成 FP8，做 FP8 MFMA。后 32 行全是补齐的
@@ -19,8 +20,11 @@ from .prefill import compile_prefill_gemm, compile_prefill_quant
 from .weights import MXFP4Weights
 
 BLOCK_M = 16
-# (最大 T, 配置)：T 取第一条“最大 T >= T”的行，None 表示没有上界。decode 的 tile 沿用 M0 FP8 ptpc 配置表
-# （pyhip.testing.moe_a8w4_ptpc.FLY_CONFIGS）的 decode 行：T=1 batch1 gn32，2..16 batch1 gn64，17..128 split-K。
+# (最大 T, 配置)：T 取第一条“最大 T >= T”的行，None 表示没有上界。decode 的交界沿用 M0 FP8 ptpc 配置表
+# （pyhip.testing.moe_a8w4_ptpc.FLY_CONFIGS）：T<=16 每条路由一组 CTA，17..128 split-K。T<=16 用 gemv 而不是
+# batch1：每条路由只有一行激活，BF16 MFMA 只用到 16 列中的 1 列，持续运行时它的发射率让 MI308X 降频（bench 的
+# TP2 T=16 在约 134 / 162 µs 两态间跳）；gemv 不发 MFMA、不降频。MI308X 上按 bench 协议实测：T=1 gemv gn32
+# 与 batch1 gn32 相当（TP2 22.8 / 23.3 µs），T=8 / 16 gemv gn128 dn64 比 batch1 gn64 快 8% / 16%（TP2）。
 # prefill 的 Gate/Up 与 FP8 表相同（M64、gn128），Down 一律 1x4（M64xN256，行距补 128 B）；FP8 表在 TP4
 # T>8192 用的 compact Down 留到性能阶段。Gate/Up 的 BK 取 128：MI308X 上按 bench 协议实测，TP2/TP4 的
 # T=1024/8192/65536 都比 256 快 3%~8%（FP8 表在 T>1024 或 TP4 取 256）。half_m：后 32 行全是补齐的排序块
@@ -30,8 +34,8 @@ BLOCK_M = 16
 # quant="fly"：输入与中间结果的按行量化用 ``prefill.py`` 的 FlyDSL kernel（算术同参考 ``quantize_rows``，
 # T=1024 中间结果 4.6us，Aiter HIP kernel 18.9us）；"aiter" 为 M2 的 Aiter per-token 量化。
 CONFIGS = (
-    (1, dict(path="decode", alg="batch1", tile_n_gate=32, tile_n_down=64)),
-    (16, dict(path="decode", alg="batch1", tile_n_gate=64, tile_n_down=64)),
+    (1, dict(path="decode", alg="gemv", tile_n_gate=32, tile_n_down=64)),
+    (16, dict(path="decode", alg="gemv", tile_n_gate=128, tile_n_down=64)),
     (128, dict(path="decode", alg="splitk", tile_n_gate=128, tile_n_down=128)),
     (None, dict(path="prefill", tile_m=64, tile_n_gate=128, tile_k_gate=128, tile_n_down=256, padding=128,
                 half_m=True, prefetch_gate=2, prefetch_down=2, quant="fly")),
@@ -105,7 +109,7 @@ def fused_moe(hidden_states, weights, topk_weight, topk_ids, *, output=None, con
     down = compile_decode_gemm(stage="down", N=hidden, K=inter,
                                BLOCK_TILE_SIZE_N=config["tile_n_down"], **common)
     w = weights
-    if config["alg"] == "batch1":
+    if config["alg"] in ("batch1", "gemv"):
         # Gate/Up 顺带清零 out，同一 stream 上的 Down 再原子加。
         _run_compiled(gateup, *map(_ptr, (hidden_states, w.w1, mid, topk_ids, out, w.w1_factor, w.w1_delta)),
                       tokens, stream)
