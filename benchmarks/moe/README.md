@@ -229,3 +229,28 @@ GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter�
 | AITER_INCORRECT | Aiter 数值检查失败，winner 通过；除 check-only 外仍显示延迟和 speedup，退出码保持非零 |
 | NOT_COMPARABLE | 执行/输出元数据检查失败，或 winner 精度失败，不生成 speedup |
 | ERROR | 数据准备、参考或调用错误；reason 中保留异常 |
+
+## Qwen3.8-Flash-Next ptpc：FlyDSL 固定配置对照 Aiter
+
+入口：[bench_moe_a8w4_ptpc.py](bench_moe_a8w4_ptpc.py)，输入、参考和配置表在
+[moe_a8w4_ptpc](../../src/pyhip/testing/moe_a8w4_ptpc.py)。与上面的 tuned API 对照不同，
+它只测一个模型的单卡分片：H=2560、E=512、top-10、SiLU，TP2（I=320）/ TP4（I=160）×
+T ∈ {1, 8, 16, 32, 128, 1024, 8192, 65536}，共 16 个 case，均匀随机路由、固定种子。
+
+- `fly_ptpc`（第一个实现，作为指标）：tuned_moe 的 FlyDSL ptpc 候选，经 `make_moe_runner`
+  固定为 `FLY_CONFIGS` 中的配置，不调优、不回退 Aiter。
+- `aiter_ptpc`（参考行）：`aiter.fused_moe.fused_moe(quant_type=per_Token)`，由 Aiter 自选 kernel。
+- TP4 的 I=160 不满足 FlyDSL Down 的 64 对齐，两个实现都用同一份补零到 I=192 的权重；
+  补出的通道输出为 0，结果与 I=160 精确等价。这是本脚本唯一的 shape 改动。
+- 计时：至少 4 组权重，输入轮换到两次复用之间触达 >=512 MiB 专家权重；预热后连续跑 1 秒，
+  再取 20 个样本的中位数；每个样本前放 sleep kernel，把主机下发挡在 GPU event 区间外。
+  decode（T<=32）按 CUDA graph replay 计时，其余 eager。
+
+```bash
+# myflow 格式：MF_METRIC case=tp2_t1 value=<us> unit=us / REF impl=aiter_ptpc case=... value=<us>
+python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf
+# 表格，并先对 FP32 参考检查两个实现（T=65536 每 16 个 token 取一个）
+python benchmarks/moe/bench_moe_a8w4_ptpc.py --check --cases tp2_t1,tp4_t65536
+# 计时 tuned_moe 对每个 case 生成的全部 FlyDSL 候选，用于更新 FLY_CONFIGS
+python benchmarks/moe/bench_moe_a8w4_ptpc.py --sweep
+```

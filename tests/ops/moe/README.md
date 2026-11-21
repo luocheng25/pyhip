@@ -132,6 +132,26 @@ E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的�
 有效 FLOPs 为 `6*M*topk*H*I_tp`，不含无效 padding。没有自动清缓存、设备状态
 门槛或性能通过阈值；计时是当前运行结果，不保证跨设备可比较。
 
+## Qwen3.8 FlyDSL ptpc 形状（a8w4_ptpc/）
+
+[a8w4_ptpc/test_qwen38_ptpc.py](a8w4_ptpc/test_qwen38_ptpc.py) 用 Qwen3.8-Flash-Next 单卡分片
+（H=2560、E=512、top-10、SiLU；TP2 I=320，TP4 I=160 补零到 192）检查 tuned_moe 的 FlyDSL
+ptpc 路径。每个 T 经 `make_moe_runner` 固定使用
+[moe_a8w4_ptpc](../../../src/pyhip/testing/moe_a8w4_ptpc.py) 中 `FLY_CONFIGS` 的配置，并断言它
+确实是 `_configs()` 对该输入生成的 FlyDSL 候选；参考按所选路径的数据流量化激活（decode 读
+BF16，prefill 两级输入按 token 量化成 FP8）。容差沿用上游 aiter `op_tests/test_flydsl_moe_gfx942.py`：
+逐元素偏差不超过该 token 参考值的 1 个 RMS、`logits_diff`（与 `calc_diff` 同一公式）< 1e-3、
+最差 token 的相对 L2 误差 < 0.2，比上面的 `calc_diff <= 0.02` 严。T 覆盖
+1/8/16/32/128/256/257/1024/2000/8192，TP4 另加 8200（配置表中 8192 以上的 compact Down）；
+decode 的三种配置另在 CUDA graph 中 replay 新输入。用例还断言 tuned_moe 的两次 `compile_gemm`
+都被 `moe_gemm_2stage/gemm.py` 分流到上游 gfx9_fp8 实现，而不是 `*_legacy`。
+只在 gfx942 上运行，配置表由 [bench_moe_a8w4_ptpc.py](../../../benchmarks/moe/bench_moe_a8w4_ptpc.py)
+`--sweep` 实测选出。
+
+```bash
+python3 -m pytest tests/ops/moe/a8w4_ptpc -q
+```
+
 ## 旧用例迁移
 
 | 旧路径 | 固定配置 / pytest |

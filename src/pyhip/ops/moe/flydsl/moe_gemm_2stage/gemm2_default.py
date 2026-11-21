@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# pyhip legacy: the default Down builder of the previous pyhip implementation. The legacy Down
+# dispatcher (gemm2_legacy.py) still uses it for the Down configs gemm.py routes to legacy (fp4/mxfp4
+# and gfx950 Down, configs upstream rejects), and so do the N128 tails of the legacy compact path.
+# Upstream's default Down is in gemm2.py.
 
 """MoE stage2 default down-projection kernel builder."""
 
@@ -14,8 +18,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
-from . import common as fxh
-from .common import _f32_to_bf16
+from . import common_legacy as fxh
+from .common_legacy import _f32_to_bf16
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
 _DOWN_STORE_CACHE_MODIFIER = 2

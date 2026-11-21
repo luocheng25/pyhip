@@ -1,5 +1,33 @@
 # FlyDSL MoE 两阶段：性能、测试与 8x1 流水线
 
+<a id="upstream-replacement"></a>
+
+> **替换状态（2026-11-21，moe-ptpc-a8w4 M0）：本文其余部分描述替换前的 pyhip 实现，它现在是 legacy。** gfx942 上 BF16/FP8 × SiLU/SwiGLU 的生产路径已换成上游 ROCm/aiter@df3e0b2f `aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8/`，由 [gemm.py](gemm.py) 按配置在上游与 legacy 之间分流。分流规则、Qwen3.8 用到的上游 kernel、用例与替换前后的测量见 [a8w4_ptpc/README.md](../a8w4_ptpc/README.md)。
+
+| 本目录文件 | 现在的内容 |
+|---|---|
+| `__init__.py`、`common.py`、`gemm1.py`、`gemm2.py`、`gemm2_1x4.py`、`gemm2_8x1.py`、`gemm2_8x1_compact.py`、`moe_reduce.py`、`quant.py` | 上游 df3e0b2f 的同名文件，只改 import、文件头、个别函数名（上游版加 `_upstream` 后缀）和 BF16 舍入默认值；pyhip 独有函数附在 `common.py`、`moe_reduce.py` 末尾 |
+| `common_legacy.py`、`gemm1_legacy.py`、`gemm2_legacy.py`、`gemm2_1x4_legacy.py`、`gemm2_8x1_legacy.py`、`gemm2_8x1_compact_legacy.py`、`gemm2_default.py` | 替换前的 pyhip 实现（本文描述的对象），只改 import 与文件头；只在上游不支持时使用：SiTUv2、FP4/MXFP4、gfx950、`METADATA_TILE_SIZE_M`≠BM、独立 8x1、compact K=320、上游 host 会拒绝的 tile |
+| `gemm.py` | pyhip：按设备缓存的 `compile_gemm`；`gemm_implementation` 判定上游或 legacy，并把上游 batch1、compact 的 launcher 包装成 pyhip 原来的调用约定 |
+
+接口变化（`tuned_moe`、`moe_gemm_splitk` 和现有用例的调用方式不变）：
+- `compile_gemm` 新增 `has_num_local_tokens=False`（只有上游支持，原样返回上游 launcher）；`MOE_PREFILL_TILE_K` 只作用于 Gate/Up，上游 Down 不读（替换前 default、1x4 Down 也读）。
+- 包导出：`compile_moe_gemm1/2` 现在是上游 builder，pyhip 原 builder 在 `gemm1_legacy` / `gemm2_legacy`；另导出 `compile_gemm`、`sorted_sum`、`flydsl_absmax`、`flydsl_quant_per_tensor`。
+- 下列原名仍是 pyhip 签名：`gemm1._build_moe_gemm1`、`gemm2_8x1._build_moe_gemm2_8x1`、`gemm2_8x1_compact._build_moe_gemm2_8x1_compact` 与 `allocate_task_buffers`、`moe_reduce.sorted_sum` / `compile_moe_reduction` / `invert_sorted_ids`；上游的同名实现带 `_upstream` 后缀。
+- 上游 `quant.flydsl_absmax` 不再在内部清零 Amax，amax=0 时 `flydsl_quant_per_tensor` 输出 0；pyhip 内没有调用方。
+- `CU_NUM` 只影响上游 `get_cu_num()`：上游 Down 按 CU 数是否为 80 判定 MI308X，legacy 仍按设备名判定。
+- BF16 舍入默认仍是简化 RTA（上游默认 RTE），两套实现共用开关，`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=0` 切到 RTE。
+
+| 本文章节 | 替换后的状态 |
+|---|---|
+| 下面的开头说明与“版本边界 / 测量边界 / 准备清单” | 写于替换前（2026-09-11），说的是 pyhip 实现（现为 legacy）及其收据；“13 源”及其 SHA256 不再对应现在的文件；上游路径的说明见 [a8w4_ptpc/README.md](../a8w4_ptpc/README.md) |
+| [1.1 支持范围](#scope) | 四个 path 与 K 约束是 legacy 的；gfx942 FP8 的 default、1x4、compact 在满足分流条件时由上游实现（上游 compact 没有 K=320），独立 8x1 只在 legacy |
+| [1.2 测试方法](#testing) | 仍适用（这些用例未改）；替换相关的新用例在 `tests/ops/moe/a8w4_ptpc/` |
+| [1.3](#matrix42)–[1.6](#validation-boundaries) 性能、落选、比较、验证 | **已过期**：替换前 pyhip 实现的测量，没有对上游重测 |
+| [2.1–2.8 流水线](#pipeline) | 描述 legacy 的 8x1 / compact（源码链接已指向 `*_legacy.py`）；上游 `gemm2_8x1.py` 只作 compact 的 M256 full 任务，结构不同，本文没有描述 |
+| [2.9 资源](#resources) | **已过期**：legacy kernel 在替换前的离线资源 |
+| [三、重要优化](#optimizations) | 描述 legacy 实现的机制 |
+
 本文是MoE当前唯一维护的说明文档，独立说明支持范围、路径选择、测试方法、六K完整流水及重要优化。默认目标为 **MI308X / gfx942、FP8 E4M3FNUZ A/W、BF16输出**，不将8x1结果外推其它dtype或硬件。
 
 **版本边界：**2026-09-11仅保留Down四path：`default`、`1x4_64x256`、`8x1`、`8x1_compact`；`1x8/2x4/4x1`已删除，旧path明确报错、不静默回退。生产集合为 **13源（11个包内模块＋2个依赖）**，8x1为单文件、固定1N循环，首拍前建立错相并由共享/独立tile从step0开始，保留原pack消费FIFO。本文推荐来自离线测试选择，不是生产自动selector。
@@ -18,6 +46,8 @@
 
 ## 一、性能与测试
 
+> 替换后：本章的性能、推荐与收据是替换前 pyhip 实现（现为 legacy）的测量，对上游实现已过期，见[替换状态](#upstream-replacement)。
+
 <a id="scope"></a>
 
 ### 1.1 支持范围与七组shape
@@ -31,7 +61,7 @@
 
 8x1/compact只支持 **K=192/256/320/384/512/640**，正N为128倍数；weight/activation支持 `ptpc/ptpc`、`per_tensor/per_tensor`、`per_tensor/ptpc`，activation未指定则随weight。padding为0/32/64/128B，BF16行stride=`N+padding/2`，sum须匹配；compact要求`0<E≤2048`。
 
-**K192整192，K320为128+192，其余BK128。** K192/K320兼容`tile_k=None/128/192`但都转入真实192实现，不是三种算法。8x1的K128、BK64、pure/rolling环境开关、legacy wait及固定`_block_k`实验参数已删；其它Down算法的K128支持不受影响。现行builder固定每回边处理1个N，已删除仅用于测试/调优的`_n_loop/unroll_n`参数及0/2测试维度；小N的必要展开仍保留。`_store_cache`默认2，不是自动selector。源码：[四path分发](gemm2.py)、[8x1](gemm2_8x1.py)、[compact](gemm2_8x1_compact.py)。
+**K192整192，K320为128+192，其余BK128。** K192/K320兼容`tile_k=None/128/192`但都转入真实192实现，不是三种算法。8x1的K128、BK64、pure/rolling环境开关、legacy wait及固定`_block_k`实验参数已删；其它Down算法的K128支持不受影响。现行builder固定每回边处理1个N，已删除仅用于测试/调优的`_n_loop/unroll_n`参数及0/2测试维度；小N的必要展开仍保留。`_store_cache`默认2，不是自动selector。源码：[四path分发](gemm2_legacy.py)（[gemm.py](gemm.py)先在上游与legacy间分流）、[8x1](gemm2_8x1_legacy.py)、[compact](gemm2_8x1_compact_legacy.py)。
 
 每case的Batch为1024/2048/4096/8192/16384/32768（1K–32K），七组共42点。
 
@@ -301,6 +331,8 @@ D/C/F=Down/Combined/Full，ms/T为wall-time有效TFLOPS；配对改善正值更�
 
 ## 二、流水线设计
 
+> 替换后：本章描述 legacy 的 8x1 / compact（`gemm2_8x1_legacy.py`、`gemm2_8x1_compact_legacy.py`），不是 gfx942 FP8 生产路径所用的上游实现，见[替换状态](#upstream-replacement)。
+
 以下设计按 **2026-09-11最终源码：首拍前错相、首N从step0进入主循环、原pack消费FIFO、PTPC、固定1N循环** 核对。三个`first_tile()`薄封装已删除，布局/partition集中在`prepare_views()`；主流程直接显示prologue、首N地址、错相屏障、N0/N1、回边、尾部和epilogue。**逐stage表左Memory、右紧接的Compute；每行是单wave一次逻辑配对，不是一个cycle或全WG同步同行。** 首拍改序包含真实等待变化，不声称只是改名或ISA完全相同；MFMA贡献、pack时点和跨N状态保持。
 
 <a id="notation"></a>
@@ -343,31 +375,31 @@ D/C/F=Down/Combined/Full，ms/T为wall-time有效TFLOPS；配对改善正值更�
 
 | 主文件区域 | 当前符号、职责与执行位置 |
 |---|---|
-| 公共入口 | `_build_moe_gemm2_8x1`做[统一校验](gemm2_8x1.py#L24)；[唯一kernel](gemm2_8x1.py#L84)统一任务映射、错相前的有效性guard和编译期K分派；[唯一launcher](gemm2_8x1.py#L136)保持原ABI、grid `(1, task_num, 1)`、block `(512, 1, 1)`及编译选项。ordinary不是三个kernel依次launch。 |
-| 8x1共享原语 | [屏障](gemm2_8x1.py#L161)/[priority](gemm2_8x1.py#L167)、[A gather](gemm2_8x1.py#L191)、[scale加载](gemm2_8x1.py#L214)、[pack](gemm2_8x1.py#L230)、[CShuffle](gemm2_8x1.py#L254)、[输出store](gemm2_8x1.py#L284)、[MFMA](gemm2_8x1.py#L308)及[BK128交织模板](gemm2_8x1.py#L320)均归主文件，不再放在common。 |
-| 8x1共享账本/tile/SSA | [pack事件](gemm2_8x1.py#L337)、[输出quarter](gemm2_8x1.py#L360)、[VM事件账本](gemm2_8x1.py#L368)、`run_8x1_tile`的[单tile实现](gemm2_8x1.py#L911)及[状态保存](gemm2_8x1.py#L412)/[恢复](gemm2_8x1.py#L428)供BK128族和K320复用。所有N从step0进入同一实现，scale列表在tile内初始化。 |
-| BK128：`_emit_k128n_body` | [实现](gemm2_8x1.py#L456)覆盖K256/384/512/640；[连续执行区](gemm2_8x1.py#L854)显示prologue、首N地址、q0前错相、N0/N1、固定1N回边、末N及补pack C3。 |
-| K192：`_emit_k192_body` | [实现](gemm2_8x1.py#L1100)保留整BK192；[执行区](gemm2_8x1.py#L1337)、[独立VM账本](gemm2_8x1.py#L1031)及`run_k192_tile`的[两拍实现](gemm2_8x1.py#L1393)仍剥离最后两N，使用独立[状态保存](gemm2_8x1.py#L1063)/[恢复](gemm2_8x1.py#L1076)，不是共享BK128尾部。 |
-| K320：`_emit_k320_body` | [实现](gemm2_8x1.py#L1476)固定128＋192；[执行区](gemm2_8x1.py#L1727)直接q0前错相，再调用共享tile处理完整首N及后续N，不另写首拍算法。 |
+| 公共入口 | `_build_moe_gemm2_8x1`做[统一校验](gemm2_8x1_legacy.py#L26)；[唯一kernel](gemm2_8x1_legacy.py#L86)统一任务映射、错相前的有效性guard和编译期K分派；[唯一launcher](gemm2_8x1_legacy.py#L138)保持原ABI、grid `(1, task_num, 1)`、block `(512, 1, 1)`及编译选项。ordinary不是三个kernel依次launch。 |
+| 8x1共享原语 | [屏障](gemm2_8x1_legacy.py#L163)/[priority](gemm2_8x1_legacy.py#L169)、[A gather](gemm2_8x1_legacy.py#L193)、[scale加载](gemm2_8x1_legacy.py#L216)、[pack](gemm2_8x1_legacy.py#L232)、[CShuffle](gemm2_8x1_legacy.py#L256)、[输出store](gemm2_8x1_legacy.py#L286)、[MFMA](gemm2_8x1_legacy.py#L310)及[BK128交织模板](gemm2_8x1_legacy.py#L322)均归主文件，不再放在common。 |
+| 8x1共享账本/tile/SSA | [pack事件](gemm2_8x1_legacy.py#L339)、[输出quarter](gemm2_8x1_legacy.py#L362)、[VM事件账本](gemm2_8x1_legacy.py#L370)、`run_8x1_tile`的[单tile实现](gemm2_8x1_legacy.py#L913)及[状态保存](gemm2_8x1_legacy.py#L414)/[恢复](gemm2_8x1_legacy.py#L430)供BK128族和K320复用。所有N从step0进入同一实现，scale列表在tile内初始化。 |
+| BK128：`_emit_k128n_body` | [实现](gemm2_8x1_legacy.py#L458)覆盖K256/384/512/640；[连续执行区](gemm2_8x1_legacy.py#L856)显示prologue、首N地址、q0前错相、N0/N1、固定1N回边、末N及补pack C3。 |
+| K192：`_emit_k192_body` | [实现](gemm2_8x1_legacy.py#L1102)保留整BK192；[执行区](gemm2_8x1_legacy.py#L1339)、[独立VM账本](gemm2_8x1_legacy.py#L1033)及`run_k192_tile`的[两拍实现](gemm2_8x1_legacy.py#L1395)仍剥离最后两N，使用独立[状态保存](gemm2_8x1_legacy.py#L1065)/[恢复](gemm2_8x1_legacy.py#L1078)，不是共享BK128尾部。 |
+| K320：`_emit_k320_body` | [实现](gemm2_8x1_legacy.py#L1478)固定128＋192；[执行区](gemm2_8x1_legacy.py#L1729)直接q0前错相，再调用共享tile处理完整首N及后续N，不另写首拍算法。 |
 
-[common](common.py#L14)现在只保留通用设备/Host接口、[布局reexport](common.py#L58)、偏移检查及`BufferTensor`/`LdsTensor`，不承载8x1专属原语、账本或tile，也不反向导入8x1实现。
+[common](common_legacy.py)现在只保留通用设备/Host接口、[布局reexport](common_legacy.py)、偏移检查及`BufferTensor`/`LdsTensor`，不承载8x1专属原语、账本或tile，也不反向导入8x1实现。
 
 各body按“**配置/原语准备区 → 连续Pipeline执行区**”阅读，末尾依次 **prologue → 首N地址 → group1错相屏障 → N0 → N1 → loop/末N → epilogue**。主流程不穿插函数定义、布局构造或`partial`绑定；SSA载体只由`prepare_loop_state()`在N1完成后、确实建立回边时创建。
 
-- 三族`prologue()`均先调用`prepare_views()`集中准备视图，再执行**首B → gather A → 首B落LDS/预取Q1/Q2**。BK128的[B模板/partition及输出视图](gemm2_8x1.py#L709)也在准备区；[prologue](gemm2_8x1.py#L812)中C读地址pin仍在A读取之后，首N完整B地址仍在prologue返回后pin。
-- BK128的[B g→r](gemm2_8x1.py#L600)直接返回P槽，[MFMA回调](gemm2_8x1.py#L782)按整half/packet片段选择N组；CShuffle写/读合在[输出重排](gemm2_8x1.py#L632)，随后显式C r→g。
+- 三族`prologue()`均先调用`prepare_views()`集中准备视图，再执行**首B → gather A → 首B落LDS/预取Q1/Q2**。BK128的[B模板/partition及输出视图](gemm2_8x1_legacy.py#L711)也在准备区；[prologue](gemm2_8x1_legacy.py#L814)中C读地址pin仍在A读取之后，首N完整B地址仍在prologue返回后pin。
+- BK128的[B g→r](gemm2_8x1_legacy.py#L602)直接返回P槽，[MFMA回调](gemm2_8x1_legacy.py#L784)按整half/packet片段选择N组；CShuffle写/读合在[输出重排](gemm2_8x1_legacy.py#L634)，随后显式C r→g。
 - 三族均在首N调用前执行`if group == 1: stage_end()`；与group0首Memory末屏障配对，从q0开始错相。`first_tile()`已删除，K192两拍tile也不再接收`group`或保留内部运行时错相判断。
-- K320的[prologue](gemm2_8x1.py#L1683)同样先准备再访存；[B g→r](gemm2_8x1.py#L1582)/[B r→s](gemm2_8x1.py#L1599)直接使用共享tile签名，K192段仍为16B＋8B，不新增padding或归约贡献。
+- K320的[prologue](gemm2_8x1_legacy.py#L1685)同样先准备再访存；[B g→r](gemm2_8x1_legacy.py#L1584)/[B r→s](gemm2_8x1_legacy.py#L1601)直接使用共享tile签名，K192段仍为16B＋8B，不新增padding或归约贡献。
 
 启动坐标为`(n, kb, half, lds_slot)`，只为Q1/Q2查询q=0/1；主循环中`b_target(..., ahead=1/3)`分别给出写LDS/新预取目标。共享`widths`缺省为`(128,) * (k // 128)`，K320显式`(128, 192)`，K192独立整192。`short_n_k128`只描述BK128族T<3的等待模式，适用于N0/N1；`read_full_half`则是**当前拍**的B读取方式：BK128首N的q0总读N64，短N首tile余拍也读N64，其余读两个N32。整half读取与两个packet互斥，MFMA仍按两个N32执行；K320始终读两个packet。K192的回调为`read_b_s2r(half, *, packet, addresses)`、`store_b_r2s(half, fragments, *, addresses)`，保留两LDS槽和5地址。
 
 现行循环**固定每回边1个N128**；历史0/2展开调优参数已删除，不是可传的生产选项，历史收据不重标。小N仍保留必要展开，具体零迭代回边见2.8。没有新增Context/Workflow，也不把每条硬件指令封装成独立阶段。
 
-`prepare_b_addresses=None`是**真实生产路径，而非失效回调**：[BK128回调选择](gemm2_8x1.py#L800)在K256/K512中因KS=2/4为偶数，槽`(n*KS+kb)&1`不随N翻转；K320的KS=2且16/24KiB两槽固定。K384/K640仅在T≥3时提供4地址回调，T=1/2已按静态N定址，无需跨动态回边携带地址。因此None分支仍执行正常B读/写，不能删除。K192按`n&1`换槽，独立[5地址准备](gemm2_8x1.py#L1196)在短N也保留，只是不建立动态回边SSA。
+`prepare_b_addresses=None`是**真实生产路径，而非失效回调**：[BK128回调选择](gemm2_8x1_legacy.py#L802)在K256/K512中因KS=2/4为偶数，槽`(n*KS+kb)&1`不随N翻转；K320的KS=2且16/24KiB两槽固定。K384/K640仅在T≥3时提供4地址回调，T=1/2已按静态N定址，无需跨动态回边携带地址。因此None分支仍执行正常B读/写，不能删除。K192按`n&1`换槽，独立[5地址准备](gemm2_8x1_legacy.py#L1198)在短N也保留，只是不建立动态回边SSA。
 
-wait使用`rocdl.s_waitcnt(lgkmcnt=...)`/`rocdl.s_waitcnt(vmcnt=...)`。q0前错相要求prologue的Q0写入在`lgkmcnt(0)`和双方barrier后完成；首q0 Memory末也显式`lgkmcnt(0)`保护下一拍的跨组Q1读取，K320首M1另保留同样交接保护。共享tile的[短N末拍等待guard](gemm2_8x1.py#L973-L975)保留lowering在scale使用前补wait的行为，不前移到Memory。
+wait使用`rocdl.s_waitcnt(lgkmcnt=...)`/`rocdl.s_waitcnt(vmcnt=...)`。q0前错相要求prologue的Q0写入在`lgkmcnt(0)`和双方barrier后完成；首q0 Memory末也显式`lgkmcnt(0)`保护下一拍的跨组Q1读取，K320首M1另保留同样交接保护。共享tile的[短N末拍等待guard](gemm2_8x1_legacy.py#L975-L977)保留lowering在scale使用前补wait的行为，不前移到Memory。
 
-公共访存的[BufferTensor](common.py#L109)/[LdsTensor](common.py#L145)不携带额外动态Python字段；Tensor/view描述数据dtype、packet或partition，预计算地址仍是显式SSA值：
+公共访存的[BufferTensor](common_legacy.py)/[LdsTensor](common_legacy.py)不携带额外动态Python字段；Tensor/view描述数据dtype、packet或partition，预计算地址仍是显式SSA值：
 
 - `BufferTensor.load(voffset_bytes=..., soffset_bytes=...)`接收两路**完整32位字节偏移**，相对descriptor根；显式偏移替代、不是累加slice隐含偏移，调用者须已包含slice位置。`soffset`必须wave-uniform，接口不把divergent值伪装成SGPR。只接受静态连续一维32/64/128bit packet，不暗中拆访存；K192/K320仍明确16B＋8B两请求。
 - `LdsTensor.load(address_bytes=..., offset_bytes=..., into=..., copy_atom=...)`及`store(...)`接收含allocation/lane/slot的完整LDS字节地址；`offset_bytes`仅为编译期、按元素对齐的固定增量。复杂MMA partition必须保留原layout、copy atom和目标retile，不根据numel改成连续load。完整地址在原Compute尾准备/pin后跨回边传入，`load/store`内部不准备动态偏移、不pin、不插wait。
@@ -440,7 +472,7 @@ N0结束保留BF16 C0/C1/C2，FP32 C3与S3。**首Memory0已纳入共享循环�
 
 Pack列是同编号C→缩放/pack→BF16，不是store。Memory按功能列，非严格左到右：**scale→CShuffle写/读→B packet0读→lgkmcnt(4)→BF16 store×2→B packet1读→vmcnt→B提交→B预取**。首N无CShuffle/store，首M0另lgkmcnt(0)再交接。两4-wave组错相，非WG同步逐行。
 
-足够长PTPC最后N wait=**7/7/6/6**，末拍无下一B仍保护当前C2 pack；其后vmcnt(0)补C3，按L/H、r0/r1回写末N全部BF16、drain依赖、平衡barrier。短N按实际请求裁剪，不当所有ISA逐条模板。源码：[公共入口](gemm2_8x1.py#L24)、[BK128执行流程](gemm2_8x1.py#L854)、[共享tile](gemm2_8x1.py#L911)与[VM账本](gemm2_8x1.py#L368)。
+足够长PTPC最后N wait=**7/7/6/6**，末拍无下一B仍保护当前C2 pack；其后vmcnt(0)补C3，按L/H、r0/r1回写末N全部BF16、drain依赖、平衡barrier。短N按实际请求裁剪，不当所有ISA逐条模板。源码：[公共入口](gemm2_8x1_legacy.py#L26)、[BK128执行流程](gemm2_8x1_legacy.py#L856)、[共享tile](gemm2_8x1_legacy.py#L913)与[VM账本](gemm2_8x1_legacy.py#L370)。
 
 <a id="pipeline-k192"></a>
 
@@ -490,7 +522,7 @@ N0结束：BF16 C0/C1，FP32 C2/C3及S2/S3。
 2. 上N Compute1尾prepare_b_addresses预备下N**5个完整lane地址**：当前读、H写16B/8B、下L写16B/8B，跨回边携带；group1在首Memory0之前额外barrier建立错相。首M0末lgkmcnt(0)保证双方Q1写完成后再进入H。
 3. 始终跨N两BF16 C0/C1+两FP32 C2/C3及scale，下N Compute0 pack旧C2/C3，Memory1写完才清零高半累加器。
 4. 最后两N独立裁剪：倒数第二N不发不存在的n+2/L；最后N不提交/预取越界。足够长PTPC末N**12/12**，后vmcnt(0)补C2/C3、L/H与r0/r1全部回写。
-5. T=1无P1下N种子；T<4无动态回边，6/6、10/14、14/14表不机械套单N。源码：[K192 body](gemm2_8x1.py#L1100)、[执行区](gemm2_8x1.py#L1337)、[独立VM账本](gemm2_8x1.py#L1031)及[两拍tile](gemm2_8x1.py#L1393)。
+5. T=1无P1下N种子；T<4无动态回边，6/6、10/14、14/14表不机械套单N。源码：[K192 body](gemm2_8x1_legacy.py#L1102)、[执行区](gemm2_8x1_legacy.py#L1339)、[独立VM账本](gemm2_8x1_legacy.py#L1033)及[两拍tile](gemm2_8x1_legacy.py#L1395)。
 
 <a id="pipeline-k320"></a>
 
@@ -540,7 +572,7 @@ M0保护上一N S2/S3，首N末拍无store所以5而深稳态7；BK192双VMEM改
 
 #### 交接与尾部
 
-只有Compute0/2各pack两份，与packet0/1交织，模板仍是BK128 16-MFMA，不移到BK192拍。正常Memory同K256，B packet0后store前**K0 lgkmcnt4、K1 lgkmcnt6**；首M0和首M1交接前另lgkmcnt0，不能依赖晚Compute尾wait。足够长末N前3拍**7/10/6**，末M3无B提交/pack消费者，账本63且不发VM wait；后vmcnt0补C2/C3全部回写。共享循环独立N0/N1/末N，短N裁去越界。源码：[K320 body](gemm2_8x1.py#L1476)、[执行区](gemm2_8x1.py#L1727)及[共享pack事件](gemm2_8x1.py#L337)。
+只有Compute0/2各pack两份，与packet0/1交织，模板仍是BK128 16-MFMA，不移到BK192拍。正常Memory同K256，B packet0后store前**K0 lgkmcnt4、K1 lgkmcnt6**；首M0和首M1交接前另lgkmcnt0，不能依赖晚Compute尾wait。足够长末N前3拍**7/10/6**，末M3无B提交/pack消费者，账本63且不发VM wait；后vmcnt0补C2/C3全部回写。共享循环独立N0/N1/末N，短N裁去越界。源码：[K320 body](gemm2_8x1_legacy.py#L1478)、[执行区](gemm2_8x1_legacy.py#L1729)及[共享pack事件](gemm2_8x1_legacy.py#L339)。
 
 <a id="pipeline-k384"></a>
 
@@ -730,7 +762,7 @@ N0结束BF16 C0/C1/C2、FP32 C3与S3。
 
 LDS槽`(5n+kb)&1`随N翻转，上一N的Compute 9准备4个读/写lane地址跨回边；L/K4与H/K0可在同槽不同半区，不按`step&1`猜LDS。Scale/旧store仅在Memory 0–3；Compute 0 pack旧C3，Compute 4/5/9分别pack当前C0/C1/C2；**Compute 4没有新scale却使用保留的S0**。N0 wait为**3/5/5/5/3/1/1/1/1/1**，N1/steady为**5/9/9/9/5/1/1/1/1/1**；后六拍仍有B/MFMA。足够长PTPC末N为**5/9/9/9/5/1/1/1/0/11**，末拍C2仍有scale消费者，后`vmcnt(0)`补C3完整回写；11不推广到稳态或其它K。
 
-K384/512/640共用[BK128 body](gemm2_8x1.py#L456)及其[执行区](gemm2_8x1.py#L854)、[共享tile](gemm2_8x1.py#L911)、[VM事件账本](gemm2_8x1.py#L368)；这些8x1专属实现已不在common。
+K384/512/640共用[BK128 body](gemm2_8x1_legacy.py#L458)及其[执行区](gemm2_8x1_legacy.py#L856)、[共享tile](gemm2_8x1_legacy.py#L913)、[VM事件账本](gemm2_8x1_legacy.py#L370)；这些8x1专属实现已不在common。
 
 <a id="pipeline-boundaries"></a>
 
@@ -758,7 +790,7 @@ K384/512/640共用[BK128 body](gemm2_8x1.py#L456)及其[执行区](gemm2_8x1.py#
 
 只有q+1<2KS·T才写下一B、q+3<2KS·T才预取；取消越界B不取消当前pack消费者。展开路径可能已被更早严格wait保护，不能强塞尾拍冗余wait，错相/退出barrier仍须平衡。以上102行逐stage和24行prologue按实际两个VM账本及最终源核对：四个BK128族首M0由2改3，五个非K192种子交接增加lgkmcnt(0)，非PTPC对应四个首M0由0改1；其余表内B/scale/pack/输出事件保持。等待表是逻辑消费者预算，具体ISA可能合并或补充等待，不保证逐条相同。
 
-compact M256 full沿用上述同K流水，从M64 metadata任务表读取`[physical_row_begin, expert_id]`及count，保持physical行编号，不改pack/K宽度。**构表→full→M64 tail**同stream，无host count读回；N%256=0时tail1x4，否则default，K192/K320 full的192归约不改变tail既有BK128。见[组合launcher](gemm2_8x1_compact.py#L68)与[任务表构建](gemm2_8x1_compact.py#L132)。
+compact M256 full沿用上述同K流水，从M64 metadata任务表读取`[physical_row_begin, expert_id]`及count，保持physical行编号，不改pack/K宽度。**构表→full→M64 tail**同stream，无host count读回；N%256=0时tail1x4，否则default，K192/K320 full的192归约不改变tail既有BK128。见[组合launcher](gemm2_8x1_compact_legacy.py#L71)与[任务表构建](gemm2_8x1_compact_legacy.py#L135)。
 
 <a id="resources"></a>
 
@@ -848,6 +880,8 @@ compact K256 full的metadata/next_free_vgpr为160/169，K320 tail为158/169，K5
 <a id="optimizations"></a>
 
 ## 三、重要优化
+
+> 替换后：本章描述 legacy 实现的机制，见[替换状态](#upstream-replacement)。
 
 ### 3.1 确实现有的机制
 
