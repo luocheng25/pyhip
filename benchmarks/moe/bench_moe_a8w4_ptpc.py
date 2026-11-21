@@ -6,8 +6,8 @@ Case：TP2（I=320）/ TP4（I=160，补零到 192，见 pyhip.testing.moe_a8w4_
 
 实现（``--impl`` 逗号分隔，默认 ``a8w4,fly_ptpc,aiter_ptpc``，第一个是指标）：
   a8w4        ``pyhip.ops.moe.flydsl.a8w4_ptpc.fused_moe``，mxfp4 权重（``moe_a8w4_mxfp4`` 生成，
-              加载时 ``prepare_weights``）；M1 只有 decode 档（配置表当前 T<=128），prefill 档的 case
-              跳过它（不输出 MF_METRIC、不算失败），其余实现照常计时
+              加载时 ``prepare_weights``）；按它的配置表分档：decode 档（当前 T<=128）W4A16，prefill 档
+              A8W4（激活与中间结果按 token 量化成 FP8，与 fly_ptpc 的 prefill 数据流相同）
   fly_ptpc    tuned_moe 的 FlyDSL FP8 ptpc 候选（M0 路径），经 ``make_moe_runner`` 固定为
               ``moe_a8w4_ptpc.FLY_CONFIGS`` 中的配置（不调优、不回退）
   aiter_ptpc  ``aiter.fused_moe.fused_moe(quant_type=per_Token)``，由 Aiter 自选 kernel；
@@ -24,7 +24,8 @@ Case：TP2（I=320）/ TP4（I=160，补零到 192，见 pyhip.testing.moe_a8w4_
 
 ``--mf`` 对第一个实现输出 ``MF_METRIC case=<tp2|tp4>_t<T> value=<us> unit=us``，其余实现输出
 ``REF impl=<名> case=<...> value=<us>``；否则打印表格（含 a8w4 / fly_ptpc 的耗时比）。``--check`` 先用
-FP32 参考检查每个实现（T=65536 每 16 个 token 取一个；a8w4 对 mxfp4 参考）。``--sweep`` 不计指标，而是
+FP32 参考检查每个实现（T=65536 每 16 个 token 取一个；a8w4 对 mxfp4 参考，数据流与它所在的档一致），
+第一个实现超出容差时退出码为 1（仍照常计时、输出）。``--sweep`` 不计指标，而是
 对每个 case 计时 tuned_moe 生成的全部 FlyDSL 候选，按中位数排序输出，用于更新 ``FLY_CONFIGS``。
 """
 
@@ -220,7 +221,8 @@ def time_impl(calls, *, graph, warmup, iters, sleeper, warmup_seconds):
 class Reference:
     """按数据流缓存一组输入的 FP32 参考；大 T 只比较等间隔抽取的 token。
 
-    ``kind``：False / True 为 FP8 权重的 decode / prefill 数据流（``act_quant``），"mxfp4" 为 a8w4 的参考。
+    ``kind``：False / True 为 FP8 权重的 decode / prefill 数据流（``act_quant``），("mxfp4", act_quant) 为
+    a8w4 的参考（mxfp4 权重，decode / prefill 数据流）。
     """
 
     def __init__(self, raw, inputs, raw_mxfp4=None):
@@ -238,10 +240,10 @@ class Reference:
     def errors(self, output, kind):
         if kind not in self.cache:
             hidden, weight, ids = self.inputs
-            if kind == "mxfp4":
+            if isinstance(kind, tuple):
                 from pyhip.testing import moe_a8w4_mxfp4 as X
 
-                self.cache[kind] = X.reference_moe(hidden, self.raw_mxfp4, weight, ids)
+                self.cache[kind] = X.reference_moe(hidden, self.raw_mxfp4, weight, ids, act_quant=kind[1])
             else:
                 self.cache[kind] = M.reference_moe(hidden, self.raw, weight, ids, act_quant=kind)
         return M.output_errors(self.cache[kind], output[self.rows])
@@ -265,10 +267,10 @@ def gemm_routes(run):
         fly.compile_gemm = original
 
 
-def check_impl(impl, call, reference, config):
-    # Aiter 的 ptpc kernel 对两级输入都按 token 量化；a8w4 对 mxfp4 参考。
+def check_impl(impl, call, reference, config, tokens):
+    # Aiter 的 ptpc kernel 对两级输入都按 token 量化；a8w4 对 mxfp4 参考，数据流按它的配置表分档。
     if impl == "a8w4":
-        return reference.errors(call(), "mxfp4")
+        return reference.errors(call(), ("mxfp4", not decode_tier(tokens)))
     act_quant = True if impl == "aiter_ptpc" else M.act_quant(config)
     return reference.errors(call(), act_quant)
 
@@ -313,16 +315,12 @@ def run(args):
                 config = M.fly_config(tp, tokens)
                 row = results.setdefault(case, {"config": M.describe(config), "input_sets": count})
                 for impl in args.impl:
-                    if impl == "a8w4" and not decode_tier(tokens):
-                        row[impl] = None  # 不计时、不算失败
-                        note(f"a8w4 {case} skipped: the prefill tier comes in M2")
-                        continue
                     try:
                         calls = [make_call(impl, kernels[impl][index], inputs[index], config)
                                  for index in range(count)]
                         if args.check:
                             row[f"{impl}_err"], route = gemm_routes(
-                                lambda: check_impl(impl, calls[0], reference, config))
+                                lambda: check_impl(impl, calls[0], reference, config, tokens))
                             if impl == "fly_ptpc":
                                 row["route"] = route
                             note(f"{impl} {case} vs FP32: beyond/logits_diff/token_err="
@@ -351,7 +349,8 @@ def sweep_case(case, kernels, inputs, reference, timing):
         try:
             calls = [make_call("fly_ptpc", kernels[index], inputs[index], config)
                      for index in range(len(inputs))]
-            errors, route = gemm_routes(lambda: check_impl("fly_ptpc", calls[0], reference, config))
+            errors, route = gemm_routes(lambda: check_impl("fly_ptpc", calls[0], reference, config,
+                                                           hidden.shape[0]))
             if not passes(errors):
                 note(f"sweep {case} {M.describe(config)} rejected: errors={errors}")
                 continue
@@ -371,7 +370,7 @@ def sweep_case(case, kernels, inputs, reference, timing):
 
 def emit(args, case, impl, row):
     value = row[impl]
-    if not args.mf or value is None:
+    if not args.mf:
         return
     if impl == args.impl[0]:
         print(f"MF_METRIC case={case} value={value:.3f} unit=us", flush=True)
@@ -380,8 +379,7 @@ def emit(args, case, impl, row):
 
 
 def _ratio(row, num, den):
-    a, b = row.get(num), row.get(den)
-    return math.nan if a is None or b is None else a / b
+    return row[num] / row[den]
 
 
 def print_table(args, results):
@@ -400,8 +398,7 @@ def print_table(args, results):
     for case, row in results.items():
         config = f"{row['config']} [{row['route']}]" if "route" in row else row["config"]
         line = f"{case:<10} {config:<84} {row['input_sets']:>4} "
-        values = [math.nan if row.get(impl) is None else row[impl] for impl in args.impl]
-        line += " ".join(f"{value:>16.2f}" for value in values)
+        line += " ".join(f"{row[impl]:>16.2f}" for impl in args.impl)
         line += "".join(f" {_ratio(row, num, den):>9.3f}x" for num, den in ratios)
         print(line)
         for impl in args.impl:
@@ -421,8 +418,11 @@ def main(argv=None):
         print_table(args, results)
     if args.sweep:
         return 0 if all(results.values()) else 1
+    metric = args.impl[0]
     failed = [case for case, row in results.items()
-              if row[args.impl[0]] is not None and math.isnan(row[args.impl[0]])]
+              if math.isnan(row[metric]) or (f"{metric}_err" in row and not passes(row[f"{metric}_err"]))]
+    if failed:
+        note(f"{metric} failed (error or beyond tolerance): {failed}")
     return 1 if failed else 0
 
 

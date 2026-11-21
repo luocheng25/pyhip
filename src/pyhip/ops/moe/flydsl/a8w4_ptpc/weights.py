@@ -12,11 +12,18 @@
   delta   uint8 [E, N/64, K/32, 16, 4]：min(c_max - code, 11) * 8；dword (n64, g, l) 的字节 j 属于
           第 64*n64 + 16*j + l 行的第 g 组。c_max 是该行所有组 E8M0 code 的最大值。
   factor  float32 [E, N]：2^(c_max - 132)（c_max < 6 时为 fp32 次正规数，精确）；补零的通道为 1。
+  prefill 的 kernel 按 wave 分 N（decode 按 wave 分 K），同样的 delta 字节按它的读法另存一份（M2），
+  每个 lane 每次读一个 dword：
+  w1_pdelta uint8 [E, 2I/16, H/256, 2, 16, 4]：dword (n16, kb, h, l) 的字节 i 属于第 16*n16 + l 行的
+          第 8*kb + 2*i + h 组（Gate/Up：lane 在 64-K 块里读的 16 个 K 落在奇偶为 h 的组，字节 i 对应
+          256-K 块里的第 i 个 64-K 块）；
+  w2_pdelta uint8 [E, H/64, I/32, 16, 4]：dword (n64, g, r) 的字节 i 属于第 64*n64 + 16*(r//4) + r%4 + 4*i
+          行的第 g 组（Down：N256 tile 的通道排列下，lane r 的 4 个 M repeat）。
 
 数值（与 PR #64 的 fd2 相同）：kernel 把 nibble 的 |E2M1| 经查找表变成 FP8 E4M3FNUZ 值
-|E2M1| * 2^(5 - d)（d = c_max - code <= 11 时都是正规数，精确），再精确展开成 BF16；fp32 累加结果
-乘 factor 得 E2M1 * 2^(code - 127)，即 mxfp4 精确反量化。d >= 12 的组（不到该通道最大组 scale 的
-2^-11）解码为 0（flush），参考实现施加同一规则。
+|E2M1| * 2^(5 - d)（d = c_max - code <= 11 时都是正规数，精确）；decode 再精确展开成 BF16 做 BF16 MFMA，
+prefill 直接做 FP8 MFMA。fp32 累加结果乘 factor 得 E2M1 * 2^(code - 127)，即 mxfp4 精确反量化。
+d >= 12 的组（不到该通道最大组 scale 的 2^-11）解码为 0（flush），参考实现施加同一规则。
 
 I 补零到 64 的倍数（TP4 的 160 -> 192；Down 的 K 与 delta 的 64 行分块都要求）：补的 nibble 为 0，
 补的组 code 记 0（不改变真实通道的 c_max），补的通道 factor 为 1，结果与不补零精确等价。
@@ -49,6 +56,8 @@ class MXFP4Weights:
     w2_factor: torch.Tensor
     inter: int
     inter_padded: int
+    w1_pdelta: torch.Tensor
+    w2_pdelta: torch.Tensor
 
     @property
     def experts(self):
@@ -74,14 +83,27 @@ def channel_factor(c_max):
     return torch.where(c_max >= FACTOR_EXP_OFFSET - 126, normal, subnormal).view(torch.float32)
 
 
-def _prepare_gemm(w, codes, real_rows, chunk):
-    """一个 GEMM：自然布局 w [E, N, K/2]、codes [E, N, K/32] -> (w, delta, factor)。"""
+def _gateup_pdelta(d8):
+    """delta 字节 [e, N, G] -> w1_pdelta [e, N/16, K/256, 2, 16, 4]（组 g = 8*kb + 2*i + h）。"""
+    e, n, groups = d8.shape
+    return d8.view(e, n // 16, 16, groups // 8, 4, 2).permute(0, 1, 3, 5, 2, 4)
+
+
+def _down_pdelta(d8):
+    """delta 字节 [e, N, G] -> w2_pdelta [e, N/64, G, 16, 4]（行 64*n64 + 16*(r//4) + r%4 + 4*i）。"""
+    e, n, groups = d8.shape
+    return d8.view(e, n // 64, 4, 4, 4, groups).permute(0, 1, 5, 2, 4, 3).reshape(e, n // 64, groups, 16, 4)
+
+
+def _prepare_gemm(w, codes, real_rows, chunk, pdelta):
+    """一个 GEMM：自然布局 w [E, N, K/2]、codes [E, N, K/32] -> (w, delta, factor, pdelta)。"""
     experts, n, kb = w.shape
     k = 2 * kb
     groups = k // GROUP_K
     out_w = torch.empty((experts, n // 16, k // 16, 16, 8), dtype=torch.uint8, device=w.device)
     out_d = torch.empty((experts, n // 64, groups, 16, 4), dtype=torch.uint8, device=w.device)
     out_f = torch.empty((experts, n), dtype=torch.float32, device=w.device)
+    out_p = None
     for begin in range(0, experts, chunk):
         end = min(experts, begin + chunk)
         e = end - begin
@@ -96,9 +118,13 @@ def _prepare_gemm(w, codes, real_rows, chunk):
         out_w[begin:end] = fd1.view(e, n // 16, 16, k // 16, 8).permute(0, 1, 3, 2, 4)
         d8 = (delta.clamp(max=MAX_DELTA) * 8).to(torch.uint8)
         out_d[begin:end] = d8.view(e, n // 64, 4, 16, groups).permute(0, 1, 4, 3, 2)
+        p = pdelta(d8)
+        if out_p is None:
+            out_p = torch.empty((experts, *p.shape[1:]), dtype=torch.uint8, device=w.device)
+        out_p[begin:end] = p
         out_f[begin:end] = channel_factor(c_max)
     out_f[:, ~real_rows] = 1.0
-    return out_w, out_d, out_f
+    return out_w, out_d, out_f, out_p
 
 
 def prepare_weights(w1, w1_scale, w2, w2_scale, *, chunk=32):
@@ -136,6 +162,7 @@ def prepare_weights(w1, w1_scale, w2, w2_scale, *, chunk=32):
     rows1 = torch.zeros(2 * padded, dtype=torch.bool, device=device)
     rows1[:inter] = rows1[padded:padded + inter] = True
     rows2 = torch.ones(hidden, dtype=torch.bool, device=device)
-    k1 = _prepare_gemm(w1, w1_scale, rows1, chunk)
-    k2 = _prepare_gemm(w2, w2_scale, rows2, chunk)
-    return MXFP4Weights(*k1, *k2, inter=inter, inter_padded=padded)
+    w1, w1_delta, w1_factor, w1_pdelta = _prepare_gemm(w1, w1_scale, rows1, chunk, _gateup_pdelta)
+    w2, w2_delta, w2_factor, w2_pdelta = _prepare_gemm(w2, w2_scale, rows2, chunk, _down_pdelta)
+    return MXFP4Weights(w1, w1_delta, w1_factor, w2, w2_delta, w2_factor, inter=inter, inter_padded=padded,
+                        w1_pdelta=w1_pdelta, w2_pdelta=w2_pdelta)

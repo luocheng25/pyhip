@@ -239,8 +239,8 @@ GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter�
 T ∈ {1, 8, 16, 32, 128, 1024, 8192, 65536}，共 16 个 case，均匀随机路由、固定种子。
 
 - `a8w4`（默认第一个实现，作为指标）：`pyhip.ops.moe.flydsl.a8w4_ptpc.fused_moe`，随机 mxfp4 权重经
-  `prepare_weights` 一次性准备。M1 只有 decode 档（W4A16，配置表当前 T<=128）；prefill 档的 case
-  跳过它（不输出 MF_METRIC，也不算失败），其余实现照常计时。
+  `prepare_weights` 一次性准备，按它的配置表分档：decode 档（当前 T<=128）W4A16，prefill 档 A8W4
+  （激活与中间结果按 token 量化成 FP8，数据流同 `fly_ptpc` 的 prefill）。16 个 case 都输出 MF_METRIC。
 - `fly_ptpc`（参考行，M0 路径）：tuned_moe 的 FlyDSL FP8 ptpc 候选，经 `make_moe_runner`
   固定为 `FLY_CONFIGS` 中的配置，不调优、不回退 Aiter。
 - `aiter_ptpc`（参考行）：`aiter.fused_moe.fused_moe(quant_type=per_Token)`，由 Aiter 自选 kernel。
@@ -254,7 +254,8 @@ T ∈ {1, 8, 16, 32, 128, 1024, 8192, 65536}，共 16 个 case，均匀随机路
 ```bash
 # myflow 格式：MF_METRIC case=tp2_t1 value=<us> unit=us / REF impl=fly_ptpc case=... value=<us>
 python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf
-# 表格（含 a8w4/fly、aiter/fly 耗时比），并先对 FP32 参考检查每个实现（T=65536 每 16 个 token 取一个）
+# 表格（含 a8w4/fly、aiter/fly 耗时比），并先对 FP32 参考检查每个实现（T=65536 每 16 个 token 取一个；
+# a8w4 按所在档的数据流对 mxfp4 参考），指标实现超出容差时退出码为 1
 python benchmarks/moe/bench_moe_a8w4_ptpc.py --check --cases tp2_t1,tp4_t65536
 # 只测 M0 的 FP8 路径（fly_ptpc 为指标）
 python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf --impl fly_ptpc,aiter_ptpc

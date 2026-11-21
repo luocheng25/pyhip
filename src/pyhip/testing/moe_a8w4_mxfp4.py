@@ -6,8 +6,9 @@ tests/ops/moe/a8w4_ptpc 与 benchmarks/moe/bench_moe_a8w4_ptpc.py 共用；形�
 - 权重：自然布局（checkpoint 形式）的随机 mxfp4。nibble 在 16 个 E2M1 编码上均匀取（含 -0）；每行一个基准
   E8M0 code，各 32-K 组再随机减 0..20，使“通道最大 code − 组 code”覆盖查找表平移的 0..11 和会被 flush 的 >= 12。
 - 参考：权重为 mxfp4 精确反量化 E2M1 * 2^(code-127)，并施加 kernel 的 flush 规则（比通道最大 code 小 12 以上的
-  组为 0）；激活 BF16，FP32 计算，Gate/Up 结果先舍入成 BF16（kernel 以 BF16 保存中间结果），与 M0 的
-  ``reference_moe(act_quant=False)`` 相同。
+  组为 0）；FP32 计算，Gate/Up 结果先舍入成 BF16（kernel 以 BF16 保存中间结果）。decode 的数据流（M1）激活为 BF16，
+  与 M0 的 ``reference_moe(act_quant=False)`` 相同；prefill 的数据流（M2，``act_quant=True``）把两级 GEMM 的输入
+  都按行量化成 FP8，与 M0 的 ``reference_moe(act_quant=True)`` 相同。
 """
 
 from pyhip.testing import moe_a8w4_ptpc as M
@@ -87,8 +88,12 @@ def dequant_mxfp4(w, codes, *, flush=True):
     return grouped.flatten(-2)
 
 
-def reference_moe(hidden, raw, topk_weight, topk_ids):
-    """自然布局 mxfp4 权重上的 FP32 参考（decode 数据流：BF16 激活），返回 ``[T, H]`` FP32。"""
+def reference_moe(hidden, raw, topk_weight, topk_ids, *, act_quant=False):
+    """自然布局 mxfp4 权重上的 FP32 参考，返回 ``[T, H]`` FP32。
+
+    ``act_quant=False``：decode 的数据流（BF16 激活，M1）；``True``：prefill 的数据流（M2），两级 GEMM 的输入
+    都按行量化成 FP8 再反量化（``moe_a8w4_ptpc.quantize_rows``，同 M0 的 ``reference_moe(act_quant=True)``）。
+    """
     torch = _torch()
     w1, s1, w2, s2 = raw
     tokens, topk = topk_ids.shape
@@ -96,7 +101,7 @@ def reference_moe(hidden, raw, topk_weight, topk_ids):
     routes = topk_ids.reshape(-1).long()
     order = torch.argsort(routes, stable=True)
     counts = torch.bincount(routes, minlength=w1.shape[0]).tolist()
-    a1 = hidden.float()
+    a1 = _dequant_rows(hidden) if act_quant else hidden.float()
     act = torch.empty((tokens * topk, inter), dtype=torch.bfloat16, device=hidden.device)
     down = torch.empty((tokens * topk, w2.shape[1]), dtype=torch.float32, device=hidden.device)
     begin = 0
@@ -106,10 +111,17 @@ def reference_moe(hidden, raw, topk_weight, topk_ids):
             gate_up = a1[rows // topk] @ dequant_mxfp4(w1[expert], s1[expert]).t()
             gate, up = gate_up[:, :inter], gate_up[:, inter:]
             act[rows] = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-            down[rows] = act[rows].float() @ dequant_mxfp4(w2[expert], s2[expert]).t()
+            a2 = _dequant_rows(act[rows]) if act_quant else act[rows].float()
+            down[rows] = a2 @ dequant_mxfp4(w2[expert], s2[expert]).t()
             begin += count
     down = down.view(tokens, topk, -1) * topk_weight.float().unsqueeze(-1)
     return down.sum(dim=1)
+
+
+def _dequant_rows(x):
+    """按行量化成 FP8（per-token）再反量化成 fp32。"""
+    q, scale = M.quantize_rows(x)
+    return q.float() * scale
 
 
 def decode_prepared(w, delta, factor):

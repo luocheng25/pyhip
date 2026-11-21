@@ -151,15 +151,24 @@ decode 的三种配置另在 CUDA graph 中 replay 新输入。用例还断言 t
 
 A8W4（mxfp4 权重）的 W4A16 decode 档：[a8w4_ptpc/test_a8w4_decode.py](a8w4_ptpc/test_a8w4_decode.py)
 测 `prepare_weights` 的逐位格式（CPU 小形状）、TP2 / TP4 × decode 档 T ∈ {1, 8, 16, 32, 128}
-对 FP32 参考（mxfp4 精确反量化、BF16 激活，容差同上）、三种 decode 配置的 CUDA graph replay，
-以及 prefill 档（T=129）报 `NotImplementedError`；[a8w4_ptpc/test_a8w4_decode_edges.py](a8w4_ptpc/test_a8w4_decode_edges.py)
+对 FP32 参考（mxfp4 精确反量化、BF16 激活，容差同上）、三种 decode 配置的 CUDA graph replay；
+[a8w4_ptpc/test_a8w4_decode_edges.py](a8w4_ptpc/test_a8w4_decode_edges.py)
 补入口的输入检查、T=0、各档下界 T=2 / 17、配置表以外的 tile 与编译缓存。随机 mxfp4 权重与参考在
 [moe_a8w4_mxfp4](../../../src/pyhip/testing/moe_a8w4_mxfp4.py)。
+
+A8W4 的 prefill 档（M2）：[a8w4_ptpc/test_a8w4_prefill.py](a8w4_ptpc/test_a8w4_prefill.py) 测 prefill 另存的
+delta 排列（`w1_pdelta` / `w2_pdelta`）逐字节（CPU）、TP2 / TP4 × T ∈ {129（交界）, 1024, 8192, 65536}
+对 FP32 参考（激活与中间结果按 token 量化成 FP8，容差同上），并断言实际编译的是配置表这一档、T=1024 的
+CUDA graph replay、配置表以外的 tile（BK256、BN256）、未知 path 报错与编译缓存；
+[a8w4_ptpc/test_a8w4_prefill_edges.py](a8w4_ptpc/test_a8w4_prefill_edges.py) 补 `config=` 让小 T（0、1、51、52）
+走 prefill 档、形状边界（H=512、补零后 I=832 可以 / 896 报错）与构建断言。
 
 ```bash
 python3 -m pytest tests/ops/moe/a8w4_ptpc -q
 # 只跑 A8W4 decode（约 30 s）
 python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_decode.py tests/ops/moe/a8w4_ptpc/test_a8w4_decode_edges.py -q
+# 只跑 A8W4 prefill（约 35 s）
+python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_prefill.py tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_edges.py -q
 ```
 
 ## 旧用例迁移

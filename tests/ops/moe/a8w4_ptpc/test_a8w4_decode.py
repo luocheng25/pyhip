@@ -10,7 +10,7 @@ kernel 的 flush 规则（比该行最大 code 小 12 以上的组为 0），激
 - decode：TP2 / TP4 × decode 档内的 T（1、8、16、32 和配置表的 decode 上界，当前 128），断言实际编译的
   两级 kernel 就是配置表这一档（batch1 gn32 / batch1 gn64 / split-K）。
 - CUDA graph：三种 decode 配置各捕获一次，replay 时换入新的输入与路由。
-- prefill 档（decode 上界 + 1，当前 129）报 ``NotImplementedError``（M2 实现）。
+- prefill 档（decode 上界 + 1 起，M2 实现）见 ``test_a8w4_prefill.py``。
 """
 
 import pytest
@@ -209,13 +209,3 @@ def test_decode_cuda_graph(gpu, shard, tp, tokens):
             assert not torch.equal(previous, output), "replay did not follow the new inputs"
         previous = output.clone()
 
-
-def test_prefill_tier_not_implemented(gpu, shard):
-    _, prep = shard(4)
-    tokens = DECODE_MAX + 1
-    assert A.select_config(tokens)["path"] == "prefill"
-    hidden, weight, ids = M.make_inputs(tokens, seed=1)
-    output = torch.full_like(hidden, float("nan"))
-    with pytest.raises(NotImplementedError, match="M2"):
-        A.fused_moe(hidden, prep, weight, ids, output=output)
-    assert bool(output.isnan().all()), "the prefill tier must not launch anything"
