@@ -162,6 +162,10 @@ delta 排列（`w1_pdelta` / `w2_pdelta`）逐字节（CPU）、TP2 / TP4 × T �
 CUDA graph replay、配置表以外的 tile（BK256、BN256）、未知 path 报错与编译缓存；
 [a8w4_ptpc/test_a8w4_prefill_edges.py](a8w4_ptpc/test_a8w4_prefill_edges.py) 补 `config=` 让小 T（0、1、51、52）
 走 prefill 档、形状边界（H=512、补零后 I=832 可以 / 896 报错）与构建断言。
+M3 的 [a8w4_ptpc/test_a8w4_prefill_m3.py](a8w4_ptpc/test_a8w4_prefill_m3.py) 测 M3 新增的 prefill 逻辑：
+按指定路由（某专家恰好 32 / 33 行等）逐块断言 half_m 分派走的路径、与 M2 路径（不分派、预取 1 步）逐位相同并对
+参考检查；K tile 少的形状上权重预取 2 步（Down K=64 / 128、Gate/Up 2 / 4 个 K tile）；FlyDSL 按行量化与参考
+`quantize_rows` 逐位相同（输入与中间结果宽度、全零行、极大值、FP8 中点、行数不对齐）；`quant="aiter"` 选项。
 
 ```bash
 python3 -m pytest tests/ops/moe/a8w4_ptpc -q
@@ -169,6 +173,8 @@ python3 -m pytest tests/ops/moe/a8w4_ptpc -q
 python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_decode.py tests/ops/moe/a8w4_ptpc/test_a8w4_decode_edges.py -q
 # 只跑 A8W4 prefill（约 35 s）
 python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_prefill.py tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_edges.py -q
+# 只跑 M3 新增的 prefill 逻辑（约 25 s）
+python3 -m pytest tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_m3.py -q
 ```
 
 ## 旧用例迁移

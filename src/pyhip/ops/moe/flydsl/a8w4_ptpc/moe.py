@@ -4,17 +4,18 @@
   T 很小时 batch1（不排序，每条路由一组 CTA，Gate/Up 顺带清零输出）；否则 split-K（先排序）。
 - prefill 档：A8W4，数据流与 M0 FP8 ptpc 的 prefill 相同（``prefill.py``）：按 M64 排序，输入按 token 量化成
   FP8，Gate/Up（1x4）写 BF16 中间结果，中间结果再按 (token, k) 量化成 FP8，Down（1x4，M64xN256）每个排序行
-  写一行，最后按 token 把 top-k 行相加；权重在寄存器里精确解码成 FP8，做 FP8 MFMA。
+  写一行，最后按 token 把 top-k 行相加；权重在寄存器里精确解码成 FP8，做 FP8 MFMA。后 32 行全是补齐的
+  排序块（``half_m``），两级都只算前 32 行，Down 也只写这 32 行（补齐行 sorted_sum 不读）。
 
 档位与 tile 只看 ``CONFIGS``（与 M0 FP8 ptpc 的配置表同一交界，当前 T<=128 为 decode），代码里不写交界。
-运行时依赖 Aiter 的 ``moe_sorting``（split-K 与 prefill）和 per-token 量化（prefill，与 M0 相同）；
-kernel 本身不导入 Aiter。
+运行时依赖 Aiter 的 ``moe_sorting``（split-K 与 prefill）；prefill 的按行量化默认用 ``prefill.py`` 的 FlyDSL
+kernel（配置 ``quant="aiter"`` 时用 Aiter 的 per-token 量化，与 M0 相同）；kernel 本身不导入 Aiter。
 """
 
 import torch
 
 from .decode import compile_decode_gemm
-from .prefill import compile_prefill_gemm
+from .prefill import compile_prefill_gemm, compile_prefill_quant
 from .weights import MXFP4Weights
 
 BLOCK_M = 16
@@ -22,12 +23,18 @@ BLOCK_M = 16
 # （pyhip.testing.moe_a8w4_ptpc.FLY_CONFIGS）的 decode 行：T=1 batch1 gn32，2..16 batch1 gn64，17..128 split-K。
 # prefill 的 Gate/Up 与 FP8 表相同（M64、gn128），Down 一律 1x4（M64xN256，行距补 128 B）；FP8 表在 TP4
 # T>8192 用的 compact Down 留到性能阶段。Gate/Up 的 BK 取 128：MI308X 上按 bench 协议实测，TP2/TP4 的
-# T=1024/8192/65536 都比 256 快 3%~8%（FP8 表在 T>1024 或 TP4 取 256）。
+# T=1024/8192/65536 都比 256 快 3%~8%（FP8 表在 T>1024 或 TP4 取 256）。half_m：后 32 行全是补齐的排序块
+# 两级都只算（Down 也只写）前 32 行（均匀路由 T=1024 时每专家约 20 行，几乎每块如此，MFMA 减半）；
+# prefetch_gate：32 行 tile 的 Gate/Up 提前 2 个 K tile 读权重（T=1024 快约 3%；64 行 tile 保持 1，T=8192
+# 用 2 会慢 0.3%）；prefetch_down：Down 提前 2 个 K core 读权重（同进程 A/B 比 1 快约 2%，3 不再更快）。
+# quant="fly"：输入与中间结果的按行量化用 ``prefill.py`` 的 FlyDSL kernel（算术同参考 ``quantize_rows``，
+# T=1024 中间结果 4.6us，Aiter HIP kernel 18.9us）；"aiter" 为 M2 的 Aiter per-token 量化。
 CONFIGS = (
     (1, dict(path="decode", alg="batch1", tile_n_gate=32, tile_n_down=64)),
     (16, dict(path="decode", alg="batch1", tile_n_gate=64, tile_n_down=64)),
     (128, dict(path="decode", alg="splitk", tile_n_gate=128, tile_n_down=128)),
-    (None, dict(path="prefill", tile_m=64, tile_n_gate=128, tile_k_gate=128, tile_n_down=256, padding=128)),
+    (None, dict(path="prefill", tile_m=64, tile_n_gate=128, tile_k_gate=128, tile_n_down=256, padding=128,
+                half_m=True, prefetch_gate=2, prefetch_down=2, quant="fly")),
 )
 FP8 = torch.float8_e4m3fnuz
 
@@ -116,10 +123,20 @@ def fused_moe(hidden_states, weights, topk_weight, topk_ids, *, output=None, con
     return out
 
 
+def _quantize_rows(x, stream):
+    """BF16 ``x`` [rows, cols] -> (FP8 ``q`` like ``x``, FP32 ``scale`` [rows])，按行量化（``prefill.py``）。"""
+    from ..moe_gemm_2stage.common import _run_compiled
+
+    rows, cols = x.shape
+    q = torch.empty(x.shape, dtype=FP8, device=x.device)
+    scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
+    launch, rows_per_block = compile_prefill_quant(cols)
+    _run_compiled(launch, _ptr(x), _ptr(q), _ptr(scale), rows, -(-rows // rows_per_block), stream)
+    return q, scale
+
+
 def _fused_moe_prefill(hidden_states, w, topk_weight, topk_ids, out, config, stream):
     """prefill 档：数据流同 tuned_moe 的 FlyDSL FP8 ptpc prefill（M0 的 ``_run_fly``），权重换成 mxfp4。"""
-    import aiter
-
     from ..._aiter_compat import moe_sorting
     from ..moe_gemm_2stage.common import _run_compiled
     from ..moe_gemm_2stage.moe_reduce import invert_sorted_ids, sorted_sum
@@ -131,17 +148,26 @@ def _fused_moe_prefill(hidden_states, w, topk_weight, topk_ids, out, config, str
     routing = moe_sorting(topk_ids, topk_weight, experts, hidden, hidden_states.dtype, block_m,
                           accumulate=False)[:4]
     tasks = routing[2].numel()
-    quantize = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    if config.get("quant", "aiter") == "fly":
+        def quantize(x):
+            return _quantize_rows(x, stream)
+    else:
+        import aiter
+
+        def quantize(x):
+            return aiter.get_hip_quant(aiter.QuantType.per_Token)(x, quant_dtype=FP8)
     common = dict(TOPK=topk, BLOCK_TILE_SIZE_M=block_m, E=experts)
     gateup = compile_prefill_gemm(stage="gateup", N=2 * inter, K=hidden, BLOCK_TILE_SIZE_N=config["tile_n_gate"],
-                                  tile_k=config["tile_k_gate"], **common)
+                                  tile_k=config["tile_k_gate"], half_m=config.get("half_m", False),
+                                  prefetch=config.get("prefetch_gate", 1), **common)
     down = compile_prefill_gemm(stage="down", N=hidden, K=inter, BLOCK_TILE_SIZE_N=config["tile_n_down"],
-                                padding=padding, **common)
-    x, x_scale = quantize(hidden_states, quant_dtype=FP8)
+                                padding=padding, prefetch=config.get("prefetch_down", 1),
+                                half_m=config.get("half_m", False), **common)
+    x, x_scale = quantize(hidden_states)
     mid = torch.empty((tokens, topk, inter), dtype=torch.bfloat16, device=device)
     _run_compiled(gateup, *map(_ptr, (x, w.w1, mid, *routing, w.w1_factor, w.w1_pdelta, x_scale)),
                   tokens, tasks, stream)
-    mid_q, mid_scale = quantize(mid.view(tokens * topk, inter), quant_dtype=FP8)
+    mid_q, mid_scale = quantize(mid.view(tokens * topk, inter))
     routes = torch.empty((tasks * block_m, hidden + padding // 2), dtype=torch.bfloat16, device=device)
     _run_compiled(down, *map(_ptr, (mid_q, w.w2, routes, *routing, w.w2_factor, w.w2_pdelta, mid_scale)),
                   tokens, tasks, stream)

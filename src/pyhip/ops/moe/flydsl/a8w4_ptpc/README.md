@@ -1,7 +1,7 @@
 # MoE PTPC A8W4（Qwen3.8-Flash-Next，MI308X）：入口
 
 <!-- mf:summary -->
-> 由 mf 生成（11-21 17:22）· 目标：pyhip 新增 MoE 算子：bf16 激活按 token 量化成 fp8、权重 mxfp4；功能正确，decode 接近访存上限、prefill 接近算力上限（TP2/TP4 单卡形状）（1× 相对冻结基线）· 已完成 3 个里程碑（含本提交 M2） · 最佳累计 — · 下一步：M3 T=1024 prefill 追上 aiter_ptpc（TP2/TP4）；之后：M4 TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 每 lane 每轮读 16 B）（暂定）
+> 由 mf 生成（11-21 20:05）· 目标：pyhip 新增 MoE 算子：bf16 激活按 token 量化成 fp8、权重 mxfp4；功能正确，decode 接近访存上限、prefill 接近算力上限（TP2/TP4 单卡形状）（1.094× 相对冻结基线）· 已完成 4 个里程碑（含本提交 M3） · 最佳累计 1.238× · 下一步：M4 TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 每 lane 每轮读 16 B）
 <!-- /mf:summary -->
 
 > - **这是什么**：Qwen3.8-Flash-Next MoE（H=2560、E=512、top-10、SiLU，TP2/TP4 单卡分片）在 MI308X 上的 A8W4 ptpc 算子任务；M0 把 `moe_gemm_2stage` 换成上游 aiter `gfx9_fp8`，让 FP8 权重的 ptpc 路径（prefill 为 A8W8，decode 读 BF16 激活）经 `tuned_moe` 的 FlyDSL 候选跑通，作为后续 A8W4 的起点。
@@ -14,23 +14,43 @@
 |---|---|---|---|---|---|---|---|---|
 | M0 | ✅ 已推送 | 功能 | 把上游 aiter gfx9_fp8 的 kernel 更新到 pyhip moe_gemm_2stage（同名文件替换 / 更新） | — | — | ✓ | 冷读✓ 3分 | [moe-ptpc-a8w4-M0](https://github.com/luocheng25/pyhip/commit/e433e8d9184cdc5fd387641a00bc5686abec37cc) |
 | M1 | ✅ 已推送 | 功能 | W4A16 decode：mxfp4 权重格式 + decode 路径（配置表 decode 档，当前 T≤128） | — | — | ✓ | ✓ | [moe-ptpc-a8w4-M1](https://github.com/luocheng25/pyhip/commit/cc271e29d151356c40607da4db96af8ea068e459) |
-| M2 | ✅ 本提交 | 功能 | A8W4 prefill：fd2 解码接入 fp8 MFMA（配置表 prefill 档，当前 T≥129） | — | — | ✓ | ✓ | 本提交 |
-| M3 | ⏳ 承诺 | 性能 | T=1024 prefill 追上 aiter_ptpc（TP2/TP4） | —（预期 1.1×） | — | — | — |  |
+| M2 | ✅ 已推送 | 功能 | A8W4 prefill：fd2 解码接入 fp8 MFMA（配置表 prefill 档，当前 T≥129） | — | — | ✓ | ✓ | [moe-ptpc-a8w4-M2](https://github.com/luocheng25/pyhip/commit/2e5a428be2a332b3e45fe3879b4391f26fee0b8c) |
+| M3 | ✅ 本提交 | 性能 | T=1024 prefill 追上 aiter_ptpc（TP2/TP4） | 1.238× 对基线（预期 1.1×） | 1.238× | ✓ | ✓ | 本提交 |
 | M4 | · 暂定 | 性能 | TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 每 lane 每轮读 16 B） | —（预期 1.05×） | — | — | — |  |
 
-下一步（本提交的承诺）：M3 T=1024 prefill 追上 aiter_ptpc（TP2/TP4）；之后：M4 TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 每 lane 每轮读 16 B）（暂定）
+下一步（本提交的承诺）：M4 TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 每 lane 每轮读 16 B）
 <!-- /mf:roadmap -->
 
 ## 2. 性能
 <!-- mf:perf -->
-（尚无复核数据）
+M3 的复核（V2：同卡 ABBA 4 对，GPU0，噪声 ±0.24%，冻结基线 `2e5a428be2`）
+
+| case | 基线 | 当前 | 累计加速 | 增量加速 |
+|---|---|---|---|---|
+| tp2_t1 | 23.3005 | 23.28 | 1.000× | — |
+| tp2_t1024 | 553.773 | 402.992 | 1.375× | — |
+| tp2_t128 | 392.202 | 392.092 | 1.000× | — |
+| tp2_t16 | 155.451 | 157.921 | 0.983× | — |
+| tp2_t32 | 210.751 | 210.231 | 1.003× | — |
+| tp2_t65536 | 12805.3 | 11651.9 | 1.098× | — |
+| tp2_t8 | 74.51 | 74.18 | 1.003× | — |
+| tp2_t8192 | 1790.25 | 1563.79 | 1.145× | — |
+| tp4_t1 | 19.61 | 19.4405 | 1.002× | — |
+| tp4_t1024 | 399.772 | 284.151 | 1.405× | — |
+| tp4_t128 | 251.452 | 251.211 | 1.001× | — |
+| tp4_t16 | 86.8305 | 86.861 | 1.000× | — |
+| tp4_t32 | 138.131 | 137.97 | 1.002× | — |
+| tp4_t65536 | 9181.33 | 7891.15 | 1.163× | — |
+| tp4_t8 | 50.281 | 50.0705 | 1.002× | — |
+| tp4_t8192 | 1298.59 | 1086.95 | 1.193× | — |
 <!-- /mf:perf -->
 
-- 验收口径（用户 11-21 确认）：每个 case 的 `latency_us` 基本达到同形状 aiter_ptpc（FP8 ptpc，A8W8）的水平，bench 里的 `aiter_ptpc` 是对照行；摘要里“decode 接近访存上限、prefill 接近算力上限”是任务方向的描述。按当前计划，基线在 M2（A8W4 prefill）完成后冻结，届时按与 aiter_ptpc 对照的实测把“1×”换算成相对 M2 基线的目标；M0 无性能主张（上面的块还没有数据）。下面几条都不是 mf 复核的数据，来源见 [深度参考 §5](m0_upstream_replacement.md#sources)。
+- 验收口径（用户 11-21 确认）：每个 case 的 `latency_us` 基本达到同形状 aiter_ptpc（FP8 ptpc，A8W8）的水平，bench 里的 `aiter_ptpc` 是对照行；摘要里“decode 接近访存上限、prefill 接近算力上限”是任务方向的描述。基线已在 M2（`2e5a428be2`，bench 3 次取中位数）冻结：按 SPEC 换算，指标只计未达“每 case ≥0.95× aiter_ptpc（耗时 ≤1.053×）”的 3 个 case（TP2 T=16、TP2 / TP4 T=1024），目标是相对基线加权几何平均 1.094×（myflow 任务的 `plan.md`）；上面的块是 mf 的复核（M3），M0–M2 无性能主张。下面几条都不是 mf 复核的数据，来源见 [深度参考 §5](m0_upstream_replacement.md#sources)。
 - 替换前后（编排者复测，6 轮轮换，`runs/20261121-094917-_task-run-8e2d/out.log`）：中位比值（替换后 ÷ 替换前的耗时，6 轮的中位数，大于 1 为变慢）在默认 RTA 下 prefill（T≥1024）为 1.002–1.005，TP4 T=65536 为 0.963（改用上游 compact），decode（T≤128）为 0.988–1.023（最慢的是 TP2 T=32）；改用 RTE 则 prefill 慢 3.1–4.0%（TP4 T=65536 因同时换成 compact 为 1.003）。
 - 与 aiter_ptpc 参考行相比（实现者自测，f97327ce，`runs/20261121-101211-_task-run-bebe/out.log`）：T=1024 两个 TP 都慢（1.27×、1.24×），TP2 T=32 / 128 为 1.01× / 1.03×，其余 12 个 case 更快。
 - M0 验收项“`bench_tuned_moe` 替换前后对比”（编排者，[深度参考 §5](m0_upstream_replacement.md#sources)）：43 个 case 初筛 9 个慢 3% 以上，两轮复测后只剩 mimo_ptpc M=256（约 +12%，原因是 tuner 在 jit_splitk 与 aiter 之间选择翻转，用户已接受为后续事项，见 §3.6 第 4 条）；qwen35_35B M=16 三次为 1.050 / 1.066 / 1.027，贴着 3% 门槛。
 - M2 自测（实现者，`runs/20261121-163935-_task-run-61df/out.log`，`--mf --check`）：a8w4 ÷ aiter_ptpc 的 16 个 case 几何平均 0.867×（a8w4 更快，主要因为 T=1 时 aiter 慢：0.354 / 0.342），按 SPEC 每 case ≥0.95×（耗时 ≤1.053×）未达到的有 TP2 T=16（1.213×）、TP2 T=1024（1.216×）、TP4 T=1024（1.244×），是性能阶段的目标；prefill 6 个 case 的 a8w4 ÷ fly_ptpc（M0 FP8）为 0.961–1.071（几何平均 1.015）。
+- M3 自测（L1 实现者，A6 = `8c123ceefb`，`runs/20261121-191253-L1-run-3f52/out.log`，`--mf --check`，rc=0）：a8w4 tp2_t1024 400.1 µs、tp4_t1024 286.0 µs，同次 aiter_ptpc 465.1 / 329.3 µs（0.860 / 0.868）；16 个 case 都在容差内，a8w4 对 FP32 参考 logits_diff ≤ 9.9e-6。
 - 解读：prefill 排序用 `accumulate=False`，省掉 fly_ptpc 路径的两次 T×H 清零，与 FP8 对照时比值略偏向 a8w4；TP4 T=65536 的 fly_ptpc 用 compact Down，a8w4 只有 1x4。基线在 M2 之后冻结，正式数字以冻结时的测量为准。
 
 ## 3. 设计
@@ -80,9 +100,10 @@
 | 环境变量 `CU_NUM` | 覆盖 CU 数 | 只改上游 `get_cu_num()` | 上游 Down 按 CU 数是否为 80 判定 MI308X |
 | [`a8w4_ptpc.prepare_weights`](weights.py#L130)（M1、M2） | `(w1, w1_scale, w2, w2_scale, *, chunk=32)` → `MXFP4Weights` | dtype 不对报 `TypeError`；维数 / 形状不一致、`H % 256 ≠ 0`、`I % 32 ≠ 0` 或 I=0、E8M0 code 255 报 `ValueError` | 加载时调用一次；输入布局见本节末尾，输出格式见 [weights.py 模块说明](weights.py#L1)；I 补零到 64 的倍数（TP4 160→192）；M2 起另算 prefill 的 delta 排列 |
 | [`a8w4_ptpc.MXFP4Weights`](weights.py#L48)（M1、M2） | frozen dataclass：`w1`、`w1_delta`、`w1_factor`、`w2`、`w2_delta`、`w2_factor`、`inter`、`inter_padded`；M2 加 `w1_pdelta` uint8 `[E, 2I/16, H/256, 2, 16, 4]`、`w2_pdelta` uint8 `[E, H/64, I/32, 16, 4]`；属性 `experts`、`hidden` | 只由 `prepare_weights` 构造 | decode（M1）用 `*_delta`，prefill（M2）用 `*_pdelta`：同一批 delta 字节按 prefill kernel 的读法另存（[weights.py L17](weights.py#L17)），其余字段共用 |
-| [`a8w4_ptpc.fused_moe`](moe.py#L74)（M1、M2） | `(hidden_states, weights, topk_weight, topk_ids, *, output=None, config=None)` → `output` | 见本节末尾；`config` 的 path 不是 decode / prefill 时在启动前报 `ValueError`（M2） | `Σ_k topk_weight · Down(SiLU(Gate x) · Up x)`，只有 SiLU；decode、prefill（M2 起可用）两档；不调优、不回退 aiter |
-| [`a8w4_ptpc.select_config`](moe.py#L35) / [`decode_max_tokens`](moe.py#L43) / [`CONFIGS`](moe.py#L26)（M1、M2） | `select_config(tokens, configs=CONFIGS)` → 配置副本；`decode_max_tokens(configs=CONFIGS)` → decode 档上界（当前 128） | 不报错；T 超过所有上界时取最后一行 | 档位只看 `CONFIGS`，代码里不写交界；prefill 行（M2）为 `tile_m=64, tile_n_gate=128, tile_k_gate=128, tile_n_down=256, padding=128` |
-| [`a8w4_ptpc.prefill.compile_prefill_gemm`](prefill.py#L1102)（M2） | `(*, stage, N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, tile_k=None, padding=0, E=None)` → launcher | Gate/Up：`tile_k` ∈ {128, 256}、`K % 256 == 0`、K/BK 为偶数、BN ∈ {128, 256} 且 `N % BN == 0`、BM 为 32–256 中 32 的倍数；Down：只有 BM×BN = 64×256（`fused_moe` 两级共用 `tile_m`，所以只能取 64）、`N % 256 == 0`、`K % 64 == 0`、64·K + 9 KiB ≤ 64 KiB（K ≤ 880）；不满足报 `AssertionError` | 按设备缓存；两级参数都是 `(输入 FP8, 权重, 输出, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, 通道因子, pdelta, a_scale, M, 任务数, stream)` |
+| [`a8w4_ptpc.fused_moe`](moe.py#L81)（M1、M2） | `(hidden_states, weights, topk_weight, topk_ids, *, output=None, config=None)` → `output` | 见本节末尾；`config` 的 path 不是 decode / prefill 时在启动前报 `ValueError`（M2） | `Σ_k topk_weight · Down(SiLU(Gate x) · Up x)`，只有 SiLU；decode、prefill（M2 起可用）两档；不调优、不回退 aiter |
+| [`a8w4_ptpc.select_config`](moe.py#L42) / [`decode_max_tokens`](moe.py#L50) / [`CONFIGS`](moe.py#L32)（M1–M3） | `select_config(tokens, configs=CONFIGS)` → 配置副本；`decode_max_tokens(configs=CONFIGS)` → decode 档上界（当前 128） | 不报错；T 超过所有上界时取最后一行 | 档位只看 `CONFIGS`，代码里不写交界；prefill 行（M2）为 `tile_m=64, tile_n_gate=128, tile_k_gate=128, tile_n_down=256, padding=128`，M3 加 `half_m=True, prefetch_gate=2, prefetch_down=2, quant="fly"`；`config=` 缺这 4 个键时按 M2（`False`、1、1、aiter 量化），`quant` 不是 `"fly"` 的值都走 aiter、不报错 |
+| [`a8w4_ptpc.prefill.compile_prefill_gemm`](prefill.py#L1266)（M2、M3） | `(*, stage, N, K, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, tile_k=None, padding=0, E=None, half_m=False, prefetch=1)` → launcher | Gate/Up：`tile_k` ∈ {128, 256}、`K % 256 == 0`、K/BK 为偶数、BN ∈ {128, 256} 且 `N % BN == 0`、BM 为 32–256 中 32 的倍数；Down：只有 BM×BN = 64×256（`fused_moe` 两级共用 `tile_m`，所以只能取 64）、`N % 256 == 0`、`K % 64 == 0`、64·K + 9 KiB ≤ 64 KiB（K ≤ 880）；M3：Gate/Up 的 `prefetch` ∈ {1, 2}、`half_m` 要 BM % 64 == 0，Down 的 `prefetch` ≥ 1；不满足报 `AssertionError` | 按设备缓存；两级参数都是 `(输入 FP8, 权重, 输出, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, 通道因子, pdelta, a_scale, M, 任务数, stream)`。M3：`half_m` 时排序块第 BM/2+1 行是补齐行就只算（Down 只写）前 BM/2 行；`prefetch` 是权重提前读的步数，Gate/Up 只用于 ≤32 行的 tile（64 行 tile 固定 1），Down 实际取 min(prefetch, K/64) |
+| [`a8w4_ptpc.prefill.compile_prefill_quant`](prefill.py#L1295)（M3） | `(cols)` → `(launch, rows_per_block)`；`launch(x, q, scale, rows, blocks, stream)` | `cols % 8 == 0`，否则 `AssertionError` | 按设备缓存；BF16 `[rows, cols]` 按行量化成 FP8 `q` 与 fp32 `scale[rows]`，算术同 `pyhip.testing.moe_a8w4_ptpc.quantize_rows`（逐位相同）；每行 min(64, cols/8 的最大 2 的幂因子) 个 lane，每 CTA 256 线程；`blocks` 由调用方取 ⌈rows / rows_per_block⌉，越过 `rows` 的行不写；生产经 [`moe._quantize_rows`](moe.py#L126) 调用 |
 
 `fused_moe` 走本地 kernel 的输入（[`_native_kind`](../../tuned_moe.py#L40) 检查；任一条不满足就整体转交 aiter，不报错）：
 - `hidden_states`：BF16 `[T, H]`，0 < T < 2^24，`H % 128 == 0`；所有张量在同一 CUDA 设备上且连续，架构为 gfx942 或 gfx950。
@@ -103,12 +124,12 @@ dispatch（[`gemm_implementation`](../moe_gemm_2stage/gemm.py#L39) 按顺序判�
 
 例：Qwen3.8 的全部生产配置 → 上游（B30）；Qwen3.8 TP2 若选 compact（K=320）→ legacy；SiTUv2、FP4 / MXFP4、gfx950 → legacy；`tuned_moe` 的 `8x1`（BM256）候选 → legacy。
 
-`a8w4_ptpc` 入口（M1、M2；输入检查在 [`_check`](moe.py#L56)，任何 kernel 启动之前完成，不满足就报错，不转交 aiter）：
+`a8w4_ptpc` 入口（M1–M3；输入检查在 [`_check`](moe.py#L63)，任何 kernel 启动之前完成，不满足就报错，不转交 aiter）：
 - `prepare_weights` 的输入是单卡分片后的 checkpoint 自然布局：w1 uint8 `[E, 2I, H/2]`（一字节两个 E2M1，低半字节是偶数 k；前 I 行 gate、后 I 行 up），w1_scale uint8 E8M0 `[E, 2I, H/32]`；w2 `[E, H, I/2]`，w2_scale `[E, H, I/32]`；也接受 `torch.float4_e2m1fn_x2` / `torch.float8_e8m0fnu`（按字节读）。
 - `fused_moe`：`weights` 不是 `MXFP4Weights` → `TypeError`；`hidden_states` 不是 BF16 `[T, H]` CUDA 张量、H 或设备与权重不符、`topk_ids` / `topk_weight` 不是 int32 / fp32 `[T, topk]`、任一张量不连续或不在同一设备、`output` 不是与 `hidden_states` 同形状的 BF16 → `ValueError`；`0 ≤ topk_ids < E` 由调用方保证，不检查。
-- dispatch（[`select_config`](moe.py#L35) 查 [`CONFIGS`](moe.py#L26)）：T=0 直接返回；T=1 batch1 gn32 / dn64；2–16 batch1 gn64 / dn64（Gate/Up 顺带清零 `out`）；17–128 split-K gn128 / dn128（先调 aiter `moe_sorting`，并清零 `out`）；≥129（prefill 档，M2，[`_fused_moe_prefill`](moe.py#L119)）：aiter `moe_sorting`（M64，`accumulate=False`，不清零 `out`）→ aiter 按 token 量化 `x` → Gate/Up 1x4（gn128、BK128）写 BF16 `mid` → `mid` 按 (token, k) 量化 → Down 1x4（M64×N256，每个排序行写一行，行距补 128 B）→ `invert_sorted_ids` + `sorted_sum` 写全部 `out`。`config=` 可指定表外 tile：batch1 的 Gate/Up BN ∈ {32, 64, 128}、split-K ∈ {64, 128}，Down ∈ {64, 128}；prefill 的 Gate/Up BN ∈ {128, 256}、BK ∈ {128, 256}，Down 只有 1x4（M64×N256）；其它值由 builder 的 `assert` 拒绝。
+- dispatch（[`select_config`](moe.py#L42) 查 [`CONFIGS`](moe.py#L32)）：T=0 直接返回；T=1 batch1 gn32 / dn64；2–16 batch1 gn64 / dn64（Gate/Up 顺带清零 `out`）；17–128 split-K gn128 / dn128（先调 aiter `moe_sorting`，并清零 `out`）；≥129（prefill 档，M2，[`_fused_moe_prefill`](moe.py#L138)）：aiter `moe_sorting`（M64，`accumulate=False`，不清零 `out`）→ 按 token 量化 `x`（M3 起是 FlyDSL kernel，`quant="aiter"` 时为 aiter）→ Gate/Up 1x4（gn128、BK128）写 BF16 `mid` → `mid` 按 (token, k) 量化 → Down 1x4（M64×N256，每个排序行写一行，行距补 128 B；M3 起两级对后 32 行全是补齐的排序块只算前 32 行，补齐行 `sorted_sum` 不读）→ `invert_sorted_ids` + `sorted_sum` 写全部 `out`。`config=` 可指定表外 tile：batch1 的 Gate/Up BN ∈ {32, 64, 128}、split-K ∈ {64, 128}，Down ∈ {64, 128}；prefill 的 Gate/Up BN ∈ {128, 256}、BK ∈ {128, 256}，Down 只有 1x4（M64×N256）；其它值由 builder 的 `assert` 拒绝。
 - prefill 档的形状限制（M2；编译期 `AssertionError`，`_check` 不查）：`H % 512 == 0`（最后的 `sorted_sum` 每线程 8 个 BF16、64 线程；Gate/Up 自身只要 `H % 256`）；补零后 I ≤ 880（Down 把 64 行中间激活放进 LDS；I 补到 64 的倍数，所以 I ≤ 832）。Qwen3.8（H=2560，I=320 / 160→192）都满足。I 超限在启动 Gate/Up 之前报错；H 不满足要到 Gate/Up、Down 已启动后构建 `sorted_sum` 时才报，`out` 不写（§3.6 第 11 条）。
-- 编译：[`compile_decode_gemm`](decode.py#L1115) 与 [`compile_prefill_gemm`](prefill.py#L1102)（M2）按设备缓存，同一设备同一配置只构建一次；decode 档与 prefill 档都可进 CUDA graph（用例在 capture 之前先调用一次完成编译）。
+- 编译：[`compile_decode_gemm`](decode.py#L1115)、[`compile_prefill_gemm`](prefill.py#L1266)（M2）与 [`compile_prefill_quant`](prefill.py#L1295)（M3）按设备缓存，同一设备同一配置只构建一次；decode 档与 prefill 档都可进 CUDA graph（用例在 capture 之前先调用一次完成编译）。
 
 ### 3.3 调用链
 - 生产：`fused_moe` 能走本地 kernel 时，按 `batch_bucket = ceil_pow2(T)` 和 `model_key`（形状、dtype、布局、设备、环境变量）自动调优（[L576–579](../../tuned_moe.py#L576)）；候选（[`_configs`](../../tuned_moe.py#L148)）有 aiter、ASM `jit_*`、FlyDSL `fly_decode`（batch1 只在桶 ≤ 32）和 `fly_prefill`（桶 ≥ 64），在 torch 参考上 `calc_diff` ≤ 0.02 的候选里取最快的并缓存，胜出的不一定是 FlyDSL。
@@ -201,12 +222,12 @@ BK=128 且只有 2 个 K 步时，上一块的写回会与下一块的 K 步重�
 3. gfx950、FP4 / MXFP4、SiTUv2 全走 legacy、代码未改：SiTUv2 的 bf16 / ptpc 用例在 gfx942 上会跑（B31）；FP4 / MXFP4 与 gfx950 的用例本机跳过（B32），无法实测。
 4. `tuned_moe` 调优不稳：mimo_ptpc（见 [深度参考 §0](m0_upstream_replacement.md#terms)）M=256 经 `tuned_moe` 端到端慢 12%（初筛 1.136、复测 1.119），胜出配置从 ASM `jit_splitk` 换成 aiter；两边用同一调优配置时为 1.007。用户 11-21 决定接受：非替换造成，M0 不处理，记为 tuned_moe 调优不稳（调优测量与正式计时不一致）的后续事项。出处（编排者）：`runs/20261121-104005-_task-run-7733/out.log`（筛查）、`runs/20261121-104604-_task-run-af22/out.log`（复测）、`runs/20261121-105710-_task-run-57d8/out.log`（同一调优配置）。
 5. 正确性命令排除 9 个替换前就失败的用例：`test_asm_batch_loopn` 8 个（ASM JIT 缓存文件名含 worktree 长路径，Errno 36）和 `test_aiter_signature` 1 个（/opt/aiter 的 `fused_moe` 多 3 个参数）。
-6. 运行时仍依赖 aiter：`tuned_moe` 的排序、激活量化和 `_run_compiled`；kernel 文件本身不导入 aiter（A10）。`a8w4_ptpc` 的 split-K 与 prefill 同样调 aiter `moe_sorting`，prefill 还调 aiter 的按 token 量化（M2）。
+6. 运行时仍依赖 aiter：`tuned_moe` 的排序、激活量化和 `_run_compiled`；kernel 文件本身不导入 aiter（A10）。`a8w4_ptpc` 的 split-K 与 prefill 同样调 aiter `moe_sorting`，prefill 还调 aiter 的按 token 量化（M2；M3 起默认改用 FlyDSL 按行量化，配置 `quant="aiter"` 时仍调 aiter）。
 7. TP4 补零在权重加载侧（`make_weights`）做，算子本身不补；未补零的 I=160 在 `tuned_moe` 里没有本地候选，只走 aiter。
 8. BF16 舍入默认 RTA，偏离上游的 RTE：中点差 1 个 BF16 ulp，简化 RTA 可能不保留部分 NaN；开关在导入 `common.py` 时读取，进程内再改环境变量不生效。
 9. 替换带来的行为差异：`MOE_PREFILL_TILE_K` 不再作用于上游 Down；`CU_NUM` 会改变上游 Down 对 MI308X 拓扑的判断；`has_num_local_tokens` 只有用例在用。
 10. 文档：`moe_gemm_2stage/README.md` 的性能与资源数字是替换前 legacy 实现的测量；`tests/ops/moe/README.md` 的 a8w4_ptpc 段已过时（没有 T=65536、没提新用例），M1 时更新（M1、M2 已更新）。
-11. `a8w4_ptpc` 的 prefill 档（M2）：Down 只有 1x4，TP4 T>8192 没有 compact（推迟到性能阶段）；形状要求 `H % 512 == 0`、补零后 I ≤ 880（即 I ≤ 832），不满足时报 `AssertionError`（编译期断言，`_check` 不查），其中 H 不满足要到 Gate/Up、Down 已启动之后构建 `sorted_sum` 时才报，`out` 不写（复核实测 H=256，`runs/20261121-170845-_task-run-0d5c/out.log`）。
+11. `a8w4_ptpc` 的 prefill 档（M2）：Down 只有 1x4，TP4 T>8192 没有 compact（推迟到性能阶段，M3 仍未做）；形状要求 `H % 512 == 0`、补零后 I ≤ 880（即 I ≤ 832），不满足时报 `AssertionError`（编译期断言，`_check` 不查），其中 H 不满足要到 Gate/Up、Down 已启动之后构建 `sorted_sum` 时才报，`out` 不写（复核实测 H=256，`runs/20261121-170845-_task-run-0d5c/out.log`）。
 
 ## 4. 测试
 用例前缀：`U` = [a8w4_ptpc/test_moe_gemm_2stage_upstream.py](../../../../../../tests/ops/moe/a8w4_ptpc/test_moe_gemm_2stage_upstream.py)（94 个，只构建 launcher 或编译小 kernel），`Q` = [a8w4_ptpc/test_qwen38_ptpc.py](../../../../../../tests/ops/moe/a8w4_ptpc/test_qwen38_ptpc.py)（34 个，Qwen3.8 端到端），`TM` = `tests/ops/moe/test_moe.py`，`TT` = `tests/ops/moe/test_tuned_moe.py`（TM、TT 本里程碑未改）。`U::routes[x]` = `test_compile_gemm_routes[x]`，`U::adapt[x]` = `test_compile_gemm_adapts_launchers[x]`。覆盖项共 63 个，逐项见 [深度参考 §4](m0_upstream_replacement.md#coverage)。
@@ -286,11 +307,33 @@ BK=128 且只有 2 个 K 步时，上一块的写回会与下一块的 K 步重�
 - bench `--check` 超出容差返回 1 的新退出码没有用例（bench 不在用例范围）；FlyDSL 磁盘编译缓存在用例里关闭，只测进程内按设备缓存。
 - 冗余（不删）：PE::test_compile_prefill_gemm_shape_asserts 的 Down LDS 断言与 PE::test_prefill_min_hidden_max_inter 的 I=896 部分重复。
 
+**M3（T=1024 prefill 性能）覆盖**：实现者未改用例；前缀 `P3` = [a8w4_ptpc/test_a8w4_prefill_m3.py](../../../../../../tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_m3.py)（10 个，复核补充）。参考与容差同 M2（`reference_moe(act_quant=True)` + M0 的 `check_output`，未放宽）；“M2 路径”指同一配置改成 `half_m=False`、两级预取 1（量化相同），M3 的分派与预取不改变运算顺序，所以要求逐位相同。
+
+| 情况 | 用例 | 类型 | 结果 |
+|---|---|---|---|
+| half_m 两侧与交界（Qwen3.8 TP2 / TP4，T=256，指定路由：专家行数 31、32、1 → 只算前 32 行，33 → 整块，64、65、96、97 → 整块 + 末块按余数，其余专家各几行；同一次调用两种块并存）：逐块断言 Down 走的路径（只算 32 行的块不写后 32 行、整块写满 64 行）与按 `sorted_ids` 推出的一致；Gate/Up 的有效行都写了；`mid`、Down 的有效行、最终输出与 M2 路径逐位相同；对 FP32 参考满足容差 | P3::test_half_m_dispatch_boundary（2 个） | 功能 | 通过 |
+| 预取 2 步在 K tile 少的形状（E=8、H=512、topk=2、T=128，`config=` 指定 prefill 档，同上的分派与逐位检查）：Down K=64（1 个 K core，预取取 min(2, 1)）+ Gate/Up BK256（共 2 个 K tile，只在序言预取）；Down K=128（2 个 K core，下一 N tile 的全部 K core 在本 tile 内发出、跨 N 循环携带）+ BK128（4 个） | P3::test_prefetch_two_with_few_k_tiles（2 个） | 功能 | 通过 |
+| 预取 2 步：TP4 的 Down K=192（3 个 K core）；32 行 tile 的 Gate/Up 在 2 个 K tile（H=512、BK256）上 | PF::test_prefill_matches_reference[tp4-*]（4 个）；PE::test_prefill_min_hidden_max_inter（其路由里专家 1 有 91 行，末块 27 行） | 功能 | 通过（已有用例，未重复） |
+| FlyDSL 按行量化与参考 `quantize_rows` 的 q、scale 逐位相同：宽度 2560（输入，64 lane）、320 / 192（TP2 / TP4 的中间结果，8 lane）、256 / 128（32 / 16 lane）× 行数 1、10、33、1027（不是每块 4 / 32 行的倍数）；+0 / −0 全零行（scale=0）、±BF16 最大值行、amax=240 时的 FP8 中点（就近偶数）与次正规数、每行量级 2^-20–2^20 的随机行；直接启动时最后一块越过 `rows` 的行不写 q / scale | P3::test_quant_rows_matches_reference_bitwise（5 个） | 功能 | 通过 |
+| `quant="aiter"`（M2 的 aiter 量化，现在只经 `config=` 可达）：TP2 T=256 | P3::test_quant_aiter_option | 功能 | 通过 |
+| 默认配置（half_m、预取 2、FlyDSL 量化）的端到端：T=129 几乎全是 32 行块，T=1024 以 32 行块为主，T=8192 / 65536 两种块都多；CUDA graph（T=1024）、表外 tile、小 T（1、51、52）、最小 H / 最大 I | PF、PE 全部 21 个（M2 的用例，未改） | 功能 | 通过 |
+| 性能：本里程碑的 regime 是 prefill 档每专家约 20 行（TP2 / TP4 T=1024，几乎都是 32 行块）；T=8192 / 65536（两种块混合）与 decode 的 10 个 case 作回退检查 | bench_moe_a8w4_ptpc.py `--mf`（mf verify V2，同卡 ABBA 4 对） | 性能 | tp2_t1024 1.375×、tp4_t1024 1.405×，T=8192 / 65536 1.10–1.19×，没有超过 2% 的回退（§2） |
+| 全部功能用例（含 M0–M2） | task.json 正确性命令 | 功能 | 1404 通过 / 733 跳过 / 191 deselected（复核，`runs/20261121-195400-_task-run-a129`；M2 为 1394，加上 P3 的 10 个） |
+
+**M3 未覆盖 / 跳过**：
+- Gate/Up 走哪条 tile 路径从输出看不出来（两条都只按 token 写有效行）：P3 靠构造让两种块都出现，并与 M2 路径逐位比较；Down 的路径逐块断言。
+- half_m 依赖 aiter `moe_sorting` 把补齐放在每个专家末块的末尾：P3 断言了这一点，换排序实现时要重查。
+- 只在 BM=64 测（配置表只有 64）：BM=128 / 256 的 half_m、32 行 tile 配 `prefetch_gate=1`、`prefetch_down` ≥ 3 只经 `compile_prefill_gemm` 可达，未测。
+- 量化：amax 小到 scale 成为 fp32 次正规数（|x| 约 1e-36 以下）时 1/scale 溢出、NaN / Inf 输入、`cols % 8 ≠ 0` 的 `AssertionError` 都未测（生产宽度都满足）；P3 不在 RTE 下复跑（M3 没改 BF16 舍入）。
+- 不均匀路由（少数专家占满）下 half_m 的收益没测；性能只有 bench 的 16 个 case。
+- 冗余（不删）：PF::test_prefill_matches_reference[tp*-t129] 几乎全是 32 行块，与 P3::test_half_m_dispatch_boundary 的“只算前 32 行”一侧部分重复。
+
 ```bash
-python -m pytest -q tests/ops/moe/a8w4_ptpc                                         # 本任务的 178 个用例（M0 128 个 + M1 29 个 + M2 21 个）
+python -m pytest -q tests/ops/moe/a8w4_ptpc                                         # 本任务的 188 个用例（M0 128 个 + M1 29 个 + M2 21 个 + M3 10 个）
 python -m pytest -q tests/ops/moe/a8w4_ptpc/test_moe_gemm_2stage_upstream.py        # 只测分流与适配
 python -m pytest -q tests/ops/moe/a8w4_ptpc/test_a8w4_decode.py tests/ops/moe/a8w4_ptpc/test_a8w4_decode_edges.py  # 只测 M1 的 A8W4 decode（约 30 s）
 python -m pytest -q tests/ops/moe/a8w4_ptpc/test_a8w4_prefill.py tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_edges.py  # 只测 M2 的 A8W4 prefill（约 35 s）
+python -m pytest -q tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_m3.py                 # 只测 M3 新增的 half_m 分派、预取 2 步与 FlyDSL 按行量化（约 25 s）
 AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=0 python -m pytest -q tests/ops/moe/a8w4_ptpc  # RTE 下复跑
 python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf                                   # 性能：MF_METRIC / REF 行
 ```
@@ -308,6 +351,7 @@ python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf                               
 - M1、M2（11-21 用户；都是功能里程碑，计划里不承诺性能）：decode 档保持 BF16 激活、mxfp4 权重精确展开成 BF16（W4A16）；prefill 档激活按 token 量化成 FP8、mxfp4 经 fd2 解码成 FP8（A8W4）；中间结果按 token 量化。交界跟随配置表，当前为 T=128/129（decode 档 T≤128，prefill 档 T≥129），由调优决定，M1、M2 调优后可能移动（用户 11-21 确认）。依据：沿用 M0 各档的数据流（decode 读 BF16 激活，prefill 两级输入按 token 量化成 FP8），只把 FP8 权重换成 mxfp4；gfx942 没有 FP4 MFMA，prefill 先解码成 FP8 再走 FP8 MFMA。
 - M1：w1 字节排列暂不改，M1、M2 沿用 fd2 排列（编排者在用户 11-21 授权期内按默认值决定，记为性能阶段假设 H1）；fp4 展开用 PR #64 的 fd2 查表，没用上游 a16wmix 的 A16W4 解码；split-K 仍用 aiter `moe_sorting`（沿用 M0 的用户决定）。见 §7。
 - M2（编排者在用户 11-21 授权期内按默认值决定 / 追认）：Down 一律 1x4，TP4 T>8192 的 compact 推迟到性能阶段；prefill 需要的 delta 排列在 `MXFP4Weights` 另存（`w1_pdelta` / `w2_pdelta`），M1 字段不变；Gate/Up BK 一律 128；Down 固定 BLOCK_K=64，去掉上游的延迟写出与 task table，只保留 ptpc + SiLU；prefill 排序 `accumulate=False`；删除 M1 的 `test_prefill_tier_not_implemented`；bench `--check` 超出容差也返回 1。prefill 的 aiter 排序、按 token 量化依赖沿用用户在 M0 重做时的决定。见 §7。
+- M3：保留 M64 排序、在块内切换 32 / 64 行 tile，没做 M32 排序或 Down 另排一次（实现者；冻结的用例要求两级 BM 等于 `tile_m`、Down 拒绝 BM=32）；prefill 的按行量化改用 FlyDSL kernel（计划外，编排者在用户授权期内按默认值追认）。编排者在用户 11-21 授权期内按默认值决定：931 行的改动不拆成两个里程碑；本轮不移动 decode/prefill 交界（冻结 bench 按配置表的 decode 档决定是否 graph 计时）。死路（L1，mf deadend）：解码提前一个 tile、纯 M32 网格拆分、Down 预取 3 / 4 步、激活提前读 LDS、跳过补齐行的写出、行因子标量化、M32 调度提示重配。见 §7。
 
 ## 6. 深度参考
 - [M0 深度参考](m0_upstream_replacement.md)：补充术语与 Qwen3.8 配置全表、逐文件相对上游的改动、与上游的行为差异、分流规则全表（B1–B29）、覆盖项全表（63 项）、测量来源。
@@ -317,6 +361,62 @@ python benchmarks/moe/bench_moe_a8w4_ptpc.py --mf                               
 - 原始数据在 myflow 任务目录（不在仓库）：`runs/20261121-094917-_task-run-8e2d/out.log`（替换前后与 RTE / RTA 轮换）、`runs/20261121-104005-_task-run-7733/out.log`、`runs/20261121-104604-_task-run-af22/out.log`、`runs/20261121-105710-_task-run-57d8/out.log`（`bench_tuned_moe` 筛查、复测、同一调优配置复测）、`runs/20261121-101211-_task-run-bebe/out.log`（实现者 bench 自测）。M1：`runs/20261121-150631-_task-run-5bce/out.log`（实现者 bench `--mf --check`）、`runs/20261121-151652-_task-run-6b75/out.log`（预热时长对比）、`runs/20261121-151331-_task-run-ebce/out.log`（profiler 分 kernel 计时）、`runs/20261121-151434-_task-run-bd4c/out.log`（10 种 decode tile 扫描）、`runs/20261121-154453-_task-run-213c/out.log`（复核跑的正确性命令）。M2：`runs/20261121-163935-_task-run-61df/out.log`（实现者 bench `--mf --check`）、`runs/20261121-163005-_task-run-1319/out.log`（Gate/Up BK128 / 256 对比）、`runs/20261121-164157-_task-run-1240/out.log`（profiler 分 kernel 计时）、`runs/20261121-163438-_task-run-cdf8/out.log`（手动变异）、`runs/20261121-171053-_task-run-7755/out.log`（复核跑的正确性命令）、`runs/20261121-171057-_task-run-48ee/out.log`（复核：RTE 下的 prefill 用例）、`runs/20261121-170845-_task-run-0d5c/out.log`（复核：H=256 的 prefill 在 `sorted_sum` 报错）。
 
 ## 7. 里程碑（最新在上）
+
+### M3 · T=1024 prefill 追上 aiter_ptpc（TP2/TP4）
+**做了什么**
+- half_m（两级）：Gate/Up（[L702](prefill.py#L702)）与 Down（[L1108](prefill.py#L1108)）读排序块第 33 行（`sorted_ids[32]`），是补齐行就跑同一 tile 代码的 32 行版本（[`_gateup_tile`](prefill.py#L532)、[`_down_tile`](prefill.py#L799)），Down 也只写这 32 行；排序与编译参数仍是 M64。
+- 预取加深：Down 权重提前 2 个 K core（[L957](prefill.py#L957)，跨 N tile 携带），下一 N tile 的 ptpc scale 改在 K core 0 发出（[L990](prefill.py#L990)）；32 行 tile 的 Gate/Up fp4 权重提前 2 个 K tile（[L409–L451](prefill.py#L409)），64 行 tile 仍 1 个。
+- 新增 FlyDSL 按行 FP8 量化 [`compile_prefill_quant`](prefill.py#L1295)（[kernel](prefill.py#L1192)），经 [`_quantize_rows`](moe.py#L126) 替代 aiter `get_hip_quant(per_Token)`；[`CONFIGS`](moe.py#L32) prefill 行加 `half_m=True, prefetch_gate=2, prefetch_down=2, quant="fly"`，`compile_prefill_gemm` 加 `half_m`、`prefetch`（§3.2）。
+- 实现者只改 `prefill.py`、`moe.py`，未改用例；复核新增 [test_a8w4_prefill_m3.py](../../../../../../tests/ops/moe/a8w4_ptpc/test_a8w4_prefill_m3.py)（10 个，§4）。
+
+**为什么**
+- 瓶颈（L1 报告）：T=1024 均匀路由每专家约 20 行，M64 排序块约 2/3 的 MFMA 与 Down 写出落在补齐行；aiter_ptpc 此时走 M32 的 1-stage ASM（`fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_ps_32x320` / `_32x192`）；中间结果的 aiter 量化 + `sorted_sum` + invert 约 50 µs 是 aiter 没有的。
+- 改法：后半全补齐的块 MFMA 与写出减半；32 行 tile 每个权重的 MFMA 少、受 HBM 延迟限制，预取 2 步隐藏延迟；量化 kernel 使 T=1024 中间结果的量化 18.9→4.6 µs（L1 自测）。
+- 正确：排序把补齐放在每个专家末块的末尾，第 33 行是补齐则后 32 行都是；分派与预取不改变每个输出元素的运算顺序，与 M2 路径逐位相同（新用例断言）。量化算术同参考 `quantize_rows`（精确倒数，q / scale 逐位相同）；aiter 乘近似倒数、个别值差 1 个 FP8 步长，所以输出与 M2 不逐位相同，对 FP32 参考仍满足 M0 容差（A6 `bench --mf --check` 的 a8w4 logits_diff ≤ 9.9e-6，限 1e-3，`runs/20261121-191253-L1-run-3f52`）。
+- 效果（mf 复核 V2，§2）：tp2_t1024 553.8→403.0 µs（1.375×）、tp4_t1024 399.8→284.2 µs（1.405×），为冻结时 aiter_ptpc（465.6 / 337.9 µs，`plan.md`）的 0.866 / 0.841，达到每 case ≤1.053×；T=8192 / 65536 也快 1.10–1.19×。
+
+kernel（`[M3]` 标出相对 M2 的改动；伪代码只列改动所在的阶段）：
+```text
+# Gate/Up：prefill.py L648（M2：同一 kernel 只有 64 行 tile）
+if blockIdx.y·64 ≥ num_valid: return; sorted_lds[0:64] ← 本块 sorted_ids; barrier       —— 同 M2
+[M3] second ← readfirstlane(sorted_lds[32]); tile_m ← 64 if (second & 0xFFFFFF) < M else 32   # L702–L711
+_gateup_tile(tile_m)：gemm_1x4 → 反量化 → SiLU·up → BF16 → CShuffle → 按 token 写 mid               # L532
+gemm_1x4(tile_m)：                                                                                   # L204
+  [M3] B_AHEAD ← 2 if tile_m == 32 else 1                                                           # L592
+  prologue：A[0] → 寄存器、B[0] → 槽 0；[M3] B_AHEAD=2 时再读 B[1] → 槽 1；A → LDS ping；barrier     # L448–L454
+  stage(read, next)：                                                                               # L408
+    发起 A[next]；B_AHEAD=1 时 B[next] → 槽 1-read（同 M2）
+    decode_b(read)：槽 read 的 fp4 → FP8 fragment
+    [M3] B_AHEAD=2：解码后立即用同一槽读 B[next+1]（提前 2 个 K tile，不增寄存器）               # L417
+    MFMA；A[next] → LDS[1-read]；hot_loop_scheduler；barrier                                     —— 同 M2
+# Down：prefill.py L1035（M2：同一 kernel 只有 64 行 tile）
+gather 64 行 FP8 中间激活进 LDS; barrier                                                           —— 同 M2
+[M3] tile_m ← 32 if sorted_ids[32] 是补齐行 else 64                                               # L1108–L1125
+_down_tile(tile_m)：MFMA、行系数、CShuffle、写 routes 都只覆盖前 tile_m 行                          # L799
+[M3] pf ← min(2, K/64)；prologue 读 N tile 0 的前 pf 个 K core（M2：1 个）                          # L957
+for n in range(N/256)：循环携带下一 N tile 前 pf 个 K core 的 nibble + delta 与 scale             # L1013
+  [M3] 先发出下一 N tile 的 ptpc scale（M2：最后一个 K core 才发）                                 # L990
+  for k in range(K/64)：读第 k+pf 个 K core 的权重（越过本 tile 就读下一 N tile 的）；decode(k)；MFMA
+  × scale × 行系数 → BF16 → CShuffle → 写 tile_m 行                                                —— 同 M2
+# [M3] 按行量化：prefill.py L1192（替代 aiter get_hip_quant，输入与中间结果各一次）
+lanes ← min(64, cols/8 的最大 2 的幂因子)；每行 lanes 个线程，每个 CTA 256/lanes 行                  # L1178
+每 lane 每步读 16 B（8 个 BF16），取 |x| 的最大值；shuffle_xor 归约成行 amax                         # L1226
+scale ← amax·fp32(1/240)；inv ← scale==0 ? 0 : 1/scale；q ← cvt_fp8(clamp(x·inv, ±240))；lane 0 写 scale
+```
+
+**与计划 / 上游的差异**
+- 计划“M32 Gate/Up（配套 Down 或另排一次）”→ 实际保留 M64 排序、块内切到 32 行 tile：冻结的用例要求两级的 `BLOCK_TILE_SIZE_M` 都等于配置的 `tile_m`（PF 的 `_expected_compiles`），且 `compile_prefill_gemm(stage="down", BLOCK_TILE_SIZE_M=32)` 必须报错（PF::test_compile_prefill_gemm_cached_per_device）；L1 同进程测得纯 M32 kernel 只再快 2.5%–3%。
+- 运行时对 aiter 的依赖减少：prefill 的按行量化默认不再用 aiter（`quant="aiter"` 可切回 M2 的做法），排序仍用 aiter `moe_sorting`；SPEC §5“运行时不依赖 aiter”仍未满足，沿用用户在 M0 重做时的决定。
+- 计划外（编排者在用户授权期内按默认值追认）：量化 kernel 不在计划的方向里；`moe.py` 的改动超出计划写的“配置表的 prefill 行”（新增 `_quantize_rows`，`_fused_moe_prefill` 按配置选量化、传 `half_m` / `prefetch`）。
+- 规模：增删合计 931 行（+568/−363，多为两级 kernel 拆出 `_gateup_tile` / `_down_tile` 的缩进），超 800 行上限；编排者在用户授权期内按默认值不拆（mf 记录）。
+- 与上游：上游 1x4 kernel 没有块内 32 / 64 行分派，Down 只预取 1 个 K core（[prefill.py 文件头](prefill.py#L1)）。
+
+**已知问题**
+- 本轮不移动 decode/prefill 交界（编排者在用户授权期内按默认值决定）：L1 自测（graph 计时，同进程 A/B）M3 后 prefill 档在 T=32..128 也比 decode 档快，TP2 快 9%–14%（T=32/64/128 为 0.911/0.898/0.860），TP4 为 1.001/0.977/0.931；不移动是因为冻结的 bench 按配置表的 decode 档决定是否用 graph 计时，移动会改变计时口径。留作后续（还涉及 W4A16→A8W4 的数值变化）。
+- compact Down（TP4 T>8192）仍推迟；prefill 档的形状限制 `H % 512 == 0`、补零后 I ≤ 832 不变（M2 已知，§3.6 第 11 条）。
+- Gate/Up 每个配置编译 32、64 行两条 tile 路径（编译时间约翻倍，VGPR 取 64 行路径的 118，L1 报告）；half_m 依赖 aiter `moe_sorting` 把补齐放在每个专家末块的末尾（kernel 只看第 33 行）。
+- `config=` 缺新键时按 M2 行为（`half_m=False`、预取 1、aiter 量化）；`quant` 不是 `"fly"` 的值都走 aiter，不报错。
+- verify 里 tp2_t16 为 0.983×（噪声 ±5.3%，decode 代码 M3 未改，在每 case 2% 回退门限内；L1 交替 6 轮中位 0.993）。
 
 ### M2 · A8W4 prefill：fd2 解码接入 FP8 MFMA（配置表 prefill 档，当前 T≥129）
 **做了什么**
