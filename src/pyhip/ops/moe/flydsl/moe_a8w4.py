@@ -16,6 +16,14 @@ import torch
 
 MAX_DELTA = 11
 _PAD_I = 64
+# Token counts up to this use the decode kernels (no sorting, one workgroup per route / token).
+DECODE_MAX_M = 32
+# The decode path quantizes activations in separate row kernels instead of inside every workgroup:
+# Down's intermediate rows from DECODE_PREQUANT_MIN_M tokens on, Gate/Up's token rows from
+# DECODE_GATEUP_PREQUANT_MIN_WGS Gate/Up workgroups (M * topk * I / 16) on.
+DECODE_PREQUANT_MIN_M = 4
+DECODE_GATEUP_PREQUANT_MIN_WGS = 2560
+DECODE_DOWN_PQ_WAVES = 3
 
 # Kernels launched by the most recent ``fused_moe_a8w4`` call, in order. Kernels of the A8W4 op are
 # named ``a8w4_*`` (FP8 activations) or ``a16w4_*`` (BF16 activations); tests pick the reference by it.
@@ -130,6 +138,64 @@ def _down_kernel(N, K, topk, block_m, experts):
     return compile_a8w4_gemm2(N=N, K=K, TOPK=topk, BLOCK_TILE_SIZE_M=block_m, E=experts)
 
 
+@functools.cache
+def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq):
+    from .moe_gemm_2stage.a8w4_decode import (compile_a8w4_down_decode, compile_a8w4_down_decode_pq,
+                                              compile_a8w4_gateup_decode)
+
+    gateup = compile_a8w4_gateup_decode(N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq)
+    if down_pq:
+        # More tokens: 16-byte loads of slot pairs, DECODE_DOWN_PQ_WAVES waves with pairs in rounds.
+        return gateup, compile_a8w4_down_decode_pq(N=H, K=I, TOPK=topk,
+                                                   WAVES=min((topk + 1) // 2, DECODE_DOWN_PQ_WAVES))
+    # Few tokens (latency bound): one wave per routing slot.
+    return gateup, compile_a8w4_down_decode(N=H, K=I, TOPK=topk, WAVES=topk if topk <= 16 else 4)
+
+
+def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output):
+    M, H = hidden_states.shape
+    topk = topk_ids.shape[1]
+    I = weights.inter_padded
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+    if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
+        topk_weight = topk_weight.to(torch.float32).contiguous()
+    # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
+    gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
+    # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets.
+    down_pq = M >= DECODE_PREQUANT_MIN_M and weights.w2.numel() * weights.w2.element_size() < 2**32
+    gateup, down = _decode_kernels(2 * I, H, I, topk, gateup_pq, down_pq)
+    mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
+    if gateup_pq:
+        xq, xs = _quantize_decode(hidden_states, M, H, True)
+    else:
+        xq, xs = hidden_states, topk_weight
+    _launch("a8w4_gateup_decode" + ("_pq" if gateup_pq else ""), gateup, xq, xs, topk_ids, weights.w1,
+            weights.w1_delta, weights.w1_scale, mid, M)
+    if down_pq:
+        mq, ms = _quantize_decode(mid, M * topk, I, False)
+    else:
+        mq, ms = mid, topk_weight
+    _launch("a8w4_down_decode" + ("_pq" if down_pq else ""), down, mq, ms, topk_ids, topk_weight, weights.w2,
+            weights.w2_delta, weights.w2_scale, output, M)
+    return output
+
+
+@functools.cache
+def _row_quant_decode(cols, bf16):
+    from .moe_gemm_2stage.a8w4_decode import compile_a8w4_row_quant
+
+    return compile_a8w4_row_quant(COLS=cols, BF16=bf16)
+
+
+def _quantize_decode(x, rows, cols, bf16):
+    """``_quantize`` with the decode path's vectorized kernel (same arithmetic, bit-identical)."""
+    q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
+    scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
+    _launch("a8w4_row_quant_decode", _row_quant_decode(cols, bf16), x, q, scale, rows)
+    return q, scale
+
+
 def _quantize(x, rows, cols, dtype):
     from .moe_gemm_2stage.a8w4_quant import compile_row_quant_fp8
 
@@ -185,6 +251,8 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     if output is None:
         output = torch.empty_like(hidden_states)
     last_path.clear()
+    if M <= DECODE_MAX_M:
+        return _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output)
 
     sorted_ids, sorted_weights, sorted_experts, num_valid, _, _, loc_ids = moe_sorting(
         topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False,

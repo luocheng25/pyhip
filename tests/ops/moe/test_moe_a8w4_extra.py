@@ -4,7 +4,12 @@
 每个测试的 docstring 写明原因。端到端判据与基本测试相同（``pyhip.testing.moe_a8w4.check``，
 参考的激活精度按实际启动的 kernel 选择）；逐位用例要求 0 误差。空 expert、部分填充的尾块、
 多块 expert 与 I=160→192 补零已由基本测试覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
+M≤32 的 decode 路径：核内量化（M=3）由基本测试、M=1 / 16 的三种分派由 bench 覆盖，这里只测分派交界、
+topk 与路由输入的变体、CUDA graph、decode 行量化逐位与 w2≥4 GiB 回退（用例名带 ``decode``）。
 """
+
+import dataclasses
+import functools
 
 import pytest
 import torch
@@ -13,6 +18,12 @@ from pyhip.ops.moe.flydsl import moe_a8w4
 from pyhip.testing import moe_a8w4 as oracle
 
 HIDDEN, TOPK = 2560, 11
+# decode 三种分派（x、mid 是否先用独立 kernel 预量化）实际启动的 kernel 序列。
+_DECODE_PATHS = {
+    "nn": ["a8w4_gateup_decode", "a8w4_down_decode"],
+    "np": ["a8w4_gateup_decode", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
+    "pp": ["a8w4_row_quant_decode", "a8w4_gateup_decode_pq", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
+}
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +53,13 @@ def _run(w, prepared, x, topk_weight, topk_ids, **options):
     ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids,
                            activation=mode)
     return out, ref
+
+
+@functools.cache
+def _decode_weights(inter):
+    """decode 用例共用的 E=33 权重（按 I 缓存：生成一份约 3 秒）。"""
+    w = oracle.make_weights(33, HIDDEN, inter, seed=inter)
+    return w, _prepare(w)
 
 
 def test_grid_shrink_boundary_e513():
@@ -249,3 +267,137 @@ def test_rejects_bad_inputs():
     for inter in (320, 192):
         with pytest.raises(AssertionError, match="4096"):
             compile_a8w4_gemm2(N=HIDDEN, K=inter, TOPK=TOPK, BLOCK_TILE_SIZE_M=32)
+
+
+@pytest.mark.parametrize("inter, tokens, path", [
+    (320, 4, "np"), (320, 11, "np"), (320, 12, "pp"), (320, 32, "pp"), (320, 33, "prefill"),
+    (160, 19, "np"), (160, 20, "pp"),
+], ids=["tp2_m4", "tp2_m11", "tp2_m12", "tp2_m32", "tp2_m33", "tp4_m19", "tp4_m20"])
+def test_decode_dispatch_boundaries(inter, tokens, path):
+    """decode 分派各交界的端到端结果与实际 kernel 序列：M=4（Down 改用预量化槽对 kernel；M=3 一侧是基本测试）、
+    TP2 M=11/12 与 TP4 M=19/20（Gate/Up 的 WG 数 M·topk·I/16 跨过 2560，改读预量化的 x）、M=32/33（改走排序 prefill）。
+
+    基本测试的 decode 只有 M=3，bench 只有 M=1、16：TP2 的 Down 预量化、TP4 的全预量化与这些交界都碰不到。
+    """
+    w, prepared = _decode_weights(inter)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=90 + tokens)
+    out, ref = _run(w, prepared, x, topk_weight, topk_ids)
+    if path == "prefill":
+        assert moe_a8w4.last_path[0] == "moe_sorting_opus"
+    else:
+        assert moe_a8w4.last_path == _DECODE_PATHS[path]
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("topk, tokens, path", [(8, 16, "pp"), (17, 2, "nn")], ids=["topk8_m16", "topk17_m2"])
+def test_decode_topk_variants(topk, tokens, path):
+    """topk≠11：topk=8 是偶数，槽对 Down 3 个 wave 两轮、第二轮两个 wave 的槽对整对无效，且 M=16 时 Gate/Up 恰为
+    2560 个 WG（按 >= 走预量化）；topk=17 大于 16，核内量化的 Down 改为 4 个 wave 轮流取槽，末轮 3 个槽无效。
+
+    基本测试与 bench 都是 topk=11：槽对只有末对缺高半，核内量化的 Down 每个槽一个 wave。
+    """
+    w, prepared = _decode_weights(320)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, topk, seed=94 + topk)
+    out, ref = _run(w, prepared, x, topk_weight, topk_ids)
+    assert moe_a8w4.last_path == _DECODE_PATHS[path]
+    oracle.assert_close(out, ref)
+
+
+def test_decode_duplicate_and_int64_ids():
+    """同一 token 的几个槽选同一 expert（含同一槽对的两半），topk_ids 为 int64 且不连续、topk_weight 不连续（M=5）：
+    decode 路径在 host 侧转成连续的 int32 / f32 再 launch。
+
+    输入生成的路由互不重复，且是连续的 int32 / f32：基本测试与 bench 都碰不到。
+    """
+    w, prepared = _decode_weights(320)
+    tokens = 5
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=96)
+    topk_ids[:, 1] = topk_ids[:, 0]
+    topk_ids[:, 4] = topk_ids[:, 0]
+    ids = torch.empty((tokens, 2 * TOPK), dtype=torch.int64)[:, ::2]
+    ids.copy_(topk_ids)
+    weights = torch.empty((tokens, 2 * TOPK))[:, 1::2]
+    weights.copy_(topk_weight)
+    assert not ids.is_contiguous() and not weights.is_contiguous()
+    out, ref = _run(w, prepared, x, weights, ids)
+    assert moe_a8w4.last_path == _DECODE_PATHS["np"]
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("tokens, path", [(1, "nn"), (5, "np"), (16, "pp")], ids=["m1_nn", "m5_np", "m16_pp"])
+def test_decode_graph_replay(tokens, path):
+    """decode 路径的三种分派都可被 CUDA graph 捕获并重放：重放读到新写入的输入（路径内分配的 xq / mid / mq 由 graph 持有）。
+
+    基本测试与 bench 都是 eager 调用；test_graph_replay 的 M=64 走 prefill。
+    """
+    w, prepared = _decode_weights(320)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=97 + tokens)
+    out = torch.empty_like(x)
+    moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)  # 在捕获外编译
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
+    assert moe_a8w4.last_path == _DECODE_PATHS[path]
+    x2, topk_weight2, topk_ids2 = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=98 + tokens)
+    x.copy_(x2)
+    topk_weight.copy_(topk_weight2)
+    topk_ids.copy_(topk_ids2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = oracle.reference(x2, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight2, topk_ids2,
+                           activation="fp8")
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("dtype, cols", [("f32", 192), ("f32", 320), ("f32", 640),
+                                         ("bf16", 1024), ("bf16", 2560), ("bf16", 4096)])
+def test_decode_row_quant_bitexact(dtype, cols):
+    """decode 路径的行量化 kernel 与 a8w4_quant、参考逐位一致（q 字节与 scale 位），且不写 rows 以外的行。
+
+    特殊行：全零、amax/240 下溢成 0（scale 取 1，只有 f32 能表示）、次正规 scale、-0 与舍入成 -0 的负数（存 +0）；
+    f32 192 / 320 / 640 列每行 48 / 80 / 160 个 16 B 片（末轮不满 64 片），bf16 1024 / 2560 / 4096 列；
+    37 行（最后一个 WG 只有 1 行，其后 3 行不得被写）。端到端判据看不出少量 fp8 翻转，基本测试与 bench
+    只有 192 / 320 / 2560 列的随机数据。
+    """
+    rows, guard = 37, 3
+    gen = torch.Generator(device="cuda").manual_seed(83)
+    x = torch.randn((rows, cols), generator=gen) * 3
+    x[1].zero_()
+    x[2].zero_()
+    x[2, 7] = 1e-45
+    x[3] *= 1e-38
+    x[4].zero_()
+    x[4, 0] = 200.0
+    x[4, 1:9] = -1e-6
+    x[4, 9] = -0.0
+    x = x.to(torch.bfloat16) if dtype == "bf16" else x
+    q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
+    scale = torch.full((rows + guard,), -1.0)
+    moe_a8w4._launch("a8w4_row_quant_decode", moe_a8w4._row_quant_decode(cols, dtype == "bf16"), x,
+                     q.view(torch.float8_e4m3fnuz), scale, rows)
+    assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
+    q0, scale0 = moe_a8w4._quantize(x, rows, cols, dtype)
+    assert torch.equal(q[:rows], q0.view(torch.uint8))
+    assert torch.equal(scale[:rows].view(torch.int32), scale0.view(torch.int32))
+    xf = x.float()
+    amax = xf.abs().amax(-1, keepdim=True)
+    ref_scale = amax / torch.full_like(amax, 240.0)
+    ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
+    assert torch.equal(scale[:rows].view(-1, 1), ref_scale)
+    assert torch.equal(q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8))
+
+
+def test_decode_down_fallback_w2_4gib():
+    """w2 总字节数 >= 4 GiB 时，Down 不用预量化槽对 kernel（它用 32 位字节偏移寻址全部 expert），改走单槽核内量化 Down。
+
+    真实 4 GiB 权重太大：用 stride 0 的视图让 w2 报告 2^32 字节（数据指针不变，kernel 只按指针与 expert 偏移读），
+    验证 M=16 时的分派与单槽 Down 的结果；基本测试、bench 与其余用例的 w2 都远小于 4 GiB。
+    """
+    w, prepared = _decode_weights(320)
+    big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(1 << 32))
+    x, topk_weight, topk_ids = oracle.make_inputs(16, HIDDEN, 33, TOPK, seed=99)
+    out, ref = _run(w, big, x, topk_weight, topk_ids)
+    assert moe_a8w4.last_path == ["a8w4_row_quant_decode", "a8w4_gateup_decode_pq", "a8w4_down_decode"]
+    oracle.assert_close(out, ref)

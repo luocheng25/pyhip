@@ -1,11 +1,11 @@
 """A8W4 MoE（FP8 激活 × MXFP4 权重）基本功能测试：公开入口每个分档一例。
 
-每次小改动先跑本文件。``prepare_a8w4_weights`` + ``fused_moe_a8w4`` 跑完整调用（排序、
-激活量化、Gate/Up、中间量化、Down、规约），与独立 FP32 参考比较（``pyhip.testing.moe_a8w4``
+每次小改动先跑本文件。``prepare_a8w4_weights`` + ``fused_moe_a8w4`` 跑完整调用（M≤32 走免排序的 decode
+路径；更大的 M 走排序、激活量化、Gate/Up、中间量化、Down、规约），与独立 FP32 参考比较（``pyhip.testing.moe_a8w4``
 的判据：calc_diff <= 1e-3 且 max|out-ref| <= 2%·max|ref|，无 NaN/Inf），参考的激活精度按
 算子实际启动的 kernel 选择，并断言确实启动了 A8W4 / A16W4 kernel。H=2560、topk=11，最后一个
 expert 是每个 token 必选的融合 shared expert；E 缩到 33 以控制参考耗时：TP2（I=320）的小 M
-（M·topk = E）与大 M（多块与尾块）、TP4（I=160，prepare 补零到 192）各一例。
+（M=3，decode 路径在 kernel 内量化激活）与大 M（多块与尾块）、TP4（I=160，prepare 补零到 192）各一例。
 其余覆盖见 test_moe_a8w4_extra.py。
 """
 
