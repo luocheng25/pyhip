@@ -1,7 +1,7 @@
 # MoE PTPC A8W4（Qwen3.8-Flash-Next，MI308X）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-22 05:42）· 目标：pyhip 新增 MoE 算子：bf16 激活按 token 量化成 fp8、权重 mxfp4；功能正确，decode 接近访存上限、prefill 接近算力上限（TP2/TP4 单卡形状）（1.094× 相对冻结基线）· 已完成 8 个里程碑（含本提交 M7） · 最佳累计 1.322× · 下一步：写报告
+> 由 mf 生成（11-22 08:54）· 目标：pyhip 新增 MoE 算子：bf16 激活按 token 量化成 fp8、权重 mxfp4；功能正确，decode 接近访存上限、prefill 接近算力上限（TP2/TP4 单卡形状）（1.094× 相对冻结基线）· 已完成 9 个里程碑（含本提交 M8） · 最佳累计 1.322× · 下一步：写报告
 <!-- /mf:summary -->
 
 ## 1. 目标与范围
@@ -48,6 +48,7 @@ for k in range(K / BK):                          # BK=128；A 经 LDS ping/pong�
 # prefill Down 1x4：CTA = 64 排序行 × 全部 H 列（N 循环 H/256 次），4 个 wave 沿列，half_m 同上；FP8 mid 先 gather 进 LDS
 # 每步 fd2 解码 + FP8 MFMA，权重提前 2 个 64-K 块读并跨 N tile 携带；× 因子 × 行系数后每个排序行写一行
 ```
+prefill 两个 1x4 kernel 的完整任务划分与逐拍流水线见 [kernels.md](kernels.md)。
 
 ## 3. 关键决策
 核心取舍：decode 保住激活精度、按访存优化；prefill 用 FP8 MFMA 吃算力，fp4 在寄存器里精确解码。
@@ -152,6 +153,7 @@ for k in range(K / BK):                          # BK=128；A 经 LDS ping/pong�
 ## 7. 进一步阅读
 - 代码入口：[`fused_moe`](moe.py#L85)、配置表 [`CONFIGS`](moe.py#L36)（注释里有各档选择的实测依据）、[`prepare_weights`](weights.py#L130)。
 - 格式与 kernel：[weights.py 模块说明](weights.py#L1)（fd2 与精确性论证）；[decode.py](decode.py#L1)、[prefill.py](prefill.py#L1) 文件头（相对上游的改动）。
+- kernel 设计（任务划分与流水线）：[kernels.md](kernels.md)
 - 接口细节：[`compile_decode_gemm`](decode.py#L1459)、[`compile_prefill_gemm`](prefill.py#L1266) 的 docstring（launcher 参数、可选 tile）。
 - 上游替换：[深度参考](m0_upstream_replacement.md)（`tuned_moe` FP8 接口与调用链、同名文件改动、分流规则、已知限制）。
 - 用例与 bench：[tests/ops/moe/README.md](../../../../../../tests/ops/moe/README.md)、[benchmarks/moe/README.md](../../../../../../benchmarks/moe/README.md)。
@@ -165,7 +167,8 @@ for k in range(K / BK):                          # BK=128；A 经 LDS ping/pong�
 - M4 ✅ 已推送 · 性能 · TP2 T=16 decode 追上 aiter_ptpc（假设 H1：w1 … · 1.074× 对 M3（预期 1.05×） · [提交](https://github.com/luocheng25/pyhip/commit/5c562dc418d5cf405015786fdd938e43756a6e8c)
 - M5 ✅ 已推送 · 维护 · 入口文档按最终结果更新（顶部摘要、各档路径一览、M4 标题更正） · [提交](https://github.com/luocheng25/pyhip/commit/f48b61744b2383f7827ba3da5bbd2d1746b57225)
 - M6 ✅ 已推送 · 维护 · 入口文档补“基线与对照的来源”，并按篇幅预算收拢 · [提交](https://github.com/luocheng25/pyhip/commit/4c0c98887e7e002d4525e33d935badf344ceeef6)
-- M7 ✅ 本提交 · 维护 · 入口文档按设计文档标准重写（给 tech lead 的设计说明）
+- M7 ✅ 已推送 · 维护 · 入口文档按设计文档标准重写（给 tech lead 的设计说明） · [提交](https://github.com/luocheng25/pyhip/commit/a3823d2c353686ca6aa80d9fbdf5cd090009d5bd)
+- M8 ✅ 本提交 · 维护 · 补 A8W4 prefill 1x4 的 kernel 设计说明（kernel…
 
 下一步（本提交的承诺）：写报告
 <!-- /mf:roadmap -->
