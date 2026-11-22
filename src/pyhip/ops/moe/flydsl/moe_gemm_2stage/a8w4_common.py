@@ -32,6 +32,7 @@ from .common import BufferTensor
 
 W_BLOCK_BYTES = 512
 D_BLOCK_BYTES = 128
+LDS_BYTES = 64 * 1024  # LDS of one workgroup on gfx942
 
 
 def delta_dwords(K):

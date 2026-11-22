@@ -51,6 +51,24 @@ _MAX_DELTA = 11  # largest delta stored by prepare_a8w4_weights (MAX_DELTA)
 _LUT_BYTES = 8 * (_MAX_DELTA + 1)
 
 
+def gateup_decode_fits(K):
+    """Whether ``compile_a8w4_gateup_decode`` supports hidden size ``K``: one thread per 16-byte piece
+    of the FP8 token row, at most 256 pieces."""
+    return K % 512 == 0 and K // 16 <= 256
+
+
+def down_decode_fits(K, TOPK, WAVES, paired):
+    """Whether the Down decode kernel (``paired``: ``compile_a8w4_down_decode_pq``) supports padded I
+    ``K`` with ``WAVES`` waves: the staged intermediate rows fit in LDS (``SharedStorage`` of the
+    kernel) and, for slot pairs, the 16-byte pieces of one row fit in the waves' lanes."""
+    if paired:
+        rows = 2 * WAVES * (((TOPK + 1) // 2 + WAVES - 1) // WAVES)
+        lds, pieces_ok = (rows + 1) * K + WAVES * 32 * 4, K // 16 <= 64 * WAVES
+    else:
+        lds, pieces_ok = WAVES * ((TOPK + WAVES - 1) // WAVES) * K + WAVES * 16 * 4, True
+    return K % 64 == 0 and pieces_ok and lds + _LUT_BYTES <= a8w4.LDS_BYTES
+
+
 def _lds_ptr(base, byte_off, elem, align):
     p = fx.add_offset(base, fx.make_int_tuple(byte_off))
     return fx.recast_iter(fx.PointerType.get(elem.ir_type, fx.AddressSpace.Shared, align), p)
