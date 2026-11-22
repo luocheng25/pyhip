@@ -229,4 +229,14 @@ GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter�
 | PASS | 两条实现和实际计时输出校验通过，显示延迟和加速比 |
 | AITER_INCORRECT | Aiter 数值检查失败，winner 通过；除 check-only 外仍显示延迟和 speedup，退出码保持非零 |
 | NOT_COMPARABLE | 执行/输出元数据检查失败，或 winner 精度失败，不生成 speedup |
+
+## A8W4 对照 Aiter FP8 ptpc
+
+[bench_moe_a8w4.py](bench_moe_a8w4.py) 独立于上面的 tuned MoE 对照：测 `pyhip.ops.moe.flydsl.moe_a8w4.fused_moe_a8w4` 的 12 个 case
+（TP2 / TP4 × M1…16384，H2560、E513、topk11），同进程同协议交替对照 Aiter FP8 ptpc（只用 Aiter 自带 qwen38 调优表并断言命中）。
+计时协议与输出格式见脚本 docstring；设计、对照来源与结果见 [A8W4 设计说明](../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
+
+```bash
+PYTHONPATH=src python benchmarks/moe/bench_moe_a8w4.py --cases tp2_m1 tp4_m16384
+```
 | ERROR | 数据准备、参考或调用错误；reason 中保留异常 |

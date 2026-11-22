@@ -63,6 +63,8 @@ intermediates; both weights must be shuffled, and activation/shape limits apply:
 
 FlyDSL 两阶段底座逐字取自 Aiter `gfx9_fp8`，只支持 BF16 与 FP8 per-token / per-tensor
 权重的 SiLU / SwiGLU；FlyDSL 的 MXFP4、SiTUv2 和单独 8x1 Down 已删除。
+FP8 激活 × MXFP4 权重（A8W4）是独立入口 [flydsl/moe_a8w4.py](flydsl/moe_a8w4.py)，不在 `fused_moe` 的候选里；
+设计见 [moe_gemm_2stage/README.md](flydsl/moe_gemm_2stage/README.md)。
 
 These A16W8/A16W4 candidates compete with activation-quantized paths. They still
 must pass the same Torch reference and `calc_diff <= 0.02` check; no per-candidate

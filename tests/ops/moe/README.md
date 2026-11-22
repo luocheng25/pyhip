@@ -10,6 +10,10 @@ FlyDSL 两阶段底座（Aiter `gfx9_fp8`）的固定配置用例分两个文件
 每次小改动先跑），[test_fly_2stage_extra.py](test_fly_2stage_extra.py) 只放基本测试与 bench
 覆盖不了的情况，每个用例写明原因。
 
+A8W4 算子（[moe_a8w4.py](../../../src/pyhip/ops/moe/flydsl/moe_a8w4.py)）同样分两个文件：[test_moe_a8w4.py](test_moe_a8w4.py) 是基本功能测试，
+[test_moe_a8w4_extra.py](test_moe_a8w4_extra.py) 只放基本测试与 bench（[bench_moe_a8w4.py](../../../benchmarks/moe/bench_moe_a8w4.py)）覆盖不了的情况；
+参考与判据在 [pyhip.testing.moe_a8w4](../../../src/pyhip/testing/moe_a8w4.py)，覆盖表见 [A8W4 设计说明](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md) 第 5 节。
+
 [test_tuned_moe.py](test_tuned_moe.py) 保留调优策略、缓存、benchmark、
 特殊数值和 graph 边界回归（按设备隔离的 FlyDSL 编译缓存已随底座替换删除）。固定 kernel 的覆盖不随候选策略变化。
 
@@ -37,6 +41,9 @@ python3 -m pytest 'tests/ops/moe/test_moe.py::test_asm_splitk[ptpc-m17]' -q
 # FlyDSL 两阶段底座：基本功能测试（每次小改动先跑）与其他覆盖测试
 python3 -m pytest tests/ops/moe/test_fly_2stage_basic.py -q
 python3 -m pytest tests/ops/moe/test_fly_2stage_extra.py -q -k 'test_prefill_variants and compact'
+
+# A8W4：基本功能测试与其他覆盖测试
+python3 -m pytest tests/ops/moe/test_moe_a8w4.py tests/ops/moe/test_moe_a8w4_extra.py -q
 
 # 性能单独选择；默认不运行 perf
 python3 -m pytest tests/ops/moe/test_moe.py -m perf -k 'test_fly_batch1_perf and bf16' -s
