@@ -164,9 +164,28 @@ def compile_a8w4_gemm1(
             a_r2s.get_slice(tid).partition_D(a_pong),
         ]
         a_cp_frag_retile = a_r2s.get_slice(tid).retile(a_cp_frag)
+
+        # MMA reads see K permuted within each 128-K step so that lane group g reads 32-K
+        # group g of the step in both 64-K halves h (one FP8 LUT per lane and step):
+        # MMA-side K 64*h + 16*g + 8*c + v -> stored K 32*g + 16*h + 8*c + v.
+        k_shape = (8, 2, 4, 2, TILE_K // 128)
+        k_stride = (1, 8, 32, 16, 128)
+
+        def _read_view(buf):
+            return fx.make_view(
+                buf.ptr,
+                fx.make_composed_layout(
+                    fx.static(swz), fx.make_layout((TILE_M, k_shape), (TILE_K, k_stride))
+                ),
+            )
+
         a_lds_r = [
-            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_ping),
-            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_pong),
+            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(
+                _read_view(lds.gemm.a_ping)
+            ),
+            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(
+                _read_view(lds.gemm.a_pong)
+            ),
         ]
         a_frag = tiled_mma.make_fragment_B(a_ping)
         a_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(a_frag)
@@ -195,7 +214,24 @@ def compile_a8w4_gemm1(
         _n_reps = fx.size(fx.get_shape(c_gate)[2]).to_py_value()
         k_iters = KB_PER_TILE
 
-        w_voff, d_voff = a8w4.lane_offsets(tid, K)
+        # Lane (g, r) of wave w: 64-K block g // 2 of the step, layout lane group 2 * (g % 2) + h
+        # for half h (+128 B), delta half g % 2 and byte 2 * (step % 2) + g // 2 of that dword.
+        lane = tid % 64
+        lane_group = lane // 16
+        wave = tid // 64
+        w_voff = fx.Int32(
+            (lane_group // 2) * a8w4.W_BLOCK_BYTES + (lane_group % 2) * 256 + (lane % 16) * 8
+            + wave * (KB * a8w4.W_BLOCK_BYTES)
+        )
+        d_voff = fx.Int32(
+            (lane_group % 2) * 64 + (lane % 16) * 4 + wave * (KQ * a8w4.D_BLOCK_BYTES)
+        )
+        lut_sel = [fx.Uint32((lane_group // 2 + 2 * v) * 0x01010101) for v in range(2)]
+        # FP8 LUT of the latest decoded step per [gate/up][m] (reused by its second half).
+        lut_regs = [
+            [fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Uint32) for _ in range(_m_reps)]
+            for _ in range(2)
+        ]
         # Raw FP4 dwords and delta dwords per [slot][gate/up][m]; slot = tile parity.
         w_regs = [
             [
@@ -221,23 +257,65 @@ def compile_a8w4_gemm1(
                 for m in range_constexpr(_m_reps):
                     rb = row_block16(gu, m)
                     for ki in range_constexpr(k_iters):
+                        # Half ki % 2 of the 128-K step starting at 64-K block kb0 + ki - ki % 2.
                         w_regs[slot][gu][m][ki].store(a8w4.load_dwordx2(
                             w_buf, w_voff,
-                            fx.Int32((rb * KB + kb0 + ki) * a8w4.W_BLOCK_BYTES)))
+                            fx.Int32((rb * KB + kb0 + ki - ki % 2) * a8w4.W_BLOCK_BYTES
+                                     + (ki % 2) * 128)))
                     d_regs[slot][gu][m].store(a8w4.load_dword(
                         d_buf, d_voff, fx.Int32((rb * KQ + kb0 // 4) * a8w4.D_BLOCK_BYTES)))
 
-        def decode_weights(slot, k_tile, ki):
+        def decode_weights(slot, parity, ki):
+            # parity = tile index % 2 (static: ping tiles are even); the first half of a
+            # 128-K step builds the LUT, the second half reuses it.
+            step_parity = ((parity * KB_PER_TILE + ki) // 2) % 2
             for gu in range_constexpr(2):
                 for m in range_constexpr(_m_reps):
-                    if const_expr(KB_PER_TILE % 4 == 0):
-                        selector = fx.Uint32(ki * 0x01010101)
+                    if const_expr(ki % 2 == 0):
+                        lut = a8w4.fp8_lut(d_regs[slot][gu][m].load()[0], lut_sel[step_parity])
+                        lut_regs[gu][m].store(Vec.from_elements(list(lut), fx.Uint32))
                     else:
-                        selector = fx.Uint32(((k_tile * KB_PER_TILE + ki) % 4) * 0x01010101)
-                    lut = a8w4.fp8_lut(d_regs[slot][gu][m].load()[0], selector)
+                        held = lut_regs[gu][m].load()
+                        lut = (held[0], held[1])
                     raw = w_regs[slot][gu][m][ki].load()
                     for c in range_constexpr(2):
                         w_frag[gu][None, m, (c, ki)].store(a8w4.fp4x8_to_fp8(raw[c], lut))
+
+        mfma_per_ki = 4 * _m_reps * _n_reps
+        dsrd_per_ki = TILE_M // 16
+
+        def valu_for(ki):
+            # Region ki decodes block ki + 1 (or the next tile's block 0); first halves add the LUT.
+            return 2 * _m_reps * (20 if (ki + 1) % 2 == 0 else 16)
+
+        a_vmem_cnt = TILE_M * TILE_K // (256 * 16)
+        w_vmem_cnt = 2 * _m_reps * (k_iters + 1)
+
+        def hot_loop_scheduler(do_prefetch):
+            # Next-tile loads go out with the first MFMAs; the next 64-K block's LDS reads and
+            # FP4 decode hide under the current block's MFMAs (the last block decodes the next
+            # tile's first block); LDS writes close the stage.
+            valu = 0x002
+            n_vmem = (a_vmem_cnt + w_vmem_cnt) * int(do_prefetch)
+            n_dswr = a_vmem_cnt * int(do_prefetch)
+            rocdl.sched_dsrd(dsrd_per_ki)
+            issued = 0
+            for ki in range_constexpr(k_iters):
+                last = ki + 1 == k_iters
+                valu_per_ki = valu_for(ki)
+                for j in range_constexpr(mfma_per_ki):
+                    rocdl.sched_mfma(1)
+                    if const_expr(issued < n_vmem):
+                        rocdl.sched_vmem(1)
+                        issued += 1
+                    if const_expr(not last or do_prefetch):
+                        cnt = (valu_per_ki * (j + 1)) // mfma_per_ki - (valu_per_ki * j) // mfma_per_ki
+                        if const_expr(cnt > 0):
+                            rocdl.sched_group_barrier(valu, cnt, 0)
+                    if const_expr(not last and j % 2 == 1 and j // 2 < dsrd_per_ki):
+                        rocdl.sched_dsrd(1)
+                    if const_expr(last and j >= mfma_per_ki - n_dswr):
+                        rocdl.sched_dswr(1)
 
         def pipeline_stage(read_i, k_cur, k_next, do_prefetch):
             write_i = read_i ^ 1
@@ -250,7 +328,8 @@ def compile_a8w4_gemm1(
                     a_lds_r[read_i][None, None, ki],
                     a_frag_retile[None, None, ki],
                 )
-                decode_weights(read_i, k_cur, ki)
+                if const_expr(ki > 0):
+                    decode_weights(read_i, read_i, ki)
                 for n in range_constexpr(_n_reps):
                     for m in range_constexpr(_m_reps):
                         for k in range_constexpr(2):
@@ -269,7 +348,9 @@ def compile_a8w4_gemm1(
                                 c_up[None, m, n],
                             )
             if const_expr(do_prefetch):
+                decode_weights(write_i, write_i, 0)
                 fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
+            hot_loop_scheduler(do_prefetch)
             rocdl.sched_barrier(0)
             gpu.barrier()
 
@@ -277,6 +358,7 @@ def compile_a8w4_gemm1(
         load_weights(0, fx.Int32(0))
         rocdl.s_waitcnt(vmcnt=0)
         fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
+        decode_weights(0, 0, 0)
         gpu.barrier()
 
         acc_init = [c_gate.load(), c_up.load()]
@@ -394,10 +476,21 @@ def compile_a8w4_gemm1(
             asc_idx = fx.make_fragment_like(asc_thr)
             fx.copy(fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32), asc_thr, asc_idx)
 
-            c_gate_frag, c_up_frag = gemm_1x4(BM, BN, blk_n, arg_p_input, w_buf, d_buf, lds)
-            _apply_dequant(c_gate_frag, c_up_frag, tid, expert_id, blk_n, contiguous_n, asc_idx,
-                           M, p_w_scale, p_a_scale)
-            _store_silu_f32(c_gate_frag, c_up_frag, tid, blk_n, contiguous_n, asc_idx, M, p_output)
+            def run(tile_m):
+                c_gate_frag, c_up_frag = gemm_1x4(tile_m, BN, blk_n, arg_p_input, w_buf, d_buf, lds)
+                _apply_dequant(c_gate_frag, c_up_frag, tid, expert_id, blk_n, contiguous_n, asc_idx,
+                               M, p_w_scale, p_a_scale)
+                _store_silu_f32(c_gate_frag, c_up_frag, tid, blk_n, contiguous_n, asc_idx, M, p_output)
+
+            if const_expr(BM % 64 == 0):
+                # Valid rows lead a sorted block: when row BM/2 is padding, BM/2 rows suffice.
+                half_id = fx.make_view(lds.sorted_lds.ptr, fx.make_layout(BM, 1))[BM // 2]
+                if (fx.Int32(rocdl.readfirstlane(T.i32, half_id)) & 0xFFFFFF) >= M:
+                    run(BM // 2)
+                else:
+                    run(BM)
+            else:
+                run(BM)
 
     @flyc.jit
     def launch(

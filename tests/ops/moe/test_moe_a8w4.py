@@ -4,9 +4,9 @@
 （``pyhip.testing.moe_a8w4`` 的判据：calc_diff <= 1e-3 且 max|out-ref| <= 2%·max|ref|，无 NaN/Inf），
 参考的激活精度按算子实际启动的 kernel 选择，并断言确实启动了 A8W4 / A16W4 kernel 与预期分档的 kernel。
 H=2560、topk=11，最后一个 expert 是每个 token 必选的融合 shared expert；E 缩到 33 以控制参考耗时。
-三个分档：M≤32 免排序的 decode（TP2 M=3，激活在 kernel 内量化）；33≤M≤2048 的流式路径（E=33 时每个 expert
-几百行，排序块取 64：TP2 M=1031 的中间激活单独量化，TP4 M=257 在 Gate/Up 尾部量化，I=160 由 prepare 补零到 192）；
-M>2048 的 prefill（TP2 M=2053）。流式与 prefill 的例子都含多块 expert 与部分填充的尾块。其余覆盖见 test_moe_a8w4_extra.py。
+三个分档：M≤32 免排序的 decode（TP2 M=3，激活在 kernel 内量化）；M>32 且每个 expert 平均不超过 22 行
+（E=33 时 M≤66）的流式路径（TP2 M=64：排序块 32，Gate/Up 尾部量化中间激活）；其余走 prefill（TP2 M=1031；
+TP4 M=257，I=160 由 prepare 补零到 192）。prefill 的例子含多块 expert 与部分填充的尾块。其余覆盖见 test_moe_a8w4_extra.py。
 """
 
 import pytest
@@ -50,12 +50,12 @@ def _check(inter, tokens, seed, kernel):
 
 
 # kernel：该分档的 kernel 名里一定出现的片段（decode / 流式 / prefill）。
-@pytest.mark.parametrize("tokens, kernel", [(3, "_decode"), (1031, "_stream_"), (2053, "_prefill_")],
-                         ids=["m3", "m1031", "m2053"])
+@pytest.mark.parametrize("tokens, kernel", [(3, "_decode"), (64, "_stream_"), (1031, "_prefill_")],
+                         ids=["m3", "m64", "m1031"])
 def test_tp2(tokens, kernel):
     _check(320, tokens, seed=11, kernel=kernel)
 
 
 def test_tp4_padded():
-    prepared = _check(160, 257, seed=21, kernel="_stream_")
+    prepared = _check(160, 257, seed=21, kernel="_prefill_")
     assert (prepared.inter, prepared.inter_padded) == (160, 192)

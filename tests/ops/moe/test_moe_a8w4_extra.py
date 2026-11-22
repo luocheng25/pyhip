@@ -6,8 +6,9 @@
 补零已由基本测试覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
 M≤32 的 decode 路径：核内量化（M=3）由基本测试、M=1 / 16 的三种分派由 bench 覆盖，这里只测分派交界、
 topk 与路由输入的变体、CUDA graph、decode 行量化逐位与 w2≥4 GiB 回退（用例名带 ``decode``）。
-33≤M≤2048 的流式路径：排序块 64 由基本测试、16 / 32 由 bench 覆盖，这里只测与 prefill 的交界、两处量化逐位
-（用例名带 ``stream``）以及 grid 收缩与 graph；非目标形状的回退见 ``test_shape_fallbacks``。
+M>32 且每个 expert 平均不超过 22 行的流式路径：排序块 32 由基本测试、16 / 32 由 bench 覆盖，这里只测与 prefill
+的交界、两处量化逐位（用例名带 ``stream``）以及 grid 收缩与 graph。prefill 路径：默认 tile 由基本测试与 bench
+覆盖，这里只测半块变体的交界、tile 参数与 graph。非目标形状的回退见 ``test_shape_fallbacks``。
 """
 
 import dataclasses
@@ -26,9 +27,12 @@ _DECODE_PATHS = {
     "np": ["a8w4_gateup_decode", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
     "pp": ["a8w4_row_quant_decode", "a8w4_gateup_decode_pq", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
 }
-# prefill（默认 tile）实际启动的 kernel 序列。
-_PREFILL_PATH = ["moe_sorting_opus", "a8w4_row_quant_fp8", "a8w4_gateup_prefill_bm64_bn128_tk256", "a8w4_row_quant_fp8",
-                 "a8w4_down_prefill_bm64", "sorted_sum"]
+
+
+def _prefill_path(tile_k, block_m=64, block_n=128):
+    """prefill 路径实际启动的 kernel 序列（kernel 名带排序块、Gate/Up 的 N tile 与 K tile）。"""
+    return ["moe_sorting_opus", "a8w4_row_quant_fp8", f"a8w4_gateup_prefill_bm{block_m}_bn{block_n}_tk{tile_k}",
+            "a8w4_row_quant_fp8", f"a8w4_down_prefill_bm{block_m}", "sorted_sum"]
 
 
 def _stream_path(block_m, fused):
@@ -89,19 +93,50 @@ def test_grid_shrink_boundary_e513():
 
 
 @pytest.mark.parametrize("inter, options", [
-    (320, dict(tile_k=128)),
     (256, dict(block_m=128, block_n=256)),
-], ids=["tk128", "bm128_bn256"])
+], ids=["bm128_bn256"])
 def test_tile_variants(inter, options):
-    """给了 tile 参数时走 prefill（M=300 本在流式范围内）：TILE_K=128（delta 字节按 tile 号动态选取）、
-    BLOCK_N=256（每个 wave 两个 16 行块）、BLOCK_M=128。
+    """给了 tile 参数时按参数选 prefill 的 tile：BLOCK_N=256（每个 wave 两个 16 行块）、BLOCK_M=128，
+    没给的 tile_k 在 M≤2048 时取 256（M=300）。
 
-    基本测试与 bench 只走默认 tile（BLOCK_M=64、BLOCK_N=128、TILE_K=256）。
+    基本测试与 bench 只走默认 tile（BLOCK_M=64、BLOCK_N=128，每个 expert 行多时 TILE_K=128）。
     """
     w = oracle.make_weights(33, HIDDEN, inter, seed=36)
     x, topk_weight, topk_ids = oracle.make_inputs(300, HIDDEN, 33, TOPK, seed=37)
     oracle.assert_close(*_run(w, _prepare(w), x, topk_weight, topk_ids, **options))
-    assert any(name.startswith("a8w4_gateup_prefill_") for name in moe_a8w4.last_path), moe_a8w4.last_path
+    assert moe_a8w4.last_path == _prefill_path(256, block_m=128, block_n=256)
+
+
+@functools.cache
+def _half_block_weights():
+    """半块用例共用的 E=9、H=512、I=64 权重（topk=2；最后两个 expert 只用来把 M 凑到 2048 / 2049）。"""
+    w = oracle.make_weights(9, 512, 64, seed=131)
+    return w, _prepare(w)
+
+
+@pytest.mark.parametrize("filler, options, block_m, tile_k", [
+    (0, {}, 64, 128),
+    (1854, dict(block_m=128), 128, 256),
+    (1855, dict(block_m=64), 64, 128),
+], ids=["default_m194", "bm128_m2048", "bm64_m2049"])
+def test_prefill_half_block_boundary(filler, options, block_m, tile_k):
+    """prefill 的 Gate/Up 与 Down 在排序块第 BM/2 行是填充时只算前 BM/2 行（有效行在块首）：路由构造成各 expert
+    恰有 32、33、64、65、96、97、1 行，尾块第 BM/2 行恰为填充或有效（BM64 的 32 / 33、96 / 97，BM128 的 64 / 65），
+    K=512 时 Gate/Up 每个 128-K 步的 delta 字节 0–3 都会用到。同时核对 tile_k：默认分派到 prefill 用 128，
+    给了 tile 参数时 M=2048 用 256、M=2049 用 128。
+
+    随机路由的尾块行数是随机的，基本测试与 bench 不保证碰到恰好的交界，也不给 tile 参数；H=512、I=64、topk=2 控制耗时。
+    """
+    w, prepared = _half_block_weights()
+    counts = torch.tensor([32, 33, 64, 65, 96, 97, 1, filler, filler])
+    flat = torch.repeat_interleave(torch.arange(counts.numel()), counts)
+    tokens = flat.numel() // 2
+    # 按 expert 排好的路由对折成两列：每个 expert 的行数都不超过 tokens，所以同一 token 的两个 expert 不同。
+    topk_ids = torch.stack([flat[:tokens], flat[tokens:]], dim=1).to(torch.int32).contiguous()
+    x, topk_weight, _ = oracle.make_inputs(tokens, 512, 9, 2, seed=132)
+    out, ref = _run(w, prepared, x, topk_weight, topk_ids, **options)
+    assert moe_a8w4.last_path == _prefill_path(tile_k, block_m=block_m)
+    oracle.assert_close(out, ref)
 
 
 def _pack(nibbles):
@@ -196,11 +231,11 @@ def test_prepare_layout_bitexact():
     assert torch.equal(p.w2_scale.view(E, -1), c2)
 
 
-@pytest.mark.parametrize("options, path", [({}, _stream_path(32, True)), (dict(block_m=64), _PREFILL_PATH)],
+@pytest.mark.parametrize("options, path", [({}, _stream_path(32, True)), (dict(block_m=64), _prefill_path(256))],
                          ids=["stream", "prefill"])
 def test_graph_replay(options, path):
     """整个调用可被 CUDA graph 捕获并重放（无 host 同步），重放读到的是新写入的输入：M=64 默认走流式路径
-    （排序块 32、Gate/Up 尾部量化），给 tile 参数时走 prefill。
+    （排序块 32、Gate/Up 尾部量化），给 tile 参数时走 prefill（TILE_K 256）。
 
     基本测试与 bench 都是 eager 调用，不检查 graph 捕获。
     """
@@ -229,14 +264,22 @@ def test_graph_replay(options, path):
 
 @pytest.mark.parametrize("dtype, cols", [("bf16", 2560), ("f32", 320)])
 def test_row_quant_bitexact(dtype, cols):
-    """激活的行量化（scale = amax/240，q = RNE(x/scale)）与参考逐位一致，含全零行与 BF16 常见的精确中点。
+    """激活的行量化（scale = amax/240，q = RNE(x/scale)）与参考逐位一致，含全零行与 BF16 常见的精确中点；
+    kernel 用倒数乘法加两次 FMA 修正求商、scale < 2^-64 的行逐元素除法，另加两行直接乘倒数会改变 FP8 值的数据。
 
     基本测试只看端到端误差：量化算术的微小差异（例如乘倒数）只让少量 FP8 值翻转，小 M 时判据未必发现，
-    却会吃掉大 M 下 2% 最大误差的余量。
+    却会吃掉大 M 下 2% 最大误差的余量；随机数据里乘倒数恰好舍错的元素很少，所以另构造这两行。
     """
     gen = torch.Generator(device="cuda").manual_seed(81)
     x = torch.randn((997, cols), generator=gen) * 3
     x[5].zero_()
+    # 第 6 行 scale = 52.5/240 = 7/32（不是 2 的幂），其余元素的商恰为 FP8 舍入中点（尾数 23/16 … 31/16）：
+    # 乘倒数的结果多出一个 f32 ulp，越过中点后舍入方向改变。第 7 行再乘 2^-70，scale < 2^-64 走逐元素除法。
+    tie = torch.arange(23, 32, 2).float().view(-1, 1) / 16 * torch.exp2(torch.arange(-6, 7).float())
+    tie = torch.cat([tie.flatten(), -tie.flatten()]) * (7 / 32)
+    x[6] = tie.repeat(cols // tie.numel() + 1)[:cols]
+    x[6, 0] = 52.5
+    x[7] = x[6] * 2.0 ** -70
     x = x.to(torch.bfloat16) if dtype == "bf16" else x
     q, scale = moe_a8w4._quantize(x, x.shape[0], cols, dtype)
     ref = oracle.quant_rows_fp8(x)
@@ -245,6 +288,10 @@ def test_row_quant_bitexact(dtype, cols):
     assert torch.equal(scale.view(-1, 1), ref_scale)
     assert torch.equal(q.float() * scale.view(-1, 1), ref)
     assert int((q.view(torch.uint8) == 0x80).sum()) == 0
+    exact = (x.float() / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    naive = (x.float() * (torch.ones_like(ref_scale) / ref_scale)).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    assert bool((exact[6] != naive[6]).any()) and bool((exact[7] != naive[7]).any())
+    assert float(scale[7]) < 2.0 ** -64 <= float(scale[6])
 
 
 def test_rejects_bad_inputs():
@@ -424,13 +471,13 @@ def test_decode_down_fallback_w2_4gib():
     oracle.assert_close(out, ref)
 
 
-@pytest.mark.parametrize("tokens, path", [(2048, _stream_path(64, False)), (2049, _PREFILL_PATH)],
-                         ids=["m2048", "m2049"])
+@pytest.mark.parametrize("tokens, path", [(66, _stream_path(32, True)), (67, _prefill_path(128))],
+                         ids=["m66", "m67"])
 def test_stream_dispatch_boundary(tokens, path):
-    """流式路径的上界：M=2048 仍走流式（E=33 时每个 expert 平均约 680 行，排序块 64；I=320 时 4 个 wave 的累加器
-    放不下整段 I，中间激活另起行量化），M=2049 改走 prefill。
+    """流式与 prefill 的交界（M·topk ≤ 22·E 走流式）：E=33、topk=11 时 M=66（每个 expert 平均 22 行）仍走流式
+    （排序块 32、Gate/Up 尾部量化），M=67 改走 prefill，且默认 TILE_K=128。
 
-    基本测试的流式 M=1031、prefill M=2053，bench 是 1024 与 4096，都不在交界上。
+    基本测试的流式 M=64、prefill M=1031，bench 的 E=513 各档都不在交界上。
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=tokens)
@@ -484,7 +531,8 @@ def test_stream_row_quant_bitexact(cols):
 def test_stream_fused_quant_bitexact(inter, block_m):
     """流式 Gate/Up 尾部量化的中间激活（倒数乘法 + 1∓2^-20 夹逼判定；有元素靠近舍入边界、或 scale 不是有限正规数时
     整个 wave 回退 IEEE 除法）与同一排序下写 f32 再用 a8w4_quant 量化的结果逐位一致（q 字节与 scale 位）。
-    配置取分派实际用的：TP2 排序块 32（每 wave 5 个 gate 块、不共享激活）、TP4 排序块 64（3 个 gate 块、LDS 共享激活）。
+    TP2 排序块 32（分派实际用的：每 wave 5 个 gate 块、不共享激活）；TP4 排序块 64（3 个 gate 块、LDS 共享激活，
+    子块数可到 4；分派对 TP4 用排序块 32，同一份代码，排序块 64 只在调大 STREAM_MAX_ROWS 时用）。
 
     M=1031 的随机行里有商落在舍入边界 2^-20 以内的元素（下面断言存在，回退分支确实跑到）；另把 6 个 token 的 x 缩小
     1e-17…1e-23 倍或置零，使中间行的 scale 为很小的正规数、次正规数与 0（取 1）。端到端判据看不出少量 fp8 翻转。
@@ -528,25 +576,28 @@ def _small_weights(hidden, inter):
     return w, _prepare(w)
 
 
-@pytest.mark.parametrize("hidden, inter, tokens, path, shared", [
-    (4096, 64, 8, _DECODE_PATHS["np"], None),
-    (4608, 64, 8, _PREFILL_PATH, None),
-    (512, 1024, 4, _DECODE_PATHS["np"], None),
-    (512, 1088, 4, _DECODE_PATHS["nn"], None),
-    (512, 1024, 64, _stream_path(32, False), True),
-    (512, 1024, 300, _stream_path(64, False), False),
+@pytest.mark.parametrize("hidden, inter, tokens, path, shared, max_rows", [
+    (4096, 64, 8, _DECODE_PATHS["np"], None, None),
+    (4608, 64, 8, _prefill_path(256), None, None),
+    (512, 1024, 4, _DECODE_PATHS["np"], None, None),
+    (512, 1088, 4, _DECODE_PATHS["nn"], None, None),
+    (512, 1024, 48, _stream_path(32, False), True, None),
+    (512, 1024, 300, _stream_path(64, False), False, 120),
 ], ids=["h4096_decode", "h4608_prefill", "i1024_pair_down", "i1088_single_down", "i1024_bm32_shared",
         "i1024_bm64_unshared"])
-def test_shape_fallbacks(hidden, inter, tokens, path, shared):
+def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_rows):
     """非目标形状按 kernel 上限回退，结果仍对：H<=4096 才走 decode（Gate/Up decode 每线程一片 16 B，至多 256 片），
-    H=4608 的 M<=32 改走 prefill；槽对 Down 要把每行 I/16 片放进 64·WAVES 个 lane（topk=2 时 1 个 wave），I=1088
-    改用单槽 Down；流式 Down 只在共享激活行放得进 64 KiB LDS 时让 4 个 wave 共享（I=1024：排序块 32 放得下，64 放不下，
-    后者若误选共享 tile 会在构建 kernel 时报错）。
+    H=4608 的 M<=32 改走 prefill（每个 expert 行少，TILE_K 256）；槽对 Down 要把每行 I/16 片放进 64·WAVES 个 lane
+    （topk=2 时 1 个 wave），I=1088 改用单槽 Down；流式 Down 只在共享激活行放得进 64 KiB LDS 时让 4 个 wave 共享
+    （I=1024：排序块 32 放得下，64 放不下，后者若误选共享 tile 会在构建 kernel 时报错；默认分派的流式只到排序块 32，
+    这里临时调大 STREAM_MAX_ROWS 让 M=300 走排序块 64）。
 
     前两类只有目标形状（H=2560，I=320 / 192），碰不到这些上限；E=5、topk=2 控制耗时。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage import a8w4_common, a8w4_stream
 
+    if max_rows is not None:
+        monkeypatch.setattr(moe_a8w4, "STREAM_MAX_ROWS", max_rows)
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, 5, 2, seed=tokens)
     out, ref = _run(w, prepared, x, topk_weight, topk_ids)

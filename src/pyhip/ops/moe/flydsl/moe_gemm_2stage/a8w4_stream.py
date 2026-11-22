@@ -2,20 +2,25 @@
 
 """A8W4 weight-streaming Gate/Up and Down kernels for the memory-bound token range.
 
-``fused_moe_a8w4`` uses them for 33 <= M <= 2048, where each routed expert sees only a few to a few
-dozen tokens and the cost is reading the MXFP4 weights once. Both kernels walk moe_sorting blocks of
-``BLOCK_M`` (16/32/64) rows in sub-blocks of 16 and use MFMA 16x16x32 FP8 with the weights as A and
-16 sorted rows as B. Every wave owns a few 16-row weight blocks of the block's expert and reads them
-straight into VGPRs in the ``a8w4_common`` layout (several 64-K steps in flight), decodes FP4 -> FP8
-with the per-group LUT and multiplies; the B operand comes straight from global memory too: lane
-``16b + t`` loads bytes ``16b .. 16b+15`` of row ``t`` in each 64-K block, which is the K
-permutation of the weight layout. No LDS, no barriers: waves of a workgroup only share the block.
+``fused_moe_a8w4`` uses them above the decode range while each routed expert sees at most a few dozen
+tokens on average (``moe_a8w4.STREAM_MAX_ROWS`` rows per expert), where the cost is reading the MXFP4
+weights once. Both kernels walk moe_sorting blocks of ``BLOCK_M`` (16/32/64) rows in sub-blocks of 16
+and use MFMA 16x16x32 FP8 with the weights as A and 16 sorted rows as B. Every wave owns a few 16-row
+weight blocks of the block's expert and reads them straight into VGPRs in the ``a8w4_common`` layout
+(several 64-K steps in flight), decodes FP4 -> FP8 with the per-group LUT and multiplies. Lane
+``16b + t`` of the B operand holds bytes ``16b .. 16b+15`` of row ``t`` in each 64-K block, which is
+the K permutation of the weight layout; the rows come straight from global memory or, with ``SHARE``
+and several waves per workgroup, are loaded once per workgroup into LDS (a ring of two 64-K steps in
+Gate/Up, the block's whole rows in Down).
 
 Gate/Up: wave ``w`` of workgroup ``(g, block)`` owns gate 16-row blocks ``(g * W + w) * G + j`` and
 the matching up blocks, accumulates over the whole K and writes SiLU(gate) * up as float32 by
-(token, slot), the same epilogue arithmetic as ``a8w4_gemm1``. Down: the wave keeps its rows' FP8
-activations (all of K = I) in VGPRs and streams ``R`` 16-row blocks of the hidden dimension, writing
-BF16 rows by sorted position for ``sorted_sum`` (padding rows are not written).
+(token, slot), the same epilogue arithmetic as ``a8w4_gemm1``; with ``QUANT`` (the waves cover all of
+I) it quantizes those rows to FP8 itself, exchanging the row maxima through LDS. Down: the wave keeps
+its rows' FP8 activations (all of K = I) in VGPRs, stages its ``R * 16`` channel factors in LDS and
+streams ``R`` 16-row blocks of the hidden dimension, writing BF16 rows by sorted position (padding
+rows are not written). ``compile_row_quant_bf16`` (input rows) and ``compile_route_sum`` (sum of a
+token's routes) replace the prefill path's input quantization and ``sorted_sum``.
 """
 
 import flydsl.compiler as flyc

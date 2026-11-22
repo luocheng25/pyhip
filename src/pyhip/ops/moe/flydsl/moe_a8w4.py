@@ -9,10 +9,10 @@ per-row FP8 quantization of the input, Opus ``moe_sorting``, the A8W4 Gate/Up ke
 kernel (routing weight applied) and ``sorted_sum``. Token counts up to ``DECODE_MAX_M`` skip the
 sorting and use the decode kernels of ``moe_gemm_2stage/a8w4_decode.py`` (Gate/Up per route, Down
 per token summing its routes in the workgroup and writing BF16; activations quantized inside the
-kernels or by a row kernel). Token counts in ``STREAM_TOKENS`` use the
-weight-streaming kernels of ``moe_gemm_2stage/a8w4_stream.py`` (small sorting blocks; with
-larger blocks the Gate/Up kernel also quantizes the intermediate; ``a8w4_route_sum`` does the
-``sorted_sum`` step), larger token counts the prefill kernels.
+kernels or by a row kernel). Larger token counts with at most ``STREAM_MAX_ROWS`` rows per expert
+(M * topk / E) use the weight-streaming kernels of ``moe_gemm_2stage/a8w4_stream.py`` (small sorting
+blocks; with larger blocks the Gate/Up kernel also quantizes the intermediate; ``a8w4_route_sum``
+does the ``sorted_sum`` step), more rows per expert the prefill kernels.
 """
 
 import functools
@@ -30,8 +30,10 @@ DECODE_MAX_M = 32
 DECODE_PREQUANT_MIN_M = 4
 DECODE_GATEUP_PREQUANT_MIN_WGS = 2560
 DECODE_DOWN_PQ_WAVES = 3
-# Token counts that run the weight-streaming kernels (memory-bound: a few dozen rows per expert at most).
-STREAM_TOKENS = range(DECODE_MAX_M + 1, 2049)
+# Above DECODE_MAX_M tokens the weight-streaming kernels run while the mean rows per expert
+# (M * topk / E) stay at or below this, the prefill kernels (TILE_K 128) beyond: measured crossover
+# between 22.0 and 24.7 rows per expert for TP2 and TP4 alike (E513, topk 11: M = 1024 / 1152).
+STREAM_MAX_ROWS = 22
 
 # Kernels launched by the most recent ``fused_moe_a8w4`` call, in order. Kernels of the A8W4 op are
 # named ``a8w4_*`` (FP8 activations) or ``a16w4_*`` (BF16 activations); tests pick the reference by it.
@@ -354,15 +356,18 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
 
     ``weights`` comes from ``prepare_a8w4_weights``; ``topk_weight`` float32 [M, topk] is applied
     in Down; ``topk_ids`` int32 [M, topk] in ``[0, E)`` (a fused shared expert is an ordinary
-    expert id). The input and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
+    expert id), distinct within a token (the sorted paths keep one route of a repeated id). The input
+    and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
     E4M3FNUZ with ``scale = amax / 240`` and ``q = RNE(x / scale)``. SiLU only, no expert mask /
     bias; ``M * topk * I_padded * 4 < 2**31``. Issues no host synchronization. Unless a tile option is
     given, M <= ``DECODE_MAX_M`` runs the decode kernels (no sorting) when they support the shape
-    (H <= 4096, the intermediate rows fit in LDS) and M in ``STREAM_TOKENS`` the streaming kernels. ``block_m`` / ``block_n`` / ``tile_k``
-    select the prefill kernels' tiles (defaults 64 / 128 / 256): ``block_m`` is the sorting block and
-    M tile of both kernels (``block_m * I_padded % 4096 == 0``, e.g. 64 or 128); ``block_n`` /
-    ``tile_k`` are the Gate/Up N tile (128 or 256, dividing 2 * padded I into whole gate/up halves)
-    and K tile (128 or 256).
+    (H <= 4096, the intermediate rows fit in LDS), larger M with at most ``STREAM_MAX_ROWS`` rows per
+    expert the streaming kernels and the rest the prefill kernels (TILE_K 128 when chosen for having
+    more rows per expert). ``block_m`` / ``block_n`` / ``tile_k`` select the prefill kernels'
+    tiles: ``block_m`` (default 64) is the sorting block and M tile of both kernels
+    (``block_m * I_padded % 4096 == 0``, e.g. 64 or 128); ``block_n`` (default 128) / ``tile_k`` are
+    the Gate/Up N tile (128 or 256, dividing 2 * padded I into whole gate/up halves) and K tile (128
+    or 256; default 128 for M > 2048, where its lower LDS and register use raise occupancy, else 256).
     """
     from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 
@@ -381,11 +386,13 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     if block_m is None and block_n is None and tile_k is None:
         if M <= DECODE_MAX_M and _decode_fits(H, I, topk, False):
             return _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output)
-        if M in STREAM_TOKENS:
+        many_rows = M * topk > STREAM_MAX_ROWS * E
+        if M > DECODE_MAX_M and not many_rows:
             return _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output)
+        tile_k = 128 if many_rows else 256
     block_m = 64 if block_m is None else block_m
     block_n = 128 if block_n is None else block_n
-    tile_k = 256 if tile_k is None else tile_k
+    tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k
 
     sorted_ids, sorted_weights, sorted_experts, num_valid, _, _, loc_ids = moe_sorting(
         topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False,
