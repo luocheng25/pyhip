@@ -16,9 +16,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from pyhip.codegen.flydsl import helpers as fxh
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import (
-    torch_tensor_to_pointer as _ptr,
-)
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import _ptr
 
 # fxh.dump_ir(True)
 

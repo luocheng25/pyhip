@@ -106,21 +106,22 @@ python benchmarks/moe/bench_tuned_moe.py \
   专用 Gate/Up 搜索 M/N128/256，Down N128。
   **A4W4 候选仍需通过公共 A16W4 Torch 参考的原精度门槛**，不能因为支持该 kernel
   就保证它在每个 shape 上成为有效候选。固定 kernel pytest 单独检查 A4W4 数值语义。
-- FlyDSL direct decode 将输出清零融合进 Gate/Up，BF16/FP8/MXFP4 都支持，
-  大 H、小 I_tp 时用多轮清零覆盖全部输出。MXFP4 的 B1 同时搜索 Down DN32/64。
-  `fly_decode` 的 direct/sorted 路径均保留 BF16 激活，支持 PTPC、per-tensor 和
-  MXFP4 权重反量化，不支持 block scale；`jit_splitk` 支持 PTPC、block、MXFP4，
+- FlyDSL 两阶段底座逐字取自 Aiter `ca6bc0f851` 的 `gfx9_fp8`，只支持 BF16 与 FP8
+  per-token / per-tensor 权重的 SiLU / SwiGLU；FlyDSL 的 MXFP4、SiTUv2 和单独 8x1 Down 已删除。
+  direct decode 将输出清零融合进 Gate/Up，大 H、小 I_tp 时用多轮清零覆盖全部输出。
+  `fly_decode` 的 direct/sorted 路径均保留 BF16 激活，支持 PTPC、per-tensor 权重反量化，
+  不支持 block scale；`jit_splitk` 支持 PTPC、block、MXFP4，
   不直接支持 per-tensor scales。省去激活量化可能降低小 batch 开销，但不保证
   所有输入都更快或更接近量化参考；加入候选不等于一定通过 prune 或成为 winner。
-  prefill 的 Gate/Up BN 搜索128/256，BK 为 BF16 的64/128或 FP8 的128/256；
-  三条专用 Down 路径也覆盖这两组 BN，输出 padding 搜索0/128B。
-  默认 FP8 Down 不再排除 I192/I320。候选层只枚举配置并尊重 caller 的 M 设置，
-  不重复维护 FlyDSL 的 K/E 白名单、对齐和 LDS 公式；kernel 编译失败的配置由
+  prefill 的 Gate/Up BN 搜索128/256（跳过不完整的 N tile），BK 为 BF16 的64/128或 FP8 的128/256；
+  两条专用 Down 路径（`1x4_64x256`、`8x1_compact`，Gate/Up 与 Down 同用 M64）也覆盖这两组 BN，
+  输出 padding 搜索0/128B。默认 Down 的 M×I_tp 激活超过 64 KiB LDS 时只会在 launch 报错，
+  候选层直接跳过；其余 K/E 白名单与对齐不在候选层重复，kernel 编译失败的配置由
   prune 排除，其余配置仍须通过原精度检查。winner 的 `tile_k_gate` 保存在 JSON。
-  Gate/Up 和 Down 的 FP32→BF16 沿用公共转换函数的 RTA/RTE 选项，当前默认 RTA；
-  如需 RTE，在进程启动前设置 `AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=0`。
+  Gate/Up 和 Down 的 FP32→BF16 默认 RTE（与 Aiter 一致）；如需简化 RTA，在进程启动前设置
+  `AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1`。
   舍入选项应在导入 kernel 前设置；改变选项后重新调优，不在运行中切换。
-  inverse/sorted reduce 的编译缓存按 tensor 所在设备隔离，每次使用该设备当前 stream。
+  prefill 规约使用 moe_sorting（Opus aux）给出的 loc_ids；编译缓存与 Aiter 一样不按设备区分。
 - `--activation gelu --dtype bf16` 使用 G1U0：W1 为 `[E, I_tp, H]`，不含 gate；
   W2 为 `[E, H, I_tp]`。`jit_gelu` 复用现有 8-wave kernel，固定 M/N tile=256，
   要求 gfx950、H/I_tp 按256对齐、`--gate-mode separated`，并满足32-bit buffer

@@ -59,7 +59,10 @@ intermediates; both weights must be shuffled, and activation/shape limits apply:
 | FP8 PTPC | Yes | Yes |
 | FP8 per-tensor | No | Yes |
 | FP8 block (W128×128) | Yes, H divisible by 512 | No |
-| MXFP4 | Yes, H divisible by 1024 | Yes |
+| MXFP4 | Yes, H divisible by 1024 | No |
+
+FlyDSL 两阶段底座逐字取自 Aiter `gfx9_fp8`，只支持 BF16 与 FP8 per-token / per-tensor
+权重的 SiLU / SwiGLU；FlyDSL 的 MXFP4、SiTUv2 和单独 8x1 Down 已删除。
 
 These A16W8/A16W4 candidates compete with activation-quantized paths. They still
 must pass the same Torch reference and `calc_diff <= 0.02` check; no per-candidate

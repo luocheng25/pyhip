@@ -12,7 +12,8 @@ from flydsl._mlir import ir
 from flydsl.expr import range_constexpr, rocdl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr, rocdl_aux
+from pyhip.codegen.flydsl.helpers import rocdl_aux
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import _ptr
 if __package__:
     from .moe_multistage_down import _scalar
 else:
@@ -95,3 +96,41 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
     reduce.config = {"output_layout": "packed", "sort_block_m": sort_block_m, "num_threads": 256, "block_cols": 2048,
                      "read_policy": 2, "write_policy": 0}
     return reduce
+
+
+@cache
+def make_moe_inverse(TOPK):
+    """inverse[token, slot] = sorted row; only rows below num_valid are scanned.
+
+    Moved here from the removed pyhip moe_reduce, which these experiments still use.
+    """
+    num_threads = 64
+
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    def moe_inverse_kernel(sorted_ids: fx.Pointer, invert: fx.Pointer, p_num_valid: fx.Pointer,
+                           num_ids: fx.Uint32, batch_size: fx.Uint32):
+        slot = fx.block_idx.x * num_threads + fx.thread_idx.x
+        # The tail beyond num_valid is uninitialized and could map tokens onto unwritten rows.
+        num_valid = p_num_valid[0].to(fx.Uint32)
+        if slot < num_valid:
+            sid = sorted_ids[slot].to(fx.Uint32)
+            tok_id = sid & 0xFFFFFF
+            top_id = sid >> 24
+            if top_id < TOPK and tok_id < batch_size:
+                invert[tok_id * TOPK + top_id] = fx.Uint32(slot)
+
+    @flyc.jit
+    def launch(sorted_ids: fx.Pointer, invert: fx.Pointer, p_num_valid: fx.Pointer,
+               num_ids: fx.Uint32, batch_size: fx.Uint32, stream):
+        grid_size = (num_ids + num_threads - 1) // num_threads
+        moe_inverse_kernel(sorted_ids, invert, p_num_valid, num_ids, batch_size).launch(
+            grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream)
+
+    def run(sorted_ids, invert, num_valid, num_ids, batch_size):
+        assert sorted_ids.device == invert.device == num_valid.device
+        with torch.cuda.device(sorted_ids.device):
+            _run_compiled(launch, _ptr(sorted_ids), _ptr(invert), _ptr(num_valid),
+                          fx.Uint32(num_ids), fx.Uint32(batch_size),
+                          torch.cuda.current_stream(sorted_ids.device))
+
+    return run

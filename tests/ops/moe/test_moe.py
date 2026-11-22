@@ -3,9 +3,9 @@
 每个 batch/dtype/layout 是独立 node，可用 -k 或 node id 选择。
 普通用例只验正确性，jit_blockscale 同时打印耗时和 diff；
 -m perf 显式运行大 shape 和其余固定路径的多 buffer 计时。
+FlyDSL 两阶段底座的正确性用例在 test_fly_2stage_basic.py / test_fly_2stage_extra.py。
 """
 
-import inspect
 import json
 import math
 import statistics
@@ -194,136 +194,6 @@ def test_jit_gelu(tokens, preshuffle):
                       tile_n_gate=256, tile_n_down=256))
 
 
-@pytest.mark.parametrize("tokens", [2, 4, 16], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("precision", ["bf16", "ptpc", "per_tensor"])
-def test_fly_decode(tokens, precision):
-    _check(_prepare(DECODE_MODEL, tokens, precision),
-           dict(_impl="fly_decode", tile_n_gate=128, tile_n_down=128))
-
-
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("precision", ["bf16", "ptpc", "per_tensor"])
-def test_fly_direct(tokens, precision):
-    _check(_prepare(DECODE_MODEL, tokens, precision),
-           dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32, tile_n_down=64))
-
-
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 64], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
-@pytest.mark.parametrize("algorithm", ["direct", "sorted"])
-def test_fly_mxfp4(tokens, gate_mode, algorithm):
-    config = (dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=64 if tokens >= 4 else 32,
-                   tile_n_down=32) if algorithm == "direct" else
-              dict(_impl="fly_decode", tile_m_gate=32, tile_m_down=32, tile_n_gate=64, tile_n_down=64))
-    _check(_prepare(DECODE_MODEL, tokens, "mxfp4", gate_mode=gate_mode), config)
-
-
-@pytest.mark.parametrize("inter_size", [3072, 4096], ids=lambda i: f"i{i // 8}")
-@pytest.mark.parametrize("betas", [(1.0, 1.0), (.5, 2.0)], ids=["unit", "scaled"])
-@pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
-@pytest.mark.parametrize("tokens", [1, 2], ids=lambda m: f"m{m}")
-def test_fly_mxfp4_situv2(tokens, inter_size, betas, gate_mode):
-    model = dict(HIDDEN_SIZE=3584, INTER_SIZE=inter_size, TP=8, E=8, TOPK=4)
-    call = _prepare(model, tokens, "mxfp4", activation="situv2", gate_mode=gate_mode,
-                    beta=betas[0], linear_beta=betas[1])
-    config = (dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32) if tokens == 1 else
-              dict(_impl="fly_decode", tile_m_gate=32, tile_m_down=32))
-    _check(call, config)
-
-
-@pytest.mark.parametrize("tokens", [1, 2], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("precision", ["bf16", "ptpc"])
-def test_fly_situv2_decode(tokens, precision):
-    config = (dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32) if tokens == 1 else
-              dict(_impl="fly_decode"))
-    _check(_prepare(SMALL_MODEL, tokens, precision, activation="situv2"), config)
-
-
-@pytest.mark.parametrize("precision", ["bf16", "ptpc", "mxfp4"])
-def test_fly_situv2_direct(precision):
-    model = dict(HIDDEN_SIZE=3584, INTER_SIZE=3072, TP=8, E=8, TOPK=4)
-    call = _prepare(model, 2, precision, activation="situv2", beta=.5, linear_beta=2.0,
-                    gate_mode="interleave" if precision == "mxfp4" else "separated")
-    _check(call, dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32,
-                      tile_n_down=32 if precision == "mxfp4" else 64))
-
-
-@pytest.mark.parametrize("precision", ["bf16", "ptpc"])
-def test_fly_situv2_prefill(precision):
-    _check(_prepare(SMALL_MODEL, 64, precision, activation="situv2"),
-           dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=64, tile_n_gate=128,
-                tile_n_down=128, tile_k_gate=64 if precision == "bf16" else 128))
-
-
-@pytest.mark.parametrize("tokens, config", [
-    pytest.param(1, dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32), id="direct-m1"),
-    pytest.param(2, dict(_impl="fly_decode", tile_m_gate=64, tile_m_down=64,
-                         tile_n_gate=128, tile_n_down=128), id="sorted-m2"),
-    pytest.param(64, dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=64,
-                          tile_n_gate=128, tile_n_down=128, tile_k_gate=64), id="prefill-m64"),
-])
-def test_fly_swiglu(tokens, config):
-    _check(_prepare(SMALL_MODEL, tokens, "bf16", activation="swiglu", swiglu_limit=.02), config)
-
-
-@pytest.mark.parametrize("inter", [192, 256, 320, 384, 512, 640], ids=lambda i: f"i{i}")
-@pytest.mark.parametrize("precision", ["ptpc", "per_tensor"])
-@pytest.mark.parametrize("path, down_m, down_n, padding", [
-    ("default", 64, 128, None), ("1x4_64x256", 64, 256, 128),
-    ("8x1", 256, 128, 128), ("8x1_compact", 64, 128, 128),
-], ids=["default", "1x4", "8x1", "compact"])
-def test_fly_down_paths(inter, precision, path, down_m, down_n, padding):
-    model = dict(HIDDEN_SIZE=512, INTER_SIZE=inter, TP=1, E=8, TOPK=4)
-    config = dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=down_m,
-                  tile_n_gate=128, tile_n_down=down_n, tile_k_gate=128,
-                  down_path=path, padding=padding)
-    _check(_prepare(model, 33, precision), config)
-
-
-@pytest.mark.parametrize("device_name, expected", [
-    ("AMD Instinct MI308X", (True, 4)), ("AMD Instinct MI300X", (False, 8)),
-    ("AMD Instinct MI355X", (False, 8)),
-])
-def test_down_device_config(device_name, expected):
-    from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import down_device_config_from_name
-
-    assert down_device_config_from_name(device_name) == expected
-
-
-@pytest.mark.parametrize("inter_size", [192, 320])
-@pytest.mark.parametrize("tile_k", [None, 128, 192])
-@pytest.mark.parametrize("weight_quant, act_quant", [("ptpc", None), ("per_tensor", None), ("per_tensor", "ptpc")])
-def test_fly_down_8x1_mixed_dispatch(inter_size, tile_k, weight_quant, act_quant):
-    from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
-
-    result = _build_moe_gemm2_8x1(
-        N=512, K=inter_size, weight_dtype="fp8", weight_quant_type=weight_quant,
-        TOPK=4, BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128,
-        stage="down", alg="prefill_1x4", USE_ATOMIC_WRITE=False,
-        act_quant_type=act_quant, tile_k=tile_k, down_path="8x1", down_output_padding_bytes=128)
-    kernel = inspect.getclosurevars(result.func).nonlocals["moe_2stage_down_prefill_8x1"]
-    params = inspect.getclosurevars(kernel._func).nonlocals
-    assert callable(result)
-    assert {key: params[key] for key in (
-        "N", "K", "TOPK", "tile_k", "weight_quant_type", "act_quant_type",
-        "down_output_padding_bytes", "_task_table", "_store_cache",
-    )} == dict(N=512, K=inter_size, TOPK=4, tile_k=192, weight_quant_type=weight_quant,
-              act_quant_type=act_quant or weight_quant, down_output_padding_bytes=128,
-              _task_table=False, _store_cache=2)
-
-
-@pytest.mark.parametrize("inter_size", [192, 320])
-def test_fly_down_8x1_rejects_removed_bk64(inter_size):
-    from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
-
-    with pytest.raises(AssertionError, match="仅保留K192整块192"):
-        _build_moe_gemm2_8x1(
-            N=512, K=inter_size, weight_dtype="fp8", weight_quant_type="ptpc", TOPK=4,
-            BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128, stage="down", alg="prefill_1x4",
-            USE_ATOMIC_WRITE=False, act_quant_type="ptpc", tile_k=64,
-            down_path="8x1", down_output_padding_bytes=128)
-
-
 @pytest.mark.perf
 @pytest.mark.parametrize("tokens", [8192, 16384], ids=lambda m: f"m{m}")
 @pytest.mark.parametrize("model_name", ["qwen35_397B_k256"])
@@ -369,22 +239,10 @@ def test_small_batch_perf(tokens, precision, record_property):
 
 @pytest.mark.perf
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("precision", ["bf16", "ptpc", "mxfp4"])
-def test_force_batch1_path_perf(tokens, precision, record_property):
-    config = dict(_impl="fly_decode", decode_alg="batch1",
-                  tile_n_gate=64 if precision == "mxfp4" and tokens >= 4 else 32,
-                  tile_n_down=32 if precision == "mxfp4" else 64)
+@pytest.mark.parametrize("precision", ["bf16", "ptpc"])
+def test_fly_batch1_perf(tokens, precision, record_property):
+    config = dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=32, tile_n_down=64)
     _measure(_prepare(DECODE_MODEL, tokens, precision), config, record_property)
-
-
-@pytest.mark.perf
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8], ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("algorithm", ["direct", "sorted"])
-def test_mxfp4_fly_default_force_perf(tokens, algorithm, record_property):
-    model = dict(HIDDEN_SIZE=7168, INTER_SIZE=3072, TP=8, E=896, TOPK=16)
-    config = (dict(_impl="fly_decode", decode_alg="batch1", tile_n_gate=64 if tokens >= 4 else 32,
-                   tile_n_down=32) if algorithm == "direct" else dict(_impl="fly_decode"))
-    _measure(_prepare(model, tokens, "mxfp4", gate_mode="interleave"), config, record_property)
 
 
 @pytest.mark.perf
@@ -398,9 +256,8 @@ def test_splitk_perf(tokens, precision, record_property):
 @pytest.mark.parametrize("tokens", [64, 1024, 8192], ids=lambda m: f"m{m}")
 @pytest.mark.parametrize("model_name", list(MOE_MODELS))
 @pytest.mark.parametrize("path, down_m, down_n, padding", [
-    ("default", 64, 128, None), ("1x4_64x256", 64, 256, 128),
-    ("8x1", 256, 128, 128), ("8x1_compact", 64, 128, 128),
-], ids=["default", "1x4", "8x1", "compact"])
+    ("default", 64, 128, None), ("1x4_64x256", 64, 256, 128), ("8x1_compact", 64, 128, 128),
+], ids=["default", "1x4", "compact"])
 def test_model_prefill_perf(tokens, model_name, path, down_m, down_n, padding, record_property):
     model = MOE_MODELS[model_name]
     config = dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=down_m,

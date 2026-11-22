@@ -19,14 +19,13 @@ if __package__:
     from .moe_multistage_down import flydsl_moe_gemm_8wave_down
     from . import moe_multistage_down_m128 as m128_kernel
     from .moe_multistage_pipeline import DownReduceWorkspace, compile_packed_down_reduce
-    from .moe_multistage_reduce import make_moe_sum
+    from .moe_multistage_reduce import make_moe_inverse, make_moe_sum
 else:
     from moe_8wave_down import flydsl_moe_gemm_8wave_down as legacy_flydsl_down
     from moe_multistage_down import flydsl_moe_gemm_8wave_down
     import moe_multistage_down_m128 as m128_kernel
     from moe_multistage_pipeline import DownReduceWorkspace, compile_packed_down_reduce
-    from moe_multistage_reduce import make_moe_sum
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
+    from moe_multistage_reduce import make_moe_inverse, make_moe_sum
 
 
 def make_m128_priority3_down(*, n, k=256, topk, num_experts):
@@ -597,7 +596,7 @@ def test_native_sorting_expert_boundaries(persistent):
     expected = ((assignments.float() + 1) * routing * 0.5).to(torch.bfloat16).view(tokens, topk, 1).expand(-1, -1, n)
     torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
     inverse = torch.full((tokens, topk), -1, dtype=torch.int32, device="cuda")
-    invert_sorted_ids(topk)(ids, inverse, valid, ids.numel(), tokens)
+    make_moe_inverse(topk)(ids, inverse, valid, ids.numel(), tokens)
     output = torch.empty((tokens, n), dtype=torch.bfloat16, device="cuda")
     make_moe_sum(n=n, topk=topk, sort_block_m=block_m)(output, packed, inverse)
     torch.testing.assert_close(output, expected[:, 0], rtol=0, atol=0)

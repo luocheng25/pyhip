@@ -1,16 +1,22 @@
 # 固定 MoE kernel 的 pytest
 
-[test_moe.py](test_moe.py) 测试显式指定的 FlyDSL/ASM 完整 MoE 路径，
+[test_moe.py](test_moe.py) 测试显式指定的 ASM 完整 MoE 路径（另含 FlyDSL 底座的 `-m perf` 计时入口），
 取代旧的 `entry_common()`、私有 buffer 池、后端别名和手动主循环。
 每个 batch、dtype、布局是独立 pytest node；不读取 autotune winner，
 不调用 `_configs()`，失败时不会悄悄改选其它实现。
 
+FlyDSL 两阶段底座（Aiter `gfx9_fp8`）的固定配置用例分两个文件：
+[test_fly_2stage_basic.py](test_fly_2stage_basic.py) 是基本功能测试（每条公开路径一例，
+每次小改动先跑），[test_fly_2stage_extra.py](test_fly_2stage_extra.py) 只放基本测试与 bench
+覆盖不了的情况，每个用例写明原因。
+
 [test_tuned_moe.py](test_tuned_moe.py) 保留调优策略、缓存、benchmark、
-特殊数值和 graph/多设备边界回归。固定 kernel 的覆盖不随候选策略变化。
+特殊数值和 graph 边界回归（按设备隔离的 FlyDSL 编译缓存已随底座替换删除）。固定 kernel 的覆盖不随候选策略变化。
 
 ## 依赖接口
 
-当前基准为 FlyDSL 0.3.0 和 Aiter `cdfd46fcd`，直接使用 SiTUv2、原生 buffer
+当前基准为 FlyDSL 0.5.0；FlyDSL 两阶段底座逐字取自 Aiter `ca6bc0f851` 的 `gfx9_fp8`（保留其对
+`aiter.jit.utils.chip_info`、`tensor_shim` 的依赖），直接使用原生 buffer
 描述符、命名 waitcnt 和 autotune artifact，不再提供旧版接口回退。
 为兼容尚无 `output` 参数的 Aiter，保留 `moe_sorting` / `fused_moe` 的输出清零/复制适配。
 `stage2_scatter` 和三项激活量化参数按原生签名转发；旧版不支持的 `None` 默认值会被移除，
@@ -28,12 +34,12 @@ python3 -m pytest tests/ops/moe/test_moe.py --collect-only -q
 # 指定 ASM split-K 的一个精度和实际 batch
 python3 -m pytest 'tests/ops/moe/test_moe.py::test_asm_splitk[ptpc-m17]' -q
 
-# 固定 FlyDSL sorted decode / direct，或特定 Down 路径
-python3 -m pytest tests/ops/moe/test_moe.py -k 'test_fly_decode or test_fly_direct' -q
-python3 -m pytest tests/ops/moe/test_moe.py -k 'test_fly_down_paths and compact and i320' -q
+# FlyDSL 两阶段底座：基本功能测试（每次小改动先跑）与其他覆盖测试
+python3 -m pytest tests/ops/moe/test_fly_2stage_basic.py -q
+python3 -m pytest tests/ops/moe/test_fly_2stage_extra.py -q -k 'test_prefill_variants and compact'
 
 # 性能单独选择；默认不运行 perf
-python3 -m pytest tests/ops/moe/test_moe.py -m perf -k 'test_force_batch1_path_perf and bf16' -s
+python3 -m pytest tests/ops/moe/test_moe.py -m perf -k 'test_fly_batch1_perf and bf16' -s
 python3 -m pytest tests/ops/moe/test_moe.py -m perf \
   -k 'test_model_prefill_perf and qwen35_35B_k256 and compact and m1024' -s \
   -o junit_family=xunit1 --junitxml=/tmp/moe-kernel-perf.xml
@@ -122,7 +128,7 @@ MXFP4 pytest 额外保留旧测试的 expert/row/K-group 幅度变化，覆盖�
 E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的当前设置，
 完整 MoE 参考和容差不随舍入模式放宽。
 
-固定路径计时包含 sorting、quant、Gate/Up、Down、inverse/sum、内部 workspace
+固定路径计时包含 sorting、quant、Gate/Up、Down、sorted_sum 规约、内部 workspace
 和 Python launch；**不是单个裸 Gate/Up 或 Down 的设备时间**。`perf` 用例先
 编译和检查，再以2个副本、2次 warmup、10次 sample 测量；输出完整配置、
 中位时延、有效 TFLOPS、diff，并通过 `record_property` 保存到 JUnit。
@@ -144,9 +150,9 @@ E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的�
 | FP8 block-scale 8-wave | `jit_blockscale` / `test_jit_blockscale` |
 | MXFP4 通用/专用 Gate/Up | `jit_mxfp4` / `jit_mxfp4_4wave` / `test_jit_mxfp4` |
 | BF16 GELU | `jit_gelu` / `test_jit_gelu`；不保留 MXFP4 GELU Torch fallback |
-| `fly_splitk_2s` 的 batch/启发式分支 | `fly_decode` / `fly_prefill`，按 direct、sorted、prefill 明确拆开 |
-| SiTUv2 / SwiGLU / MXFP4 布局 | 保留专门的参数化用例，不在一个 test 中改写 dtype 列表 |
-| 8x1 六种 K 和两种量化 | `test_fly_down_paths`，扩展为四条 Down 路径 |
+| `fly_splitk_2s` 的 batch/启发式分支 | `fly_decode` / `fly_prefill`，按 direct、sorted、prefill 拆开；底座换成 Aiter `gfx9_fp8` 后见 `test_fly_2stage_basic.py` / `test_fly_2stage_extra.py` |
+| SiTUv2 / SwiGLU / MXFP4 布局 | SwiGLU 见 `test_fly_2stage_extra.py`；FlyDSL 的 SiTUv2 与 MXFP4 已随底座替换删除 |
+| 8x1 六种 K 和两种量化 | 单独 8x1 已删除；default / 1x4_64x256 / 8x1_compact 见两个 `test_fly_2stage_*.py` |
 | 手动模型性能循环 | `test_model_prefill_perf`；Aiter 对照仍使用原 benchmark |
 
 旧 FP8 split-K 的 `block` 参数曾遗漏传给执行函数，实际重复测试 PTPC；

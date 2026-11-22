@@ -12,6 +12,7 @@ FLYDSL_AUTOTUNE_CONFIG_DIR 用于指定离线配置的导出目录。
 精度阈值沿用 test_moe 的 ``calc_diff <= 0.02``，并非逐元素 2% 相对误差。
 """
 
+import functools
 import json
 import math
 import os
@@ -177,6 +178,13 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
         # ASM wrapper 用整除计算 launch grid，不能丢掉最后一个 N tile。
         if impl.startswith("jit_") and ((2 * i) % gn or h % dn):
             return
+        # FlyDSL prefill Gate/Up 不检查不完整的 N tile，Aiter 也在配置层排除。
+        if impl == "fly_prefill" and (2 * i) % gn:
+            return
+        # 默认 prefill Down 把 M×I 激活放进 LDS；超过 64 KiB 不会编译失败，而是 launch 时报错。
+        if (impl == "fly_prefill" and kwargs.get("down_path", "default") == "default"
+                and dm * i * (2 if kind == "bf16" else 1) > 64 * 1024):
+            return
         params = dict(_impl=impl, tile_m_gate=gm, tile_m_down=dm,
                       tile_n_gate=gn, tile_n_down=dn, **kwargs)
         if impl == "fly_prefill":
@@ -226,28 +234,25 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                 for n in (128, 256):
                     add("jit_mxfp4_4wave", m, m, n, 128)
 
-    if kind == "block":
-        return configs  # 当前 FlyDSL kernel 不支持 128×128 block scale。
+    if kind in ("block", "fp4") or options["activation"] == aiter.ActivationType.Situv2:
+        return configs  # FlyDSL kernel 只支持 BF16 / FP8 per-token、per-tensor 的 SiLU 和 SwiGLU。
     if batch_bucket <= 32:
-        down_ns = (32,) if kind == "fp4" else (64,)
-        if kind == "fp4" and batch_bucket == 1:
-            down_ns += (64,)
         for gn in (32, 64):
-            for dn in down_ns:
-                add("fly_decode", gn=gn, dn=dn, decode_alg="batch1")
+            add("fly_decode", gn=gn, dn=64, decode_alg="batch1")
     for m in (16, 32, 64):
         for n in (64, 128):
             add("fly_decode", m, m, n, n)
-    if kind == "fp4" or batch_bucket < 64:
+    if batch_bucket < 64:
         return configs
     for m in (32, 64, 128):
         for n in (128, 256):
             add("fly_prefill", m, m, n, 128)
     if kind != "bf16":
-        for path, dm, dn in (("1x4_64x256", 64, 256), ("8x1", 256, 128), ("8x1_compact", 64, 128)):
+        # 专用 Down 要求 Gate/Up 与 Down 共用 M64 排序块。
+        for path, dn in (("1x4_64x256", 256), ("8x1_compact", 128)):
             for gn in (128, 256):
                 for padding in (0, 128):
-                    add("fly_prefill", 64, dm, gn, dn, down_path=path, padding=padding)
+                    add("fly_prefill", 64, 64, gn, dn, down_path=path, padding=padding)
     return configs
 
 
@@ -410,88 +415,97 @@ def _run_8wave(x, w1, w2, ids, weights, options, out, m, gn, dn,
     return out
 
 
+@functools.cache
+def _fly_kernel(**params):
+    """同一配置只编译一次；与 Aiter 一样不按设备区分缓存。"""
+    from .flydsl.moe_gemm_2stage import compile_gemm
+
+    return compile_gemm(**params)
+
+
 def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
              decode_alg, down_path, padding, tile_k_gate=0):
-    """执行 FlyDSL 的两阶段 MoE，每次调用都重新获取当前 stream。"""
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
+    """按 Aiter fused_moe_gfx942 的 batch1 / split-K / prefill 调用链执行 FlyDSL 两阶段 MoE。
+
+    每次调用都重新获取当前 stream。
+    """
+    from aiter.fused_moe import AUX_SORT_OPUS
+    from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-    from .flydsl.moe_gemm_splitk import compile_gemm, invert_sorted_ids, sorted_sum
+    from .flydsl.moe_gemm_2stage import flydsl_absmax, flydsl_quant_per_tensor, sorted_sum
+    from .flydsl.moe_gemm_2stage.common import _ptr
 
-    def ptr(t):
-        """将 tensor 转为 FlyDSL 指针；FP8/FP4/E8M0 用字节指针传入。"""
-        elem = {torch.bfloat16: fx.BFloat16, torch.float32: fx.Float32,
-                torch.int32: fx.Int32}.get(t.dtype, fx.Uint8)
-        return flyc.from_c_void_p(elem, t.data_ptr())
-
-    def launch(params, tensors, *args):
+    def launch(params, *args):
         # 首次 compile 会同时执行 kernel，不能再调用一次，否则 atomic add 会重复累加。
-        _run_compiled(compile_gemm(**params), *(ptr(t) for t in tensors), *args, stream)
+        _run_compiled(_fly_kernel(**params),
+                      *(_ptr(a) if isinstance(a, torch.Tensor) else a for a in args), stream)
 
     def quantize(t):
-        """为 native FP8 prefill 生成量化激活和 per-token/per-tensor scale。"""
-        qtype = (aiter.QuantType.per_Token if quant == "ptpc" else aiter.QuantType.per_Tensor)
-        q, scale = aiter.get_hip_quant(qtype)(t.view(-1, t.shape[-1]), quant_dtype=w1.dtype)
-        return q, scale.to(torch.float32).contiguous()
+        """为 FP8 prefill 生成量化激活和 scale；per-tensor 与 Aiter 一样用 FlyDSL absmax。"""
+        t = t.view(-1, t.shape[-1])
+        if quant == "ptpc":
+            q, scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(t, quant_dtype=w1.dtype)
+            return q, scale.to(torch.float32).contiguous()
+        amax = torch.zeros(1, dtype=torch.float32, device=t.device)
+        q = torch.empty_like(t, dtype=w1.dtype)
+        flydsl_absmax()(t, amax)
+        flydsl_quant_per_tensor(w1.dtype)(t, amax, q)
+        return q, amax / torch.finfo(w1.dtype).max
 
     b, h = x.shape
     e, n1, _ = w1.shape
     i, topk = n1 // 2, ids.shape[1]
     stream = torch.cuda.current_stream(x.device)
-    kind = "bf16" if w1.dtype == torch.bfloat16 else "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
+    kind = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     quant = {aiter.QuantType.No: "no", aiter.QuantType.per_Token: "ptpc",
-             aiter.QuantType.per_Tensor: "per_tensor", aiter.QuantType.per_1x32: "mxfp4"}[options["quant_type"]]
+             aiter.QuantType.per_Tensor: "per_tensor"}[options["quant_type"]]
     dummy = torch.empty(1, device=x.device, dtype=torch.float32)
     s1 = options["w1_scale"] if options["w1_scale"] is not None else dummy
     s2 = options["w2_scale"] if options["w2_scale"] is not None else dummy
     mid = torch.empty((b, topk, i), device=x.device, dtype=x.dtype)
-    common = dict(weight_dtype=kind, weight_quant_type=quant, TOPK=topk, E=e,
-                  act_quant_type="no" if kind == "fp4" else quant)
-    activation = {aiter.ActivationType.Silu: "silu", aiter.ActivationType.Swiglu: "swiglu",
-                  aiter.ActivationType.Situv2: "situv2"}[options["activation"]]
+    common = dict(weight_dtype=kind, weight_quant_type=quant, TOPK=topk)
+    activation = {aiter.ActivationType.Silu: "silu",
+                  aiter.ActivationType.Swiglu: "swiglu"}[options["activation"]]
     g = dict(common, N=n1, K=h, stage="gateup", BLOCK_TILE_SIZE_M=gm,
-             BLOCK_TILE_SIZE_N=gn, activation=activation,
-             # Aiter 的 SiTUv2 不做 clamp；这里传入 inf，让现有 kernel 保持相同行为。
-             swiglu_limit=float("inf") if activation == "situv2" else options["swiglu_limit"],
-             situ_beta=1.0 if options["beta"] is None else float(options["beta"]),
-             situ_linear_beta=1.0 if options["linear_beta"] is None else float(options["linear_beta"]),
-             mxfp4_gate_up_interleaved=options["gate_mode"] == GateMode.INTERLEAVE)
+             BLOCK_TILE_SIZE_N=gn, activation=activation, swiglu_limit=options["swiglu_limit"])
     d = dict(common, N=h, K=i, stage="down", BLOCK_TILE_SIZE_M=dm, BLOCK_TILE_SIZE_N=dn)
     if impl == "fly_decode" and decode_alg == "batch1":
-        # Gate/Up 清零整个输出，后续同 stream 的 Down 再 atomic add。
-        launch(dict(g, alg="batch1", fused_down_clear=True),
-               (x, w1, mid, ids, out, s1), b)
-        launch(dict(d, alg="batch1"), (mid, w2, out, ids, weights, s2), b)
+        # Gate/Up 清零整个输出，后续同 stream 的 Down 再 atomic add；launcher 的 task 数是路由数。
+        launch(dict(g, alg="batch1", fused_down_clear=True), x, w1, mid, ids, out, s1, b * topk)
+        launch(dict(d, alg="batch1"), mid, w2, out, ids, weights, s2, b * topk)
+        return out
+    if gm != dm:
+        raise ValueError("FlyDSL Gate/Up and Down must share the sorting M tile")
+
+    if impl == "fly_decode":
+        si, sw, se, valid, _ = moe_sorting(ids, weights, e, h, x.dtype, dm, output=out)
+        launch(dict(g, alg="splitk", E=e), x, w1, mid, si, sw, se, valid, s1, b, se.numel())
+        launch(dict(d, alg="splitk", E=e), mid, w2, out, si, sw, se, valid, s2, b, se.numel())
         return out
 
-    si, sw, se, valid, _ = moe_sorting(ids, weights, e, h, x.dtype, dm, output=out)
+    # Opus 排序同时给出每条路由所在的排序行；sorted_sum 会写满 out，排序不必清零。
+    si, sw, se, valid, _, _, loc_ids = moe_sorting(
+        ids, weights, e, h, x.dtype, dm, accumulate=False, output_aux=AUX_SORT_OPUS)
     routing = (si, sw, se, valid)
     grid = se.numel()
-    if impl == "fly_decode":
-        launch(dict(g, alg="splitk", METADATA_TILE_SIZE_M=dm), (x, w1, mid, *routing, s1), b, grid)
-        launch(dict(d, alg="splitk"), (mid, w2, out, *routing, s2), b, grid)
-        return out
-
     gate_in, a_scale = quantize(x) if kind == "fp8" else (x, dummy)
-    launch(dict(g, alg="prefill_1x4", METADATA_TILE_SIZE_M=dm,
-                 tile_k=tile_k_gate or (128 if kind == "fp8" else 64)),
-           (gate_in, w1, mid, *routing, s1, a_scale), b, grid)
+    if quant == "per_tensor":
+        mid.zero_()  # Gate/Up 不写排序合并掉的路由，但 Down 的 absmax 会读所有行。
+    launch(dict(g, alg="prefill_1x4", E=e, tile_k=tile_k_gate or (128 if kind == "fp8" else 64)),
+           gate_in, w1, mid, *routing, s1, a_scale, b, grid)
     down_in, a_scale = quantize(mid) if kind == "fp8" else (mid, dummy)
-    routes = torch.empty((grid * dm, h + (padding or 0) // 2), device=x.device, dtype=x.dtype)
-    extra_tensors, extra_args = (), ()
+    padding = padding or 0
+    routes = torch.empty((grid * dm, h + padding // x.element_size()), device=x.device, dtype=x.dtype)
+    params = dict(d, alg="prefill_1x4", E=e, down_path=down_path, down_output_padding_bytes=padding)
+    args = (down_in, w2, routes, *routing, s2, a_scale, b, grid)
     if down_path == "8x1_compact":
         from .flydsl.moe_gemm_2stage.gemm2_8x1_compact import allocate_task_buffers
-        # 这里只分配 workspace；full/tail 任务表会在每次 launch 时由 GPU 重新生成。
-        full, tail, counts = allocate_task_buffers(se, e)
-        extra_tensors, extra_args = (full, tail, counts), (full.shape[0], tail.shape[0])
-    params = dict(d, alg="prefill_1x4", USE_ATOMIC_WRITE=False,
-                  down_path=down_path, down_output_padding_bytes=padding)
-    # compact 接口中，workspace 指针必须跟在 b 和 grid 两个运行时参数之后。
-    _run_compiled(compile_gemm(**params), *(ptr(t) for t in (down_in, w2, routes, *routing, s2, a_scale)),
-                  b, grid, *(ptr(t) for t in extra_tensors), *extra_args, stream)
-    loc_ids = torch.empty((b, topk), device=x.device, dtype=torch.int32)
-    # 只为排序 buffer 中的有效条目建立反向索引，避免读取未初始化的尾部。
-    invert_sorted_ids(topk)(si, loc_ids, valid, si.numel(), b)
+
+        # 任务表每次 launch 由 GPU 重建；切分策略与 workspace 容量必须用同一个 CU 数。
+        cu_count = get_cu_num()
+        full, tail, counts = allocate_task_buffers(se, e, cu_count)
+        args += (full, tail, counts, full.shape[0], tail.shape[0], cu_count)
+    launch(params, *args)
     sorted_sum(topk, h, padding)(loc_ids, routes, out, b)
     return out
 
@@ -577,13 +591,14 @@ _autotuned_fmoe = autotune(
     configs=_configs,
     key=["batch_bucket", "model_key"],
     prune_configs_by=_prune_invalid_configs,
-    artifact_name="pyhip_fused_moe_v6",
+    artifact_name="pyhip_fused_moe_v7",
 )(_fmoe_wrapper)
 
 def _model_key(call):
     """把影响配置选择的信息加入 cache key；缓存只保存配置，不保存张量数据。"""
     # FlyDSL 不会读取 tensor 的自定义属性或展开 options 中的张量，需要手动补充。
-    values = {"version": 6}
+    # v7：FlyDSL 底座换成 Aiter gfx9_fp8，删去 MXFP4/SiTUv2/8x1 候选，旧 winner 需重新调优。
+    values = {"version": 7}
     if call["quant_type"] in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
         # 新策略同时搜索 A8W8/A16W8，不复用只允许 A1x128 激活的旧 winner。
         values["block_activation_quant"] = "per_1x128_or_bf16"

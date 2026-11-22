@@ -25,7 +25,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
 from pyhip.codegen.flydsl import helpers as fxh
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import _ptr
 
 
 ATT_TUNED_BN128_CONFIG = {

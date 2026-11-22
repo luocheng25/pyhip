@@ -6,10 +6,9 @@
 import torch
 
 if __package__:
-    from .moe_multistage_reduce import make_moe_sum
+    from .moe_multistage_reduce import make_moe_inverse, make_moe_sum
 else:
-    from moe_multistage_reduce import make_moe_sum
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
+    from moe_multistage_reduce import make_moe_inverse, make_moe_sum
 
 
 class DownReduceWorkspace:
@@ -45,7 +44,7 @@ def compile_packed_down_reduce(down, *, n, topk, workspace=None):
     workspace = DownReduceWorkspace() if workspace is None else workspace
     sort_block_m = down.config["block_m"]
     assert sort_block_m in (128, 256) and down.config["output_layout"] == "packed"
-    inverse_kernel = invert_sorted_ids(topk)
+    inverse_kernel = make_moe_inverse(topk)
     reduce = make_moe_sum(n=n, topk=topk, sort_block_m=sort_block_m)
 
     def buffers(args):

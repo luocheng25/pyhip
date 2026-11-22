@@ -71,7 +71,7 @@ PyHIP沿原token/slot写routed行；同wave的相邻排序行可能落在不相�
 2. 256线程、2048列/CTA，提前读TOPK位置和片段，FP32顺序累加后转BF16。
 3. 没有额外的“先restore成routed再sum”中间步骤；但inverse和gather本身有成本，必须计入Full。
 
-代码：[inverse有效前缀](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)、[packed reducer](moe_multistage_reduce.py#L20-L59)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
+代码：[inverse有效前缀](moe_multistage_reduce.py#L101-L136)、[packed reducer](moe_multistage_reduce.py#L20-L59)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
 
 若排序位置为l、输出列为j、Block M为B，则packed元素索引为：
 
