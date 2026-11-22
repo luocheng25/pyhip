@@ -2,7 +2,7 @@
 
 <a id="upstream-replacement"></a>
 
-> **替换状态（2026-11-21，moe-ptpc-a8w4 M0）：本文其余部分描述替换前的 pyhip 实现，它现在是 legacy。** gfx942 上 BF16/FP8 × SiLU/SwiGLU 的生产路径已换成上游 ROCm/aiter@df3e0b2f `aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8/`，由 [gemm.py](gemm.py) 按配置在上游与 legacy 之间分流。分流规则、Qwen3.8 用到的上游 kernel、用例与替换前后的测量见 [a8w4_ptpc/history.md](../a8w4_ptpc/history.md)（M6 从入口文档 [a8w4_ptpc/README.md](../a8w4_ptpc/README.md) 移去）。
+> **替换状态（2026-11-21，moe-ptpc-a8w4 M0）：本文其余部分描述替换前的 pyhip 实现，它现在是 legacy。** gfx942 上 BF16/FP8 × SiLU/SwiGLU 的生产路径已换成上游 ROCm/aiter@df3e0b2f `aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8/`，由 [gemm.py](gemm.py) 按配置在上游与 legacy 之间分流。分流规则、Qwen3.8 用到的上游 kernel、用例与替换前后的测量见 [a8w4_ptpc/m0_upstream_replacement.md](../a8w4_ptpc/m0_upstream_replacement.md)；基于它的 A8W4 算子见 [a8w4_ptpc/README.md](../a8w4_ptpc/README.md)。
 
 | 本目录文件 | 现在的内容 |
 |---|---|
@@ -20,7 +20,7 @@
 
 | 本文章节 | 替换后的状态 |
 |---|---|
-| 下面的开头说明与“版本边界 / 测量边界 / 准备清单” | 写于替换前（2026-09-11），说的是 pyhip 实现（现为 legacy）及其收据；“13 源”及其 SHA256 不再对应现在的文件；上游路径的说明见 [a8w4_ptpc/history.md §3](../a8w4_ptpc/history.md#design) |
+| 下面的开头说明与“版本边界 / 测量边界 / 准备清单” | 写于替换前（2026-09-11），说的是 pyhip 实现（现为 legacy）及其收据；“13 源”及其 SHA256 不再对应现在的文件；上游路径的说明见 [a8w4_ptpc/m0_upstream_replacement.md §1](../a8w4_ptpc/m0_upstream_replacement.md#callchain) |
 | [1.1 支持范围](#scope) | 四个 path 与 K 约束是 legacy 的；gfx942 FP8 的 default、1x4、compact 在满足分流条件时由上游实现（上游 compact 没有 K=320），独立 8x1 只在 legacy |
 | [1.2 测试方法](#testing) | 仍适用（这些用例未改）；替换相关的新用例在 `tests/ops/moe/a8w4_ptpc/` |
 | [1.3](#matrix42)–[1.6](#validation-boundaries) 性能、落选、比较、验证 | **已过期**：替换前 pyhip 实现的测量，没有对上游重测 |

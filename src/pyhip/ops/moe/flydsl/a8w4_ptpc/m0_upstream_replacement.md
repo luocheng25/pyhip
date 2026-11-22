@@ -1,7 +1,8 @@
 # M0 深度参考：`moe_gemm_2stage` 换成上游 gfx9_fp8
 
-入口文档是 [README.md](README.md)，M0 的设计说明在 M6 移到了 [history.md](history.md)。本文放它们装不下的细节：补充术语、Qwen3.8 配置全表、逐文件相对上游的改动、
-行为差异、分流规则全表（B1–B29）、覆盖项全表（63 项）和测量来源。
+入口文档 [README.md](README.md) 是 A8W4 算子的设计说明。本文是它的底座（`moe_gemm_2stage` 换成上游 gfx9_fp8）的深度参考：
+术语与 Qwen3.8 配置全表、`tuned_moe` 的 FP8 接口与调用链、逐文件相对上游的改动、行为差异、已知限制、分流规则全表（B1–B29）、
+覆盖项全表（63 项）和测量来源。
 
 “上游”= ROCm/aiter@df3e0b2f 的 `aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8/`；
 “legacy”= 替换前（8027faad）的 pyhip 实现，现在在 `*_legacy.py` 与 `gemm2_default.py`。
@@ -12,22 +13,29 @@
 
 <a id="terms"></a>
 
-## 0. 补充术语与配置全表
+## 0. 术语与配置全表
 
-[history.md §3.1](history.md#terms) 只列 10 条主要术语，其余在这里：
+- **分流**：[`gemm_implementation`](../moe_gemm_2stage/gemm.py#L39) 对一个 `compile_gemm` 配置返回 `"upstream"` 或 `"legacy"`，在按设备的编译缓存里只判定一次；规则见 §5。
+- **ptpc / A8W8 / W8A16**：ptpc 是 FP8（E4M3FNUZ）量化，激活每 token 一个 fp32 scale、权重每输出通道一个。A8W8 = 激活与权重都是 FP8，做 FP8 MFMA；W8A16 = FP8 权重在寄存器里展开成 BF16，与 BF16 激活做 BF16 MFMA。
+- **fly_decode / fly_prefill**：`tuned_moe` 的两类 FlyDSL 候选。fly_decode 读 BF16 激活（batch1 或 split-K，W8A16）；fly_prefill 把两级 GEMM 的输入都按 token 量化成 FP8（A8W8）。
+- **路由 / 排序行 / 任务**：一个 (token, top-k 槽) 是一条路由；`moe_sorting` 把路由按专家排序并按 BM 补齐成排序行，每 BM 行是一个任务。
+- **batch1 / split-K / 1x4 / compact**：batch1 不排序，每条路由单独一组 CTA；split-K 先排序，Gate/Up 的 4 个 wave 沿 K 切分（Down 的 split-K 每个 CTA 只有 1 个 wave、不切 K，只是沿用算法名）；1x4 是 prefill 的 M64×N256 Down；compact 是任务表驱动的 M256 full（8x1，8 wave）加 M64 tail（1x4）Down。
+- **BM / BN / BK 与 gm·gn·gk·dm·dn**：tile 在排序行、输出通道、归约维上的尺寸；配置里 g = Gate/Up、d = Down，如 gn128 是 Gate/Up 的 BN=128。
+- **RTA / RTE**：FP32→BF16 舍入。简化 RTA = `(bits + 0x8000) >> 16`（中点远离零，可能不保留部分 NaN）；RTE = 就近偶数并保留 NaN。
+- **覆盖项 id**：A 接口契约、B 分流与变体、C 边界、D 执行模式、E 数值，如 B12；逐项见 §5、§6。
 - **`METADATA_TILE_SIZE_M`**：`moe_sorting` 补齐用的块行数（tuned_moe 里取 Down 的 BM）。Gate/Up 的 BM 比它小时，一个排序块拆成多个任务；只有 legacy 支持，上游要求两者相等（B6）。
 - **full / tail 容量**：compact 预先分配的任务表行数（[`task_capacities`](../moe_gemm_2stage/gemm2_8x1_compact.py#L27)）。full 任务每个 M256（4 个 M64 排序块），tail 任务每个 M64；超出 GPU 上实际任务数的 CTA 直接返回。
 - **padding 128 B**：prefill Down 写中间结果时每行末尾多留 128 字节（行跨度 = N + 64 个 BF16），`sorted_sum` 按同一跨度读；由配置的 `padding=128`（即 `down_output_padding_bytes`）指定。
 - **shuffle（权重）**：aiter `shuffle_weight(w)`（默认 layout (16, 16)）把每个专家的权重按 16 行 × 16 字节的小块重排，并给返回的张量加 `is_shuffled = True`；`tuned_moe` 靠这个属性判断能否走本地 kernel。
 - **`jit_*`**：`tuned_moe` 的 ASM 候选（`pyhip.ops.moe.asm`），如 `jit_batch1`、`jit_batch`、`jit_splitk`（两阶段 split-K）。
 - **mimo_ptpc**：`pyhip.testing.moe_shapes` 里的 MiMo 形状（H=6144、每卡 I=256、E=384、top-8、FP8 ptpc），`bench_tuned_moe.py` 用它计时。
-- **fd2 解码**（M2 计划，细节以实现为准）：pyhip PR #64 的 mxfp4 权重格式。每个输出通道取各 32-K 组 E8M0 scale 的最大值作通道因子（在 epilogue 乘，位置与 FP8 的每通道 scale 相同），组内只存相对它的指数差（差太大的组置 0）；K 循环里查表把 E2M1 精确转成 FP8，再做 FP8 MFMA（gfx942 没有 FP4 MFMA）。
+- **fd2 解码**（a8w4 使用，格式以 [weights.py 模块说明](weights.py#L1) 为准）：pyhip PR #64 的 mxfp4 权重格式。每个输出通道取各 32-K 组 E8M0 scale 的最大值作通道因子（在 epilogue 乘，位置与 FP8 的每通道 scale 相同），组内只存相对它的指数差（差太大的组置 0）；K 循环里查表把 E2M1 精确转成 FP8，再做 FP8 MFMA（gfx942 没有 FP4 MFMA）。
 - **logits_diff**：`1 − 2·Σ(x·y) / Σ(x² + y²)`，x 为参考、y 为输出，对全部元素求和，0 表示完全一致；与 aiter `calc_diff` 是同一公式（TM、TT 与 tuned_moe 调优用 `calc_diff` ≤ 0.02，Q 用 < 1e-3）。
 - **中位比值**：替换后 ÷ 替换前的耗时比，每轮算一次，取各轮的中位数；大于 1 表示变慢。
 
 <a id="configs"></a>
 
-Qwen3.8 配置全表（[`FLY_CONFIGS`](../../../../testing/moe_a8w4_ptpc.py#L41)；只在用例和 bench 里经 `make_moe_runner` 强制走 FlyDSL，生产调用由 `tuned_moe` 自动调优，见 [history.md §3.3](history.md#callchain)）。T 取第一条“上界 ≥ T”的行，超出最后一行时用最后一行；decode / prefill 交界由这张表决定，当前是 128/129，M1、M2 跟随它（用户 11-21 确认）。
+Qwen3.8 配置全表（[`FLY_CONFIGS`](../../../../testing/moe_a8w4_ptpc.py#L41)；只在用例和 bench 里经 `make_moe_runner` 强制走 FlyDSL，生产调用由 `tuned_moe` 自动调优，见 [§1](#callchain)）。T 取第一条“上界 ≥ T”的行，超出最后一行时用最后一行；decode / prefill 交界由这张表决定，当前是 128/129，a8w4 的 `CONFIGS` 沿用同一交界。
 
 | T | TP2（I=320） | TP4（I=160 补零到 192） |
 |---|---|---|
@@ -40,9 +48,53 @@ Qwen3.8 配置全表（[`FLY_CONFIGS`](../../../../testing/moe_a8w4_ptpc.py#L41)
 
 TP4 补零：FlyDSL Down 要求 I % 64 == 0（tuned_moe 也按 `i % 64` 判断能否走本地 kernel），[`make_weights`](../../../../testing/moe_a8w4_ptpc.py#L114) 在加载权重时给 gate、up 各补 32 行零、w2 补 32 列零、w1 scale 补 1；补出的通道输出 0，结果与 I=160 等价（只差累加顺序）。未补零的 I=160 在 tuned_moe 里没有本地候选，只走 aiter。
 
+<a id="callchain"></a>
+
+## 1. `tuned_moe` 的 FP8 接口与调用链
+
+| 符号 / 环境变量 | 说明 |
+|---|---|
+| [`tuned_moe.fused_moe`](../../tuned_moe.py#L629) | aiter `fused_moe` 的参数加 `output`，写入并返回 BF16 `[T, H]`；Qwen3.8 用 `per_Token` 与 `Silu` |
+| [`_native_kind`](../../tuned_moe.py#L40) | 判断能否走本地 kernel；任一条不满足就整体转交 aiter，不报错（主要条件见表下） |
+| `pyhip.testing.moe.make_moe_runner(config)` | 固定一个 `tuned_moe` 候选（不调优、不回退 aiter）；用例与 bench 用它固定 `FLY_CONFIGS` |
+| [`compile_gemm`](../moe_gemm_2stage/gemm.py#L322) | 按设备缓存，经 [`gemm_implementation`](../moe_gemm_2stage/gemm.py#L39) 分流（§5），返回 pyhip 调用约定的 launcher；`has_num_local_tokens` 见 §3 第 8 条 |
+| `AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED` | 默认 `1`（简化 RTA），`0` 为 RTE；导入 `common.py` 时读取，进程内再改不生效；上游、legacy 与 a8w4 共用 |
+| `AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED` | 默认 `0`，只在 RTE 时起作用：`1` 为简化 RTE（`(bits + 0x7FFF + ((bits >> 16) & 1)) >> 16`，不保证保留 NaN），`0` 为保留 NaN 的 RTE |
+| `MOE_PREFILL_TILE_K`、`CU_NUM` | 分别只影响 Gate/Up 的 BK 与上游 `get_cu_num()`，见 §3 第 4、5 条 |
+
+FP8 ptpc 走本地 kernel 的主要条件（完整以 `_native_kind` 为准）：BF16 `hidden [T, H]`（0 < T < 2^24，`H % 128 == 0`），张量都连续、在同一
+gfx942 / gfx950 设备上；`w1` / `w2` 为 FP8 `[E, 2I, H]` / `[E, H, I]`、`I % 64 == 0`，经 aiter `shuffle_weight` 且带 `is_shuffled`；
+`quant_type=per_Token`，激活为 Silu / Swiglu / SiTUv2；`expert_mask`、bias、shared expert 等可选输入都为空。`0 ≤ topk_ids < E` 由调用方保证。
+`output` 的形状、dtype、设备不符、不连续或与输入重叠时报 `RuntimeError`；调优时参考含 NaN / Inf、没有候选通过检查，或在 CUDA graph
+capture 中触发调优，也报 `RuntimeError`。
+
+调用链：
+- 生产：能走本地 kernel 时按 `batch_bucket = ceil_pow2(T)` 与 `model_key`（形状、dtype、布局、设备、环境变量）自动调优；候选
+  （[`_configs`](../../tuned_moe.py#L148)）有 aiter、ASM `jit_*`、FlyDSL `fly_decode`（batch1 只在桶 ≤ 32）和 `fly_prefill`（桶 ≥ 64），
+  在 torch 参考上 `calc_diff` ≤ 0.02 的候选里取最快的并缓存，胜出的不一定是 FlyDSL。
+- 用例与 bench：`make_moe_runner` 固定 §0 的 `FLY_CONFIGS`，两级都判给上游（B30）。
+
+Qwen3.8 用到的上游 kernel（③–⑥ 在寄存器里把 FP8 权重展开成 BF16，做 BF16 MFMA 16×16×16，即 W8A16；⑦⑧⑨ 做 FP8 MFMA 16×16×32）：
+
+| # | kernel | grid × block | 作用 |
+|---|---|---|---|
+| ① | `moe_sorting`（aiter） | aiter 自定 | 排序路由、按 BM 补齐，并清零 `out`（batch1 不用） |
+| ② | 按 token 量化（aiter `get_hip_quant`） | aiter 自定 | prefill 时把 `x`、`mid` 各量化成 FP8 |
+| ③ | [`moe_2stage_gateup_batch1`](../moe_gemm_2stage/gemm1.py#L746) | (N/BN, 10, T) × 256 | 一条路由 × BN 列，4 个 wave 沿 K 切分，顺带清零 `out` |
+| ④ | [`moe_2stage_down_batch1`](../moe_gemm_2stage/gemm2.py#L293) | (2560/64, 10, T) × 64 | 一条路由 × 64 列，BF16 原子加到 `out` |
+| ⑤ | [`moe_2stage_gateup_splitk`](../moe_gemm_2stage/gemm1.py#L633) | (N/128, 任务数) × 256 | 16 排序行 × 128 列，4 个 wave 沿 K 切分 |
+| ⑥ | [`moe_2stage_down_splitk`](../moe_gemm_2stage/gemm2.py#L156) | (2560/128, 任务数) × 64 | 16 排序行 × 128 列，原子加到 `out` |
+| ⑦ | [`moe_2stage_gateup_prefill_1x4`](../moe_gemm_2stage/gemm1.py#L856) | (N/128, 任务数) × 256 | 64 排序行 × 64 对 gate/up 通道，写 BF16 `mid` |
+| ⑧ | [`moe_2stage_down_prefill_1x4_64x256`](../moe_gemm_2stage/gemm2_1x4.py#L227) | (1, 任务数) × 256 | 64 排序行 × 全部 2560 列，每个排序行写一行 |
+| ⑨ | compact：[任务表](../moe_gemm_2stage/gemm2_8x1_compact.py#L55) → [8x1 full](../moe_gemm_2stage/gemm2_8x1.py#L719) → 1x4 tail | (1) × 256 → (1, full 容量) × 512 → (1, tail 容量) × 256 | TP4 T>8192 时代替 ⑧ |
+| ⑩ | [`invert_sorted_ids`](../moe_gemm_2stage/moe_reduce.py#L255) → [`sorted_sum`](../moe_gemm_2stage/moe_reduce.py#L187) | (⌈排序行/64⌉) × 64 → (T) × 64 | 把每个 token 的 10 条路由求和写 `out` |
+
+N = 2·I（TP2 640、TP4 384）。任务数默认是排序后 BM 块的上限（越界的块直接返回），⑤⑥⑦ 在 T·TOPK ≤ E 时改为 T·TOPK（Qwen3.8 只在 T ≤ 51 时）。
+⑦⑧ 的 tile 划分与流水线骨架同入口文档 §2 的 prefill 伪代码：a8w4 由它们派生，只把权重读取换成 fp4 + fd2 解码，并加了 half_m 与更深的预取。
+
 <a id="files"></a>
 
-## 1. 同名文件相对上游的改动
+## 2. 同名文件相对上游的改动
 
 增删行数是对照上游同名文件 `diff` 的结果（含空行）；每个文件头都写明了来源和差异。
 
@@ -64,13 +116,14 @@ legacy 文件相对替换前同名文件的改动（只改 import 与文件头�
 
 <a id="differences"></a>
 
-## 2. 与上游的行为差异
+## 3. 与上游的行为差异
 
 1. 按设备缓存：上游 `compile_gemm` 与 `sorted_sum` 不分设备；pyhip 的 `compile_gemm`、`sorted_sum`、`invert_sorted_ids`
    每个设备各编一份（D1、D6）。
 2. 分流与包装只在 pyhip 的 `gemm.py`：上游 batch1 launcher 多一个 token 数指针、取路由数 `batch·TOPK`，compact 多一个
    `cu_count`，`gemm.py` 把它们包成 pyhip 原来的参数（A1、A2）。
-3. BF16 舍入默认简化 RTA（上游默认 RTE），legacy 与上游共用同一个开关（E2）。
+3. BF16 舍入默认简化 RTA（上游默认 RTE），legacy 与上游共用同一个开关（E2）。RTE 让 Qwen3.8 的 prefill 慢 3.1%–4.0%，RTA 与替换前
+   持平；两种模式只在中点差 1 个 BF16 ulp，都满足同一参考与容差（E4）。
 4. `MOE_PREFILL_TILE_K`：`compile_gemm` 在分流前解析，只作用于 Gate/Up；上游 Down 不读，legacy Down 仍读。替换前
    default、1x4 Down 也读它（BF16 default Down 的 BK 由它决定），这是行为差异（A13）。
 5. `CU_NUM`：只影响上游 `get_cu_num()`。上游 Down（1x4、compact full）按 CU 数是否为 80 判定 MI308X 拓扑，legacy 按
@@ -82,9 +135,21 @@ legacy 文件相对替换前同名文件的改动（只改 import 与文件头�
 8. `has_num_local_tokens=True` 只有上游支持，且只允许 batch1：`compile_gemm` 不做包装，原样返回上游原生 launcher（多一个 token 数指针，接收路由数 T·TOPK）；计数之后的行不计算，输出保持 Gate/Up 清零后的 0（A4、A6）。pyhip 内只有用例调用。
 9. `sorted_sum_upstream`、`allocate_task_buffers_upstream` 只为与上游一致而保留，pyhip 不调用（A3、A7）。
 
+<a id="limits"></a>
+
+## 4. 已知限制
+
+1. 两套实现并存：包内 `*.py` 由 8006 行增到 14158 行；只有上游不支持的配置走 legacy，修 bug 可能要改两处。
+2. gfx950、FP4 / MXFP4、SiTUv2 全走 legacy、代码未改：SiTUv2 的 bf16 / ptpc 用例在 gfx942 上会跑（B31）；FP4 / MXFP4 与 gfx950
+   的用例本机跳过（B32），无法实测。测内部细节的旧用例（8x1 闭包变量、compact 签名、legacy 报错文本）测的是 legacy。
+3. `tuned_moe` 调优不稳：mimo_ptpc M=256 经 `tuned_moe` 端到端慢约 12%（胜出配置从 ASM `jit_splitk` 换成 aiter；两边用同一调优配置时
+   为 1.007），不是替换造成，记为后续事项（调优时的测量与正式计时不一致）。
+4. 运行时仍依赖 aiter：`tuned_moe` 的排序、激活量化和 `_run_compiled`；kernel 文件本身不导入 aiter（A10）。
+5. [moe_gemm_2stage/README.md](../moe_gemm_2stage/README.md) 的性能与资源数字是替换前 legacy 实现的测量，没有对上游重测。
+
 <a id="routes"></a>
 
-## 3. 分流规则全表（B1–B29）
+## 5. 分流规则全表（B1–B29）
 
 [`gemm.gemm_implementation`](../moe_gemm_2stage/gemm.py#L39) 按表中顺序判定，首个命中即返回。例子是 `U::routes[...]`
 的参数 id，基准形状是 Qwen3.8 TP2 的 FP8 ptpc（Gate/Up N=640、K=2560；Down N=2560、K=320；compact 例子 K=192）。
@@ -125,7 +190,7 @@ legacy 文件相对替换前同名文件的改动（只改 import 与文件头�
 
 <a id="coverage"></a>
 
-## 4. 覆盖项全表（63 项）
+## 6. 覆盖项全表（63 项）
 
 测试负责人整理（M0 收尾），每项至少一个用例；B32、D6 的用例在本机（单张 gfx942）跳过。B1–B29 见上一节。
 
@@ -190,13 +255,13 @@ legacy 文件相对替换前同名文件的改动（只改 import 与文件头�
 
 <a id="sources"></a>
 
-## 5. 测量来源（都不是 mf 复核的数据）
+## 7. 测量来源（都不是 mf 复核的数据）
 
 路径都在 myflow 任务目录（`/root/.myflow/tasks/moe-ptpc-a8w4/`）下，不在仓库里。
 
 | 内容 | 谁测的 | 位置 |
 |---|---|---|
-| Qwen3.8 bench 16 个 case：替换前、替换后 RTE、替换后 RTA 三版本轮换 6 轮 | 编排者 | `runs/20261121-094917-_task-run-8e2d/out.log` |
+| Qwen3.8 bench 16 个 case：替换前、替换后 RTE、替换后 RTA 三版本轮换 6 轮。RTA 下中位比值 prefill 1.002–1.005、decode 0.988–1.023、TP4 T=65536 0.963（改用上游 compact）；RTE 下 prefill 慢 3.1%–4.0% | 编排者 | `runs/20261121-094917-_task-run-8e2d/out.log` |
 | `bench_tuned_moe.py` 替换前后初筛：7 个 FP8 模型、2 个 BF16 模型共 43 个 case，9 个慢 3% 以上（mimo_ptpc M=256 为 1.136） | 编排者 | `runs/20261121-104005-_task-run-7733/out.log` |
 | 9 个初筛 case 第一轮复测：mimo_ptpc M=256 为 1.119（胜出从 jit_splitk 换成 aiter）；胜出配置相同的 qwen35_35B M=16 为 1.066、qwen35_397B_k256 M=16 为 1.035，另 4 个 ≤ 1.018；qwen35_35B_k256 M=1、qwen35_397B_k256 M=1 换了胜出配置（1.064、1.047） | 编排者 | `runs/20261121-104604-_task-run-af22/out.log` |
 | 第二轮复测，两边强制用同一调优配置：5 个 case 为 0.938–1.027，mimo_ptpc M=256 为 1.007 | 编排者 | `runs/20261121-105710-_task-run-57d8/out.log` |
