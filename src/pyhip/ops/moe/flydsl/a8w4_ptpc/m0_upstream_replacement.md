@@ -1,6 +1,6 @@
 # M0 深度参考：`moe_gemm_2stage` 换成上游 gfx9_fp8
 
-入口文档是 [README.md](README.md)。本文放入口文档装不下的细节：补充术语、Qwen3.8 配置全表、逐文件相对上游的改动、
+入口文档是 [README.md](README.md)，M0 的设计说明在 M6 移到了 [history.md](history.md)。本文放它们装不下的细节：补充术语、Qwen3.8 配置全表、逐文件相对上游的改动、
 行为差异、分流规则全表（B1–B29）、覆盖项全表（63 项）和测量来源。
 
 “上游”= ROCm/aiter@df3e0b2f 的 `aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8/`；
@@ -14,7 +14,7 @@
 
 ## 0. 补充术语与配置全表
 
-入口文档 §3.1 只列 10 条主要术语，其余在这里：
+[history.md §3.1](history.md#terms) 只列 10 条主要术语，其余在这里：
 - **`METADATA_TILE_SIZE_M`**：`moe_sorting` 补齐用的块行数（tuned_moe 里取 Down 的 BM）。Gate/Up 的 BM 比它小时，一个排序块拆成多个任务；只有 legacy 支持，上游要求两者相等（B6）。
 - **full / tail 容量**：compact 预先分配的任务表行数（[`task_capacities`](../moe_gemm_2stage/gemm2_8x1_compact.py#L27)）。full 任务每个 M256（4 个 M64 排序块），tail 任务每个 M64；超出 GPU 上实际任务数的 CTA 直接返回。
 - **padding 128 B**：prefill Down 写中间结果时每行末尾多留 128 字节（行跨度 = N + 64 个 BF16），`sorted_sum` 按同一跨度读；由配置的 `padding=128`（即 `down_output_padding_bytes`）指定。
@@ -27,7 +27,7 @@
 
 <a id="configs"></a>
 
-Qwen3.8 配置全表（[`FLY_CONFIGS`](../../../../testing/moe_a8w4_ptpc.py#L41)；只在用例和 bench 里经 `make_moe_runner` 强制走 FlyDSL，生产调用由 `tuned_moe` 自动调优，见入口文档 §3.3）。T 取第一条“上界 ≥ T”的行，超出最后一行时用最后一行；decode / prefill 交界由这张表决定，当前是 128/129，M1、M2 跟随它（用户 11-21 确认）。
+Qwen3.8 配置全表（[`FLY_CONFIGS`](../../../../testing/moe_a8w4_ptpc.py#L41)；只在用例和 bench 里经 `make_moe_runner` 强制走 FlyDSL，生产调用由 `tuned_moe` 自动调优，见 [history.md §3.3](history.md#callchain)）。T 取第一条“上界 ≥ T”的行，超出最后一行时用最后一行；decode / prefill 交界由这张表决定，当前是 128/129，M1、M2 跟随它（用户 11-21 确认）。
 
 | T | TP2（I=320） | TP4（I=160 补零到 192） |
 |---|---|---|
