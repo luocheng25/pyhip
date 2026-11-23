@@ -1,7 +1,7 @@
 # MoE A8W4（fp8 ptpc 激活 × mxfp4 权重）gfx942 新算子：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-23 10:28）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8，decode 可用 bf16）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc（用 aiter 调优表），达不到说明原因；第二轮（用户 11-22）：M=1–32 本实现耗时 ≤ aiter fp8 ptpc 的 0.5×（fp4 权重数据量约为 fp8 的一半），TP2 与 TP4（1.11× 相对冻结基线）· 已完成 8 个里程碑（含本提交 M8） · 最佳累计 — · 下一步：等你决定
+> 由 mf 生成（11-23 12:42）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8，decode 可用 bf16）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc（用 aiter 调优表），达不到说明原因；第二轮（用户 11-22）：M=1–32 本实现耗时 ≤ aiter fp8 ptpc 的 0.5×（fp4 权重数据量约为 fp8 的一半），TP2 与 TP4（1.11× 相对冻结基线）· 已完成 9 个里程碑（含本提交 M9） · 最佳累计 — · 下一步：等你决定
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -43,7 +43,7 @@ fused_moe_a8w4（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 CUDA g
 | 给了 tile 参数；decode 不支持的 M ≤ 32 | prefill；TK 默认 M>2048 取 128，否则 256 | tile 参数只对 prefill 有意义 |
 
 门槛取自实测交叉点。decode 只在 H ≤ 4096 且 Down 的 mid 行放得进 LDS 时用；槽对 Down 放不下或 w2 ≥ 4 GiB 时用单槽版。
-核心 kernel 骨架（完整任务划分与逐拍流水线见 [kernels.md](kernels.md)；decode 的块对 / 槽对映射见 [a8w4_decode.py](a8w4_decode.py)）：
+核心 kernel 骨架（[kernels.md](kernels.md) 每节先给 Gluon 风格的分阶段写法，写明放置、预取与 barrier，再给任务划分与逐拍流水线；decode 的块对 / 槽对映射见 [a8w4_decode.py](a8w4_decode.py)）：
 ```text
 prefill Gate/Up：grid (2I/128, 排序块)，4 wave 管 64 行 × 64 gate 与同号 64 up；x 经 LDS 双缓冲、权重进 VGPR，提前 1 个 tile 预取
   每 128-K 步建一次 LUT → 解码 → MFMA 16x16x32（解码与 LDS 读排进上一块的 MFMA 间）；epilogue → SiLU(gate)·up → f32 写 mid
@@ -220,7 +220,8 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - M5 ✖ 放弃 · 性能 · decode 档（M≤32）再提速：单次 launch 的小 M 融合 dec… · 预期 1.11×
 - M6 ✅ 已推送 · 维护 · 性能数据细扫：bench 改为 M=1…32768（2 的幂）× TP2/TP… · [提交](https://github.com/luocheng25/pyhip/commit/21a02e7e9969a26a4fd8d1d20c50068f8bd290ca)
 - M7 ✅ 已推送 · 维护 · 补充 M=48 性能 case：覆盖 E513 下 M=33–62 的排序块 … · [提交](https://github.com/luocheng25/pyhip/commit/e8b7260961cf47f1c4565ecf95017e50573f3a88)
-- M8 ✅ 本提交 · 维护 · 测试合并为单一文件、kernels.md 增加 Triton 风格写法
+- M8 ✅ 已推送 · 维护 · 测试合并为单一文件、kernels.md 增加 Triton 风格写法 · [提交](https://github.com/luocheng25/pyhip/commit/3aa7bee2d8c65dd59a9aef896f3fcf54ad8b8db6)
+- M9 ✅ 本提交 · 维护 · kernels.md：Triton 风格改为 Gluon 风格的分阶段写法（显…
 
 下一步（本提交的承诺）：等你决定
 <!-- /mf:roadmap -->
