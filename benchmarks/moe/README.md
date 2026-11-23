@@ -229,14 +229,15 @@ GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter�
 | PASS | 两条实现和实际计时输出校验通过，显示延迟和加速比 |
 | AITER_INCORRECT | Aiter 数值检查失败，winner 通过；除 check-only 外仍显示延迟和 speedup，退出码保持非零 |
 | NOT_COMPARABLE | 执行/输出元数据检查失败，或 winner 精度失败，不生成 speedup |
+| ERROR | 数据准备、参考或调用错误；reason 中保留异常 |
 
 ## A8W4 对照 Aiter FP8 ptpc
 
-[bench_moe_a8w4.py](bench_moe_a8w4.py) 独立于上面的 tuned MoE 对照：测 `pyhip.ops.moe.flydsl.moe_a8w4.fused_moe_a8w4` 的 34 个 case
+A8W4 的性能测试不在本目录，而是 [tests/ops/moe/test_moe_a8w4.py](../../tests/ops/moe/test_moe_a8w4.py) 的区域 5（脚本入口，pytest 不收集）。
+它独立于上面的 tuned MoE 对照：测 `pyhip.ops.moe.flydsl.moe_a8w4.fused_moe_a8w4` 的 34 个 case
 （TP2 / TP4 × M=1、2、4…32768 按 2 的幂细扫，另加 E513 下走排序块 32 流式段的 M=48；H2560、E513、topk11），同进程同协议交替对照 Aiter FP8 ptpc（只用 Aiter 自带 qwen38 调优表并断言命中）。
-每个 case 输出两边的耗时、TB/s 与 TFLOPS；计时协议与输出格式见脚本 docstring；设计、对照来源与结果见 [A8W4 设计说明](../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
+每个 case 输出两边的耗时、TB/s 与 TFLOPS；计时协议与输出格式见该区域开头的注释；设计、对照来源与结果见 [A8W4 设计说明](../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
 
 ```bash
-PYTHONPATH=src python benchmarks/moe/bench_moe_a8w4.py --cases tp2_m1 tp4_m16384
+PYTHONPATH=src python tests/ops/moe/test_moe_a8w4.py --cases tp2_m1 tp4_m16384
 ```
-| ERROR | 数据准备、参考或调用错误；reason 中保留异常 |

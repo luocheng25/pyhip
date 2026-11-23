@@ -3,7 +3,7 @@
 每个 batch/dtype/layout 是独立 node，可用 -k 或 node id 选择。
 普通用例只验正确性，jit_blockscale 同时打印耗时和 diff；
 -m perf 显式运行大 shape 和其余固定路径的多 buffer 计时。
-FlyDSL 两阶段底座的正确性用例在 test_fly_2stage_basic.py / test_fly_2stage_extra.py。
+FlyDSL 两阶段底座的正确性用例在 test_moe_a8w4.py（区域 2、4）。
 """
 
 import json

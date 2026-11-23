@@ -5,14 +5,18 @@
 每个 batch、dtype、布局是独立 pytest node；不读取 autotune winner，
 不调用 `_configs()`，失败时不会悄悄改选其它实现。
 
-FlyDSL 两阶段底座（Aiter `gfx9_fp8`）的固定配置用例分两个文件：
-[test_fly_2stage_basic.py](test_fly_2stage_basic.py) 是基本功能测试（每条公开路径一例，
-每次小改动先跑），[test_fly_2stage_extra.py](test_fly_2stage_extra.py) 只放基本测试与 bench
-覆盖不了的情况，每个用例写明原因。
+A8W4 算子（[moe_a8w4.py](../../../src/pyhip/ops/moe/flydsl/moe_a8w4.py)）及其 FlyDSL 两阶段底座（Aiter `gfx9_fp8`）的全部测试（含性能测试）
+只放在 [test_moe_a8w4.py](test_moe_a8w4.py) 一个文件里：新用例加进对应区域，不新建测试文件。文件用注释分成六个区域：
 
-A8W4 算子（[moe_a8w4.py](../../../src/pyhip/ops/moe/flydsl/moe_a8w4.py)）同样分两个文件：[test_moe_a8w4.py](test_moe_a8w4.py) 是基本功能测试，
-[test_moe_a8w4_extra.py](test_moe_a8w4_extra.py) 只放基本测试与 bench（[bench_moe_a8w4.py](../../../benchmarks/moe/bench_moe_a8w4.py)）覆盖不了的情况；
-参考与判据在 [pyhip.testing.moe_a8w4](../../../src/pyhip/testing/moe_a8w4.py)，覆盖表见 [A8W4 设计说明](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md) 第 5 节。
+| 区域 | 内容 | 怎么跑 |
+|---|---|---|
+| 0 | 公共：导入、GPU 环境 | — |
+| 1 / 2 | 基本功能：A8W4 每个分档一例 / 底座每条公开路径一例（`test_fp8_*`），标 `@pytest.mark.basic` | `-m basic`，每次小改动先跑 |
+| 3 / 4 | 其他覆盖：A8W4 / 底座（`test_fp8_*`），只放基本功能与性能测试覆盖不了的，docstring 写明原因 | `-m "not basic"` |
+| 5 | 性能测试：A8W4 对照 Aiter FP8 ptpc 的 34 个 case（脚本入口，pytest 不收集） | `python tests/ops/moe/test_moe_a8w4.py` |
+
+`basic` marker 注册在仓库的 [pytest.ini](../../../pytest.ini)。参考与判据在 [pyhip.testing.moe_a8w4](../../../src/pyhip/testing/moe_a8w4.py)（A8W4）
+与 [pyhip.testing.moe](../../../src/pyhip/testing/moe.py)（底座），覆盖表见 [A8W4 设计说明](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md) 第 5 节。
 
 [test_tuned_moe.py](test_tuned_moe.py) 保留调优策略、缓存、benchmark、
 特殊数值和 graph 边界回归（按设备隔离的 FlyDSL 编译缓存已随底座替换删除）。固定 kernel 的覆盖不随候选策略变化。
@@ -38,12 +42,12 @@ python3 -m pytest tests/ops/moe/test_moe.py --collect-only -q
 # 指定 ASM split-K 的一个精度和实际 batch
 python3 -m pytest 'tests/ops/moe/test_moe.py::test_asm_splitk[ptpc-m17]' -q
 
-# FlyDSL 两阶段底座：基本功能测试（每次小改动先跑）与其他覆盖测试
-python3 -m pytest tests/ops/moe/test_fly_2stage_basic.py -q
-python3 -m pytest tests/ops/moe/test_fly_2stage_extra.py -q -k 'test_prefill_variants and compact'
+# A8W4 与 FlyDSL 两阶段底座：基本功能测试（每次小改动先跑）与其他覆盖测试（可用 -k 选用例）
+python3 -m pytest tests/ops/moe/test_moe_a8w4.py -m basic -q
+python3 -m pytest tests/ops/moe/test_moe_a8w4.py -m "not basic" -q -k 'test_fp8_prefill_variants and compact'
 
-# A8W4：基本功能测试与其他覆盖测试
-python3 -m pytest tests/ops/moe/test_moe_a8w4.py tests/ops/moe/test_moe_a8w4_extra.py -q
+# A8W4 性能测试：直接运行该文件（默认 34 个 case，--cases 选子集）
+PYTHONPATH=src python3 tests/ops/moe/test_moe_a8w4.py --cases tp2_m1 tp4_m16384
 
 # 性能单独选择；默认不运行 perf
 python3 -m pytest tests/ops/moe/test_moe.py -m perf -k 'test_fly_batch1_perf and bf16' -s
@@ -157,9 +161,9 @@ E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的�
 | FP8 block-scale 8-wave | `jit_blockscale` / `test_jit_blockscale` |
 | MXFP4 通用/专用 Gate/Up | `jit_mxfp4` / `jit_mxfp4_4wave` / `test_jit_mxfp4` |
 | BF16 GELU | `jit_gelu` / `test_jit_gelu`；不保留 MXFP4 GELU Torch fallback |
-| `fly_splitk_2s` 的 batch/启发式分支 | `fly_decode` / `fly_prefill`，按 direct、sorted、prefill 拆开；底座换成 Aiter `gfx9_fp8` 后见 `test_fly_2stage_basic.py` / `test_fly_2stage_extra.py` |
-| SiTUv2 / SwiGLU / MXFP4 布局 | SwiGLU 见 `test_fly_2stage_extra.py`；FlyDSL 的 SiTUv2 与 MXFP4 已随底座替换删除 |
-| 8x1 六种 K 和两种量化 | 单独 8x1 已删除；default / 1x4_64x256 / 8x1_compact 见两个 `test_fly_2stage_*.py` |
+| `fly_splitk_2s` 的 batch/启发式分支 | `fly_decode` / `fly_prefill`，按 direct、sorted、prefill 拆开；底座换成 Aiter `gfx9_fp8` 后见 `test_moe_a8w4.py` 的 `test_fp8_*` |
+| SiTUv2 / SwiGLU / MXFP4 布局 | SwiGLU 见 `test_moe_a8w4.py` 的 `test_fp8_swiglu`；FlyDSL 的 SiTUv2 与 MXFP4 已随底座替换删除 |
+| 8x1 六种 K 和两种量化 | 单独 8x1 已删除；default / 1x4_64x256 / 8x1_compact 见 `test_moe_a8w4.py` 的 `test_fp8_prefill*` |
 | 手动模型性能循环 | `test_model_prefill_perf`；Aiter 对照仍使用原 benchmark |
 
 旧 FP8 split-K 的 `block` 参数曾遗漏传给执行函数，实际重复测试 PTPC；
