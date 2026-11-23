@@ -1,7 +1,7 @@
 # MoE A8W4（fp8 ptpc 激活 × mxfp4 权重）gfx942 新算子：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-23 14:17）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc。第三轮（用户 11-23）：Qwen TP2/TP4 与 MiMo-V2.6-Flash TP8/TP4（H4096 E256 topk8，I=256/512）每个 M（1…32768 的 2 的幂及 48）的耗时 ≤ min(R1 M8, tingqli refactor/a8w4 最快配置) × 1.02，以 cmp3 同卡同协议对比验收；误差门限 err≤4.5%（与 tingqli 同级）（1.06× 相对冻结基线）· 已完成 10 个里程碑（含本提交 M10） · 最佳累计 — · 下一步：M11 MiMo 小 / 中 M（8–2048）追上 tingqli：decode / 流式分派与排序块按形状调、decode 按 expert 去重、流式 Gate/Up 提速、Down 原子累加去掉 route_sum、辅助 kernel 合并；之后：M12 大 M prefill（≥1024）追上 R1 / tingqli：Gate/Up prefill 提速（借鉴 R1 1x4）、Down 结果原子累加去掉 sorted_sum、行量化与排序提速（承诺）
+> 由 mf 生成（11-23 14:37）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc。第三轮（用户 11-23）：Qwen TP2/TP4 与 MiMo-V2.6-Flash TP8/TP4（H4096 E256 topk8，I=256/512）每个 M（1…32768 的 2 的幂及 48）的耗时 ≤ min(R1 M8, tingqli refactor/a8w4 最快配置) × 1.02，以 cmp3 同卡同协议对比验收；误差门限 err≤4.5%（与 tingqli 同级）（1.06× 相对冻结基线）· 已完成 11 个里程碑（含本提交 M10a） · 最佳累计 — · 下一步：M11 MiMo 小 / 中 M（8–2048）追上 tingqli：decode / 流式分派与排序块按形状调、decode 按 expert 去重、流式 Gate/Up 提速、Down 原子累加去掉 route_sum、辅助 kernel 合并；之后：M12 大 M prefill（≥1024）追上 R1 / tingqli：Gate/Up prefill 提速（借鉴 R1 1x4）、Down 结果原子累加去掉 sorted_sum、行量化与排序提速（承诺）
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -256,9 +256,10 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - M7 ✅ 已推送 · 维护 · 补充 M=48 性能 case：覆盖 E513 下 M=33–62 的排序块 … · [提交](https://github.com/luocheng25/pyhip/commit/e8b7260961cf47f1c4565ecf95017e50573f3a88)
 - M8 ✅ 已推送 · 维护 · 测试合并为单一文件、kernels.md 增加 Triton 风格写法 · [提交](https://github.com/luocheng25/pyhip/commit/3aa7bee2d8c65dd59a9aef896f3fcf54ad8b8db6)
 - M9 ✅ 已推送 · 维护 · kernels.md：Triton 风格改为 Gluon 风格的分阶段写法（显… · [提交](https://github.com/luocheng25/pyhip/commit/fb345e1a5f7519c225e69b4f488467dec2d8a41f)
-- M10 ✅ 本提交 · 维护 · 第三轮度量契约：bench 与用例加入 MiMo-V2.6-Flash TP8…
+- M10 ✅ 已推送 · 维护 · 第三轮度量契约：bench 与用例加入 MiMo-V2.6-Flash TP8… · [提交](https://github.com/luocheng25/pyhip/commit/00b617f1e9623b1f66fd22dc37e96724b654ca65)
 - M11 ⏳ 承诺 · 性能 · MiMo 小 / 中 M（8–2048）追上 tingqli：decode /… · 预期 1.04×
 - M12 ⏳ 承诺 · 性能 · 大 M prefill（≥1024）追上 R1 / tingqli：Gate/… · 预期 1.03×
+- M10a ✅ 本提交 · 维护 · 用例的路径断言改为检查关键 kernel 顺序（第三轮去掉 route_sum…
 
 下一步（本提交的承诺）：M11 MiMo 小 / 中 M（8–2048）追上 tingqli：decode / 流式分派与排序块按形状调、decode 按 expert 去重、流式 Gate/Up 提速、Down 原子累加去掉 route_sum、辅助 kernel 合并；之后：M12 大 M prefill（≥1024）追上 R1 / tingqli：Gate/Up prefill 提速（借鉴 R1 1x4）、Down 结果原子累加去掉 sorted_sum、行量化与排序提速（承诺）
 <!-- /mf:roadmap -->

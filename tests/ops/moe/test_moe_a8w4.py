@@ -233,25 +233,31 @@ def test_fp8_prefill_bf16(kernels):
 # 的交界、tile 参数与 graph。非目标形状的回退见 ``test_shape_fallbacks``。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-# decode 三种分派（x、mid 是否先用独立 kernel 预量化）实际启动的 kernel 序列。
+# decode 三种分派（x、mid 是否先用独立 kernel 预量化）各自的 Gate/Up 与 Down kernel。
 _DECODE_PATHS = {
     "nn": ["a8w4_gateup_decode", "a8w4_down_decode"],
-    "np": ["a8w4_gateup_decode", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
-    "pp": ["a8w4_row_quant_decode", "a8w4_gateup_decode_pq", "a8w4_row_quant_decode", "a8w4_down_decode_pq"],
+    "np": ["a8w4_gateup_decode", "a8w4_down_decode_pq"],
+    "pp": ["a8w4_gateup_decode_pq", "a8w4_down_decode_pq"],
 }
 
 
 def _prefill_path(tile_k, block_m=64, block_n=128):
-    """prefill 路径实际启动的 kernel 序列（kernel 名带排序块、Gate/Up 的 N tile 与 K tile）。"""
-    return ["moe_sorting_opus", "a8w4_row_quant_fp8", f"a8w4_gateup_prefill_bm{block_m}_bn{block_n}_tk{tile_k}",
-            "a8w4_row_quant_fp8", f"a8w4_down_prefill_bm{block_m}", "sorted_sum"]
+    """prefill 路径的 Gate/Up 与 Down kernel（名字带排序块、Gate/Up 的 N tile 与 K tile）。"""
+    return [f"a8w4_gateup_prefill_bm{block_m}_bn{block_n}_tk{tile_k}", f"a8w4_down_prefill_bm{block_m}"]
 
 
 def _stream_path(block_m, fused):
-    """流式路径实际启动的 kernel 序列：``fused`` 时 Gate/Up 在尾部量化中间激活，否则另起行量化。"""
-    gateup = [f"a8w4_gateup_quant_stream_bm{block_m}"] if fused else [f"a8w4_gateup_stream_bm{block_m}",
-                                                                      "a8w4_row_quant_fp8"]
-    return ["moe_sorting_opus", "a8w4_row_quant_bf16", *gateup, f"a8w4_down_stream_bm{block_m}", "a8w4_route_sum"]
+    """流式路径的 Gate/Up 与 Down kernel（名字带排序块）：``fused`` 时 Gate/Up 在尾部量化中间激活。"""
+    gateup = f"a8w4_gateup_quant_stream_bm{block_m}" if fused else f"a8w4_gateup_stream_bm{block_m}"
+    return [gateup, f"a8w4_down_stream_bm{block_m}"]
+
+
+def _assert_path(expected):
+    """决定分档与变体的关键 kernel（``expected``，按名字精确匹配）按序出现在 ``last_path`` 中，中间可以夹别的 kernel：
+    排序、行量化与 route_sum / sorted_sum 不逐个断言，它们的正确性由每个用例对参考的端到端校验覆盖。
+    """
+    rest = iter(moe_a8w4.last_path)
+    assert all(name in rest for name in expected), (expected, moe_a8w4.last_path)
 
 
 def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
@@ -526,7 +532,7 @@ def test_stream_fused_quant_bitexact(inter, block_m):
     (160, 19, "np"), (160, 20, "pp"),
 ], ids=["tp2_m4", "tp2_m11", "tp2_m12", "tp2_m32", "tp2_m33", "tp4_m19", "tp4_m20"])
 def test_decode_dispatch_boundaries(inter, tokens, path):
-    """decode 分派各交界的端到端结果与实际 kernel 序列：M=4（Down 改用预量化槽对 kernel；M=3 一侧是基本测试）、
+    """decode 分派各交界的端到端结果与关键 kernel：M=4（Down 改用预量化槽对 kernel；M=3 一侧是基本测试）、
     TP2 M=11/12 与 TP4 M=19/20（Gate/Up 的 WG 数 M·topk·I/16 跨过 2560，改读预量化的 x）、M=32/33（改走排序的
     流式路径；E=33 时每个 expert 平均 11 行，排序块取 16）。
 
@@ -537,9 +543,9 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=90 + tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     if path == "stream":
-        assert moe_a8w4.last_path == _stream_path(16, False)
+        _assert_path(_stream_path(16, False))
     else:
-        assert moe_a8w4.last_path == _DECODE_PATHS[path]
+        _assert_path(_DECODE_PATHS[path])
     oracle.assert_close(out, ref)
 
 
@@ -554,7 +560,7 @@ def test_decode_topk_variants(topk, tokens, path):
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, topk, seed=94 + topk)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    assert moe_a8w4.last_path == _DECODE_PATHS[path]
+    _assert_path(_DECODE_PATHS[path])
     oracle.assert_close(out, ref)
 
 
@@ -575,7 +581,7 @@ def test_decode_duplicate_and_int64_ids():
     weights.copy_(topk_weight)
     assert not ids.is_contiguous() and not weights.is_contiguous()
     out, ref = _a8w4_run(w, prepared, x, weights, ids)
-    assert moe_a8w4.last_path == _DECODE_PATHS["np"]
+    _assert_path(_DECODE_PATHS["np"])
     oracle.assert_close(out, ref)
 
 
@@ -589,7 +595,7 @@ def test_decode_down_fallback_w2_4gib():
     big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(1 << 32))
     x, topk_weight, topk_ids = oracle.make_inputs(16, HIDDEN, 33, TOPK, seed=99)
     out, ref = _a8w4_run(w, big, x, topk_weight, topk_ids)
-    assert moe_a8w4.last_path == ["a8w4_row_quant_decode", "a8w4_gateup_decode_pq", "a8w4_down_decode"]
+    _assert_path(["a8w4_gateup_decode_pq", "a8w4_down_decode"])
     oracle.assert_close(out, ref)
 
 
@@ -606,7 +612,7 @@ def test_grid_shrink_boundary_e513():
     for tokens in (46, 47):
         x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 513, TOPK, seed=32 + tokens)
         oracle.assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
-        assert moe_a8w4.last_path == _stream_path(32, True)
+        _assert_path(_stream_path(32, True))
 
 
 @pytest.mark.parametrize("tokens, path", [(66, _stream_path(32, True)), (67, _prefill_path(128))],
@@ -620,7 +626,7 @@ def test_stream_dispatch_boundary(tokens, path):
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    assert moe_a8w4.last_path == path
+    _assert_path(path)
     oracle.assert_close(out, ref)
 
 
@@ -636,7 +642,7 @@ def test_tile_variants(inter, options):
     w = oracle.make_weights(33, HIDDEN, inter, seed=36)
     x, topk_weight, topk_ids = oracle.make_inputs(300, HIDDEN, 33, TOPK, seed=37)
     oracle.assert_close(*_a8w4_run(w, _a8w4_prepare(w), x, topk_weight, topk_ids, **options))
-    assert moe_a8w4.last_path == _prefill_path(256, block_m=128, block_n=256)
+    _assert_path(_prefill_path(256, block_m=128, block_n=256))
 
 
 @functools.cache
@@ -667,7 +673,7 @@ def test_prefill_half_block_boundary(filler, options, block_m, tile_k):
     topk_ids = torch.stack([flat[:tokens], flat[tokens:]], dim=1).to(torch.int32).contiguous()
     x, topk_weight, _ = oracle.make_inputs(tokens, 512, 9, 2, seed=132)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
-    assert moe_a8w4.last_path == _prefill_path(tile_k, block_m=block_m)
+    _assert_path(_prefill_path(tile_k, block_m=block_m))
     oracle.assert_close(out, ref)
 
 
@@ -690,7 +696,7 @@ def test_graph_replay(options, path):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out, **options)
-    assert moe_a8w4.last_path == path
+    _assert_path(path)
     mode = oracle.path_activation(moe_a8w4.last_path)
     x2, topk_weight2, topk_ids2 = oracle.make_inputs(64, HIDDEN, 33, TOPK, seed=53)
     x.copy_(x2)
@@ -718,7 +724,7 @@ def test_decode_graph_replay(tokens, path):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
-    assert moe_a8w4.last_path == _DECODE_PATHS[path]
+    _assert_path(_DECODE_PATHS[path])
     x2, topk_weight2, topk_ids2 = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=98 + tokens)
     x.copy_(x2)
     topk_weight.copy_(topk_weight2)
@@ -808,7 +814,7 @@ def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_r
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, 5, 2, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    assert moe_a8w4.last_path == path
+    _assert_path(path)
     oracle.assert_close(out, ref)
     if shared is not None:
         block_m = moe_a8w4._stream_block_m(tokens, 2, 5)
