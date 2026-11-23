@@ -6,7 +6,7 @@
   区域 2  基本功能 · 底座：每条公开路径一例
   区域 3  其他覆盖 · A8W4：基本功能与性能测试覆盖不了的情况（布局与量化、decode、流式与 prefill、graph、报错与回退）
   区域 4  其他覆盖 · 底座
-  区域 5  性能测试：A8W4 对照 Aiter FP8 ptpc 的 34 个 case（脚本入口，pytest 不收集）
+  区域 5  性能测试：Qwen3.8 TP2 / TP4（对照 Aiter FP8 ptpc）与 MiMo-V2.6-Flash TP8 / TP4 共 68 个 case（脚本入口，pytest 不收集）
 基本功能用例标 ``@pytest.mark.basic``，每次小改动先跑：``pytest tests/ops/moe/test_moe_a8w4.py -m basic``
 （myflow 的 commands.correctness）；其他覆盖用 ``-m "not basic"``（commands.verify_extra），每条 docstring
 写明基本功能与性能测试为什么覆盖不了；性能测试直接运行本文件：``python tests/ops/moe/test_moe_a8w4.py``
@@ -62,25 +62,27 @@ def _gpu_environment(monkeypatch):
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 # 区域 1｜基本功能 · A8W4（@pytest.mark.basic）
 # ``prepare_a8w4_weights`` + ``fused_moe_a8w4`` 跑完整调用，与独立 FP32 参考比较（``pyhip.testing.moe_a8w4`` 的
-# 判据：calc_diff <= 1e-3 且 max|out-ref| <= 2%·max|ref|，无 NaN/Inf），参考的激活精度按算子实际启动的 kernel
+# 判据：calc_diff <= 1e-3 且 max|out-ref| <= 4.5%·max|ref|，无 NaN/Inf），参考的激活精度按算子实际启动的 kernel
 # 选择，并断言确实启动了 A8W4 / A16W4 kernel 与预期分档的 kernel。H=2560、topk=11，最后一个 expert 是每个
 # token 必选的融合 shared expert；E 缩到 33 以控制参考耗时。三个分档：M≤32 免排序的 decode（TP2 M=3，激活在
 # kernel 内量化）；M>32 且每个 expert 平均不超过 22 行（E=33 时 M≤66）的流式路径（TP2 M=64：排序块 32，
 # Gate/Up 尾部量化中间激活）；其余走 prefill（TP2 M=1031；TP4 M=257，I=160 由 prepare 补零到 192）。
-# prefill 的例子含多块 expert 与部分填充的尾块。
+# prefill 的例子含多块 expert 与部分填充的尾块。MiMo 形状（H=4096、E=256、topk=8，无 shared expert、均匀路由）
+# 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1100。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
+MIMO_HIDDEN, MIMO_EXPERTS, MIMO_TOPK = 4096, 256, 8
 
 
 def _a8w4_prepare(w):
     return moe_a8w4.prepare_a8w4_weights(w["w1"], w["w1_scale"], w["w2"], w["w2_scale"])
 
 
-def _a8w4_check(inter, tokens, seed, kernel):
-    w = oracle.make_weights(EXPERTS, HIDDEN, inter, seed=seed)
+def _a8w4_check(inter, tokens, seed, kernel, hidden=HIDDEN, experts=EXPERTS, topk=TOPK, shared=True):
+    w = oracle.make_weights(experts, hidden, inter, seed=seed)
     prepared = _a8w4_prepare(w)
-    x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, EXPERTS, TOPK, seed=seed + 1)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, experts, topk, seed=seed + 1, shared=shared)
     out = torch.full_like(x, float("nan"))
     result = moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
     assert result is out
@@ -104,6 +106,15 @@ def test_tp2(tokens, kernel):
 def test_tp4_padded():
     prepared = _a8w4_check(160, 257, seed=21, kernel="_prefill_")
     assert (prepared.inter, prepared.inter_padded) == (160, 192)
+
+
+@pytest.mark.basic
+@pytest.mark.parametrize("inter, tokens, kernel", [(256, 5, "_decode"), (256, 300, "_stream_"), (512, 24, "_decode"),
+                                                   (512, 1100, "_prefill_")],
+                         ids=["tp8_m5", "tp8_m300", "tp4_m24", "tp4_m1100"])
+def test_mimo(inter, tokens, kernel):
+    _a8w4_check(inter, tokens, seed=41, kernel=kernel, hidden=MIMO_HIDDEN, experts=MIMO_EXPERTS, topk=MIMO_TOPK,
+                shared=False)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -361,7 +372,7 @@ def test_row_quant_bitexact(dtype, cols):
     kernel 用倒数乘法加两次 FMA 修正求商、scale < 2^-64 的行逐元素除法，另加两行直接乘倒数会改变 FP8 值的数据。
 
     基本测试只看端到端误差：量化算术的微小差异（例如乘倒数）只让少量 FP8 值翻转，小 M 时判据未必发现，
-    却会吃掉大 M 下 2% 最大误差的余量；随机数据里乘倒数恰好舍错的元素很少，所以另构造这两行。
+    却会吃掉大 M 下 4.5% 最大误差的余量；随机数据里乘倒数恰好舍错的元素很少，所以另构造这两行。
     """
     gen = torch.Generator(device="cuda").manual_seed(81)
     x = torch.randn((997, cols), generator=gen) * 3
@@ -395,7 +406,7 @@ def test_decode_row_quant_bitexact(dtype, cols):
     特殊行：全零、amax/240 下溢成 0（scale 取 1，只有 f32 能表示）、次正规 scale、-0 与舍入成 -0 的负数（存 +0）；
     f32 192 / 320 / 640 列每行 48 / 80 / 160 个 16 B 片（末轮不满 64 片），bf16 1024 / 2560 / 4096 列；
     37 行（最后一个 WG 只有 1 行，其后 3 行不得被写）。端到端判据看不出少量 fp8 翻转，基本测试与 bench
-    只有 192 / 320 / 2560 列的随机数据。
+    只有随机数据（f32 192 / 256 / 320 / 512 列，bf16 2560 / 4096 列）。
     """
     rows, guard = 37, 3
     gen = torch.Generator(device="cuda").manual_seed(83)
@@ -519,8 +530,8 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
     TP2 M=11/12 与 TP4 M=19/20（Gate/Up 的 WG 数 M·topk·I/16 跨过 2560，改读预量化的 x）、M=32/33（改走排序的
     流式路径；E=33 时每个 expert 平均 11 行，排序块取 16）。
 
-    基本测试的 decode 只有 M=3；bench 的 M 只取 2 的幂与 48（没有 11/12、19/20、33），也不断言 kernel 序列：
-    M=4、32 两例与 bench 同 M 同路径，留作交界的一侧。
+    基本测试的 decode 只有 M=3 与 MiMo 的 M=5 / 24（都不在这些交界上）；bench 的 M 只取 2 的幂与 48（没有 11/12、
+    19/20、33），也不断言 kernel 序列：M=4、32 两例与 bench 同 M 同路径，留作交界的一侧。
     """
     w, prepared = _decode_weights(inter)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=90 + tokens)
@@ -537,7 +548,8 @@ def test_decode_topk_variants(topk, tokens, path):
     """topk≠11：topk=8 是偶数，槽对 Down 3 个 wave 两轮、第二轮两个 wave 的槽对整对无效，且 M=16 时 Gate/Up 恰为
     2560 个 WG（按 >= 走预量化）；topk=17 大于 16，核内量化的 Down 改为 4 个 wave 轮流取槽，末轮 3 个槽无效。
 
-    基本测试与 bench 都是 topk=11：槽对只有末对缺高半，核内量化的 Down 每个槽一个 wave。
+    基本测试与 bench 的 Qwen 是 topk=11：槽对只有末对缺高半；MiMo 的 topk=8 也有整对无效的槽对，但 Gate/Up 的 WG 数
+    不在 2560 上；两者都不超过 16，核内量化的 Down 每个槽一个 wave。
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, topk, seed=94 + topk)
@@ -586,7 +598,7 @@ def test_decode_down_fallback_w2_4gib():
 def test_grid_shrink_boundary_e513():
     """E=513 满规模下流式 Gate/Up、Down 的 grid 收缩（M·topk <= E 时 task 数取 M·topk）交界两侧：M=46（506）、M=47（517）。
 
-    基本测试用 E=33；bench 在 33–63 只有 M=48（528 条路由 > E，不收缩，与 M=47 同侧），不在交界上。这两个 M 的路由数
+    基本测试（E=33 / 256）不在交界上；bench 在 33–63 只有 M=48（528 条路由 > E，不收缩，与 M=47 同侧）。这两个 M 的路由数
     少于 4E/3，排序块取 32（aiter 对 block 16 会换用另一种排序），与 bench 的 M=48 同一路径。
     """
     w = oracle.make_weights(513, HIDDEN, 320, seed=31)
@@ -603,7 +615,7 @@ def test_stream_dispatch_boundary(tokens, path):
     """流式与 prefill 的交界（M·topk ≤ 22·E 走流式）：E=33、topk=11 时 M=66（每个 expert 平均 22 行）仍走流式
     （排序块 32、Gate/Up 尾部量化），M=67 改走 prefill，且默认 TILE_K=128。
 
-    基本测试的流式 M=64、prefill M=1031，bench 的 E=513 各档都不在交界上。
+    基本测试（流式 M=64 / 300，prefill M=257 / 1031 / 1100）与 bench 的各档都不在交界上。
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=tokens)
@@ -786,7 +798,8 @@ def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_r
     （I=1024：排序块 32 放得下，64 放不下，后者若误选共享 tile 会在构建 kernel 时报错；默认分派的流式只到排序块 32，
     这里临时调大 STREAM_MAX_ROWS 让 M=300 走排序块 64）。
 
-    前两类只有目标形状（H=2560，I=320 / 192），碰不到这些上限；E=5、topk=2 控制耗时。
+    前两类只有目标形状（H=2560 / 4096，I=192–512）：MiMo 的 H=4096 只覆盖 decode 上限的一侧（与 h4096_decode 相同），
+    其余上限碰不到；E=5、topk=2 控制耗时。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage import a8w4_common, a8w4_stream
 
@@ -1076,42 +1089,51 @@ def test_fp8_down_rounds_before_packing(path):
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 # 区域 5｜性能测试（脚本入口，commands.bench；pytest 不收集）
 # 用法：PYTHONPATH=<repo>/src python tests/ops/moe/test_moe_a8w4.py [--cases tp2_m1 ...]
-# pyhip ``fused_moe_a8w4`` 对照 Aiter FP8 ptpc。34 个 case：TP2（I=320）与 TP4（I=160，prepare 补零到 192；Aiter 用同一份
-# BF16 权重补零到 192）× M 按 2 的幂细扫 {1, 2, 4, …, 32768}，另加 M=48（E513 下 M=33–62 走排序块 32 的流式段，
-# 2 的幂跳过了它），名为 tp2_m1 … tp4_m32768、tp2_m48、tp4_m48。H=2560，E=513（512 routed + 最后一个融合 shared，
-# 每个 token 的最后槽位必选），topk=11，SiLU，BF16 进出；权重与输入由 ``pyhip.testing.moe_a8w4`` 生成（BF16 权重逐
-# expert 生成），种子取环境变量 MF_SEED（默认 0）。
-# 协议：两种实现在同一进程、同一协议下交替计时。每次调用前写 512 MiB flush buffer，再用 ``torch.cuda._sleep``
-# 让 GPU 空转（至少 200 µs，且不短于 warmup 后实测的两种实现 host 下发一次调用耗时较大者的 2 倍），使 host
+# 68 个 case = 4 个形状 × M 按 2 的幂细扫 {1, 2, 4, …, 32768} 再加 M=48（E513 下 M=33–62 走排序块 32 的流式段，
+# 2 的幂跳过了它），名为 <形状>_m<M>，SiLU，BF16 进出：
+#   tp2 / tp4：Qwen3.8-Flash-Next，H=2560，E=513（512 routed + 最后一个融合 shared，每个 token 的最后槽位必选），
+#     topk=11，I=320 / 160（prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）；对照 Aiter FP8 ptpc。
+#   mimo_tp8 / mimo_tp4：MiMo-V2.6-Flash，H=4096，E=256，topk=8，均匀路由，I=256 / 512；Aiter 没有这两个形状的
+#     调优表，只测 A8W4。
+# case 的输入种子按它在 BENCH_CASES 里的序号取（Qwen 在前、MiMo 在后）；权重与输入由 ``pyhip.testing.moe_a8w4``
+# 生成（BF16 权重逐 expert 生成），种子取环境变量 MF_SEED（默认 0）。
+# 协议：有对照时两种实现在同一进程、同一协议下交替计时。每次调用前写 512 MiB flush buffer，再用 ``torch.cuda._sleep``
+# 让 GPU 空转（至少 200 µs，且不短于 warmup 后实测的各实现 host 下发一次调用耗时较大者的 2 倍），使 host
 # 提前排队，event 只计完整调用的 GPU 时间；不设默认设备（它的 TorchFunctionMode 会给每个 torch 调用加 host 开销）。
 # warmup 3 次，30 次取中位，4 组输入轮换。被计时的 A8W4 输出按 ``moe_a8w4.check`` 校验，任一组不过即退出非零。
 # Aiter 对照只用 ``aiter/configs/model_configs/qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv``（复制到临时目录后经
 # AITER_CONFIG_FMOE 指定），每个 case 断言 dispatcher 用的就是表中那一行。
-# 输出：``MF_METRIC case=<名> value=<us> unit=us flops=<F> bytes=<B>``（A8W4 中位数）；
+# 输出：``MF_METRIC case=<名> value=<us> unit=us flops=<F> bytes=<B>``（A8W4 中位数）；有对照的 case 另有
 # ``MF_REF case=<名> impl=aiter_fp8_ptpc value=<us> flops=<F> bytes=<B> ratio=<A8W4/aiter> kernels=<名>``；
 # flops 按补零后的 I 计 6·M·topk·I·H，bytes 是各自的最小数据量（被选中 expert 的权重与 scale + 输入读、输出写）；
 # ``INFO`` 行给所走路径、校验结果、带宽与算力利用率（MI308X：HBM 5.3 TB/s，FP8 稠密约 606 TFLOPS）。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-BENCH_EXPERTS = 513  # HIDDEN、TOPK 同区域 1
+# 形状前缀: (H, E, topk, 真实 I, 计算用的补零 I, 融合 shared expert, 对照 Aiter)
+BENCH_SHAPES = {
+    "tp2": (2560, 513, 11, 320, 320, True, True),
+    "tp4": (2560, 513, 11, 160, 192, True, True),
+    "mimo_tp8": (4096, 256, 8, 256, 256, False, False),
+    "mimo_tp4": (4096, 256, 8, 512, 512, False, False),
+}
 BENCH_TOKENS = tuple(1 << k for k in range(16))  # 1, 2, 4, …, 32768
-BENCH_EXTRA_TOKENS = (48,)  # 排序块 32 的小 M 流式段；追加在末尾，已有 case 的输入种子（按序号）不变
-BENCH_INTER = {"tp2": (320, 320), "tp4": (160, 192)}  # (真实 I, 计算用的补零 I)
-BENCH_CASES = ([f"{tp}_m{m}" for tp in BENCH_INTER for m in BENCH_TOKENS]
-               + [f"{tp}_m{m}" for tp in BENCH_INTER for m in BENCH_EXTRA_TOKENS])
+BENCH_EXTRA_TOKENS = (48,)  # 排序块 32 的小 M 流式段
+BENCH_CASES = ([f"{tp}_m{m}" for tp in ("tp2", "tp4") for m in BENCH_TOKENS]
+               + [f"{tp}_m{m}" for tp in ("tp2", "tp4") for m in BENCH_EXTRA_TOKENS]
+               + [f"{tp}_m{m}" for tp in ("mimo_tp8", "mimo_tp4") for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS])
 HBM_BYTES_PER_S, FP8_FLOPS = 5.3e12, 606e12
 WARMUP, ITERS, GROUPS = 3, 30, 4
 FLUSH_BYTES, IDLE_US = 512 << 20, 200
 BENCH_TABLE = "qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv"
 
 
-def _aiter_row(fm, tokens, inter):
+def _aiter_row(fm, tokens, hidden, inter, experts, topk):
     from aiter import ActivationType, QuantType, dtypes
 
-    key = (fm.get_gfx_runtime(), fm.get_cu_num(), fm.get_padded_M(tokens), HIDDEN, inter, BENCH_EXPERTS, TOPK,
+    key = (fm.get_gfx_runtime(), fm.get_cu_num(), fm.get_padded_M(tokens), hidden, inter, experts, topk,
            str(ActivationType.Silu), str(dtypes.bf16), str(dtypes.fp8), str(dtypes.fp8),
            str(QuantType.per_Token), 1, 0)
-    fm.get_2stage_cfgs(fm.get_padded_M(tokens), HIDDEN, inter, BENCH_EXPERTS, TOPK, dtypes.bf16, dtypes.fp8,
+    fm.get_2stage_cfgs(fm.get_padded_M(tokens), hidden, inter, experts, topk, dtypes.bf16, dtypes.fp8,
                        dtypes.fp8, QuantType.per_Token, True, ActivationType.Silu, False, 0, 0)
     row = fm.cfg_2stages[0].get(key)
     if row is None or not 0 < float(row["us"]) < math.inf:
@@ -1164,25 +1186,26 @@ def _host_us(fn, cycles_per_us):
     return statistics.median(times)
 
 
-def _traffic(ids, per_expert):
+def _traffic(ids, per_expert, hidden):
     """最小数据量：被选中 expert 的全部权重（含 scale）+ 输入读与输出写（字节）。"""
-    return ids.unique().numel() * per_expert + ids.shape[0] * HIDDEN * 2 * 2
+    return ids.unique().numel() * per_expert + ids.shape[0] * hidden * 2 * 2
 
 
-def _bytes_per_expert(weights):
+def _bytes_per_expert(weights, experts):
     values = weights.values() if isinstance(weights, dict) else vars(weights).values()
-    return sum(t.numel() * t.element_size() for t in values if isinstance(t, torch.Tensor)) // BENCH_EXPERTS
+    return sum(t.numel() * t.element_size() for t in values if isinstance(t, torch.Tensor)) // experts
 
 
 def _bench_case(name, weights, cycles_per_us, flush, seed):
     import aiter.fused_moe as fm
     from aiter import ActivationType, QuantType
 
-    tp, tokens = name.split("_m")[0], int(name.split("_m")[1])
-    inter, inter_pad = BENCH_INTER[tp]
+    tp, tokens = name.rsplit("_m", 1)[0], int(name.rsplit("_m", 1)[1])
+    hidden, experts, topk, inter, inter_pad, shared, compare = BENCH_SHAPES[tp]
     w, prepared, fp8_w = weights
     index = BENCH_CASES.index(name)
-    groups = [oracle.make_inputs(tokens, HIDDEN, BENCH_EXPERTS, TOPK, seed=seed * 1000 + 100 + index * GROUPS + g)
+    groups = [oracle.make_inputs(tokens, hidden, experts, topk, seed=seed * 1000 + 100 + index * GROUPS + g,
+                                 shared=shared)
               for g in range(GROUPS)]
     outputs = [torch.empty_like(x) for x, _, _ in groups]
     theirs_out = [None] * GROUPS
@@ -1197,35 +1220,37 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
                                      activation=ActivationType.Silu, quant_type=QuantType.per_Token,
                                      w1_scale=fp8_w["w1_scale"], w2_scale=fp8_w["w2_scale"])
 
-    row = _aiter_row(fm, tokens, inter_pad)
-    seen = []
-    resolve = fm.get_2stage_cfgs
+    impls = (("ours", ours), ("theirs", theirs)) if compare else (("ours", ours),)
+    if compare:
+        row = _aiter_row(fm, tokens, hidden, inter_pad, experts, topk)
+        seen = []
+        resolve = fm.get_2stage_cfgs
 
-    def spy(*args, **kwargs):
-        meta = resolve(*args, **kwargs)
-        seen.append(meta)
-        return meta
+        def spy(*args, **kwargs):
+            meta = resolve(*args, **kwargs)
+            seen.append(meta)
+            return meta
 
-    fm.get_2stage_cfgs = spy
-    try:
-        theirs(0)
-    finally:
-        fm.get_2stage_cfgs = resolve
-    expected = _row_kernels(row)
-    if not seen or not _uses_row(seen[-1], row):
-        raise RuntimeError(f"{name}: Aiter did not run the tuned row {expected} (block_m={row['block_m']}); "
-                           f"got {seen[-1] if seen else None}")
+        fm.get_2stage_cfgs = spy
+        try:
+            theirs(0)
+        finally:
+            fm.get_2stage_cfgs = resolve
+        expected = _row_kernels(row)
+        if not seen or not _uses_row(seen[-1], row):
+            raise RuntimeError(f"{name}: Aiter did not run the tuned row {expected} (block_m={row['block_m']}); "
+                               f"got {seen[-1] if seen else None}")
     for i in range(WARMUP):
-        ours(i % GROUPS)
-        theirs(i % GROUPS)
+        for _, fn in impls:
+            fn(i % GROUPS)
     # 空转要盖住 host 下发一次调用的时间，否则 host 开销会落进计时区间。
-    host = {impl: _host_us(fn, cycles_per_us) for impl, fn in (("ours", ours), ("theirs", theirs))}
+    host = {impl: _host_us(fn, cycles_per_us) for impl, fn in impls}
     idle_us = max(IDLE_US, 2 * max(host.values()))
     sleep_cycles = int(idle_us * cycles_per_us)
 
-    events = {impl: [] for impl in ("ours", "theirs")}
+    events = {impl: [] for impl, _ in impls}
     for i in range(ITERS):
-        for impl, fn in (("ours", ours), ("theirs", theirs)):
+        for impl, fn in impls:
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             flush.zero_()
             torch.cuda._sleep(sleep_cycles)
@@ -1246,16 +1271,15 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
         if not result["ok"]:
             print(f"FAIL case={name} group={g} check={result}", flush=True)
             sys.exit(1)
-        if not bool(torch.isfinite(theirs_out[g]).all()):
+        if compare and not bool(torch.isfinite(theirs_out[g]).all()):
             print(f"FAIL case={name} group={g} aiter output is not finite", flush=True)
             sys.exit(1)
         if worst is None or result["err_ratio"] > worst["err_ratio"]:
             worst = result
         del ref
 
-    flops = 6 * tokens * TOPK * inter_pad * HIDDEN
-    bytes_ours = statistics.mean(_traffic(ids, _bytes_per_expert(prepared)) for _, _, ids in groups)
-    bytes_theirs = statistics.mean(_traffic(ids, _bytes_per_expert(fp8_w)) for _, _, ids in groups)
+    flops = 6 * tokens * topk * inter_pad * hidden
+    bytes_ours = statistics.mean(_traffic(ids, _bytes_per_expert(prepared, experts), hidden) for _, _, ids in groups)
 
     def util(t_us, nbytes):
         bw, fl = nbytes / (t_us * 1e-6), flops / (t_us * 1e-6)
@@ -1263,12 +1287,16 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
                 f"{fl / 1e12:.1f}TFLOPS({fl / FP8_FLOPS * 100:.1f}%)")
 
     print(f"MF_METRIC case={name} value={us['ours']:.2f} unit=us flops={flops} bytes={bytes_ours:.0f}", flush=True)
-    print(f"MF_REF case={name} impl=aiter_fp8_ptpc value={us['theirs']:.2f} flops={flops} bytes={bytes_theirs:.0f} "
-          f"ratio={us['ours'] / us['theirs']:.3f} kernels={expected}", flush=True)
+    versus = ""
+    if compare:
+        bytes_theirs = statistics.mean(_traffic(ids, _bytes_per_expert(fp8_w, experts), hidden) for _, _, ids in groups)
+        print(f"MF_REF case={name} impl=aiter_fp8_ptpc value={us['theirs']:.2f} flops={flops} bytes={bytes_theirs:.0f} "
+              f"ratio={us['ours'] / us['theirs']:.3f} kernels={expected}", flush=True)
+        versus = f" aiter={util(us['theirs'], bytes_theirs)}"
     print(f"INFO case={name} I={inter}->{inter_pad} path={'>'.join(path)} activation={mode} "
-          f"a8w4={util(us['ours'], bytes_ours)} aiter={util(us['theirs'], bytes_theirs)} "
+          f"a8w4={util(us['ours'], bytes_ours)}{versus} "
           f"worst_check=calc_diff:{worst['calc_diff']:.2e},err_ratio:{worst['err_ratio'] * 100:.2f}% "
-          f"host_us=a8w4:{host['ours']:.0f},aiter:{host['theirs']:.0f} idle_us={idle_us:.0f}", flush=True)
+          f"host_us={','.join(f'{k}:{v:.0f}' for k, v in host.items())} idle_us={idle_us:.0f}", flush=True)
 
 
 def _bench_main():
@@ -1294,15 +1322,18 @@ def _bench_main():
     print(f"INFO seed={seed} aiter_table={table_src} warmup={WARMUP} iters={ITERS} groups={GROUPS}", flush=True)
     flush = torch.empty(FLUSH_BYTES // 4, dtype=torch.float32, device="cuda")
     cycles_per_us = _cycles_per_us()
-    for tp_index, tp in enumerate(BENCH_INTER):
-        names = [n for n in args.cases if n.startswith(tp + "_")]
+    for tp_index, tp in enumerate(BENCH_SHAPES):
+        names = [n for n in args.cases if n.rsplit("_m", 1)[0] == tp]
         if not names:
             continue
-        inter, inter_pad = BENCH_INTER[tp]
-        w = oracle.make_weights(BENCH_EXPERTS, HIDDEN, inter, seed=seed * 1000 + tp_index, fp8_inter=inter_pad)
+        hidden, experts, topk, inter, inter_pad, shared, compare = BENCH_SHAPES[tp]
+        w = oracle.make_weights(experts, hidden, inter, seed=seed * 1000 + tp_index,
+                                fp8_inter=inter_pad if compare else None)
         prepared = moe_a8w4.prepare_a8w4_weights(w["w1"], w["w1_scale"], w["w2"], w["w2_scale"])
-        fp8_w = dict(w1=shuffle_weight(w.pop("w1_fp8"), layout=(16, 16)), w1_scale=w.pop("w1_fp8_scale"),
-                     w2=shuffle_weight(w.pop("w2_fp8"), layout=(16, 16)), w2_scale=w.pop("w2_fp8_scale"))
+        fp8_w = None
+        if compare:
+            fp8_w = dict(w1=shuffle_weight(w.pop("w1_fp8"), layout=(16, 16)), w1_scale=w.pop("w1_fp8_scale"),
+                         w2=shuffle_weight(w.pop("w2_fp8"), layout=(16, 16)), w2_scale=w.pop("w2_fp8_scale"))
         for name in names:
             _bench_case(name, (w, prepared, fp8_w), cycles_per_us, flush, seed)
         del w, prepared, fp8_w

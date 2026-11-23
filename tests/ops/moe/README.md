@@ -13,9 +13,10 @@ A8W4 算子（[moe_a8w4.py](../../../src/pyhip/ops/moe/flydsl/moe_a8w4.py)）及
 | 0 | 公共：导入、GPU 环境 | — |
 | 1 / 2 | 基本功能：A8W4 每个分档一例 / 底座每条公开路径一例（`test_fp8_*`），标 `@pytest.mark.basic` | `-m basic`，每次小改动先跑 |
 | 3 / 4 | 其他覆盖：A8W4 / 底座（`test_fp8_*`），只放基本功能与性能测试覆盖不了的，docstring 写明原因 | `-m "not basic"` |
-| 5 | 性能测试：A8W4 对照 Aiter FP8 ptpc 的 34 个 case（脚本入口，pytest 不收集） | `python tests/ops/moe/test_moe_a8w4.py` |
+| 5 | 性能测试：68 个 case，Qwen3.8 TP2 / TP4 对照 Aiter FP8 ptpc，MiMo-V2.6-Flash TP8 / TP4 只测 A8W4（脚本入口，pytest 不收集） | `python tests/ops/moe/test_moe_a8w4.py` |
 
-`basic` marker 注册在仓库的 [pytest.ini](../../../pytest.ini)。参考与判据在 [pyhip.testing.moe_a8w4](../../../src/pyhip/testing/moe_a8w4.py)（A8W4）
+`basic` marker 注册在仓库的 [pytest.ini](../../../pytest.ini)。参考与判据在 [pyhip.testing.moe_a8w4](../../../src/pyhip/testing/moe_a8w4.py)（A8W4，
+calc_diff ≤ 1e-3 且最大误差 ≤ 4.5%·max|ref|）
 与 [pyhip.testing.moe](../../../src/pyhip/testing/moe.py)（底座），覆盖表见 [A8W4 设计说明](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md) 第 5 节。
 
 [test_tuned_moe.py](test_tuned_moe.py) 保留调优策略、缓存、benchmark、
@@ -46,8 +47,8 @@ python3 -m pytest 'tests/ops/moe/test_moe.py::test_asm_splitk[ptpc-m17]' -q
 python3 -m pytest tests/ops/moe/test_moe_a8w4.py -m basic -q
 python3 -m pytest tests/ops/moe/test_moe_a8w4.py -m "not basic" -q -k 'test_fp8_prefill_variants and compact'
 
-# A8W4 性能测试：直接运行该文件（默认 34 个 case，--cases 选子集）
-PYTHONPATH=src python3 tests/ops/moe/test_moe_a8w4.py --cases tp2_m1 tp4_m16384
+# A8W4 性能测试：直接运行该文件（默认 68 个 case，--cases 选子集；tp2_* / tp4_* 为 Qwen3.8，mimo_tp8_* / mimo_tp4_* 为 MiMo）
+PYTHONPATH=src python3 tests/ops/moe/test_moe_a8w4.py --cases tp2_m1 tp4_m16384 mimo_tp8_m512
 
 # 性能单独选择；默认不运行 perf
 python3 -m pytest tests/ops/moe/test_moe.py -m perf -k 'test_fly_batch1_perf and bf16' -s

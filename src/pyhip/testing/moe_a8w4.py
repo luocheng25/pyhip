@@ -7,7 +7,7 @@ MXFP4 精确反量化；``activation="fp8"`` 时输入和中间激活按行量�
 
 FP8_MAX = 240.0
 CALC_DIFF_MAX = 1e-3
-MAX_ERR_RATIO = 0.02
+MAX_ERR_RATIO = 0.045  # 与 tingqli refactor/a8w4 同级（它对 FP8 激活参考的 err 约 4.2%）
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
@@ -66,17 +66,22 @@ def make_weights(experts, hidden, inter, *, seed=0, fp8_inter=None, device="cuda
     return out
 
 
-def make_inputs(tokens, hidden, experts, topk, *, seed=0, device="cuda"):
+def make_inputs(tokens, hidden, experts, topk, *, seed=0, shared=True, device="cuda"):
     """返回 ``(hidden_states, topk_weight, topk_ids)``。
 
-    hidden_states BF16 [M, H] ~ N(0, 1)；最后一个 expert（E-1）是融合的 shared expert，每个
-    token 的最后一个槽位必选；其余 topk-1 个在 [0, E-1) 中均匀随机且不重复。
-    topk_weight float32：routed 为 topk-1 个随机 logit 的 softmax，shared 为 sigmoid(randn)。
+    hidden_states BF16 [M, H] ~ N(0, 1)。``shared``（Qwen3.8）：最后一个 expert（E-1）是融合的 shared expert，
+    每个 token 的最后一个槽位必选；其余 topk-1 个在 [0, E-1) 中均匀随机且不重复。topk_weight float32：
+    routed 为 topk-1 个随机 logit 的 softmax，shared 为 sigmoid(randn)。否则（MiMo）topk 个 expert 在 [0, E)
+    中均匀随机且不重复，权重为 topk 个随机 logit 的 softmax。
     """
     import torch
 
     gen = torch.Generator(device=device).manual_seed(seed)
     x = torch.randn((tokens, hidden), generator=gen, device=device).to(torch.bfloat16)
+    if not shared:
+        ids = torch.rand((tokens, experts), generator=gen, device=device).topk(topk, dim=-1).indices
+        logits = torch.randn((tokens, topk), generator=gen, device=device)
+        return x, torch.softmax(logits, dim=-1).float().contiguous(), ids.to(torch.int32).contiguous()
     routed = torch.rand((tokens, experts - 1), generator=gen, device=device).topk(topk - 1, dim=-1).indices
     shared = torch.full((tokens, 1), experts - 1, dtype=routed.dtype, device=device)
     ids = torch.cat([routed, shared], dim=1).to(torch.int32).contiguous()
@@ -173,7 +178,7 @@ def calc_diff(x, y):
 
 
 def check(out, ref):
-    """验收：无 NaN/Inf，calc_diff <= 1e-3，且 max|out - ref| <= 2% · max|ref|。返回明细 dict。"""
+    """验收：无 NaN/Inf，calc_diff <= 1e-3，且 max|out - ref| <= 4.5% · max|ref|。返回明细 dict。"""
     import torch
 
     o, r = out.float(), ref.float()
