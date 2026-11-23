@@ -1,7 +1,7 @@
 """A8W4 MoE bench（任务冻结后受保护）：pyhip ``fused_moe_a8w4`` 对照 Aiter FP8 ptpc。
 
-12 个 case：TP2（I=320）与 TP4（I=160，prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）
-× M ∈ {1, 16, 128, 1024, 4096, 16384}，名为 tp2_m1 … tp4_m16384。H=2560，E=513（512 routed +
+32 个 case：TP2（I=320）与 TP4（I=160，prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）
+× M 按 2 的幂细扫 {1, 2, 4, …, 32768}，名为 tp2_m1 … tp4_m32768。H=2560，E=513（512 routed +
 最后一个融合 shared，每个 token 的最后槽位必选），topk=11，SiLU，BF16 进出；权重与输入由
 ``pyhip.testing.moe_a8w4`` 生成（BF16 权重逐 expert 生成），种子取环境变量 MF_SEED（默认 0）。
 
@@ -13,8 +13,9 @@ TorchFunctionMode 会给每个 torch 调用加 host 开销）。warmup 3 次，3
 ``aiter/configs/model_configs/qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv``（复制到临时目录后经
 AITER_CONFIG_FMOE 指定），每个 case 断言 dispatcher 用的就是表中那一行。
 
-输出：``MF_METRIC case=<名> value=<us> unit=us``（A8W4 中位数）；
-``MF_REF case=<名> impl=aiter_fp8_ptpc value=<us> ratio=<A8W4/aiter> kernels=<名>``（mf 不解析）；
+输出：``MF_METRIC case=<名> value=<us> unit=us flops=<F> bytes=<B>``（A8W4 中位数）；
+``MF_REF case=<名> impl=aiter_fp8_ptpc value=<us> flops=<F> bytes=<B> ratio=<A8W4/aiter> kernels=<名>``；
+flops 按补零后的 I 计 6·M·topk·I·H，bytes 是各自的最小数据量（被选中 expert 的权重与 scale + 输入读、输出写）；
 ``INFO`` 行给所走路径、校验结果、带宽与算力利用率（MI308X：HBM 5.3 TB/s，FP8 稠密约 606 TFLOPS）。
 用法：``PYTHONPATH=<repo>/src python benchmarks/moe/bench_moe_a8w4.py [--cases tp2_m1 ...]``
 """
@@ -31,7 +32,7 @@ import tempfile
 import time
 
 HIDDEN, EXPERTS, TOPK = 2560, 513, 11
-TOKENS = (1, 16, 128, 1024, 4096, 16384)
+TOKENS = tuple(1 << k for k in range(16))  # 1, 2, 4, …, 32768
 INTER = {"tp2": (320, 320), "tp4": (160, 192)}  # (真实 I, 计算用的补零 I)
 CASES = [f"{tp}_m{m}" for tp in INTER for m in TOKENS]
 HBM_BYTES_PER_S, FP8_FLOPS = 5.3e12, 606e12
@@ -65,11 +66,13 @@ def _aiter_row(fm, tokens, inter):
 
 def _row_kernels(row):
     name = str(row["kernelName1"])
-    return f"asm_1stage:{name}" if int(row["run_1stage"]) else name
+    if int(row["run_1stage"]):
+        return f"asm_1stage:{name}"
+    return name if name.startswith("impl__") else f"{name}+{row['kernelName2']}"
 
 
 def _uses_row(meta, row):
-    """dispatcher 最终采用的 metadata 是否就是表中这一行（只识别表里出现的 1-stage asm 与 impl__ 两类）。"""
+    """dispatcher 最终采用的 metadata 是否就是表中这一行（识别表里出现的 1-stage asm、impl__ 与 CK 两段式三类）。"""
     name = str(row["kernelName1"])
     if int(meta.block_m) != int(row["block_m"]) or bool(meta.run_1stage) != bool(int(row["run_1stage"])):
         return False
@@ -78,6 +81,9 @@ def _uses_row(meta, row):
     if meta.full_impl is not None and name.startswith("impl__"):
         configs = [c.cell_contents for c in meta.full_impl.__closure__ or () if isinstance(c.cell_contents, str)]
         return configs == [name.split("__", 2)[2]]
+    if meta.full_impl is None and name.startswith("moe_ck2stages_"):
+        return (meta.stage1.keywords.get("kernelName") == name
+                and meta.stage2.keywords.get("kernelName") == str(row["kernelName2"]))
     return False
 
 
@@ -204,8 +210,8 @@ def run_case(name, weights, cycles_per_us, flush, seed):
         return (f"{bw / 1e12:.2f}TB/s({bw / HBM_BYTES_PER_S * 100:.1f}%) "
                 f"{fl / 1e12:.1f}TFLOPS({fl / FP8_FLOPS * 100:.1f}%)")
 
-    print(f"MF_METRIC case={name} value={us['ours']:.2f} unit=us", flush=True)
-    print(f"MF_REF case={name} impl=aiter_fp8_ptpc value={us['theirs']:.2f} "
+    print(f"MF_METRIC case={name} value={us['ours']:.2f} unit=us flops={flops} bytes={bytes_ours:.0f}", flush=True)
+    print(f"MF_REF case={name} impl=aiter_fp8_ptpc value={us['theirs']:.2f} flops={flops} bytes={bytes_theirs:.0f} "
           f"ratio={us['ours'] / us['theirs']:.3f} kernels={expected}", flush=True)
     print(f"INFO case={name} I={inter}->{inter_pad} path={'>'.join(path)} activation={mode} "
           f"a8w4={util(us['ours'], bytes_ours)} aiter={util(us['theirs'], bytes_theirs)} "

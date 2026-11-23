@@ -4,7 +4,7 @@
 每个测试的 docstring 写明原因。端到端判据与基本测试相同（``pyhip.testing.moe_a8w4.check``，
 参考的激活精度按实际启动的 kernel 选择）；逐位用例要求 0 误差。部分填充的尾块、多块 expert 与 I=160→192
 补零已由基本测试覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
-M≤32 的 decode 路径：核内量化（M=3）由基本测试、M=1 / 16 的三种分派由 bench 覆盖，这里只测分派交界、
+M≤32 的 decode 路径：核内量化（M=3）由基本测试、三种分派由 bench（M=1、2、4…32）覆盖，这里只测分派交界、
 topk 与路由输入的变体、CUDA graph、decode 行量化逐位与 w2≥4 GiB 回退（用例名带 ``decode``）。
 M>32 且每个 expert 平均不超过 22 行的流式路径：排序块 32 由基本测试、16 / 32 由 bench 覆盖，这里只测与 prefill
 的交界、两处量化逐位（用例名带 ``stream``）以及 grid 收缩与 graph。prefill 路径：默认 tile 由基本测试与 bench
@@ -81,7 +81,7 @@ def _decode_weights(inter):
 def test_grid_shrink_boundary_e513():
     """E=513 满规模下流式 Gate/Up、Down 的 grid 收缩（M·topk <= E 时 task 数取 M·topk）交界两侧：M=46（506）、M=47（517）。
 
-    基本测试用 E=33；bench 的 M 档（1、16、128…）离这个交界都很远。这两个 M 的路由数少于 4E/3，排序块取 32
+    基本测试用 E=33；bench 的 M 只取 2 的幂，跳过 33–63（32 走 decode）。这两个 M 的路由数少于 4E/3，排序块取 32
     （aiter 对 block 16 会换用另一种排序），也覆盖了这条分支与大量空 expert。
     """
     w = oracle.make_weights(513, HIDDEN, 320, seed=31)
@@ -345,7 +345,8 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
     TP2 M=11/12 与 TP4 M=19/20（Gate/Up 的 WG 数 M·topk·I/16 跨过 2560，改读预量化的 x）、M=32/33（改走排序的
     流式路径；E=33 时每个 expert 平均 11 行，排序块取 16）。
 
-    基本测试的 decode 只有 M=3，bench 只有 M=1、16：TP2 的 Down 预量化、TP4 的全预量化与这些交界都碰不到。
+    基本测试的 decode 只有 M=3；bench 的 M 只取 2 的幂（没有 11/12、19/20、33），也不断言 kernel 序列：
+    M=4、32 两例与 bench 同 M 同路径，留作交界的一侧。
     """
     w, prepared = _decode_weights(inter)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=90 + tokens)
