@@ -1,7 +1,8 @@
 """A8W4 MoE bench（任务冻结后受保护）：pyhip ``fused_moe_a8w4`` 对照 Aiter FP8 ptpc。
 
-32 个 case：TP2（I=320）与 TP4（I=160，prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）
-× M 按 2 的幂细扫 {1, 2, 4, …, 32768}，名为 tp2_m1 … tp4_m32768。H=2560，E=513（512 routed +
+34 个 case：TP2（I=320）与 TP4（I=160，prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）
+× M 按 2 的幂细扫 {1, 2, 4, …, 32768}，另加 M=48（E513 下 M=33–62 走排序块 32 的流式段，
+2 的幂跳过了它），名为 tp2_m1 … tp4_m32768、tp2_m48、tp4_m48。H=2560，E=513（512 routed +
 最后一个融合 shared，每个 token 的最后槽位必选），topk=11，SiLU，BF16 进出；权重与输入由
 ``pyhip.testing.moe_a8w4`` 生成（BF16 权重逐 expert 生成），种子取环境变量 MF_SEED（默认 0）。
 
@@ -33,8 +34,9 @@ import time
 
 HIDDEN, EXPERTS, TOPK = 2560, 513, 11
 TOKENS = tuple(1 << k for k in range(16))  # 1, 2, 4, …, 32768
+EXTRA_TOKENS = (48,)  # 排序块 32 的小 M 流式段；追加在末尾，已有 case 的输入种子（按序号）不变
 INTER = {"tp2": (320, 320), "tp4": (160, 192)}  # (真实 I, 计算用的补零 I)
-CASES = [f"{tp}_m{m}" for tp in INTER for m in TOKENS]
+CASES = [f"{tp}_m{m}" for tp in INTER for m in TOKENS] + [f"{tp}_m{m}" for tp in INTER for m in EXTRA_TOKENS]
 HBM_BYTES_PER_S, FP8_FLOPS = 5.3e12, 606e12
 WARMUP, ITERS, GROUPS = 3, 30, 4
 FLUSH_BYTES, IDLE_US = 512 << 20, 200

@@ -81,8 +81,8 @@ def _decode_weights(inter):
 def test_grid_shrink_boundary_e513():
     """E=513 满规模下流式 Gate/Up、Down 的 grid 收缩（M·topk <= E 时 task 数取 M·topk）交界两侧：M=46（506）、M=47（517）。
 
-    基本测试用 E=33；bench 的 M 只取 2 的幂，跳过 33–63（32 走 decode）。这两个 M 的路由数少于 4E/3，排序块取 32
-    （aiter 对 block 16 会换用另一种排序），也覆盖了这条分支与大量空 expert。
+    基本测试用 E=33；bench 在 33–63 只有 M=48（528 条路由 > E，不收缩，与 M=47 同侧），不在交界上。这两个 M 的路由数
+    少于 4E/3，排序块取 32（aiter 对 block 16 会换用另一种排序），与 bench 的 M=48 同一路径。
     """
     w = oracle.make_weights(513, HIDDEN, 320, seed=31)
     prepared = _prepare(w)
@@ -345,7 +345,7 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
     TP2 M=11/12 与 TP4 M=19/20（Gate/Up 的 WG 数 M·topk·I/16 跨过 2560，改读预量化的 x）、M=32/33（改走排序的
     流式路径；E=33 时每个 expert 平均 11 行，排序块取 16）。
 
-    基本测试的 decode 只有 M=3；bench 的 M 只取 2 的幂（没有 11/12、19/20、33），也不断言 kernel 序列：
+    基本测试的 decode 只有 M=3；bench 的 M 只取 2 的幂与 48（没有 11/12、19/20、33），也不断言 kernel 序列：
     M=4、32 两例与 bench 同 M 同路径，留作交界的一侧。
     """
     w, prepared = _decode_weights(inter)
