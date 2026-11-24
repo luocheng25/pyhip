@@ -68,8 +68,8 @@ def _gpu_environment(monkeypatch):
 # kernel 内量化）；M>32 且每个 expert 平均不超过 22 行（E=33 时 M≤66）的流式路径（TP2 M=64：排序块 32，
 # Gate/Up 尾部量化中间激活）；其余走 prefill（TP2 M=1031；TP4 M=257，I=160 由 prepare 补零到 192）。
 # prefill 的例子含多块 expert 与部分填充的尾块。MiMo 形状（H=4096、E=256、topk=8，无 shared expert、均匀路由）
-# 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1100（MiMo 的 decode 按 expert
-# 去重：M=5 两个 kernel、M=24 四个 kernel）。
+# 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1600（H=4096 时每个 expert 平均
+# 不超过 48 行即 M≤1536 走流式；MiMo 的 decode 按 expert 去重：M=5 两个 kernel、M=24 四个 kernel）。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -111,8 +111,8 @@ def test_tp4_padded():
 
 @pytest.mark.basic
 @pytest.mark.parametrize("inter, tokens, kernel", [(256, 5, "_decode"), (256, 300, "_stream_"), (512, 24, "_decode"),
-                                                   (512, 1100, "_prefill_")],
-                         ids=["tp8_m5", "tp8_m300", "tp4_m24", "tp4_m1100"])
+                                                   (512, 1600, "_gateup_prefill_")],
+                         ids=["tp8_m5", "tp8_m300", "tp4_m24", "tp4_m1600"])
 def test_mimo(inter, tokens, kernel):
     _a8w4_check(inter, tokens, seed=41, kernel=kernel, hidden=MIMO_HIDDEN, experts=MIMO_EXPERTS, topk=MIMO_TOPK,
                 shared=False)
@@ -229,8 +229,9 @@ def test_fp8_prefill_bf16(kernels):
 # I=160→192 补零已由区域 1 覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
 # M≤32 的 decode 路径：Qwen 的核内量化（M=3）与 MiMo 的按 expert 去重（M=5 / 24）由区域 1、各分派由 bench（M=1、2、
 # 4…32，MiMo 另有 48）覆盖，这里只测分派交界、topk 与路由输入的变体、CUDA graph、行量化与去重计划逐位、w2≥4 GiB
-# 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行的流式路径：排序块 32 由区域 1、16 / 32 由 bench
-# 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位（用例名带 ``stream``）以及 grid 收缩与 graph。
+# 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行（H≥4096 为 48，H2560 排序块 64 自带量化为 56）的
+# 流式路径：排序块 32 由区域 1、16 / 32 / 64 由 bench 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位
+# （用例名带 ``stream``）、排序块 64 换 prefill Down 及其切分，以及 grid 收缩与 graph。
 # prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数与 graph。非目标形状的回退见
 # ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -404,6 +405,24 @@ def test_row_quant_bitexact(dtype, cols):
     naive = (x.float() * (torch.ones_like(ref_scale) / ref_scale)).to(torch.float8_e4m3fnuz).view(torch.uint8)
     assert bool((exact[6] != naive[6]).any()) and bool((exact[7] != naive[7]).any())
     assert float(scale[7]) < 2.0 ** -64 <= float(scale[6])
+
+
+@pytest.mark.parametrize("dtype, cols, fill", [("bf16", 2560, 11), ("f32", 512, 40)], ids=["bf16_fill11", "f32_fill40"])
+def test_row_quant_fill(dtype, cols, fill):
+    """prefill 的输入行量化顺带把 loc_ids [rows, fill] 置 -1（之后 Down 只写有效路由的排序行）：q 与 scale 和不带 fill
+    时逐位相同，fill 恰好写满 rows 行、不越界；fill=40 多于 f32·512 列时每行的 32 个 lane（每个 lane 写两轮）。
+
+    端到端只在同 token 重复 expert 时看得到这些 -1（test_prefill_duplicate_ids_keep_last_route），看不出越界写。
+    """
+    gen = torch.Generator(device="cuda").manual_seed(91)
+    rows = 997
+    x = torch.randn((rows, cols), generator=gen)
+    x = x.to(torch.bfloat16) if dtype == "bf16" else x
+    q0, s0 = moe_a8w4._quantize(x, rows, cols, dtype)
+    aux = torch.full((rows + 1, fill), 7, dtype=torch.int32)
+    q, s = moe_a8w4._quantize(x, rows, cols, dtype, fill=aux[:rows])
+    assert torch.equal(q.view(torch.uint8), q0.view(torch.uint8)) and torch.equal(s, s0)
+    assert bool((aux[:rows] == -1).all()) and bool((aux[rows] == 7).all())
 
 
 @pytest.mark.parametrize("dtype, cols", [("f32", 192), ("f32", 320), ("f32", 640),
@@ -793,12 +812,51 @@ def test_stream_dispatch_boundary(tokens, path):
     """流式与 prefill 的交界（M·topk ≤ 22·E 走流式）：E=33、topk=11 时 M=66（每个 expert 平均 22 行）仍走流式
     （排序块 32、Gate/Up 尾部量化），M=67 改走 prefill，且默认 TILE_K=128。
 
-    基本测试（流式 M=64 / 300，prefill M=257 / 1031 / 1100）与 bench 的各档都不在交界上。
+    基本测试（流式 M=64 / 300，prefill M=257 / 1031 / 1600）与 bench 的各档都不在交界上。
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, TOPK, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     _assert_path(path)
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("hidden, inter, tokens, path", [
+    (2560, 160, 140, _stream_path(64, True)),
+    (2560, 160, 141, _prefill_path(128)),
+    (4096, 256, 62, _stream_path(32, False)),
+    (4096, 256, 120, _stream_path(64, False)),
+    (4096, 256, 121, _prefill_path(128)),
+], ids=["h2560_i192_m140", "h2560_i192_m141", "h4096_i256_m62_bm32", "h4096_i256_m120", "h4096_i256_m121"])
+def test_stream_rows_limits(hidden, inter, tokens, path):
+    """流式上限按形状取：H≥4096 每个 expert 平均 ≤48 行（``STREAM_MAX_ROWS_WIDE``），H2560 且排序块 64 的 Gate/Up 自带
+    量化（I_pad=192）≤56 行（``STREAM_MAX_ROWS_FUSED_QUANT``），交界两侧各一例（E=5、topk=2：M=140 / 141 为 56 / 56.4 行，
+    M=120 / 121 为 48 / 48.4 行）。H4096·I256 的流式 Down 原子累加，排序块 32（M=62）时从 LDS 读激活（K%256==0）。
+
+    基本测试与 bench 不在这两个交界上（22 行的交界见 test_stream_dispatch_boundary）；bench 的 MiMo TP8 M512 / 1024
+    走这两种原子 Down，但不校验数值。E=5、topk=2 控制耗时。
+    """
+    w, prepared = _small_weights(hidden, inter)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, 5, 2, seed=300 + tokens, shared=False)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(path)
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("min_wgs, nsplit", [(5, 1), (8, 2), (1000, 4)], ids=["split1", "split2", "split4"])
+def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
+    """排序块 64、Down 不原子累加（I≥512）且 H≥4096 时，流式 Gate/Up 之后改用 prefill Down（顺带写 loc_ids）+ route_sum；
+    prefill Down 按排序块数把 hidden 切给 1 / 2 / 4 个 WG（E=5、M=100 共 5 个块，``DOWN_MIN_WGS`` 取 5 / 8 / 默认 1000）。
+
+    基本测试的 MiMo TP4 M1600 走 prefill，其 prefill 只用到切分 4（I≥256）与 1（I_pad=192）；bench 的 mimo_tp4_m1024
+    走这条路径但不校验数值。E=5、topk=2 控制耗时。
+    """
+    monkeypatch.setattr(moe_a8w4, "DOWN_MIN_WGS", min_wgs)
+    assert moe_a8w4._down_split(100, 2, 5, 4096, 512, 64) == nsplit
+    w, prepared = _small_weights(4096, 512)
+    x, topk_weight, topk_ids = oracle.make_inputs(100, 4096, 5, 2, seed=310, shared=False)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(["a8w4_stream_prep", "a8w4_gateup_stream_bm64", "a8w4_down_prefill_bm64", "a8w4_route_sum"])
     oracle.assert_close(out, ref)
 
 
@@ -830,7 +888,7 @@ def _half_block_weights():
     (1855, dict(block_m=64), 64, 128),
 ], ids=["default_m194", "bm128_m2048", "bm64_m2049"])
 def test_prefill_half_block_boundary(filler, options, block_m, tile_k):
-    """prefill 的 Gate/Up 与 Down 在排序块第 BM/2 行是填充时只算前 BM/2 行（有效行在块首）：路由构造成各 expert
+    """prefill 的 Down 在排序块第 BM/2 行是填充时只算前 BM/2 行、Gate/Up（BM64）按 16 行取整只算有效行（有效行在块首）：路由构造成各 expert
     恰有 32、33、64、65、96、97、1 行，尾块第 BM/2 行恰为填充或有效（BM64 的 32 / 33、96 / 97，BM128 的 64 / 65），
     K=512 时 Gate/Up 每个 128-K 步的 delta 字节 0–3 都会用到。同时核对 tile_k：默认分派到 prefill 用 128，
     给了 tile 参数时 M=2048 用 256、M=2049 用 128。
@@ -1048,6 +1106,24 @@ def test_duplicate_ids_keep_every_route(case):
         topk_ids[::3, topk - 2] = topk_ids[::3, 0]
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     _assert_path(path)
+    oracle.assert_close(out, ref)
+
+
+def test_prefill_duplicate_ids_keep_last_route():
+    """prefill 遇到同一 token 的两个槽选同一 expert：aiter 排序只保留后一个槽，前一个槽的 loc 保持输入行量化写的 -1、
+    被 sorted_sum 跳过（不读未初始化的行、不重复相加），结果等于把前一个槽的路由权重置 0 的参考。
+
+    输入生成的路由互不重复，基本测试与 bench 碰不到；decode、流式（逐槽相加）见 test_duplicate_ids_keep_every_route。
+    """
+    w, prepared = _small_weights(512, 64)
+    x, topk_weight, topk_ids = oracle.make_inputs(200, 512, 5, 2, seed=320, shared=False)
+    topk_ids[::2, 1] = topk_ids[::2, 0]
+    out = torch.full_like(x, float("nan"))
+    moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
+    _assert_path(_prefill_path(128))
+    kept = topk_weight.clone()
+    kept[::2, 0] = 0
+    ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], kept, topk_ids, activation="fp8")
     oracle.assert_close(out, ref)
 
 

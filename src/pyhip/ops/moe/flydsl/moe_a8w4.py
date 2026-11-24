@@ -4,15 +4,18 @@
 
 ``prepare_a8w4_weights`` converts standard MXFP4 weights once (at load time) into the private
 layout of ``moe_gemm_2stage/a8w4_common.py``; ``fused_moe_a8w4`` runs the whole MoE:
-per-row FP8 quantization of the input, Opus ``moe_sorting``, the A8W4 Gate/Up kernel
-(SiLU(gate) * up -> f32), per-row FP8 quantization of the intermediate, the A8W4 Down
-kernel (routing weight applied) and ``sorted_sum``. Token counts up to ``DECODE_MAX_M`` skip the
-sorting and use the decode kernels of ``moe_gemm_2stage/a8w4_decode.py`` (Gate/Up per route, Down
+Opus ``moe_sorting``, per-row FP8 quantization of the input, the A8W4 Gate/Up kernel
+(SiLU(gate) * up -> f32), per-row FP8 quantization of the intermediate, the A8W4 Down kernel
+(routing weight applied; also records each route's sorted row) and ``sorted_sum``.
+Token counts up to ``DECODE_MAX_M`` skip the sorting and use the decode kernels of
+``moe_gemm_2stage/a8w4_decode.py`` (Gate/Up per route, Down
 per token summing its routes in the workgroup and writing BF16; activations quantized inside the
 kernels or by a row kernel). Larger token counts with at most ``STREAM_MAX_ROWS`` rows per expert
-(M * topk / E) use the weight-streaming kernels of ``moe_gemm_2stage/a8w4_stream.py`` (small sorting
-blocks; with larger blocks the Gate/Up kernel also quantizes the intermediate; ``a8w4_route_sum``
-does the ``sorted_sum`` step), more rows per expert the prefill kernels.
+(M * topk / E; ``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of
+blocks of 64 quantizes the intermediate) use the weight-streaming kernels of
+``moe_gemm_2stage/a8w4_stream.py`` (small sorting blocks; with larger blocks the Gate/Up kernel also quantizes
+the intermediate; ``a8w4_route_sum`` does the ``sorted_sum`` step; blocks of 64 without the atomic Down take
+the prefill Down from hidden 4096 on), more rows per expert the prefill kernels.
 """
 
 import functools
@@ -54,11 +57,44 @@ DECODE_DEDUP_GATEUP_WIDE_MAX_M = 16
 DECODE_DEDUP_MAX_M = 64
 # Above DECODE_MAX_M tokens the weight-streaming kernels run while the mean rows per expert
 # (M * topk / E) stay at or below this, the prefill kernels (TILE_K 128) beyond: measured crossover
-# between 22.0 and 24.7 rows per expert for TP2 and TP4 alike (E513, topk 11: M = 1024 / 1152).
+# between 22.0 and 24.7 rows per expert for TP2 and TP4 alike (E513, topk 11: M = 1024 / 1152); with blocks of 64
+# Qwen TP2 (I=320) streams 27% slower at 33 and 44 rows.
 STREAM_MAX_ROWS = 22
+# The same with hidden >= 4096, with the atomic streaming Down (MiMo TP8) and without (MiMo TP4): measured in one
+# process against the prefill kernels (M12 integration), 48 rows (M1536) 0.94x / 1.00x the time, 64 rows (M2048)
+# 1.04x / 1.03x.
+STREAM_MAX_ROWS_WIDE = 48
+# The same for hidden 2560 to 4095 (measured at 2560) when the Gate/Up of blocks of 64 quantizes the intermediate
+# itself (``_stream_fused_quant``, Qwen TP4 I=192): 33 / 44 / 55 rows (M1536 / 2048 / 2560) 0.96x / 0.92x / 0.98x.
+STREAM_MAX_ROWS_FUSED_QUANT = 56
+# Most mean rows per expert sorted in blocks of 32 (more: blocks of 64).
+STREAM_BM32_ROWS = 28
 STREAM_ATOMIC = 1
 # 16-row weight blocks the streaming Down keeps in flight.
 STREAM_DOWN_PREFETCH = 4
+# The shared streaming Down of 32-row blocks reads the activations from LDS at every 64-K step instead of holding
+# them in VGPRs when K % 256 == 0 (no loader scratch slot: LDS and VGPRs then allow 4 workgroups per CU, MiMo TP8
+# M512 94 -> 90 us; with K = 320 or blocks of 64 LDS still bounds the occupancy and the extra reads cost 6-8%).
+STREAM_DOWN_LDS_ACTS = 1
+# 64-K steps per workgroup barrier of the light-wave streaming Gate/Up's LDS activation ring (2: about 1% faster;
+# the fused-quantization tile keeps 1, Qwen TP4 M1024 +1.5% with 2).
+STREAM_GATEUP_SYNC = 2
+# 64-K steps of weights the light-wave streaming Gate/Up keeps in flight (5: VGPRs 85 -> 79 at blocks of 32, one
+# more 8-wave workgroup per CU; MiMo M512 about 1-2% faster).
+STREAM_GATEUP_PREFETCH = 5
+# Cache policy bits of the streaming kernels' weight loads (0 cached, 2 non-temporal): non-temporal weights make
+# the Gate/Up 10-24% faster (MiMo TP8 M64 / M512 / M1024 122 / 148 / 191 -> 93 / 126 / 163 us), the Down no faster.
+STREAM_GATEUP_W_AUX = 2
+STREAM_DOWN_W_AUX = 0
+# Sorting blocks of 64 rows without the atomic Down, hidden >= 4096: the prefill Down (a8w4_gemm2) writes the routes
+# instead of the streaming Down (MiMo TP4 M1024: Down 303 -> 289 us; with the atomic Down it is slower, MiMo TP8
+# 166 -> 187 + 29).
+STREAM_PREFILL_DOWN = 1
+# The prefill Down splits the hidden dimension over 2 or 4 workgroups per sorted block while the
+# estimated blocks (E * ceil(M * topk / E / block_m), uniform routing) times the split stay below this:
+# few blocks (M ~2048) otherwise leave the last round of workgroups mostly idle (MiMo M2048 Down -10%).
+# Padded I below 256 (short Down steps) gains nothing from it and stays unsplit.
+DOWN_MIN_WGS = 1000
 
 # Kernels launched by the most recent ``fused_moe_a8w4`` call, in order. Kernels of the A8W4 op are
 # named ``a8w4_*`` (FP8 activations) or ``a16w4_*`` (BF16 activations); tests pick the reference by it.
@@ -167,10 +203,21 @@ def _gateup_kernel(N, K, topk, block_m, block_n, tile_k, experts):
 
 
 @functools.cache
-def _down_kernel(N, K, topk, block_m, experts):
+def _down_kernel(N, K, topk, block_m, experts, nsplit=1):
     from .moe_gemm_2stage.a8w4_gemm2 import compile_a8w4_gemm2
 
-    return compile_a8w4_gemm2(N=N, K=K, TOPK=topk, BLOCK_TILE_SIZE_M=block_m, E=experts)
+    return compile_a8w4_gemm2(N=N, K=K, TOPK=topk, BLOCK_TILE_SIZE_M=block_m, E=experts, NSPLIT=nsplit)
+
+
+def _down_split(tokens, topk, experts, hidden, inter, block_m):
+    """Hidden-dimension split of the prefill Down (see ``DOWN_MIN_WGS``)."""
+    if inter < 256:
+        return 1
+    blocks = experts * -(-tokens * topk // (experts * block_m))
+    nsplit = 1
+    while nsplit < 4 and blocks * nsplit < DOWN_MIN_WGS and (hidden // 64) % (4 * nsplit) == 0:
+        nsplit *= 2
+    return nsplit
 
 
 def _decode_waves(topk, paired):
@@ -350,8 +397,10 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts):
         G = N // 2 // 64
         tile = dict(G=G, PREFETCH=(4, 3), QUANT=True, SHARE=G <= 4)
     else:
-        tile = dict(G=1, W=8 if block_m > 16 and (N // 2) % 128 == 0 else 4, PREFETCH=(6, 6))
-    return compile_a8w4_gateup_stream(N=N, K=K, TOPK=topk, BLOCK_M=block_m, E=experts, **tile)
+        tile = dict(G=1, W=8 if block_m > 16 and (N // 2) % 128 == 0 else 4,
+                    PREFETCH=(STREAM_GATEUP_PREFETCH, STREAM_GATEUP_PREFETCH), SYNC=STREAM_GATEUP_SYNC)
+    return compile_a8w4_gateup_stream(N=N, K=K, TOPK=topk, BLOCK_M=block_m, E=experts, W_AUX=STREAM_GATEUP_W_AUX,
+                                      **tile)
 
 
 @functools.cache
@@ -424,7 +473,8 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic=False):
 
     tile = dict(R=8, W=4) if _stream_down_shared(N, K, block_m) else {}
     return compile_a8w4_down_stream(N=N, K=K, TOPK=topk, BLOCK_M=block_m, E=experts, ATOMIC=atomic,
-                                    PREFETCH=STREAM_DOWN_PREFETCH, **tile)
+                                    PREFETCH=STREAM_DOWN_PREFETCH, W_AUX=STREAM_DOWN_W_AUX,
+                                    LDS_ACTS=bool(STREAM_DOWN_LDS_ACTS) and block_m == 32 and K % 256 == 0, **tile)
 
 
 def _stream_atomic(hidden, inter, block_m):
@@ -433,6 +483,16 @@ def _stream_atomic(hidden, inter, block_m):
     at I = 512 (MiMo TP4 M128 / M512 +4 us: the atomic epilogue's extra registers on top of K = 512 activations).
     ``STREAM_ATOMIC``: 0 never, 2 always (diagnostics)."""
     return STREAM_ATOMIC == 2 or (STREAM_ATOMIC == 1 and inter < 512)
+
+
+def _stream_max_rows(hidden, inter):
+    """Most mean rows per expert (M * topk / E) for the streaming kernels."""
+    if hidden >= 4096 and hidden % 512 == 0:
+        return STREAM_MAX_ROWS_WIDE
+    # Measured at hidden 2560 only; smaller hidden sizes keep STREAM_MAX_ROWS.
+    if hidden >= 2560 and _stream_fused_quant(inter, 64, hidden):
+        return STREAM_MAX_ROWS_FUSED_QUANT
+    return STREAM_MAX_ROWS
 
 
 def _stream_block_m(tokens, topk, experts):
@@ -444,15 +504,17 @@ def _stream_block_m(tokens, topk, experts):
     rows = tokens * topk / experts
     if rows <= 12:
         return 16 if 3 * tokens * topk >= 4 * experts else 32
-    return 32 if rows <= 28 else 64
+    return 32 if rows <= STREAM_BM32_ROWS else 64
 
 
-def _quantize(x, rows, cols, dtype):
+def _quantize(x, rows, cols, dtype, fill=None):
+    """Per-row FP8 quantization of ``x`` [rows, cols]; the same kernel sets int32 ``fill`` [rows, k] to -1."""
     from .moe_gemm_2stage.a8w4_quant import compile_row_quant_fp8
 
     q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
     scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
-    _launch("a8w4_row_quant_fp8", compile_row_quant_fp8(cols, dtype), x, q, scale, rows)
+    kernel = compile_row_quant_fp8(cols, dtype, 0 if fill is None else fill.shape[1])
+    _launch("a8w4_row_quant_fp8", kernel, x, q, scale, scale if fill is None else fill, rows)
     return q, scale
 
 
@@ -517,8 +579,14 @@ def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output):
                 weights.w2, weights.w2_delta, output, *down_args)
         return output
     routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=hidden_states.device)
-    _launch(f"a8w4_down_stream_bm{block_m}", _stream_down_kernel(H, I, topk, block_m, E), mq, weights.w2,
-            weights.w2_delta, routes, *down_args)
+    if STREAM_PREFILL_DOWN and block_m == 64 and H >= 4096 and H % 512 == 0:
+        # The prefill Down also stores each route's sorted row into loc_ids, the same values the prep wrote.
+        down = _down_kernel(H, I, topk, block_m, E, _down_split(M, topk, E, H, I, block_m))
+        _launch(f"a8w4_down_prefill_bm{block_m}", down, mq, weights.w2, weights.w2_delta, routes,
+                *down_args[:-2], loc_ids, M, task_num)
+    else:
+        _launch(f"a8w4_down_stream_bm{block_m}", _stream_down_kernel(H, I, topk, block_m, E), mq, weights.w2,
+                weights.w2_delta, routes, *down_args)
     if H % 512 == 0:
         _launch("a8w4_route_sum", _stream_sum_kernel(topk, H), loc_ids, routes, output, M, task_num * block_m)
         return output
@@ -540,14 +608,15 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     given, M <= ``DECODE_MAX_M`` runs the decode kernels (no sorting) when they support the shape
     (H <= 4096, the intermediate rows fit in LDS; with expert deduplication up to ``DECODE_DEDUP_MAX_M``
     tokens while at most 1.5 routes fall on an expert), larger M with at most ``STREAM_MAX_ROWS`` rows per
-    expert the streaming kernels and the rest the prefill kernels (TILE_K 128 when chosen for having
-    more rows per expert). ``block_m`` / ``block_n`` / ``tile_k`` select the prefill kernels'
-    tiles: ``block_m`` (default 64) is the sorting block and M tile of both kernels
+    expert (``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of
+    blocks of 64 quantizes the intermediate) the streaming kernels and the rest the prefill kernels
+    (TILE_K 128 when chosen for having more rows per expert). ``block_m`` / ``block_n`` / ``tile_k`` select
+    the prefill kernels' tiles: ``block_m`` (default 64) is the sorting block and M tile of both kernels
     (``block_m * I_padded % 4096 == 0``, e.g. 64 or 128); ``block_n`` (default 128) / ``tile_k`` are
     the Gate/Up N tile (128 or 256, dividing 2 * padded I into whole gate/up halves) and K tile (128
     or 256; default 128 for M > 2048, where its lower LDS and register use raise occupancy, else 256).
     """
-    from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
+    from aiter.fused_moe import moe_sorting
 
     from .moe_gemm_2stage import sorted_sum
 
@@ -565,7 +634,7 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
         if ((M <= DECODE_MAX_M or _dedup_beyond_decode(M, H, I, topk, E))
                 and _decode_fits(H, I, topk, False)):
             return _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output)
-        many_rows = M * topk > STREAM_MAX_ROWS * E
+        many_rows = M * topk > _stream_max_rows(H, I) * E
         if M > DECODE_MAX_M and not many_rows:
             return _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output)
         tile_k = 128 if many_rows else 256
@@ -573,11 +642,13 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     block_n = 128 if block_n is None else block_n
     tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k
 
-    sorted_ids, sorted_weights, sorted_experts, num_valid, _, _, loc_ids = moe_sorting(
-        topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False,
-        output_aux=AUX_SORT_OPUS)
+    sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
+        topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False)[:4]
     last_path.append("moe_sorting_opus")
-    xq, xs = _quantize(hidden_states, M, H, "bf16")
+    # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
+    # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
+    loc_ids = torch.empty((M, topk), dtype=torch.int32, device=hidden_states.device)
+    xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
 
@@ -587,8 +658,9 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
             weights.w1_delta, mid, *routing, weights.w1_scale, xs, M, grid)
     mq, ms = _quantize(mid, M * topk, I, "f32")
     routes = torch.empty((grid * block_m, H), dtype=torch.bfloat16, device=hidden_states.device)
-    _launch(f"a8w4_down_prefill_bm{block_m}", _down_kernel(H, I, topk, block_m, E), mq,
-            weights.w2, weights.w2_delta, routes, *routing, weights.w2_scale, ms, M, grid)
+    down = _down_kernel(H, I, topk, block_m, E, _down_split(M, topk, E, H, I, block_m))
+    _launch(f"a8w4_down_prefill_bm{block_m}", down, mq,
+            weights.w2, weights.w2_delta, routes, *routing, weights.w2_scale, ms, loc_ids, M, grid)
     sorted_sum(topk, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
     return output

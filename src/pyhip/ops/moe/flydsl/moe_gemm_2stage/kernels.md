@@ -67,54 +67,57 @@ global → VGPR 直读，还是经 LDS 共享 / 双缓冲）与**预取距离**�
 #     按 expert 去重（H = 4096、I%128 = 0、M ≥ 2；M ≤ 64 且 2·M·TOPK ≤ 3E 时 M > 32 也用；Down 原子累加进清零的 out）：
 #       M·I < 3072（I%256 = 0 且 out 与 x 不重叠）：gateup_decode(PLAN：写计划、清零 out) → down_decode_dd(WG 内量化 mid)
 #       其余：row_quant_plan(x；写计划、清零 out) → gateup_decode_dd → row_quant_decode(mid) → down_decode_dd
-#   流式（M > 32 且 M·TOPK ≤ 22·E）：stream_prep(排序 + 量化 x [+ 清零 out]) → gateup_stream（带尾部量化，或另跑
-#     row_quant_fp8）→ down_stream（I < 512：原子累加进 out；否则写 routes → route_sum）→ out
-#   prefill（其余，含 decode 放不下的 M ≤ 32）：moe_sorting → row_quant_fp8(x) → gateup_prefill → row_quant_fp8(mid)
-#     → down_prefill → sorted_sum → out
+#   流式（M > 32 且 M·TOPK ≤ R·E；R = 22，H ≥ 4096 为 48，H2560 且排序块 64 尾部量化为 56）：stream_prep(排序 + 量化 x
+#     [+ 清零 out]) → gateup_stream（带尾部量化，或另跑 row_quant_fp8）→ down_stream（I < 512：原子累加进 out；
+#     否则写 routes → route_sum；排序块 64 且 H ≥ 4096 时换 down_prefill）→ out
+#   prefill（其余，含 decode 放不下的 M ≤ 32）：moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1) → gateup_prefill
+#     → row_quant_fp8(mid) → down_prefill（并写有效路由的 loc_ids）→ sorted_sum → out
 ```
 
 ## A8W4 Gate/Up prefill（[a8w4_gemm1.py](a8w4_gemm1.py#L426)）
-prefill 档（M > 32 且每个 expert 平均超过 22 行、给了 tile 参数，或 decode 放不下的 M ≤ 32）按排序块算
+prefill 档（M > 32 且每个 expert 平均超过流式上限、给了 tile 参数，或 decode 放不下的 M ≤ 32）按排序块算
 mid[token, slot, :] = SiLU(x·w1_gate)·(x·w1_up)，f32 写出；结构同底座 `gemm1.py` 的 prefill_1x4，权重换成 mxfp4。
 
 **Gluon 风格**
 ```python
-# grid = (2·I/BN, 排序块数；M·TOPK ≤ E 时取 M·TOPK)，256 线程；默认 BM=64、BN=128、TILE_K=128
+# grid = (2·I/BN, 排序块数；M·TOPK ≤ E 时取 M·TOPK)，256 线程；默认 BM=64、BN=128、TILE_K=128（此时固定每 SIMD 4 wave）
 # BN = 本 CTA 的 gate + up 通道总数，输出只有 BN/2 列（每列由同号的一个 gate、一个 up 通道得到）
-# 放置：x 按 token gather，global → VGPR → LDS 双缓冲 A[2]（即逐拍里的 A_ping / A_pong），4 个 wave 共读；权重 global →
-#       本 wave 的 VGPR（两套轮换），不经 LDS；累加器一直在 VGPR。预取距离 1 个 tile：算 tile t 时发 tile t+1 的全部加载
+# 放置：x 按 token gather，global → VGPR 暂存（A_AHEAD 份）→ LDS 双缓冲 A[2]，4 个 wave 共读；权重 global → 本 wave
+#       的 VGPR 两槽，不经 LDS；累加器一直在 VGPR。预取距离：权重 2 个 tile（tile t 的槽在其最后一块解码后装 t+2），
+#       x 在 H ≤ 2560 时 2 个 tile（A_AHEAD = 2），否则 1 个
 @gluon.jit
 def a8w4_gateup_prefill(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert_ids, num_valid, mid):
     n_blk, e = gl.program_id(0), gl.program_id(1)    # n_blk：BN/2 个 gate 通道及同号 up 通道；e：排序块
     if e * BM >= num_valid: return                   # 多发的 CTA 直接退出
     ids = sorted_ids[e * BM + gl.arange(0, BM)]      # 经 LDS 分给各线程；取完后 barrier，这块 LDS 让给 A[0]
-    TILE_M = BM // 2 if uniform(ids[BM // 2] & 0xFFFFFF) >= M else BM   # 后一半全是填充：只算前一半（两份特化）
+    TILE_M = 有效行数向上取到 16 的倍数             # BM64；其他 BM 为 BM/2 或 BM（有效行在块首，按取值各一份特化）
     token, slot, expert = ids[:TILE_M] & 0xFFFFFF, ids[:TILE_M] >> 24, sorted_expert_ids[e]
     ch = n_blk * (BN // 2) + 16 * wave_id() + gl.arange(0, 16)   # 本 wave 的 16 个 gate 通道；up 用同号的 I + ch
-    A = gl.allocate_shared_memory(fp8, [2, BM, TILE_K], …)    # 两份特化都按 BM 行分配，只用前 TILE_M 行
+    wrow = 每 lane 取本 wave gate（lane%16 < 8）或 up 块的相邻两行 2·(lane%8)、+1   # 一条 16 B = 两行各 8 B
+    A = gl.allocate_shared_memory(fp8, [2, BM, TILE_K], …)    # 各特化都按 BM 行分配，只用前 TILE_M 行
     NT = H // TILE_K
-    # 序言：tile 0
-    xr = cdna3.buffer_load(xq[token, 0:TILE_K])      # gather：每线程 TILE_M·TILE_K/4096 条 16 B
-    wr = cdna3.buffer_load(w1[expert, (ch, I + ch), 0:TILE_K])   # 连同 delta 字节
-    A.index(0).store(xr); wd = decode(wr, 块 0); gl.barrier()
-    g = gl.zeros([16, TILE_M], f32)                  # A 操作数 = 权重 16 通道，B = TILE_M 个 token 的 x
-    u = gl.zeros([16, TILE_M], f32)
-    # 稳态：算 tile t，同时预取 tile t+1
+    # 序言：x 的 tile 0…A_AHEAD−1，权重 tile 0、1
+    xr = [cdna3.buffer_load(xq[token, tile(j)]) for j in range(A_AHEAD)]   # gather：每线程 TILE_M·TILE_K/4096 条 16 B
+    wr = [cdna3.buffer_load(w1[expert, wrow, tile(j)]) for j in (0, 1)]    # 连同 delta（TK128 时相邻两 tile 共用一条）
+    A.index(0).store(xr[0]); wd = decode(wr[0], 块 0); gl.barrier()
+    ce = gl.zeros([16, TILE_M], f32)                 # A 操作数 = 各 lane 的偶数行：行 R < 8 是 gate 通道 2R，R ≥ 8 是 up
+    co = gl.zeros([16, TILE_M], f32)                 # 奇数行（通道 2R+1）；B = TILE_M 个 token 的 x
+    # 稳态：算 tile t；x 提前 A_AHEAD 个 tile，权重提前 2 个 tile
     for t in range(NT):
-        if t + 1 < NT:                               # 先发，下一轮才用
-            xr = cdna3.buffer_load(xq[token, (t + 1) * TILE_K:(t + 2) * TILE_K])
-            wn = cdna3.buffer_load(w1[expert, (ch, I + ch), (t + 1) * TILE_K:(t + 2) * TILE_K])
+        if t + A_AHEAD < NT:                         # 先发，之后才用
+            xr[t % A_AHEAD] = cdna3.buffer_load(xq[token, tile(t + A_AHEAD)])
         for ki in gl.static_range(TILE_K // 64):
             b = A.index(t % 2).load(B 操作数布局)[64 * ki:64 * ki + 64, :]   # LDS → VGPR，[K, token]；按 K 置换视图读
-            if ki > 0: wd = decode(wr, 块 ki)        # K 置换（见下文）让一个 128-K 步的两个 64-K 块用同一个 delta 字节：
-                                                     #   偶数块建 LUT，奇数块复用
-            g = cdna3.mfma(wd.gate, b, g)
-            u = cdna3.mfma(wd.up, b, u)
+            if ki > 0: wd = decode(wr[t % 2], 块 ki) # K 置换（见下文）让一个 128-K 步的两个 64-K 块用同一个 delta 字节
+            ce = cdna3.mfma(wd.偶数行, b, ce)
+            co = cdna3.mfma(wd.奇数行, b, co)
+        if t + 2 < NT: wr[t % 2] = cdna3.buffer_load(w1[expert, wrow, tile(t + 2)])   # 本 tile 的槽已解码完
         if t + 1 < NT:
-            wr = wn; wd = decode(wr, 块 0)           # 下一 tile 的第 0 块提前解码
-            A.index((t + 1) % 2).store(xr)           # 写另一槽，不碰本 tile 正在读的槽
+            wd = decode(wr[(t + 1) % 2], 块 0)       # 下一 tile 的第 0 块：其权重已在路上一整个 tile
+            A.index((t + 1) % 2).store(xr[(t + 1) % A_AHEAD])   # 写另一槽，不碰本 tile 正在读的槽
         gl.barrier()                                 # 每 tile 一次：新槽写完才可读；本槽读完才会被 tile t+2 覆盖
-    # 收尾：累加器直接写出，不经 LDS
+    # 收尾：lane l 与 l^32 交换累加器（ds_bpermute），每 lane 得到 4 个相邻通道的 gate 与 up；不经 LDS
+    g, u = exchange(ce, co)
     sx = xs[token][None, :]                          # 每个 token 的激活 scale
     v = silu(g * w1_scale[expert, ch][:, None] * sx) * (u * w1_scale[expert, I + ch][:, None] * sx)
     cdna3.buffer_store(v.T, mid[token, slot, ch])    # f32；每 lane 4 个通道一次 16 B；填充行偏移越界被丢弃
@@ -126,39 +129,31 @@ def a8w4_gateup_prefill(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_exper
 | grid | (2I/128, 排序块数) | x：64 gate + 同号 64 up 通道；y：1 个排序块 |
 | CTA（256 线程） | 4 个 wave | 本块 TILE_M 个排序行（同一 expert）× 128 通道 × 全部 H |
 | wave | 1 个 16 通道块 | gate、up 各 16 通道 × TILE_M 行（TILE_M/16 个 token 块） |
-| lane | g = l/16、r = l%16 | 权重行 r 在每个 128-K 步里的第 g 个 32-K 组（两个半块各 8 B）；token r 的累加 |
+| lane | g = l/16、i = l%16 | gate（i<8）或 up 块的相邻两行 2(i%8)、+1 在每个 128-K 步里的第 g 个 32-K 组；token i 的累加 |
 | K 步 | 128-K 步（两个 64-K 半块） | 每个半块每 wave 4·TILE_M/16 条 MFMA 16x16x32 |
 
-TILE_M = BM；排序块第 BM/2 行是填充时（有效行在块首）取 BM/2，两份特化由 readfirstlane 后的标量分支选。
+TILE_M：BM64 时为有效行数向上取到 16 的倍数（有效行在块首），其他 BM 在第 BM/2 行是填充时取 BM/2、否则 BM；各取值一份特化，
+由 readfirstlane 后的标量分支选；x 仍按整趟拷贝装载（TILE_K128 时一趟 32 行）。
 `e·BM ≥ num_valid` 的 CTA 直接退出；M·topk ≤ E 时 grid 的 y 维取 M·topk（每条路由至多占一个排序块）。
 K 置换：A 的 LDS 读视图把步内 MFMA 侧的 K 64h + 16g + 8c + v 映射到存储的 32g + 16h + 8c + v，权重按同一置换取址，
 所以 lane 组 g 在步内两个半块都用同一个 32-K 组：每步只用一个 delta 字节（第 g/2 + 2·(步号%2) 个）建一次 LUT。
 
-**流水线**（逐拍；x 的 LDS 双缓冲 A_ping / A_pong，权重 VGPR 两槽 0 / 1，预取距离 1 个 tile）
+**流水线**（每个 tile 的 region 表——MFMA / LDS → VGPR / global → VGPR / 解码 / VGPR → LDS——与 4 条流水线规则见
+[a8w4_gemm1.py 文件头](a8w4_gemm1.py#L28)，这里只列骨架；x 的 LDS 双缓冲 buf = k%2，权重 VGPR 两槽 k%2）
 ```text
 序言
-  tid < BM：sorted_ids[e·BM + tid] → LDS；barrier；各线程取 epilogue 的 (token, slot)
-  LDS 第 BM/2 行（readfirstlane）是填充 → 以下 TILE_M = BM/2，否则 TILE_M = BM
-  各线程从 LDS 取 x 的 gather 行号；barrier（LDS 让给 A_ping）
-  预取 tile 0：gather x（每线程 TILE_M·TILE_K/4096 条 16 B buffer load）→ VGPR；本 wave 权重 → 槽 0
-  s_waitcnt vmcnt(0)；x → A_ping；解码 tile 0 的第 0 个 64-K 块；barrier
-主循环 i = 0 … K/(2·TILE_K) − 2（每次两拍；H2560、TILE_K128 为 9 次）
-  拍 0（读 A_ping，算 tile 2i）：
-    发预取 tile 2i+1：gather x → VGPR；权重 → 槽 1（每半块 1 条 dwordx2，每 tile 1 条 delta dword）
-    for ki in 0 … TILE_K/64 − 1：
-      A_ping 第 ki 块按置换视图读成 B 操作数（TILE_M/16 条 16 B LDS 读）
-      ki > 0：解码第 ki 块（ki 为偶数时由 delta 字节建 LUT，奇数块复用）
-      MFMA 16x16x32 fp8 × 4·TILE_M/16（gate / up × token 块 × 2 个 K32）
-    解码槽 1 的第 0 块（下一 tile）；预取的 x：VGPR → A_pong；barrier
-    指令排布（sched_group）：预取的 vmem 随前几条 MFMA 发出；下一块的 LDS 读与解码 VALU 均摊在当前块的
-      MFMA 之间（最后一块摊的是下一 tile 第 0 块的解码）；A_pong 的 LDS 写排在最后几条 MFMA 之间
-  拍 1（读 A_pong，算 tile 2i+1）：同上，预取 tile 2i+2 → 槽 0 与 A_ping
-收尾：拍 0（倒数第二个 tile，预取最后一个）；拍 1（最后一个 tile，不预取、不解码下一块）
+  tid < BM：sorted_ids[e·BM + tid] → LDS；barrier；各线程取 epilogue 的 (token, slot) 与 gather 行号；定 TILE_M
+  发 x(0 … A_AHEAD−1)、W(0)；等待；x(0) → buf 0；解码 W(0) 第 0 块；barrier；发 W(1)
+tile k（TILE_K/64 个 region）
+  region 0：发 x(k+A_AHEAD)；读 buf 的第 0、1 块；解码 W(k) 第 1 块；MFMA（偶 / 奇行各一套）
+  region i：读第 i+1 块；解码 W(k) 第 i+1 块；MFMA
+  last：MFMA；发 W(k+2) 进 tile k 的槽；解码 W(k+1) 第 0 块；暂存的 x(k+1) → buf^1；barrier
+  vmcnt 只等本拍要用的加载，更晚发的仍在路上；TK128 时偶数 tile 取两 tile 共用的 delta，奇数 tile 从槽 0 复制
+收尾：最后 A_AHEAD 个 tile 不发 x，最后一个不写 LDS，倒数第二个不发 W(k+2)
 epilogue（累加器留在 VGPR，不过 LDS）
-  acc ×= 通道因子 s[ch]（gate、up 各自）× xs[token]
-  SiLU(gate)·up = gate · rcp(1 + exp2(−gate·log2e)) · up
-  每个 token 块 4 个 f32 一次 16 B buffer store → mid[token, slot, ch … ch+3]
-  填充行（token ≥ M）的偏移改成越界值，store 被硬件丢弃
+  ds_bpermute 在 lane l 与 l^32 间交换偶 / 奇行累加器 → 每 lane 持 4 个相邻通道的 gate 与 up
+  acc ×= 通道因子 s[ch]（gate、up 各自）× xs[token]；SiLU(gate)·up = gate · rcp(1 + exp2(−gate·log2e)) · up
+  每个 token 块 4 个 f32 一次 16 B buffer store → mid[token, slot, ch … ch+3]；填充行的偏移改成越界值被丢弃
 ```
 关键代码：[排序行号进 LDS](a8w4_gemm1.py#L463)、[半块分支](a8w4_gemm1.py#L487)、[K 置换读视图](a8w4_gemm1.py#L171)、
 [lane 取址](a8w4_gemm1.py#L220)、[权重加载](a8w4_gemm1.py#L254)、[解码与 LUT 复用](a8w4_gemm1.py#L268)、
@@ -173,30 +168,31 @@ prefill 档按排序块算 routes[排序行, :] = (mq 行 · w2ᵀ) × 通道因
 
 **Gluon 风格**
 ```python
-# grid = (1, 排序块数)，256 线程；默认 BM=64
+# grid = (NSPLIT, 排序块数)，256 线程；默认 BM=64；NSPLIT = 1 / 2 / 4 个 WG 分 H（各自重新 gather 本块激活）；I ≥ 256 时关 packed FP32
 # 放置：mq 的 BM 行按路由 gather，global → VGPR → LDS，再整块（bm × I）读回 VGPR 常驻到结束（每个 wave 各存一份，
 #       BM64、I320 时每 lane 80 个 VGPR），之后同一块 LDS 改作输出双缓冲 C[2]。权重按 64 列块 global → VGPR（两套轮换），
 #       预取距离 1 块。结果经 C 转成按行连续，再 16 B 合并写出
 @gluon.jit
 def a8w4_down_prefill(mq, ms, w2, w2_delta, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid,
-                      routes):
-    e = gl.program_id(1)                             # 一个排序块 × 全部 H 列
+                      routes, loc):
+    part, e = gl.program_id(0), gl.program_id(1)    # 一个排序块 × 第 part 段 H/NSPLIT 列
     if e * BM >= num_valid: return
     ids = sorted_ids[e * BM + gl.arange(0, BM)]
     route = (ids & 0xFFFFFF) * TOPK + (ids >> 24)
     L = gl.allocate_shared_memory(fp8, [BM, I], …)
     L.store(cdna3.buffer_load(mq[route, :])); gl.barrier()   # 全 CTA 一起 gather，每次 16 B
-    bm = BM // 2 if uniform(ids[BM // 2] & 0xFFFFFF) >= M else BM   # 半块，同 Gate/Up
+    bm = BM // 2 if uniform(ids[BM // 2] & 0xFFFFFF) >= M else BM   # 后一半全是填充：只算前一半（两份特化）
     rows, expert = e * BM + gl.arange(0, bm), sorted_expert_ids[e]  # 本块的排序行号
     b = L.slice(0, bm).load(B 操作数布局); gl.barrier()  # [I, bm]；激活整块进 VGPR，L 读完才能改作 C
     C = L 改作 bf16 [2, bm, 64]
     row_scale = ms[route[:bm]] * sorted_weights[rows]     # 中间激活 scale × 路由权重
-    ch = lambda n: 64 * n + 16 * wave_id() + gl.arange(0, 16)   # 第 n 个 64 列块里本 wave 的 16 列
-    NB = H // 64
+    NB = H // 64 // NSPLIT
+    cols = lambda n: 64 * (part * NB + n) + gl.arange(0, 64)    # 本段第 n 个 64 列块
+    ch = lambda n: cols(n)[16 * wave_id():16 * wave_id() + 16]  # 其中本 wave 的 16 列
     wr = cdna3.buffer_load(w2[expert, ch(0), :])          # 连同 delta 字节与这 16 列的通道因子
     for n in range(NB):                              # 稳态：算第 n 块时，第 n+1 块的权重在路上
         if n > 0:
-            cdna3.buffer_store(C.index((n - 1) % 2).load(按行连续), routes[rows, 64 * (n - 1):64 * n])   # 上一块写出，
+            cdna3.buffer_store(C.index((n - 1) % 2).load(按行连续), routes[rows, cols(n - 1)])   # 上一块写出，
             if n + 1 < NB: wn = cdna3.buffer_load(w2[expert, ch(n + 1), :])                               #   与本块计算重叠
         acc = gl.zeros([16, bm], f32)                # A = 权重 16 列，B = bm 行激活
         for kb in gl.static_range(I // 64):          # 一个列块一次算完全部 K
@@ -206,20 +202,24 @@ def a8w4_down_prefill(mq, ms, w2, w2_delta, w2_scale, sorted_ids, sorted_weights
         C.index(n % 2).store(c.T)
         gl.barrier()                                 # 每块一次：C[n%2] 写完才可读；C[(n+1)%2] 已写出，此后可覆盖
         if n + 1 < NB: wr = wn
-    cdna3.buffer_store(C.index((NB - 1) % 2).load(按行连续), routes[rows, H - 64:H])
+    cdna3.buffer_store(C.index((NB - 1) % 2).load(按行连续), routes[rows, cols(NB - 1)])
     # 填充行也写（值无意义），之后 sorted_sum 只按 loc_ids 读有效行
+    if part == 0:                                    # 主循环后才写（写在开头会多占 VGPR、整体慢约 30%）
+        valid = (ids & 0xFFFFFF) < M                 # 排序丢掉的槽（重复 expert）保持 x 行量化写的 −1
+        cdna3.buffer_store(e * BM + gl.arange(0, BM), loc[route], mask=valid)   # 每条有效路由的排序行
 ```
 
 **任务划分**（默认 BM64；I 指补零后的值）
 | 层级 | 形状 / 数量 | 负责的数据 |
 |---|---|---|
-| grid | (1, 排序块数) | 1 个排序块 × 全部 H 列 |
-| CTA（256 线程） | 4 个 wave | bm 行 mq 整块驻留；逐个 64 列块走完 H |
+| grid | (NSPLIT, 排序块数) | 1 个排序块 × H/NSPLIT 列 |
+| CTA（256 线程） | 4 个 wave | bm 行 mq 整块驻留；逐个 64 列块走完本段 |
 | wave | 每个 64 列块中的 16 列 | 列 n·64 + 16w … +15 × bm 行 |
 | lane | l = 16b + r | 权重列 r 的 K 16b…16b+15；B 操作数的 1/64 |
 | K 步 | I/64 个 64-K 块 × 2 个 K32 | 每个列块一次算完全部 K（I320 为 10 步） |
 
-bm = BM；排序块第 BM/2 行是填充时取 BM/2（同 Gate/Up，两份特化各用一份构建缓存）。退出与 grid 收缩同 Gate/Up。H2560 共 40 个列块。
+bm = BM；排序块第 BM/2 行是填充时取 BM/2（两份特化各用一份构建缓存）。退出与 grid 收缩同 Gate/Up。H2560 共 40 个列块。
+NSPLIT 由 host 选（`_down_split`）：I_pad ≥ 256 时，排序块数·NSPLIT < 1000 就加倍，至多 4；块少时末轮 WG 不再大半空闲。
 
 **流水线**（逐拍；权重 VGPR 两槽 0 / 1，预取距离 1 个列块；输出 LDS 双缓冲 C[0] / C[1]）
 ```text
@@ -230,12 +230,13 @@ bm = BM；排序块第 BM/2 行是填充时取 BM/2（同 Gate/Up，两份特化
   行 scale = ms[token, slot] × 路由权重，按累加器布局放在 VGPR
   load_block(0) → 槽 0：本 wave 16 行权重 I/64 × dwordx2 + ⌈I/256⌉ × dword，及 64 个通道因子
   compute(槽 0) = 第 0 块；load_block(1) → 槽 1；第 0 块 × 行 scale → bf16 → C[0]；barrier
-主循环 n = 0, 2, …, H/64 − 4（每次两拍；H2560 为 19 次）
+主循环 n = 0, 2, …, H/(64·NSPLIT) − 4（每次两拍；H2560、NSPLIT 1 为 19 次；块号都是本段内的）
   拍 0：C[0] → routes 第 n 块；load_block(n+2) → 槽 0
         compute(槽 1) = 第 n+1 块 → × 行 scale → bf16 → C[1]；barrier
   拍 1：C[1] → routes 第 n+1 块；load_block(n+3) → 槽 1
         compute(槽 0) = 第 n+2 块 → × 行 scale → bf16 → C[0]；barrier
-收尾：C[0] → 第 H/64 − 2 块；compute(槽 1) = 最后一块 → C[1]；barrier；C[1] → 最后一块
+收尾：C[0] → 本段倒数第二块；compute(槽 1) = 最后一块 → C[1]；barrier；C[1] → 最后一块
+  part 0 的线程 tid < BM：排序行 tid 是有效路由时 loc[token, slot] = e·BM + tid（填充行写到越界偏移被丢弃）
 compute(槽)
   for kb in 0 … I/64 − 1：delta dword[kb/4] 第 kb%4 字节 → LUT；2 个权重 dword → 16 个 fp8
   for kb：MFMA 16x16x32 fp8 × bm/8（bm/16 个 token 块 × 2 个 K32）；结果 × 通道因子
@@ -256,36 +257,38 @@ prefill 档把 bf16 输入 [M, H] 与 f32 中间 [M·topk, I]、流式档把不�
 **Gluon 风格**
 ```python
 # grid = ⌈rows / (256/L)⌉，256 线程：每行 L 个相邻 lane（L 见任务划分）
-# 放置：不用 LDS；整行一次 global → VGPR（每 lane cols/L 个连续元素，16 B 一条），行内归约走 lane 间 shuffle
+# 放置：不用 LDS；整行一次 global → VGPR（16 B 片按 lane 交错：lane l 取片 l、l+L、…），行内归约走 lane 间 shuffle
 @gluon.jit
-def a8w4_row_quant_fp8(x, q, scale, rows):           # x：bf16 [M, H]（输入）或 f32 [M·TOPK, I]（mid）
+def a8w4_row_quant_fp8(x, q, scale, loc, rows):      # x：bf16 [M, H]（输入）或 f32 [M·TOPK, I]（mid）
     r = gl.program_id(0) * (256 // L) + gl.arange(0, 256 // L)   # 行号 ≥ rows 的读到 0、不写
+    if FILL: cdna3.buffer_store(-1, loc[r, 0:FILL])  # prefill 的输入量化顺带把 loc_ids 置 −1（lane 写列 l、l+L、…）
     v = cdna3.buffer_load(x[r, :])
-    amax = gl.max(gl.abs(v), axis=1)                 # lane 内求 max，再 log2(L) 次 shuffle_xor
+    amax = gl.max(gl.abs(v), axis=1)                 # maxnum（输入须有限）：lane 内求 max，再 log2(L) 次 shuffle_xor
     s = row_scale(amax)                              # 每行一次 IEEE 除法
     if s >= 2 ** -64:                                # 按行选：倒数乘再两次 FMA 修正，得正确舍入的 v / s
         y = 1 / s
         qv = v * y; qv += (v - qv * s) * y; qv += (v - qv * s) * y
     else:                                            # 残差可能下溢：逐元素 IEEE 除法
         qv = v / s
-    cdna3.buffer_store(to_fp8(gl.clamp(qv, -240, 240)), q[r, :])   # 与 IEEE 的 x / scale 逐位一致
+    cdna3.buffer_store(to_fp8(qv), q[r, :])          # |qv| ≤ 240·(1+2^-23) 舍入到 240，不必夹紧；与 IEEE 的 x / scale 逐位一致
     cdna3.buffer_store(s, scale[r])                  # 每行首个 lane 写
 ```
 
-**任务划分**（L 取 64、32、16、8、4 中第一个整除 cols、且每 lane 恰为整数个 16 B 的值）
+**任务划分**（L 从 64 起减半，直到整除每行的 16 B 片数且每 lane 至少 4 片，最小 4）
 | 层级 | 形状 / 数量 | 负责的数据 |
 |---|---|---|
 | grid | ⌈rows / (256/L)⌉ | 256/L 行 |
 | CTA（256 线程） | 4 个 wave | 每行 L 个相邻 lane |
-| lane | 本行连续 cols/L 个元素 | H2560 bf16：L64、40 个；I320 / I192 f32：L16、20 / 12 个 |
+| lane | 本行 16 B 片 l、l+L、… | H2560 bf16：L64、每 lane 5 片；I320 / I192 f32：L16 / L8、各 5 / 6 片 |
 
 **流水线**
 ```text
-lane 连续读 cols/L 个元素（每次 16 B buffer load；rows 以外的行读到 0，写被丢弃）
-lane 内 max|x| → log2(L) 次 shuffle_xor 得整行 amax；scale = amax / 240（IEEE；为 0 时取 1）；每行首个 lane 写 scale
+FILL > 0：loc[行, 0:FILL] 置 −1（lane 写列 l、l+L、…，列号 ≥ FILL 的写到越界偏移被丢弃）
+lane 读片 l、l+L、…（每次 16 B buffer load，一条指令覆盖连续内存；rows 以外的行读到 0，写被丢弃）
+lane 内 max|x|（v_max3）→ log2(L) 次 shuffle_xor 得整行 amax；scale = amax / 240（IEEE；为 0 时取 1）；每行首个 lane 写 scale
 scale ≥ 2^-64：y = 1/scale（IEEE，每行一次）；q = x·y，再两次 q += (x − q·scale)·y（FMA），得正确舍入的商
 scale < 2^-64（残差可能下溢）：q = x / scale，逐元素 IEEE 除法
-clamp ±240 → 每 4 个 cvt_pk_fp8（RNE）成一个字 → 0x80（-0）改 0 → 字数为偶数时每 2 个字一次 8 B 写，否则 4 B 写
+每 4 个 cvt_pk_fp8（RNE，不夹紧）成一个字 → 0x80（-0）改 0 → 每片一次写（bf16 片 8 B、f32 片 4 B）
 ```
 关键代码：[lane 数](a8w4_quant.py#L33)、[16 B 读](a8w4_quant.py#L89)、[amax 与 scale](a8w4_quant.py#L101)、
 [倒数与修正](a8w4_quant.py#L125)、[打包与 -0](a8w4_quant.py#L54)、[写回](a8w4_quant.py#L111)。
@@ -760,17 +763,18 @@ for 本 wave 的 CB 个块：
 **资源**：LDS = ROWS·(I+16) B + 16 B scale + 96 B LUT（I256 约 1.2 KiB）；out 必须先清零（计划 kernel 或 PLAN 版 Gate/Up 做）。
 
 ## A8W4 Gate/Up 流式（[a8w4_stream.py](a8w4_stream.py#L274)）
-流式档（M > 32、每个 expert 平均不超过 22 行且不走去重 decode）按排序块（同一 expert 的 16 / 32 行；64 行只在调大
-`STREAM_MAX_ROWS` 时用）算 SiLU(x·w1_gate)·(x·w1_up)：权重与激活直接从 global 读进 VGPR，不经 LDS 双缓冲；写 f32
+流式档（M > 32、每个 expert 平均不超过流式上限且不走去重 decode）按排序块（同一 expert 的 16 / 32 / 64 行）
+算 SiLU(x·w1_gate)·(x·w1_up)：权重与激活直接从 global 读进 VGPR，不经 LDS 双缓冲；写 f32
 mid[token, slot, :]，或在尾部量化成 fp8 mq[route, :] 与 ms[route]。
 
 **Gluon 风格**
 ```python
-# grid = (I/(16·G·W), 排序块数)，64·W 线程；排序块 BM = 16 / 32，G、W 见任务划分
-# 放置：权重与激活都 global → VGPR 直读，没有 prefill 那种整块 LDS 双缓冲；SHARE（W > 1；尾部量化时还要 G ≤ 4）时
-#       激活由全 WG 分片只读一份，经 LDS 两槽环（每槽一个 64-K 步）分给各 wave。预取距离 P 个 64-K 步，由分派给：
-#       尾部量化 S = 1 为 4、否则 3（子块多时少预取，省 VGPR）；其余为 6。
-#       共享时激活要在用到的前一步写进 LDS，所以实际只提前 P−1 步
+# grid = (I/(16·G·W), 排序块数)，64·W 线程；排序块 BM = 16 / 32 / 64，G、W 见任务划分
+# 放置：权重与激活都 global → VGPR 直读（权重只读一次，带 non-temporal 位），没有 prefill 那种整块 LDS 双缓冲；
+#       SHARE（W > 1；尾部量化时还要 G ≤ 4）时激活由全 WG 分片只读一份，经 LDS 环（2·SYNC 槽，每槽一个 64-K 步；
+#       轻 wave SYNC = 2，尾部量化 1）分给各 wave。预取距离 P 个 64-K 步，由分派给：
+#       尾部量化 S = 1 为 4、否则 3（子块多时少预取，省 VGPR）；其余为 5。
+#       共享时步 k+SYNC 的激活在步 k 写进 LDS（覆盖步 k−SYNC 用过的槽），每 SYNC 步一次 barrier
 @gluon.jit
 def a8w4_gateup_stream(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert_ids, num_valid, mid, mq, ms):
     c, e = gl.program_id(0), gl.program_id(1)        # c：W·G 个 16 通道 gate 块及同号 up 块；e：排序块
@@ -780,26 +784,28 @@ def a8w4_gateup_stream(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert
                                                      #   按 S 分支进入其中一份，S = 0 直接退出
     token, slot, expert = ids[:16 * S] & 0xFFFFFF, ids[:16 * S] >> 24, sorted_expert_ids[e]
     ch = 16 * ((c * W + wave_id()) * G + gl.arange(0, G))   # 本 wave 的 G 个 gate 16 行块起点，up 块同号（I + ch）
-    if SHARE: ring = gl.allocate_shared_memory(fp8, [2, BM, 64], 行内 16 B 片按 (行 >> 1) & 3 异或错开)   # 只用前 16·S 行
+    if SHARE: ring = gl.allocate_shared_memory(fp8, [2 * SYNC, BM, 64], 行内 16 B 片按 (行 >> 1) & 3 异或错开)   # 只用前 16·S 行
     NK = H // 64
     # 序言：先发 P 步。激活：不共享时每 lane 每子块 16 B（自己的那行）；共享时全 WG 把本步 BM 行 × 64 B 切片（子块 ≥ S 的片
     #   不读），每 lane 读 max(4, BM/W) B，lane 多于片数时多余的 wave 写 LDS 草稿槽。权重：每步 2G 块 × 8 B，每 4 步一条 delta
     xr = {k: cdna3.buffer_load(xq[token, 64 * k:64 * k + 64]) for k in range(P)}
     wr = {k: cdna3.buffer_load(w1[expert, (ch, I + ch), 64 * k:64 * k + 64]) for k in range(P)}
-    if SHARE: ring.index(0).store(xr.pop(0)); gl.barrier()
+    if SHARE:
+        for j in range(SYNC): ring.index(j).store(xr.pop(j))
+        gl.barrier()
     acc = gl.zeros([2 * G, 16, 16 * S], f32)         # A = 权重 16 通道，B = 16·S 个排序行
     for k in range(NK):                              # 稳态
         if k + P < NK:                               # 先激活后权重：等激活时不必等后发的权重
             xr[k + P] = cdna3.buffer_load(xq[token, 64 * (k + P):64 * (k + P + 1)])
             wr[k + P] = cdna3.buffer_load(w1[expert, (ch, I + ch), 64 * (k + P):64 * (k + P + 1)])
         if SHARE:
-            if k + 1 < NK: ring.index((k + 1) % 2).store(xr.pop(k + 1))   # 下一步的激活写另一槽
-            b = ring.index(k % 2).load(B 操作数布局)   # [64, 16·S]
+            if k + SYNC < NK: ring.index((k + SYNC) % (2 * SYNC)).store(xr.pop(k + SYNC))   # 写步 k−SYNC 用过的槽
+            b = ring.index(k % (2 * SYNC)).load(B 操作数布局)   # [64, 16·S]
         else:
             b = xr.pop(k)                            # 每 lane 每子块 16 B，加载时已是 B 操作数布局
         for i in gl.static_range(2 * G):             # 每块：建一次 LUT、2 个 dword 解码，每子块 2 条 MFMA
             acc[i] = cdna3.mfma(decode(wr[k], i), b, acc[i])
-        if SHARE and k + 1 < NK: gl.barrier()        # 新槽写完才可读；槽 k%2 读完才会被 k+2 覆盖
+        if SHARE and (k + 1) % SYNC == 0 and k + 1 < NK: gl.barrier()   # 新写的槽可读；读完的槽此后可覆盖
     # 收尾（累加器不经 LDS）
     sx = xs[token][None, :]
     v = silu(acc[:G] * w1_scale[expert, gate 通道] * sx) * (acc[G:] * w1_scale[expert, up 通道] * sx)
@@ -829,18 +835,18 @@ def a8w4_gateup_stream(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert
 MFMA 的 A 是权重（16 个通道行），B 是 16 个排序行；输出 lane l 持有通道 4(l/16) … +3、排序行 l%16。
 M·topk ≤ E 时 grid 的 y 维取 M·topk；排序块里有效行在前，所以有效子块是前缀，kernel 按 S 生成 BM/16 份特化。
 
-**流水线**（预取距离 P 个 64-K 步：S = 1 时 PREFETCH[0]，否则 PREFETCH[1]；W>1（尾部量化还要 G≤4）时激活经 LDS 两槽环共享）
+**流水线**（预取距离 P 个 64-K 步：S = 1 时 PREFETCH[0]，否则 PREFETCH[1]；W>1（尾部量化还要 G≤4）时激活经 LDS 环共享）
 ```text
 序言（一轮访存）：num_valid、本块 expert、本 lane 各子块的 sorted id → token / slot
   S = 首行有效的子块数（越过 num_valid 为 0）；进入第 S 份特化体，S = 0 直接退出
 发 kb = 0 … P−1：激活（共享时每 lane 读 max(4, BM/W) B，否则每子块 16 B）→ 2G 个权重块各 8 B → 每 4 步 delta 1 dword
-共享：激活(0) → LDS 槽 0；lgkmcnt(0) + barrier
+共享：激活(0 … SYNC−1) → LDS 槽 0 … SYNC−1；lgkmcnt(0) + barrier
 主循环 kb = 0 … H/64 − 1：
   发 kb+P 的激活与权重（先激活后权重，等激活时不必等后发的权重）
-  共享：激活(kb+1) → LDS 槽 (kb+1)%2；从槽 kb%2 读本 lane 的 16 B 作 B（行内 16 B 片按 (行号>>1)&3 异或错开）
+  共享：激活(kb+SYNC) → LDS 槽 (kb+SYNC)%(2·SYNC)；从槽 kb%(2·SYNC) 读本 lane 的 16 B 作 B（行内 16 B 片按 (行号>>1)&3 异或错开）
   不共享：B = 寄存器里的激活(kb)
   for 2G 个权重块：LUT（delta 第 kb%4 字节）→ 2 个 dword 解成 2 个 fp8 i64 → 每子块 MFMA ×2
-  共享：lgkmcnt(0) + barrier（槽 kb%2 读完才会被 kb+2 覆盖）；sched_barrier
+  共享：每 SYNC 步一次 lgkmcnt(0) + barrier（读完的槽此后才会被覆盖）；sched_barrier
 收尾
   acc × 通道因子（gate、up 各自）× xs[token] → g · rcp(1 + exp2(−g·log2e)) · u
   不量化：每子块 4 个 f32 一次 16 B store → mid[token, slot, ch … ch+3]（填充行偏移越界，store 被丢弃）
@@ -852,7 +858,7 @@ M·topk ≤ E 时 grid 的 y 维取 M·topk；排序块里有效行在前，所�
 [预取](a8w4_stream.py#L422)、[主循环](a8w4_stream.py#L430)、[SiLU](a8w4_stream.py#L306)、[尾部量化](a8w4_stream.py#L338)、
 [夹逼与回退](a8w4_stream.py#L162)、[分派的 tile](../moe_a8w4.py#L342)。
 
-**资源**：LDS = 共享时 2·BM·64 B 激活环（BM16 2 KiB、BM64 8 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时
+**资源**：LDS = 共享时 2·SYNC·BM·64 B 激活环（SYNC1：BM16 2 KiB、BM64 8 KiB，轻 wave 的 SYNC2 翻倍；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时
 BM·W·4 B amax；累加器 8·G·S 个 VGPR，分派只在它 ≤ 96 时让一个 WG 管全部 I 并尾部量化（TP2 BM32 为 80，BM64 为 160 故不量化）。
 
 ## A8W4 Down 流式（[a8w4_stream.py](a8w4_stream.py#L853)）
@@ -862,7 +868,8 @@ BM·W·4 B amax；累加器 8·G·S 个 VGPR，分派只在它 ≤ 96 时让一�
 **Gluon 风格**
 ```python
 # grid = (H/(16·R·W), 排序块数)，64·W 线程（R8·W4 或 R16·W1，见任务划分）
-# 放置：本块激活（16·S 行 mq，每行 I B）整块常驻 VGPR：W4（SHARE）时全 WG 分片只读一份进 LDS 再各自读回，
+# 放置：本块激活（16·S 行 mq，每行 I B）整块常驻 VGPR：W4（SHARE）时全 WG 分片只读一份进 LDS 再各自读回
+#       （LDS_ACTS：BM32 且 I%256 = 0 时留在 LDS、每个 64-K 步再读，省 VGPR、每 CU 多放一个 WG），
 #       W1 时直接从 global 读；通道因子一条 16 B 加载后放 LDS（每 wave 1 KiB）；权重按 16 通道块 global → VGPR，
 #       预取距离 P = min(4, R) 块；结果不经 LDS：写 routes 每 lane 8 B，或两块凑一次 bf16x2 原子加进 out
 @gluon.jit

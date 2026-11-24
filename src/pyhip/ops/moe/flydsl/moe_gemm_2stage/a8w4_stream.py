@@ -7,17 +7,20 @@ tokens on average (``moe_a8w4.STREAM_MAX_ROWS`` rows per expert), where the cost
 weights once. Both kernels walk moe_sorting blocks of ``BLOCK_M`` (16/32/64) rows in sub-blocks of 16
 and use MFMA 16x16x32 FP8 with the weights as A and 16 sorted rows as B. Every wave owns a few 16-row
 weight blocks of the block's expert and reads them straight into VGPRs in the ``a8w4_common`` layout
-(several 64-K steps in flight), decodes FP4 -> FP8 with the per-group LUT and multiplies. Lane
+(several 64-K steps in flight; the Gate/Up's weight loads can carry the non-temporal cache bit, ``W_AUX``),
+decodes FP4 -> FP8 with the per-group LUT and multiplies. Lane
 ``16b + t`` of the B operand holds bytes ``16b .. 16b+15`` of row ``t`` in each 64-K block, which is
 the K permutation of the weight layout; the rows come straight from global memory or, with ``SHARE``
-and several waves per workgroup, are loaded once per workgroup into LDS (a ring of two 64-K steps in
-Gate/Up, the block's whole rows in Down).
+and several waves per workgroup, are loaded once per workgroup into LDS (in Gate/Up a ring of
+``2 * SYNC`` 64-K steps: step k + SYNC is written during step k, one barrier every ``SYNC`` steps; in Down
+the block's whole rows).
 
 Gate/Up: wave ``w`` of workgroup ``(g, block)`` owns gate 16-row blocks ``(g * W + w) * G + j`` and
 the matching up blocks, accumulates over the whole K and writes SiLU(gate) * up as float32 by
 (token, slot), the same epilogue arithmetic as ``a8w4_gemm1``; with ``QUANT`` (the waves cover all of
 I) it quantizes those rows to FP8 itself, exchanging the row maxima through LDS. Down: the wave keeps
-its rows' FP8 activations (all of K = I) in VGPRs, stages its ``R * 16`` channel factors in LDS and
+its rows' FP8 activations (all of K = I) in VGPRs (with ``LDS_ACTS`` it reads them from the shared LDS rows
+at every 64-K step), stages its ``R * 16`` channel factors in LDS and
 streams ``R`` 16-row blocks of the hidden dimension, writing BF16 rows by sorted position (padding
 rows are not written). ``compile_row_quant_bf16`` (input rows) and ``compile_route_sum`` (sum of a
 token's routes) replace the prefill path's input quantization and ``sorted_sum``.
@@ -51,14 +54,14 @@ def _rsrc(address, nbytes):
                                   fx.Int64(nbytes).ir_value(), fx.Int32(0x27000).ir_value())
 
 
-def _load(rsrc, voffset, soffset, dwords):
-    """Raw buffer load of ``dwords`` dwords -> list of Uint32."""
+def _load(rsrc, voffset, soffset, dwords, aux=0):
+    """Raw buffer load of ``dwords`` dwords -> list of Uint32 (``aux``: cache policy bits, 2 = non-temporal)."""
     if dwords == 1:
         value = rocdl.raw_ptr_buffer_load(fx.Int32.ir_type, rsrc, fx.Int32(voffset).ir_value(),
-                                          fx.Int32(soffset).ir_value(), aux=0)
+                                          fx.Int32(soffset).ir_value(), aux=aux)
         return [fx.Uint32(value)]
     value = rocdl.raw_ptr_buffer_load(ir.VectorType.get([dwords], fx.Int32.ir_type), rsrc,
-                                      fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), aux=0)
+                                      fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), aux=aux)
     vec = Vec(value).bitcast(fx.Uint32)
     return [vec[i] for i in range(dwords)]
 
@@ -272,7 +275,7 @@ def _block_head(blk, block_m, M, lane, p_sorted_ids, p_sorted_experts, p_num_val
 
 
 def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4), QUANT=False, SHARE=True,
-                               E=None):
+                               E=None, SYNC=1, W_AUX=0):
     """Build the streaming A8W4 Gate/Up launcher.
 
     ``N`` = 2 * I (gate rows ``[0, I)``, up rows ``[I, 2I)``, ``I % (16 * G * W) == 0``), ``K`` = hidden
@@ -282,8 +285,9 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     f32 [M, TOPK, I] and out_scale unused; with ``QUANT`` one workgroup covers all I of its block
     (``W = I / (16 * G)``) and quantizes each (token, slot) row like ``a8w4_quant`` (amax over I
     exchanged through LDS): out FP8 [M * TOPK, I], out_scale f32 [M * TOPK]. With ``SHARE`` and ``W > 1``
-    the waves of a workgroup load the block's activations once into LDS (ring of two 64-K steps) instead
-    of each wave reading all of them.
+    the waves of a workgroup load the block's activations once into LDS (ring of ``2 * SYNC`` 64-K steps,
+    step k + SYNC written during step k, one barrier every ``SYNC`` steps) instead of each wave reading all
+    of them.
     """
     I = N // 2
     if QUANT:
@@ -301,7 +305,9 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     LOADER = max(4, SLOT // (64 * W))
     LOADERS = SLOT // (64 * LOADER)
     assert not SHARE or LOADER in (4, 8, 16), f"BLOCK_M={BLOCK_M} with W={W} waves: {LOADER} bytes per lane"
-    ACT_LDS = 2 * SLOT + (64 * LOADER if LOADERS < W else 0) if SHARE else 0
+    assert SYNC <= min(PREFETCH), f"SYNC={SYNC}: the activations of step k + SYNC must be in flight at step k"
+    RING = 2 * SYNC
+    ACT_LDS = RING * SLOT + (64 * LOADER if LOADERS < W else 0) if SHARE else 0
 
     def silu_mul(S, block, acc, rbs, lane, expert, M, p_w_scale, p_x_scale):
         """SiLU(gate) * up per [gate block j][sub-block s] (4 channels of one row per lane), as ``a8w4_gemm1``."""
@@ -372,10 +378,10 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
         d_voff = (lane >> 5) * 64 + (lane & 15) * 4
 
         def load_w(kb):
-            w = [_load(w_rsrc, w_voff, (rb * KB + kb) * a8w4.W_BLOCK_BYTES, 2) for rb in rbs]
+            w = [_load(w_rsrc, w_voff, (rb * KB + kb) * a8w4.W_BLOCK_BYTES, 2, W_AUX) for rb in rbs]
             d = None
             if kb % 4 == 0:
-                d = [_load(d_rsrc, d_voff, (rb * KQ + kb // 4) * a8w4.D_BLOCK_BYTES, 1)[0] for rb in rbs]
+                d = [_load(d_rsrc, d_voff, (rb * KQ + kb // 4) * a8w4.D_BLOCK_BYTES, 1, W_AUX)[0] for rb in rbs]
             return w, d
 
         if SHARE:
@@ -392,9 +398,9 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
             token = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(ld_row * 4), _raw(token)))
             ld_voff = (ld_sub < S).select(token * K + (within & 63), fx.Int32(_DROP))
             ld_lds = act_lds + ld_sub * 1024 + ld_row * 64 + ((ld_chunk ^ ((ld_row >> 1) & 3)) << 4) + (within & 15)
-            ld_slots = [ld_lds + p * SLOT for p in range(2)]
+            ld_slots = [ld_lds + p * SLOT for p in range(RING)]
             if LOADERS < W:
-                scratch = act_lds + 2 * SLOT + lane * LOADER
+                scratch = act_lds + RING * SLOT + lane * LOADER
                 ld_slots = [(wave < LOADERS).select(a, scratch) for a in ld_slots]
             row = lane & 15
             rd_lds = act_lds + row * 64 + (((lane >> 4) ^ ((row >> 1) & 3)) << 4)
@@ -403,10 +409,10 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 return _load(x_rsrc, ld_voff, kb * 64, LOADER // 4)
 
             def write_a(kb, words):
-                _lds_store(ld_slots[kb % 2], words)
+                _lds_store(ld_slots[kb % RING], words)
 
             def read_a(kb):
-                xs = [_lds_load4(rd_lds + (kb % 2) * SLOT + s * 1024) for s in range(S)]
+                xs = [_lds_load4(rd_lds + (kb % RING) * SLOT + s * 1024) for s in range(S)]
                 return [(_pack64(x[0], x[1]), _pack64(x[2], x[3])) for x in xs]
         else:
             a_voff = [t * K + (lane >> 4) * 16 for t in block.token]
@@ -423,7 +429,8 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
         acts = {kb: load_a(kb) for kb in range(P)}
         stages = [load_w(kb) for kb in range(P)]
         if SHARE:
-            write_a(0, acts.pop(0))
+            for kb in range(min(SYNC, KB)):
+                write_a(kb, acts.pop(kb))
             _lds_barrier()
         acc = [[_zeros() for _ in range(S)] for _ in rbs]
         deltas = None
@@ -436,8 +443,9 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
             if d is not None:
                 deltas = d
             if SHARE:
-                if kb + 1 < KB:
-                    write_a(kb + 1, acts.pop(kb + 1))
+                # Step k + SYNC goes into the slot of step k - SYNC, read before the last barrier.
+                if kb + SYNC < KB:
+                    write_a(kb + SYNC, acts.pop(kb + SYNC))
                 b = read_a(kb)
             else:
                 b = [(_pack64(x[0], x[1]), _pack64(x[2], x[3])) for x in acts.pop(kb)]
@@ -447,7 +455,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 for s in range(S):
                     for c in range(2):
                         acc[i][s] = _mfma(ops[c], b[s][c], acc[i][s])
-            if SHARE and kb + 1 < KB:
+            if SHARE and kb + 1 < KB and (kb + 1) % SYNC == 0:
                 _lds_barrier()
             rocdl.sched_barrier(0)
 
@@ -844,13 +852,23 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
     return launch
 
 
+def _down_scratch(K, BLOCK_M, W):
+    """Whether some loader lane of the shared Down falls past the block's rows (S * K bytes over W * 64 lanes of
+    16 bytes) for some live sub-block count S and needs the scratch slot."""
+    return any((s * K) % (W * 64) for s in range(1, BLOCK_M // 16 + 1))
+
+
 def down_stream_lds(K, BLOCK_M, W=1, SHARE=True):
     """LDS bytes of ``compile_a8w4_down_stream``: 1 KiB of channel factors per wave, plus with ``SHARE``
-    and ``W > 1`` the block's activation rows (stride ``K + 16``) and one 16-byte slot per lane."""
-    return W * 1024 + (BLOCK_M * (K + 16) + W * 64 * 16 if SHARE and W > 1 else 0)
+    and ``W > 1`` the block's activation rows (stride ``K + 16``) and, when some loader lane falls past the
+    rows, one 16-byte slot per lane."""
+    if not (SHARE and W > 1):
+        return W * 1024
+    return W * 1024 + BLOCK_M * (K + 16) + (W * 64 * 16 if _down_scratch(K, BLOCK_M, W) else 0)
 
 
-def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHARE=True, E=None, ATOMIC=False):
+def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHARE=True, E=None, ATOMIC=False,
+                             LDS_ACTS=False, W_AUX=0):
     """Build the streaming A8W4 Down launcher.
 
     ``N`` = hidden (``N % (16 * R * W) == 0``, ``R <= 16``), ``K`` = padded I (``K % 64 == 0``),
@@ -859,7 +877,8 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
     sorted_weights, sorted_expert_ids, num_valid_ids, w_scale f32 [E, N], x_scale f32 [M, TOPK], then
     M, task_num, stream. The wave's ``R * 16`` channel factors are staged in LDS with one 16-byte load
     per lane; each sub-block accumulates in two MFMA chains (the two MMAs of every 64-K step). With
-    ``SHARE`` and ``W > 1`` the waves of a workgroup load the block's activation rows once into LDS.
+    ``SHARE`` and ``W > 1`` the waves of a workgroup load the block's activation rows once into LDS; with
+    ``LDS_ACTS`` as well they stay there and each 64-K step reads them again (fewer VGPRs for many rows / long K).
     With ``ATOMIC`` (``R`` even) out is BF16 [M, N], zeroed by the caller, and each route is added into its
     token's row with agent-scope BF16x2 atomics: the MFMA takes the rows as A, so lane ``16b + j`` holds
     channel j of rows ``4b .. 4b+3``; after two 16-channel blocks neighbouring lanes swap values so that the
@@ -876,10 +895,11 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
     W_BYTES, D_BYTES = a8w4.weight_bytes(N, K), a8w4.delta_bytes(N, K)
     REGION = 1024
     SHARE = SHARE and W > 1
+    LDS_ACTS = LDS_ACTS and SHARE
     KP = K + 16  # LDS row stride: 16-byte reads of 16 rows hit distinct banks
     SUBS = BLOCK_M // 16
-    # Activation rows, then one 16-byte scratch slot per lane for loader lanes past the rows.
-    ACT_LDS = SUBS * 16 * KP + W * 64 * 16 if SHARE else 0
+    # Activation rows, then (if some loader lane can fall past the rows) one 16-byte scratch slot per lane.
+    ACT_LDS = SUBS * 16 * KP + (W * 64 * 16 if _down_scratch(K, BLOCK_M, W) else 0) if SHARE else 0
     assert W * REGION + ACT_LDS == down_stream_lds(K, BLOCK_M, W, SHARE)
     assert W * REGION + ACT_LDS <= a8w4.LDS_BYTES, f"Down needs {W * REGION + ACT_LDS} B of LDS (K={K})"
 
@@ -904,8 +924,8 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
 
         def load_stage(r):
             rb = rb0 + r
-            w = [_load(w_rsrc, w_voff, (rb * KB + kb) * a8w4.W_BLOCK_BYTES, 2) for kb in range(KB)]
-            d = [_load(d_rsrc, d_voff_pair if q + 1 < KQ else d_voff, (rb * KQ + q) * a8w4.D_BLOCK_BYTES, 1)[0]
+            w = [_load(w_rsrc, w_voff, (rb * KB + kb) * a8w4.W_BLOCK_BYTES, 2, W_AUX) for kb in range(KB)]
+            d = [_load(d_rsrc, d_voff_pair if q + 1 < KQ else d_voff, (rb * KQ + q) * a8w4.D_BLOCK_BYTES, 1, W_AUX)[0]
                  for q in range(0, KQ, 2)]
             return w, d
 
@@ -949,10 +969,14 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
             for address, words in pending:
                 _lds_store(address, words)
             _lds_barrier()
-            row = lane & 15
-            for s in range(S):
-                xs = [_lds_load4(act_lds + s * (16 * KP) + row * KP + kb * 64 + (lane >> 4) * 16) for kb in range(KB)]
-                acts.append([(_pack64(x[0], x[1]), _pack64(x[2], x[3])) for x in xs])
+            act_rd = act_lds + (lane & 15) * KP + (lane >> 4) * 16
+
+            def read_act(s, kb):
+                x = _lds_load4(act_rd + s * (16 * KP) + kb * 64)
+                return _pack64(x[0], x[1]), _pack64(x[2], x[3])
+
+            if not LDS_ACTS:
+                acts = [[read_act(s, kb) for kb in range(KB)] for s in range(S)]
         else:
             for r in route:
                 words = [_load(x_rsrc, r * K + (lane >> 4) * 16, kb * 64, 4) for kb in range(KB)]
@@ -983,13 +1007,14 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
             acc = [[_zeros() for _ in range(S)] for _ in range(2)]
             for kb in range(KB):
                 lut = a8w4.fp8_lut(d[kb // 4], fx.Uint32((kb % 4) * 0x01010101))
+                b = [read_act(s, kb) for s in range(S)] if LDS_ACTS else [acts[s][kb] for s in range(S)]
                 for c in range(2):
                     op = _decode(w[kb][c], lut)
                     for s in range(S):
                         if ATOMIC:
-                            acc[c][s] = _mfma(acts[s][kb][c], op, acc[c][s])
+                            acc[c][s] = _mfma(b[s][c], op, acc[c][s])
                         else:
-                            acc[c][s] = _mfma(op, acts[s][kb][c], acc[c][s])
+                            acc[c][s] = _mfma(op, b[s][c], acc[c][s])
             if ATOMIC:
                 ws = fx.Float32(llvm.load(fx.Float32.ir_type, _lds(region + (r * 16 + (lane & 15)) * 4), alignment=4))
                 values = []
