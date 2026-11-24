@@ -231,15 +231,17 @@ GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter�
 | NOT_COMPARABLE | 执行/输出元数据检查失败，或 winner 精度失败，不生成 speedup |
 | ERROR | 数据准备、参考或调用错误；reason 中保留异常 |
 
-## A8W4 性能测试（Qwen3.8 对照 Aiter FP8 ptpc，MiMo 只测 A8W4）
+## A8W4 性能测试（Qwen3.8 对照 Aiter FP8 ptpc，MiMo 与 DeepSeek 只测 A8W4）
 
 A8W4 的性能测试不在本目录，而是 [tests/ops/moe/test_moe_a8w4.py](../../tests/ops/moe/test_moe_a8w4.py) 的区域 5（脚本入口，pytest 不收集）。
-它独立于上面的 tuned MoE 对照：测 `pyhip.ops.moe.flydsl.moe_a8w4.fused_moe_a8w4` 的 68 个 case，即 4 个形状 × M=1、2、4…32768
+它独立于上面的 tuned MoE 对照：测 `pyhip.ops.moe.flydsl.moe_a8w4.fused_moe_a8w4` 的 85 个 case，即 5 个形状 × M=1、2、4…32768
 （按 2 的幂细扫）再加 M=48（E513 下走排序块 32 的流式段）：
 
 - Qwen3.8-Flash-Next TP2 / TP4（H2560、E513 含 1 个必选的融合 shared、topk11，I=320 / 160）：同进程同协议交替对照 Aiter FP8 ptpc
   （只用 Aiter 自带 qwen38 调优表并断言命中），输出两边的耗时、TB/s 与 TFLOPS。
 - MiMo-V2.6-Flash TP8 / TP4（H4096、E256、topk8、均匀路由，I=256 / 512）：Aiter 没有这两个形状的调优表，只测 A8W4。
+- DeepSeek-V4.1-Flash TP4（H5120、E384、topk6、均匀路由，I=576）：算子与参考都传 SwiGLU 截断 `swiglu_limit=10`；
+  Aiter 没有该形状的调优表，只测 A8W4。
 
 每个 case 的输出都按 `pyhip.testing.moe_a8w4.check` 校验（calc_diff ≤ 1e-3、最大误差 ≤ 4.5%·max|ref|），计时协议与输出格式见该区域开头的注释。
 与第一轮实现（R1）、tingqli refactor/a8w4 的逐点对比不在本仓库：用 myflow 任务目录的 cmp3 脚本（同卡、同一份权重与输入、同一计时协议）。

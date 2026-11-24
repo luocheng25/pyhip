@@ -118,12 +118,15 @@ def quant_rows_fp8(t):
     return (t / scale).to(torch.float8_e4m3fnuz).float() * scale
 
 
-def reference(x, w1, w1_scale, w2, w2_scale, topk_weight, topk_ids, *, activation="fp8"):
+def reference(x, w1, w1_scale, w2, w2_scale, topk_weight, topk_ids, *, activation="fp8", swiglu_limit=0.0):
     """独立 FP32 MoE 参考，返回 float32 [M, H]。
 
     权重为标准 MXFP4（``make_weights`` 的格式），SiLU(gate) * up，routing 权重在 Down 后乘、
     按 token 累加。``activation``：``"fp8"`` 量化输入与中间激活（每个 token、每个 token×槽位
-    一行一个 scale）；``"bf16"`` 不量化激活。
+    一行一个 scale）；``"bf16"`` 不量化激活。``swiglu_limit`` = L > 0 时按 DeepSeek-V4.1 的 SwiGLU 截断
+    （其 inference/model.py 的 ``Expert``，config 的 ``swiglu_limit``，V4.1-Flash 为 10）：对 f32 的 gate / up
+    （输入量化、权重反量化后的矩阵乘结果）先取 gate = min(gate, L)、up = clamp(up, -L, L)，再算 SiLU(gate) * up；
+    0（默认）不截断，与不传该参数逐位相同。
     """
     import torch
 
@@ -146,7 +149,11 @@ def reference(x, w1, w1_scale, w2, w2_scale, topk_weight, topk_ids, *, activatio
     mid = torch.zeros((M, topk, I), dtype=torch.float32, device=x.device)
     for e, t, s in groups:
         h = xa[t] @ dequant_mxfp4(w1[e], w1_scale[e]).T
-        mid[t, s] = torch.nn.functional.silu(h[:, :I]) * h[:, I:]
+        gate, up = h[:, :I], h[:, I:]
+        if swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        mid[t, s] = torch.nn.functional.silu(gate) * up
     if fp8:
         mid = quant_rows_fp8(mid)
     out = torch.zeros((M, H), dtype=torch.float32, device=x.device)

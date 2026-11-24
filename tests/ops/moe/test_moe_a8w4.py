@@ -6,7 +6,8 @@
   区域 2  基本功能 · 底座：每条公开路径一例
   区域 3  其他覆盖 · A8W4：基本功能与性能测试覆盖不了的情况（布局与量化、decode、流式与 prefill、graph、报错与回退）
   区域 4  其他覆盖 · 底座
-  区域 5  性能测试：Qwen3.8 TP2 / TP4（对照 Aiter FP8 ptpc）与 MiMo-V2.6-Flash TP8 / TP4 共 68 个 case（脚本入口，pytest 不收集）
+  区域 5  性能测试：Qwen3.8 TP2 / TP4（对照 Aiter FP8 ptpc）、MiMo-V2.6-Flash TP8 / TP4 与 DeepSeek-V4.1-Flash TP4 共 85 个 case
+          （脚本入口，pytest 不收集）
 基本功能用例标 ``@pytest.mark.basic``，每次小改动先跑：``pytest tests/ops/moe/test_moe_a8w4.py -m basic``
 （myflow 的 commands.correctness）；其他覆盖用 ``-m "not basic"``（commands.verify_extra），每条 docstring
 写明基本功能与性能测试为什么覆盖不了；性能测试直接运行本文件：``python tests/ops/moe/test_moe_a8w4.py``
@@ -70,10 +71,14 @@ def _gpu_environment(monkeypatch):
 # prefill 的例子含多块 expert 与部分填充的尾块。MiMo 形状（H=4096、E=256、topk=8，无 shared expert、均匀路由）
 # 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1600（H=4096 时每个 expert 平均
 # 不超过 48 行即 M≤1536 走流式；MiMo 的 decode 按 expert 去重：M=5 两个 kernel、M=24 四个 kernel）。
+# DeepSeek-V4.1-Flash TP4 形状（H=5120、topk=6、I=576，均匀路由，E 缩到 24）带 SwiGLU 截断 ``swiglu_limit=10`` 一例：
+# 流式 M=64（排序块 32），输入放大 10 倍使 gate、up 各有 >10% 的元素超过 10，对带截断的参考（其余 Gate/Up kernel 见 3.8）。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
 MIMO_HIDDEN, MIMO_EXPERTS, MIMO_TOPK = 4096, 256, 8
+DS_HIDDEN, DS_EXPERTS, DS_TOPK, DS_INTER = 5120, 24, 6, 576
+SWIGLU_LIMIT, SWIGLU_AMPLIFY = 10.0, 10.0  # 输入放大后 gate / up 的标准差约 10
 
 
 def _a8w4_prepare(w):
@@ -93,6 +98,40 @@ def _a8w4_check(inter, tokens, seed, kernel, hidden=HIDDEN, experts=EXPERTS, top
                            activation=mode)
     oracle.assert_close(out, ref)
     return prepared
+
+
+@functools.cache
+def _ds_weights():
+    """DeepSeek 形状（E=24）的权重，本区与 3.8 的截断用例共用。"""
+    w = oracle.make_weights(DS_EXPERTS, DS_HIDDEN, DS_INTER, seed=400)
+    return w, _a8w4_prepare(w)
+
+
+def _swiglu_over(x, w, topk_ids, limit):
+    """[gate > L 的比例, |up| > L 的比例]：按参考的量化点（x 按行 FP8）算每条路由的 Gate/Up 输出。"""
+    xa = oracle.quant_rows_fp8(x)
+    inter = w["w1"].shape[1] // 2
+    over = torch.zeros(2, dtype=torch.int64)
+    for e in topk_ids.unique().tolist():
+        h = xa[(topk_ids == e).any(dim=1)] @ oracle.dequant_mxfp4(w["w1"][e], w["w1_scale"][e]).T
+        over += torch.stack([(h[:, :inter] > limit).sum(), (h[:, inter:].abs() > limit).sum()])
+    return (over / (topk_ids.numel() * inter)).tolist()
+
+
+def _a8w4_swiglu_check(w, prepared, tokens, seed, hidden, experts, topk, shared, **options):
+    """``swiglu_limit=SWIGLU_LIMIT`` 的完整调用对带截断的参考；输入放大 SWIGLU_AMPLIFY 倍，先断言 gate 与 up 各有
+    >10% 的元素超过上限（截断大量触发；不截断的输出与参考的误差远超判据）。"""
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, experts, topk, seed=seed, shared=shared)
+    x = (x.float() * SWIGLU_AMPLIFY).to(torch.bfloat16)
+    over = _swiglu_over(x, w, topk_ids, SWIGLU_LIMIT)
+    assert min(over) > 0.1, over
+    out = torch.full_like(x, float("nan"))
+    result = moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out, swiglu_limit=SWIGLU_LIMIT,
+                                     **options)
+    assert result is out
+    ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids,
+                           activation=oracle.path_activation(moe_a8w4.last_path), swiglu_limit=SWIGLU_LIMIT)
+    oracle.assert_close(out, ref)
 
 
 # kernel：该分档的 kernel 名里一定出现的片段（decode / 流式 / prefill）。
@@ -116,6 +155,12 @@ def test_tp4_padded():
 def test_mimo(inter, tokens, kernel):
     _a8w4_check(inter, tokens, seed=41, kernel=kernel, hidden=MIMO_HIDDEN, experts=MIMO_EXPERTS, topk=MIMO_TOPK,
                 shared=False)
+
+
+@pytest.mark.basic
+def test_deepseek_swiglu():
+    _a8w4_swiglu_check(*_ds_weights(), 64, seed=401, hidden=DS_HIDDEN, experts=DS_EXPERTS, topk=DS_TOPK, shared=False)
+    assert any("_stream_" in name for name in moe_a8w4.last_path), moe_a8w4.last_path
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -234,6 +279,7 @@ def test_fp8_prefill_bf16(kernels):
 # （用例名带 ``stream``）、排序块 64 换 prefill Down 及其切分，以及 grid 收缩与 graph。
 # prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数、graph，以及排序用流式 prep 还是 Opus 的
 # 路由数上限（``test_prefill_prep_routes_limit``）。非目标形状的回退见 ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
+# SwiGLU 截断（``swiglu_limit``）：区域 1 只测 DeepSeek 的流式排序块 32，其余各类 Gate/Up kernel 与“gate 只截上侧”见 3.8。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 # decode 三种分派（x、mid 是否先用独立 kernel 预量化）各自的 Gate/Up 与 Down kernel。
@@ -834,7 +880,7 @@ def test_stream_rows_limits(hidden, inter, tokens, path):
     M=120 / 121 为 48 / 48.4 行）。H4096·I256 的流式 Down 原子累加，排序块 32（M=62）时从 LDS 读激活（K%256==0）。
 
     基本测试与 bench 不在这两个交界上（22 行的交界见 test_stream_dispatch_boundary）；bench 的 MiMo TP8 M512 / 1024
-    走这两种原子 Down，但不校验数值。E=5、topk=2 控制耗时。
+    走这两种原子 Down，但不断言 kernel 序列。E=5、topk=2 控制耗时。
     """
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, 5, 2, seed=300 + tokens, shared=False)
@@ -848,8 +894,8 @@ def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
     """排序块 64、Down 不原子累加（I≥512）且 H≥4096 时，流式 Gate/Up 之后改用 prefill Down（顺带写 loc_ids）+ route_sum；
     prefill Down 按排序块数把 hidden 切给 1 / 2 / 4 个 WG（E=5、M=100 共 5 个块，``DOWN_MIN_WGS`` 取 5 / 8 / 默认 1000）。
 
-    基本测试的 MiMo TP4 M1600 走 prefill，其 prefill 只用到切分 4（I≥256）与 1（I_pad=192）；bench 的 mimo_tp4_m1024
-    走这条路径但不校验数值。E=5、topk=2 控制耗时。
+    基本测试的 MiMo TP4 M1600 走 prefill，其 prefill 只用到切分 4（I≥256）与 1（I_pad=192）；bench 的 mimo_tp4_m1024 与
+    ds_tp4_m2048 走这条路径，但各只一种切分、不断言 kernel 序列。E=5、topk=2 控制耗时。
     """
     monkeypatch.setattr(moe_a8w4, "DOWN_MIN_WGS", min_wgs)
     assert moe_a8w4._down_split(100, 2, 5, 4096, 512, 64) == nsplit
@@ -1027,7 +1073,7 @@ def test_rejects_bad_inputs():
     以及 Down 的 BLOCK_M·I_pad 不是 4096 的倍数（BM32 配 I320 / 192，构建 kernel 时报错而不是静默算错）；
     swiglu_limit 为负、NaN、±inf 报 ValueError，不是实数报 TypeError，0 与 -0.0 关闭截断（输出与不传逐位相同）。
 
-    基本测试与 bench 只给合法输入，且只用默认 block_m=64、不传 swiglu_limit。
+    基本测试与 bench 只给合法输入，且只用默认 block_m=64、swiglu_limit 只取 0 或 10。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage.a8w4_gemm2 import compile_a8w4_gemm2
 
@@ -1097,8 +1143,9 @@ def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_r
     （I=1024：排序块 32 放得下，64 放不下，后者若误选共享 tile 会在构建 kernel 时报错；默认分派的流式只到排序块 32，
     这里临时调大 STREAM_MAX_ROWS 让 M=300 走排序块 64）。
 
-    前两类只有目标形状（H=2560 / 4096，I=192–512）：MiMo 的 H=4096 decode 按 expert 去重（I_pad%128==0），h4096_decode
-    （I=64）测原 decode kernel 在 H 上限的一侧，其余上限碰不到；E=5、topk=2 控制耗时。
+    前两类只有目标形状（H=2560 / 4096 / 5120，I=192–576）：MiMo 的 H=4096 decode 按 expert 去重（I_pad%128==0），
+    h4096_decode（I=64）测原 decode kernel 在 H 上限的一侧；DeepSeek 的 H=5120、M≤32 也回退 prefill，但 bench 不断言
+    kernel、test_swiglu_limit_kernels 两种路径都接受，h4608_prefill 测上限的另一侧；其余上限碰不到；E=5、topk=2 控制耗时。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage import a8w4_common, a8w4_stream
 
@@ -1183,6 +1230,88 @@ def test_inplace_output(case):
     _assert_path(path)
     assert oracle.path_activation(moe_a8w4.last_path) == "fp8"
     oracle.assert_close(x, ref)
+
+
+# ── 3.8 SwiGLU 截断（swiglu_limit）：每类 Gate/Up kernel ─────────────────────────────────────────────
+
+# case -> (形状, M, tile 参数, 按序出现的关键 kernel)；形状：qwen = H2560、E33、topk11、I320，mimo = H4096、E12、
+# topk8、I256，ds = DeepSeek H5120、E24、topk6、I576。
+_SWIGLU_CASES = {
+    "decode_nn": ("qwen", 3, {}, _DECODE_PATHS["nn"]),
+    "decode_pq": ("qwen", 12, {}, _DECODE_PATHS["pp"]),
+    "decode_plan": ("mimo", 5, {}, _DEDUP_PATHS["dd2"]),
+    "decode_dd": ("mimo", 24, {}, _DEDUP_PATHS["dd4"]),
+    "stream_fused_quant": ("qwen", 64, {}, ["a8w4_stream_prep"] + _stream_path(32, True)),
+    "stream_bm16": ("ds", 40, {}, ["a8w4_stream_prep"] + _stream_path(16, False) + ["a8w4_route_sum"]),
+    "stream_bm64": ("ds", 160, {}, ["a8w4_stream_prep", "a8w4_gateup_stream_bm64", "a8w4_down_prefill_bm64",
+                                    "a8w4_route_sum"]),
+    "prefill_tk256": ("ds", 64, dict(block_m=64), ["a8w4_stream_prep"] + _prefill_path(256)),
+    "prefill_tk128": ("ds", 256, {}, ["a8w4_stream_prep"] + _prefill_path(128)),
+    "h5120_small_m": ("ds", 8, {}, None),
+}
+
+
+@pytest.mark.parametrize("case", list(_SWIGLU_CASES))
+def test_swiglu_limit_kernels(case):
+    """``swiglu_limit=10`` 时每类 Gate/Up kernel 的截断（编译期常量，在各类 kernel 各自的收尾里接入）：decode 的核内量化
+    （nn）与预量化（pq）、去重 decode 的计划 kernel（PLAN）与去重 Gate/Up（dd）、流式排序块 16 / 64 与尾部融合量化、prefill
+    的 TILE_K 256（给 tile 参数）与 128（每个 expert 行多），以及 H5120 的 M≤32（decode 不支持该 hidden 时回退 prefill
+    TILE_K 256，支持后走 decode，两者都接受）。输入放大 10 倍使 gate、up 各有 >10% 的元素超过上限，断言关键 kernel
+    与带截断参考的端到端判据。
+
+    基本测试只有 DeepSeek 流式排序块 32 一例（这里不重复）；bench 的 DeepSeek case 输入 N(0,1)，|gate|、|up| 几乎不超过
+    10，只测截断的代价、校验不到截断本身，Qwen / MiMo 的 case 不传 swiglu_limit。
+    """
+    shape, tokens, options, path = _SWIGLU_CASES[case]
+    if shape == "qwen":
+        (w, prepared), dims = _decode_weights(320), (HIDDEN, 33, TOPK, True)
+    elif shape == "mimo":
+        (w, prepared), dims = _mimo_small_weights(256), (MIMO_HIDDEN, 12, MIMO_TOPK, False)
+    else:
+        (w, prepared), dims = _ds_weights(), (DS_HIDDEN, DS_EXPERTS, DS_TOPK, False)
+    _a8w4_swiglu_check(w, prepared, tokens, 410 + tokens, *dims, **options)
+    if path is None:
+        gateup = next(name for name in moe_a8w4.last_path if name.startswith("a8w4_gateup"))
+        assert gateup.startswith("a8w4_gateup_decode") or gateup == _prefill_path(256)[0], moe_a8w4.last_path
+    else:
+        _assert_path(path)
+
+
+@functools.cache
+def _ds_negative_gate_weights():
+    """DeepSeek 形状（E=24）的权重，gate 半改为 E2M1 −0.5、E8M0 scale 1（up 半不变）：x 全为 2^-7 时每个 gate 恰为
+    −0.5·5120·2^-7 = −20。"""
+    w = oracle.make_weights(DS_EXPERTS, DS_HIDDEN, DS_INTER, seed=420)
+    q, s = w["w1"].view(torch.uint8).clone(), w["w1_scale"].view(torch.uint8).clone()
+    q[:, :DS_INTER], s[:, :DS_INTER] = 0x99, 127
+    w = dict(w, w1=q.view(torch.float4_e2m1fn_x2), w1_scale=s.view(torch.float8_e8m0fnu))
+    return w, _a8w4_prepare(w)
+
+
+@pytest.mark.parametrize("tokens", [40, 8], ids=["stream_m40", "small_m8"])
+def test_swiglu_gate_upper_only(tokens):
+    """截断只限 gate 的上侧（DeepSeek-V4.1 的 ``Expert``：gate = min(gate, L)）：gate 全为 −20 < −L 时按原值算
+    SiLU(−20)·up；把 gate 也夹到 −L 的实现会算成 SiLU(−10)·up，输出整体放大约 1.1e4 倍，判据必然不过。流式（M=40，
+    排序块 16）与 H5120 的小 M（M=8：decode 不支持该 hidden 时回退 prefill，支持后走 decode）各一例；各类 Gate/Up
+    kernel 共用 ``a8w4_common.swiglu_clamp``。
+
+    基本测试、test_swiglu_limit_kernels 与 bench 里 gate < −L 时 SiLU(gate)、SiLU(−L) 都不到 5e-4，远小于大 gate 贡献的
+    输出，夹不夹下侧在端到端判据下看不出。
+    """
+    w, prepared = _ds_negative_gate_weights()
+    _, topk_weight, topk_ids = oracle.make_inputs(tokens, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=420 + tokens,
+                                                  shared=False)
+    x = torch.full((tokens, DS_HIDDEN), 2.0 ** -7, dtype=torch.bfloat16)
+    gate = oracle.quant_rows_fp8(x[:1]) @ oracle.dequant_mxfp4(w["w1"][0, :DS_INTER], w["w1_scale"][0, :DS_INTER]).T
+    assert torch.allclose(gate, torch.full_like(gate, -20.0)), gate.aminmax()
+    out = torch.full_like(x, float("nan"))
+    moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out, swiglu_limit=SWIGLU_LIMIT)
+    gateup = next(name for name in moe_a8w4.last_path if name.startswith("a8w4_gateup"))
+    expected = "a8w4_gateup_stream" if tokens == 40 else ("a8w4_gateup_decode", "a8w4_gateup_prefill")
+    assert gateup.startswith(expected), moe_a8w4.last_path
+    ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids,
+                           activation=oracle.path_activation(moe_a8w4.last_path), swiglu_limit=SWIGLU_LIMIT)
+    oracle.assert_close(out, ref)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1459,21 +1588,23 @@ def test_fp8_down_rounds_before_packing(path):
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 # 区域 5｜性能测试（脚本入口，commands.bench；pytest 不收集）
 # 用法：PYTHONPATH=<repo>/src python tests/ops/moe/test_moe_a8w4.py [--cases tp2_m1 ...]
-# 68 个 case = 4 个形状 × M 按 2 的幂细扫 {1, 2, 4, …, 32768} 再加 M=48（E513 下 M=33–62 走排序块 32 的流式段，
+# 85 个 case = 5 个形状 × M 按 2 的幂细扫 {1, 2, 4, …, 32768} 再加 M=48（E513 下 M=33–62 走排序块 32 的流式段，
 # 2 的幂跳过了它），名为 <形状>_m<M>，SiLU，BF16 进出：
 #   tp2 / tp4：Qwen3.8-Flash-Next，H=2560，E=513（512 routed + 最后一个融合 shared，每个 token 的最后槽位必选），
 #     topk=11，I=320 / 160（prepare 补零到 192；Aiter 用同一份 BF16 权重补零到 192）；对照 Aiter FP8 ptpc。
 #   mimo_tp8 / mimo_tp4：MiMo-V2.6-Flash，H=4096，E=256，topk=8，均匀路由，I=256 / 512；Aiter 没有这两个形状的
 #     调优表，只测 A8W4。
-# case 的输入种子按它在 BENCH_CASES 里的序号取（Qwen 在前、MiMo 在后）；权重与输入由 ``pyhip.testing.moe_a8w4``
-# 生成（BF16 权重逐 expert 生成），种子取环境变量 MF_SEED（默认 0）。
+#   ds_tp4：DeepSeek-V4.1-Flash-1017 TP4，H=5120，E=384，topk=6，均匀路由，I=576，SwiGLU 截断 swiglu_limit=10
+#     （``BENCH_SWIGLU_LIMIT``：算子与参考都传；输入 N(0,1) 时几乎不触发，测的是代价）；无 Aiter 对照，只测 A8W4。
+# case 的输入种子按它在 BENCH_CASES 里的序号取（Qwen、MiMo、DeepSeek 依次，DeepSeek 的 17 个追加在最后）；权重与输入由
+# ``pyhip.testing.moe_a8w4`` 生成（BF16 权重逐 expert 生成），种子取环境变量 MF_SEED（默认 0）。
 # 协议：有对照时两种实现在同一进程、同一协议下交替计时。每次调用前写 512 MiB flush buffer，再用 ``torch.cuda._sleep``
 # 让 GPU 空转（至少 200 µs，且不短于 warmup 后实测的各实现 host 下发一次调用耗时较大者的 2 倍），使 host
 # 提前排队，event 只计完整调用的 GPU 时间；不设默认设备（它的 TorchFunctionMode 会给每个 torch 调用加 host 开销）。
 # warmup 3 次，30 次取中位，4 组输入轮换。被计时的 A8W4 输出按 ``moe_a8w4.check`` 校验，任一组不过即退出非零。
 # Aiter 对照只用 ``aiter/configs/model_configs/qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv``（复制到临时目录后经
 # AITER_CONFIG_FMOE 指定），每个 case 断言 dispatcher 用的就是表中那一行。
-# 输出：``MF_METRIC case=<名> value=<us> unit=us flops=<F> bytes=<B>``（A8W4 中位数）；有对照的 case 另有
+# 输出：``MF_METRIC case=<名> value=<us> unit=us flops=<F> bytes=<B>``（A8W4 中位数）；有对照的 case（只有 Qwen）另有
 # ``MF_REF case=<名> impl=aiter_fp8_ptpc value=<us> flops=<F> bytes=<B> ratio=<A8W4/aiter> kernels=<名>``；
 # flops 按补零后的 I 计 6·M·topk·I·H，bytes 是各自的最小数据量（被选中 expert 的权重与 scale + 输入读、输出写）；
 # ``INFO`` 行给所走路径、校验结果、带宽与算力利用率（MI308X：HBM 5.3 TB/s，FP8 稠密约 606 TFLOPS）。
@@ -1485,12 +1616,16 @@ BENCH_SHAPES = {
     "tp4": (2560, 513, 11, 160, 192, True, True),
     "mimo_tp8": (4096, 256, 8, 256, 256, False, False),
     "mimo_tp4": (4096, 256, 8, 512, 512, False, False),
+    "ds_tp4": (5120, 384, 6, 576, 576, False, False),
 }
+# 传给 fused_moe_a8w4 与参考的 swiglu_limit（DeepSeek-V4.1 的 SwiGLU 截断）；不在表里的形状不传该参数。
+BENCH_SWIGLU_LIMIT = {"ds_tp4": 10.0}
 BENCH_TOKENS = tuple(1 << k for k in range(16))  # 1, 2, 4, …, 32768
 BENCH_EXTRA_TOKENS = (48,)  # 排序块 32 的小 M 流式段
 BENCH_CASES = ([f"{tp}_m{m}" for tp in ("tp2", "tp4") for m in BENCH_TOKENS]
                + [f"{tp}_m{m}" for tp in ("tp2", "tp4") for m in BENCH_EXTRA_TOKENS]
-               + [f"{tp}_m{m}" for tp in ("mimo_tp8", "mimo_tp4") for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS])
+               + [f"{tp}_m{m}" for tp in ("mimo_tp8", "mimo_tp4") for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS]
+               + [f"ds_tp4_m{m}" for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS])
 HBM_BYTES_PER_S, FP8_FLOPS = 5.3e12, 606e12
 WARMUP, ITERS, GROUPS = 3, 30, 4
 FLUSH_BYTES, IDLE_US = 512 << 20, 200
@@ -1574,6 +1709,7 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
     hidden, experts, topk, inter, inter_pad, shared, compare = BENCH_SHAPES[tp]
     w, prepared, fp8_w = weights
     index = BENCH_CASES.index(name)
+    limit_kw = {"swiglu_limit": BENCH_SWIGLU_LIMIT[tp]} if tp in BENCH_SWIGLU_LIMIT else {}
     groups = [oracle.make_inputs(tokens, hidden, experts, topk, seed=seed * 1000 + 100 + index * GROUPS + g,
                                  shared=shared)
               for g in range(GROUPS)]
@@ -1582,7 +1718,7 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
 
     def ours(g):
         x, topk_weight, topk_ids = groups[g]
-        moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=outputs[g])
+        moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=outputs[g], **limit_kw)
 
     def theirs(g):
         x, topk_weight, topk_ids = groups[g]
@@ -1636,7 +1772,7 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
     worst = None
     for g, (x, topk_weight, topk_ids) in enumerate(groups):
         ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids,
-                               activation=mode)
+                               activation=mode, **limit_kw)
         result = oracle.check(outputs[g], ref)
         if not result["ok"]:
             print(f"FAIL case={name} group={g} check={result}", flush=True)
@@ -1663,7 +1799,8 @@ def _bench_case(name, weights, cycles_per_us, flush, seed):
         print(f"MF_REF case={name} impl=aiter_fp8_ptpc value={us['theirs']:.2f} flops={flops} bytes={bytes_theirs:.0f} "
               f"ratio={us['ours'] / us['theirs']:.3f} kernels={expected}", flush=True)
         versus = f" aiter={util(us['theirs'], bytes_theirs)}"
-    print(f"INFO case={name} I={inter}->{inter_pad} path={'>'.join(path)} activation={mode} "
+    swiglu = f" swiglu_limit={limit_kw['swiglu_limit']:g}" if limit_kw else ""
+    print(f"INFO case={name} I={inter}->{inter_pad}{swiglu} path={'>'.join(path)} activation={mode} "
           f"a8w4={util(us['ours'], bytes_ours)}{versus} "
           f"worst_check=calc_diff:{worst['calc_diff']:.2e},err_ratio:{worst['err_ratio'] * 100:.2f}% "
           f"host_us={','.join(f'{k}:{v:.0f}' for k, v in host.items())} idle_us={idle_us:.0f}", flush=True)
