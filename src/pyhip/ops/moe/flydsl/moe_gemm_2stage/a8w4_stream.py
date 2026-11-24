@@ -75,6 +75,18 @@ def _uniform(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
 
 
+def _atomic_add_bf16x2_if(cond, base, offset, word):
+    """``*(base + offset) += word`` (two BF16, one agent-scope atomic, no return) on the lanes where ``cond``."""
+    loc = ir.Location.unknown()
+    if_op = scf.IfOp(_raw(cond), [], has_else=False, loc=loc)
+    with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+        pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), (base + fx.Int64(offset)).ir_value())
+        pair = Vec.from_elements([fx.Int32(word)], fx.Int32).bitcast(fx.BFloat16)
+        llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, pointer, _raw(pair), llvm.AtomicOrdering.monotonic,
+                         syncscope="agent", alignment=4)
+        scf.YieldOp([], loc=loc)
+
+
 def _f32(word):
     return fx.Uint32(word).bitcast(fx.Float32)
 
@@ -282,12 +294,14 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     KB, KQ = K // 64, a8w4.delta_dwords(K)
     W_BYTES, D_BYTES = a8w4.weight_bytes(N, K), a8w4.delta_bytes(N, K)
     UP = I // 16
-    # Several waves share the block's activations through LDS: each lane loads LOADER bytes per 64-K step.
+    # Several waves share the block's activations through LDS: each lane of the first LOADERS waves loads
+    # LOADER bytes per 64-K step; with more waves the rest write a scratch slot that nobody reads.
     SHARE = SHARE and W > 1
     SLOT = BLOCK_M * 64
-    LOADER = SLOT // (64 * W)
+    LOADER = max(4, SLOT // (64 * W))
+    LOADERS = SLOT // (64 * LOADER)
     assert not SHARE or LOADER in (4, 8, 16), f"BLOCK_M={BLOCK_M} with W={W} waves: {LOADER} bytes per lane"
-    ACT_LDS = 2 * SLOT if SHARE else 0
+    ACT_LDS = 2 * SLOT + (64 * LOADER if LOADERS < W else 0) if SHARE else 0
 
     def silu_mul(S, block, acc, rbs, lane, expert, M, p_w_scale, p_x_scale):
         """SiLU(gate) * up per [gate block j][sub-block s] (4 channels of one row per lane), as ``a8w4_gemm1``."""
@@ -378,6 +392,10 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
             token = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(ld_row * 4), _raw(token)))
             ld_voff = (ld_sub < S).select(token * K + (within & 63), fx.Int32(_DROP))
             ld_lds = act_lds + ld_sub * 1024 + ld_row * 64 + ((ld_chunk ^ ((ld_row >> 1) & 3)) << 4) + (within & 15)
+            ld_slots = [ld_lds + p * SLOT for p in range(2)]
+            if LOADERS < W:
+                scratch = act_lds + 2 * SLOT + lane * LOADER
+                ld_slots = [(wave < LOADERS).select(a, scratch) for a in ld_slots]
             row = lane & 15
             rd_lds = act_lds + row * 64 + (((lane >> 4) ^ ((row >> 1) & 3)) << 4)
 
@@ -385,7 +403,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 return _load(x_rsrc, ld_voff, kb * 64, LOADER // 4)
 
             def write_a(kb, words):
-                _lds_store(ld_lds + (kb % 2) * SLOT, words)
+                _lds_store(ld_slots[kb % 2], words)
 
             def read_a(kb):
                 xs = [_lds_load4(rd_lds + (kb % 2) * SLOT + s * 1024) for s in range(S)]
@@ -600,13 +618,239 @@ def compile_route_sum(topk, cols):
     return launch
 
 
+# Routes placed by each sorting workgroup of ``compile_stream_prep`` (one per thread) and routes histogrammed per
+# round trip (four 16-byte loads of ids per thread).
+_PREP_RANGE = 256
+_PREP_ROUND = 4096
+
+
+def stream_prep_sizes(M, TOPK, E, BM):
+    """``(sorting workgroups, sorted-row capacity, block capacity)`` of ``compile_stream_prep`` for M tokens: an
+    expert with c routes takes ceil(c / BM) <= (c + BM - 1) / BM blocks, over at most min(E, routes) experts."""
+    routes = M * TOPK
+    blocks = (routes + min(E, routes) * (BM - 1)) // BM
+    return -(-routes // _PREP_RANGE), blocks * BM, blocks
+
+
+def _lds_word(address):
+    return fx.Int32(llvm.load(fx.Int32.ir_type, _lds(address), alignment=4))
+
+
+def _lds_put(address, value):
+    llvm.store(fx.Int32(value).ir_value(), _lds(address), alignment=4)
+
+
+def _lds_inc(address):
+    """LDS ``atomicAdd(address, 1)``, returning the previous value."""
+    return fx.Int32(llvm.AtomicRMWOp(llvm.AtomicBinOp.add, _lds(address), fx.Int32(1).ir_value(),
+                                     llvm.AtomicOrdering.monotonic, syncscope="workgroup", alignment=4).result)
+
+
+def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
+    """Build the streaming path's prep launcher: the moe_sorting of ``BM``-row blocks and the FP8 input rows (with
+    ``ZERO`` also a zeroed output) in one launch.
+
+    Launch arguments: topk_ids int32 [M, TOPK], topk_weight f32 [M, TOPK], x BF16 [M, H] (``H % 512 == 0``),
+    sorted_ids int32 [rows], sorted_weights f32 [rows], sorted_expert_ids int32 [rows / BM], num_valid int32 [2],
+    loc_ids int32 [M, TOPK], xq FP8 [M, H], xs f32 [M], out BF16 [M, H], then M, the sorting workgroups and rows
+    of ``stream_prep_sizes``, stream.
+
+    Sorting (workgroups ``[0, n)``), in aiter moe_sorting's format: sorted_ids ``token | slot << 24`` grouped by
+    expert in ascending order, each expert padded to whole blocks with rows of token M and weight 0;
+    sorted_expert_ids per block; num_valid ``[padded rows, M]``; loc_ids the sorted row of each route (-1 for an
+    expert id outside ``[0, E)``). Every sorting workgroup histograms all routes in LDS, and separately those
+    before its own ``_PREP_RANGE`` routes, so it knows every expert's offset and its own base without talking to
+    the others; it places its routes with LDS atomics (the order within an expert is not deterministic) and
+    writes the padding rows and block experts of experts ``e % n == workgroup``. Every route of a token is kept,
+    repeated expert ids included. Quantization (the other workgroups), the arithmetic of ``a8w4_quant``: with
+    ``QW == 4`` one row per workgroup, the four waves splitting its 512-column chunks and exchanging the amax
+    through LDS (``_fp8_bytes``); with ``QW == 1`` one row per wave (IEEE division per element; fewer workgroups
+    for many rows). With ``ZERO`` the waves also zero their rows of out.
+    """
+    assert H % 512 == 0, f"H={H} must be a multiple of 512"
+    assert BM & (BM - 1) == 0, f"BM={BM} must be a power of two"
+    assert QW in (1, 4)
+    chunks = H // 512
+    LOG_BM = BM.bit_length() - 1
+    EPT = -(-E // 256)  # consecutive experts per thread in the scan
+    ES = 256 * EPT
+    # LDS words: counts, counts before this workgroup's range and cursors, each followed by one dummy slot per
+    # lane (routes that are masked off count there), then the four wave totals of the scan.
+    CNT, BEF, CUR = 0, ES + 64, 2 * (ES + 64)
+    WTOT = 3 * (ES + 64)
+    ZERO_ROUNDS = -(-2 * (ES + 64) // 256)
+    LDS_WORDS = max(WTOT + 4, 256 * ZERO_ROUNDS)
+
+    def histogram(lds, base, tid, lane, R, start, ids_rsrc):
+        first = [base + (tid + 256 * u) * 4 for u in range(_PREP_ROUND // 1024)]
+        words = [_load(ids_rsrc, i * 4, 0, 4) for i in first]
+        for i0, w4 in zip(first, words):
+            for v in range(4):
+                i = i0 + v
+                e = fx.Int32(w4[v])
+                ok = (i < R) & (e >= 0) & (e < E)
+                _lds_inc(lds + ok.select(CNT + e, CNT + ES + lane) * 4)
+                _lds_inc(lds + (ok & (i < start)).select(BEF + e, BEF + ES + lane) * 4)
+
+    def scan(lds, tid, lane, wave):
+        """Per expert of this thread: (routes, padded rows, first sorted row); and all padded rows."""
+        counts = [_lds_word(lds + (CNT + tid * EPT + k) * 4) for k in range(EPT)]
+        padded = [((c + (BM - 1)) >> LOG_BM) << LOG_BM for c in counts]
+        local = padded[0]
+        for p in padded[1:]:
+            local = local + p
+        incl = local
+        for d in (1, 2, 4, 8, 16, 32):
+            other = fx.Int32(rocdl.ds_bpermute(T.i32, _raw((lane - d) * 4), _raw(incl)))
+            incl = incl + (lane >= d).select(other, fx.Int32(0))
+        _lds_put(lds + (lane == 63).select(WTOT + wave, CNT + ES + lane) * 4, incl)
+        gpu.barrier()
+        totals = [_lds_word(lds + (WTOT + w) * 4) for w in range(4)]
+        offset = incl - local
+        for w in range(3):
+            offset = offset + (wave > w).select(totals[w], fx.Int32(0))
+        offsets = []
+        for k in range(EPT):
+            offsets.append(offset)
+            offset = offset + padded[k]
+            e = tid * EPT + k
+            _lds_put(lds + (CUR + e) * 4, offsets[k] + _lds_word(lds + (BEF + e) * 4))
+        return counts, padded, offsets, totals[0] + totals[1] + totals[2] + totals[3]
+
+    def scatter(lds, tid, lane, R, start, ids, weights, sid_rsrc, sw_rsrc, loc_rsrc):
+        i = start + tid
+        e = fx.Int32(ids)
+        ok = (i < R) & (e >= 0) & (e < E)
+        pos = _lds_inc(lds + ok.select(CUR + e, CUR + ES + lane) * 4)
+        token = i // TOPK
+        row = ok.select(pos * 4, fx.Int32(_DROP))
+        _store(sid_rsrc, [fx.Uint32(token | ((i - token * TOPK) << 24))], row)
+        _store(sw_rsrc, [weights], row)
+        _store(loc_rsrc, [fx.Uint32(ok.select(pos, fx.Int32(-1)))], (i < R).select(i * 4, fx.Int32(_DROP)))
+
+    def quant(lds, q, lane, wave, M, p_x, p_xq, p_xs, p_out):
+        """Workgroup ``q`` of the quantization: row q split over the four waves (``QW == 4``, amax through LDS),
+        or rows 4q .. 4q+3, one per wave."""
+        in_rsrc = _rsrc(_address(p_x), M * (H * 2))
+        if QW == 4:
+            row, first = q, (wave == 0) & (lane == 0)
+            mine = [(wave + 4 * j, wave + 4 * j < chunks) for j in range(-(-chunks // 4))]
+        else:
+            row = q * 4 + wave
+            first = (row < M) & (lane == 0)
+            mine = [(c, row < M) for c in range(chunks)]
+        values = []
+        for c, ok in mine:
+            for word in _load(in_rsrc, ok.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)), 0, 4):
+                values.append((word << 16).bitcast(fx.Float32))
+                values.append((word & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
+        peak = _lanes_max(_abs_bits_max(values), (32, 16, 8, 4, 2, 1))
+        if QW == 4:
+            _lds_put(lds + wave * 4, peak)
+            gpu.barrier()
+            peaks = [fx.Uint32(_lds_word(lds + w * 4)) for w in range(4)]
+            peak = _umax(_umax(peaks[0], peaks[1]), _umax(peaks[2], peaks[3]))
+        scale = _row_scale(peak.bitcast(fx.Float32))
+        q8 = _fp8_bytes(values, scale) if QW == 4 else [_fp8_byte(v / scale) for v in values]
+        out_rsrc = _rsrc(_address(p_xq), M * H)
+        zero_rsrc = _rsrc(_address(p_out), M * (H * 2))
+        for j, (c, ok) in enumerate(mine):
+            words = [_pack_bytes(q8[j * 8 + h * 4:j * 8 + h * 4 + 4]) for h in range(2)]
+            _store(out_rsrc, words, ok.select(row * H + (c * 64 + lane) * 8, fx.Int32(_DROP)))
+            if ZERO:
+                _store(zero_rsrc, [fx.Uint32(0)] * 4, ok.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)))
+        _store(_rsrc(_address(p_xs), M * 4), [scale.bitcast(fx.Uint32)], first.select(row * 4, fx.Int32(_DROP)))
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def a8w4_stream_prep(
+        p_ids: fx.Pointer,
+        p_w: fx.Pointer,
+        p_x: fx.Pointer,
+        p_sid: fx.Pointer,
+        p_sw: fx.Pointer,
+        p_se: fx.Pointer,
+        p_nv: fx.Pointer,
+        p_loc: fx.Pointer,
+        p_xq: fx.Pointer,
+        p_xs: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+        n_sort: fx.Int32,
+        rows: fx.Int32,
+    ):
+        tid = fx.Int32(gpu.thread_id("x"))
+        lane = tid & 63
+        wave = _uniform(tid >> 6)
+        wg = fx.Int32(gpu.block_id("x"))
+        lds = _lds_base(LDS_WORDS * 4)
+        if wg < n_sort:
+            R = M * TOPK
+            start = wg * _PREP_RANGE
+            ids_rsrc = _rsrc(_address(p_ids), (R * 4 + 15) & -16)
+            w_rsrc = _rsrc(_address(p_w), (R * 4 + 15) & -16)
+            sid_rsrc = _rsrc(_address(p_sid), rows * 4)
+            sw_rsrc = _rsrc(_address(p_sw), rows * 4)
+            se_rsrc = _rsrc(_address(p_se), (rows >> LOG_BM) * 4)
+            own_ids = _load(ids_rsrc, (start + tid) * 4, 0, 1)[0]
+            own_weights = _load(w_rsrc, (start + tid) * 4, 0, 1)[0]
+            for j in range_constexpr(ZERO_ROUNDS):
+                _lds_put(lds + (tid + 256 * j) * 4, 0)
+            gpu.barrier()
+            for base in range(fx.Int32(0), R, fx.Int32(_PREP_ROUND)):
+                histogram(lds, base, tid, lane, R, start, ids_rsrc)
+            gpu.barrier()
+            counts, padded, offsets, total = scan(lds, tid, lane, wave)
+            gpu.barrier()
+            scatter(lds, tid, lane, R, start, own_ids, own_weights, sid_rsrc, sw_rsrc, _rsrc(_address(p_loc), R * 4))
+            for k in range_constexpr(EPT):
+                expert = tid * EPT + k
+                owned = (expert < E) & (expert - (expert // n_sort) * n_sort == wg)
+                b0 = offsets[k] >> LOG_BM
+                b1 = b0 + owned.select(padded[k] >> LOG_BM, fx.Int32(0))
+                for b in range(b0, b1):
+                    _store(se_rsrc, [fx.Uint32(expert)], b * 4)
+                p0 = offsets[k] + counts[k]
+                p1 = owned.select(offsets[k] + padded[k], p0)
+                for p in range(p0, p1):
+                    _store(sid_rsrc, [fx.Uint32(M)], p * 4)
+                    _store(sw_rsrc, [fx.Uint32(0)], p * 4)
+            _store(_rsrc(_address(p_nv), 8), [fx.Uint32(total), fx.Uint32(M)],
+                   ((wg == 0) & (tid == 0)).select(fx.Int32(0), fx.Int32(_DROP)))
+        else:
+            quant(lds, wg - n_sort, lane, wave, M, p_x, p_xq, p_xs, p_out)
+
+    @flyc.jit
+    def launch(
+        p_ids: fx.Pointer,
+        p_w: fx.Pointer,
+        p_x: fx.Pointer,
+        p_sid: fx.Pointer,
+        p_sw: fx.Pointer,
+        p_se: fx.Pointer,
+        p_nv: fx.Pointer,
+        p_loc: fx.Pointer,
+        p_xq: fx.Pointer,
+        p_xs: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+        n_sort: fx.Int32,
+        rows: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        a8w4_stream_prep(p_ids, p_w, p_x, p_sid, p_sw, p_se, p_nv, p_loc, p_xq, p_xs, p_out, M, n_sort, rows).launch(
+            grid=(n_sort + (M if QW == 4 else (M + 3) // 4), 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch
+
+
 def down_stream_lds(K, BLOCK_M, W=1, SHARE=True):
     """LDS bytes of ``compile_a8w4_down_stream``: 1 KiB of channel factors per wave, plus with ``SHARE``
     and ``W > 1`` the block's activation rows (stride ``K + 16``) and one 16-byte slot per lane."""
     return W * 1024 + (BLOCK_M * (K + 16) + W * 64 * 16 if SHARE and W > 1 else 0)
 
 
-def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHARE=True, E=None):
+def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHARE=True, E=None, ATOMIC=False):
     """Build the streaming A8W4 Down launcher.
 
     ``N`` = hidden (``N % (16 * R * W) == 0``, ``R <= 16``), ``K`` = padded I (``K % 64 == 0``),
@@ -616,11 +860,17 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
     M, task_num, stream. The wave's ``R * 16`` channel factors are staged in LDS with one 16-byte load
     per lane; each sub-block accumulates in two MFMA chains (the two MMAs of every 64-K step). With
     ``SHARE`` and ``W > 1`` the waves of a workgroup load the block's activation rows once into LDS.
+    With ``ATOMIC`` (``R`` even) out is BF16 [M, N], zeroed by the caller, and each route is added into its
+    token's row with agent-scope BF16x2 atomics: the MFMA takes the rows as A, so lane ``16b + j`` holds
+    channel j of rows ``4b .. 4b+3``; after two 16-channel blocks neighbouring lanes swap values so that the
+    even lane holds a channel pair of the first block and the odd lane the same pair of the second, and one
+    atomic instruction covers 64 contiguous bytes of four rows.
     """
     assert K % 64 == 0, f"Down K={K} must be a multiple of 64"
     assert N % (16 * R * W) == 0, f"Down N={N} must be a multiple of {16 * R * W}"
     assert BLOCK_M in (16, 32, 64), f"BLOCK_M={BLOCK_M} must be 16, 32 or 64"
     assert R <= 16, "one 16-byte load per lane stages at most 16 blocks of channel factors"
+    assert not ATOMIC or R % 2 == 0, "atomic adds pair the 16-channel blocks"
     KB, KQ = K // 64, a8w4.delta_dwords(K)
     P = min(PREFETCH, R)
     W_BYTES, D_BYTES = a8w4.weight_bytes(N, K), a8w4.delta_bytes(N, K)
@@ -711,6 +961,16 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
         for r, p in zip(route, block.position):
             a_scale = _f32(_load(xs_rsrc, r * 4, 0, 1)[0])
             row_scale.append(a_scale * _f32(_load(sw_rsrc, p * 4, 0, 1)[0]))
+        if ATOMIC:
+            # Rows 4b .. 4b+3 of lane 16b + j (the MFMA's C layout with the rows as A).
+            src = [((lane >> 4) * 4 + v) * 4 for v in range(4)]
+            row_token = [[fx.Int32(rocdl.ds_bpermute(T.i32, _raw(src[v]), _raw(block.token[s]))) for v in range(4)]
+                         for s in range(S)]
+            row_factor = [[fx.Uint32(rocdl.ds_bpermute(T.i32, _raw(src[v]), _raw(row_scale[s].bitcast(fx.Uint32))))
+                           .bitcast(fx.Float32) for v in range(4)] for s in range(S)]
+            even = (lane & 1) == 0
+            out_base = _address(p_out)
+            held = None
         deltas = {0: resolve(stages[0][1])}
         for r in range(R):
             if r + P < R:
@@ -726,7 +986,30 @@ def compile_a8w4_down_stream(*, N, K, TOPK, BLOCK_M, R=16, W=1, PREFETCH=4, SHAR
                 for c in range(2):
                     op = _decode(w[kb][c], lut)
                     for s in range(S):
-                        acc[c][s] = _mfma(op, acts[s][kb][c], acc[c][s])
+                        if ATOMIC:
+                            acc[c][s] = _mfma(acts[s][kb][c], op, acc[c][s])
+                        else:
+                            acc[c][s] = _mfma(op, acts[s][kb][c], acc[c][s])
+            if ATOMIC:
+                ws = fx.Float32(llvm.load(fx.Float32.ir_type, _lds(region + (r * 16 + (lane & 15)) * 4), alignment=4))
+                values = []
+                for s in range(S):
+                    total = acc[0][s] + acc[1][s]
+                    values.append([(total[v] * ws) * row_factor[s][v] for v in range(4)])
+                if r % 2 == 0:
+                    held = values
+                else:
+                    channel = (rb0 + r - 1 + (lane & 1)) * 16 + (lane & 14)
+                    for s in range(S):
+                        for v in range(4):
+                            first, second = held[s][v], values[s][v]
+                            other = fx.Float32(even.select(second, first)).shuffle_xor(1, 64)
+                            word = _bf16_pair(fx.Float32(even.select(first, other)),
+                                              fx.Float32(even.select(other, second)))
+                            _atomic_add_bf16x2_if(row_token[s][v] < M, out_base,
+                                                  (row_token[s][v] * N + channel) * 2, word)
+                rocdl.sched_barrier(0)
+                continue
             ws = Vec(llvm.load(ir.VectorType.get([4], fx.Float32.ir_type), _lds(region + (r * 16 + quad) * 4),
                                alignment=16))
             channel = (rb0 + r) * 16 + quad

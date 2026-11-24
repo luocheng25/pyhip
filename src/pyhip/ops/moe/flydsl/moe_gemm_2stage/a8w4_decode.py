@@ -194,13 +194,16 @@ def _wave_index(tid):
     return fx.Int32(rocdl.readfirstlane(T.i32, _raw(tid // 64)))
 
 
-def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False):
-    """Launcher ``(x, x_scale, topk_ids, w, w_delta, w_scale, out, M, stream)``.
+def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None):
+    """Launcher ``(x, x_scale, topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``.
 
     ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``).
     x BF16 [M, K] quantized per row inside the kernel (``x_scale`` unused), or with ``PREQUANT``
     FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK]; w / w_delta in the ``a8w4_common``
-    layout; w_scale f32 [E, N]; out f32 [M, TOPK, I].
+    layout; w_scale f32 [E, N]; out f32 [M, TOPK, I]. ``PLAN = (GROUP, MAX_M, ZERO_COLS)``: the workgroups
+    of channel block 0 also write the expert-dedup plan entry of their route (``a8w4_decode_dedup``, plan
+    int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its share of its token's row of y BF16
+    [M, ZERO_COLS], for ``a8w4_decode_dedup.compile_a8w4_down_decode_dd``; without ``PLAN`` plan / y are unused.
     """
     I = N // 2
     assert I % 16 == 0 and K % 512 == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
@@ -214,6 +217,15 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False):
     assert X_CHUNKS <= 256
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
+    if PLAN is not None:
+        from .a8w4_decode_dedup import _plan_route
+        from .a8w4_stream import _address, _rsrc
+
+        GROUP, MAX_M, ZERO_COLS = PLAN
+        SEGS = (MAX_M * TOPK + 63) // 64
+        ZERO_PIECES = ZERO_COLS // 8  # 16-byte pieces of a y row
+        ZPW = (ZERO_PIECES + NJ * TOPK - 1) // (NJ * TOPK)  # of them zeroed per workgroup
+        assert ZERO_COLS % 8 == 0 and ZPW <= 256
 
     @fx.struct
     class SharedStorage:
@@ -231,6 +243,8 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False):
         p_w_delta: fx.Pointer,
         p_w_scale: fx.Pointer,
         p_out: fx.Pointer,
+        p_plan: fx.Pointer,
+        p_y: fx.Pointer,
         M: fx.Int32,
     ):
         tid = gpu.thread_idx.x
@@ -350,6 +364,17 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False):
             tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
             out = fx.make_view(fxh._as_ptr(p_out, fx.Float32) + fx.Int64(route) * I, fx.make_layout(I, 1))
             out[channel] = (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
+        if const_expr(PLAN is not None):
+            # This workgroup's share of the token's y row, then (channel block 0, wave 0) the route's plan entry.
+            y_row = _global_ptr(p_y, fx.Int64, 16) + fx.Int64(token) * (ZERO_COLS // 4)
+            piece = (fx.Int32(route % TOPK) * NJ + fx.Int32(j)) * ZPW + fx.Int32(tid)
+            if (fx.Int32(tid) < ZPW) & (piece < ZERO_PIECES):
+                fx.ptr_store(fx.full(2, 0, fx.Int64), y_row + piece * 2)
+            if (fx.Int32(j) == 0) & (wave == 0):
+                routes = M * TOPK
+                _plan_route(fx.Int32(route), fx.Int32(lane), routes, _rsrc(_address(p_ids), routes * 4),
+                            fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids)), _rsrc(_address(p_plan), routes * 16),
+                            SEGS, GROUP)
 
     @flyc.jit
     def launch(
@@ -360,12 +385,14 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False):
         p_w_delta: fx.Pointer,
         p_w_scale: fx.Pointer,
         p_out: fx.Pointer,
+        p_plan: fx.Pointer,
+        p_y: fx.Pointer,
         M: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
         a8w4_gateup_decode(
-            p_x, p_x_scale, p_ids, p_weight, p_w_delta, p_w_scale, p_out, M,
+            p_x, p_x_scale, p_ids, p_weight, p_w_delta, p_w_scale, p_out, p_plan, p_y, M,
         ).launch(grid=(NJ, M * TOPK, 1), block=(256, 1, 1), stream=stream)
 
     return launch

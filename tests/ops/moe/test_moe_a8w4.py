@@ -68,7 +68,8 @@ def _gpu_environment(monkeypatch):
 # kernel 内量化）；M>32 且每个 expert 平均不超过 22 行（E=33 时 M≤66）的流式路径（TP2 M=64：排序块 32，
 # Gate/Up 尾部量化中间激活）；其余走 prefill（TP2 M=1031；TP4 M=257，I=160 由 prepare 补零到 192）。
 # prefill 的例子含多块 expert 与部分填充的尾块。MiMo 形状（H=4096、E=256、topk=8，无 shared expert、均匀路由）
-# 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1100。
+# 各取一例：TP8（I=256）decode M=5 与流式 M=300，TP4（I=512）decode M=24 与 prefill M=1100（MiMo 的 decode 按 expert
+# 去重：M=5 两个 kernel、M=24 四个 kernel）。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -226,11 +227,12 @@ def test_fp8_prefill_bf16(kernels):
 # 只放区域 1 与 bench（区域 5 的性能测试）覆盖不了的情况，每个测试的 docstring 写明原因（docstring 里的“基本测试”指区域 1）。端到端判据
 # 与区域 1 相同（参考的激活精度按实际启动的 kernel 选择）；逐位用例要求 0 误差。部分填充的尾块、多块 expert 与
 # I=160→192 补零已由区域 1 覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
-# M≤32 的 decode 路径：核内量化（M=3）由区域 1、三种分派由 bench（M=1、2、4…32）覆盖，这里只测分派交界、topk 与
-# 路由输入的变体、CUDA graph、decode 行量化逐位与 w2≥4 GiB 回退（用例名带 ``decode``）。M>32 且每个 expert 平均
-# 不超过 22 行的流式路径：排序块 32 由区域 1、16 / 32 由 bench 覆盖，这里只测与 prefill 的交界、两处量化逐位
-# （用例名带 ``stream``）以及 grid 收缩与 graph。prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体
-# 的交界、tile 参数与 graph。非目标形状的回退见 ``test_shape_fallbacks``。
+# M≤32 的 decode 路径：Qwen 的核内量化（M=3）与 MiMo 的按 expert 去重（M=5 / 24）由区域 1、各分派由 bench（M=1、2、
+# 4…32，MiMo 另有 48）覆盖，这里只测分派交界、topk 与路由输入的变体、CUDA graph、行量化与去重计划逐位、w2≥4 GiB
+# 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行的流式路径：排序块 32 由区域 1、16 / 32 由 bench
+# 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位（用例名带 ``stream``）以及 grid 收缩与 graph。
+# prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数与 graph。非目标形状的回退见
+# ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 # decode 三种分派（x、mid 是否先用独立 kernel 预量化）各自的 Gate/Up 与 Down kernel。
@@ -442,16 +444,72 @@ def test_decode_row_quant_bitexact(dtype, cols):
     assert torch.equal(q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8))
 
 
-@pytest.mark.parametrize("cols", [512, 2560])
-def test_stream_row_quant_bitexact(cols):
-    """流式路径的输入量化 kernel（a8w4_row_quant_bf16：每 wave 一行，16 B 读、8 B 写）与 a8w4_quant、参考逐位一致
-    （q 字节与 scale 位），且不写 rows 以外的行。
+def test_decode_plan_quant_bitexact():
+    """按 expert 去重的 decode 的计划 kernel（a8w4_row_quant_plan：每行 4 个 wave 分片量化 x、amax 经 LDS 合并，同一次 launch
+    写去重计划并把 out 的行清零）：xq / xs 与 a8w4_quant、参考逐位一致，out 的前 rows 行清零，rows 以外的行不写；计划的条数与
+    组员与按定义算的相同（每个 expert 的路由按路由号每 3 条一组，组首记条数与组内各路由，其余条数为 0；条数以外的字不读，不查）。
 
-    特殊行：全零、次正规 scale（amax/240 < 2^-126）、-0 与舍入成 -0 的负数（存 +0）、商恰为 FP8 舍入中点（RNE 取偶）；
-    512 列每 lane 一片、2560 列五片；37 行（最后一个 WG 只有 1 行）。端到端判据看不出少量 fp8 翻转，
-    基本测试与 bench 只有随机数据。
+    特殊行同 test_decode_row_quant_bitexact（全零、次正规 scale、-0 与舍入成 -0 的负数）；H=4096（去重只用于这个 H），
+    37 行 × topk 8 = 296 条路由落在 40 个 expert 上，按 M≤64 规划（8 段 64 条路由的 ballot），组员跨段、尾组不满都会出现。
+    端到端判据看不出少量 fp8 翻转；计划出错多数会让端到端失败，但跨段与尾组不满的组合随机路由未必碰到。
     """
-    rows, guard = 37, 3
+    rows, guard, cols, group = 37, 3, MIMO_HIDDEN, 3
+    gen = torch.Generator(device="cuda").manual_seed(87)
+    x = torch.randn((rows, cols), generator=gen) * 3
+    x[1].zero_()
+    x[3] *= 1e-38
+    x[4].zero_()
+    x[4, 0] = 200.0
+    x[4, 1:9] = -1e-6
+    x[4, 9] = -0.0
+    x = x.to(torch.bfloat16)
+    _, _, topk_ids = oracle.make_inputs(rows, 512, 40, MIMO_TOPK, seed=88, shared=False)
+    q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
+    scale = torch.full((rows + guard,), -1.0)
+    plan = torch.full((rows * MIMO_TOPK, 4), -1, dtype=torch.int32)
+    out = torch.full((rows + guard, cols), float("nan"), dtype=torch.bfloat16)
+    moe_a8w4._launch("a8w4_row_quant_plan_decode", moe_a8w4._row_quant_plan(cols, MIMO_TOPK, group, 64), x,
+                     q.view(torch.float8_e4m3fnuz), scale, topk_ids, plan, out, rows)
+    assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
+    assert bool((out[:rows] == 0).all()) and bool(out[rows:].isnan().all())
+    q0, scale0 = moe_a8w4._quantize(x, rows, cols, "bf16")
+    assert torch.equal(q[:rows], q0.view(torch.uint8))
+    assert torch.equal(scale[:rows].view(torch.int32), scale0.view(torch.int32))
+    xf = x.float()
+    amax = xf.abs().amax(-1, keepdim=True)
+    ref_scale = amax / torch.full_like(amax, 240.0)
+    ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
+    assert float(ref_scale[3]) < 2.0 ** -126
+    assert torch.equal(q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8))
+    ids = topk_ids.flatten().tolist()
+    full = partial = 0
+    for r, e in enumerate(ids):
+        same = [s for s, f in enumerate(ids) if f == e]
+        rank = same.index(r)
+        count = min(group, len(same) - rank) if rank % group == 0 else 0
+        entry = plan[r].tolist()
+        assert entry[:2] == [count, r] and entry[1:1 + count] == same[rank:rank + count], (r, entry)
+        full += count == group
+        partial += 0 < count < group
+    assert full and partial
+
+
+@pytest.mark.parametrize("cols, qw", [(512, 4), (2560, 4), (2560, 1), (4096, 4)],
+                         ids=["h512_qw4", "h2560_qw4", "h2560_qw1", "h4096_qw4"])
+def test_stream_row_quant_bitexact(cols, qw):
+    """流式路径的 prep kernel（a8w4_stream_prep：一次 launch 排序、量化输入并清零 out）：量化与 a8w4_quant、参考逐位一致
+    （q 字节与 scale 位），out 的前 rows 行清零，rows 以外的行一律不写；排序合 aiter moe_sorting 的格式（每条路由的 loc_ids
+    指向自己的排序行，expert 升序、各补到整块，填充行 token=M、权重 0，num_valid=[补齐后的行数, M]）。
+
+    量化的两种分工都测：QW=4 每 WG 一行、4 个 wave 分 512 列块（H512 只有 wave 0 有数据，H2560 的 5 块不均分），amax 经 LDS
+    交换，倒数乘法 + 1∓2^-20 夹逼、靠近舍入边界或 scale 非正规时回退 IEEE 除法；QW=1 每 wave 一行、逐元素 IEEE 除法（分派对
+    H2560 且 M>256 用）。特殊行：全零、次正规 scale、-0 与舍入成 -0 的负数（存 +0）、商恰为舍入中点（scale 2^-2）、scale 7/32
+    下直接乘倒数会舍错的中点；37 行（QW=1 的最后一个 WG 只有 1 行）。E=513、topk=11：2 个排序 WG，每线程管 3 个 expert。
+    端到端判据看不出少量 fp8 翻转；基本测试与 bench 只有随机数据，也不查排序格式。
+    """
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.a8w4_stream import stream_prep_sizes
+
+    rows, guard, experts, block_m = 37, 3, 513, 16
     gen = torch.Generator(device="cuda").manual_seed(85)
     x = torch.randn((rows, cols), generator=gen) * 3
     x[1].zero_()
@@ -465,12 +523,27 @@ def test_stream_row_quant_bitexact(cols):
     tie = (torch.randint(8, 16, (cols,), generator=gen).float() + 0.5) * torch.exp2(exponent)
     x[4] = torch.where(torch.rand((cols,), generator=gen) < 0.5, -tie, tie) * 0.25
     x[4, 0] = 60.0
+    # 第 5 行 scale = 52.5/240 = 7/32，其余元素的商恰为舍入中点：直接乘倒数会舍错（同 test_row_quant_bitexact）。
+    tie7 = torch.arange(23, 32, 2).float().view(-1, 1) / 16 * torch.exp2(torch.arange(-6, 7).float())
+    tie7 = torch.cat([tie7.flatten(), -tie7.flatten()]) * (7 / 32)
+    x[5] = tie7.repeat(cols // tie7.numel() + 1)[:cols]
+    x[5, 0] = 52.5
     x = x.to(torch.bfloat16)
+    _, topk_weight, topk_ids = oracle.make_inputs(rows, 512, experts, TOPK, seed=86)
+    n_sort, capacity, blocks = stream_prep_sizes(rows, TOPK, experts, block_m)
+    sorted_ids = torch.full((capacity,), -1, dtype=torch.int32)
+    sorted_weights = torch.full((capacity,), -1.0)
+    sorted_experts = torch.full((blocks,), -1, dtype=torch.int32)
+    num_valid = torch.full((2,), -1, dtype=torch.int32)
+    loc_ids = torch.full((rows, TOPK), -2, dtype=torch.int32)
     q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
     scale = torch.full((rows + guard,), -1.0)
-    moe_a8w4._launch("a8w4_row_quant_bf16", moe_a8w4._stream_quant_kernel(cols), x, q.view(torch.float8_e4m3fnuz),
-                     scale, rows)
+    out = torch.full((rows + guard, cols), float("nan"), dtype=torch.bfloat16)
+    moe_a8w4._launch("a8w4_stream_prep", moe_a8w4._stream_prep_kernel(cols, TOPK, experts, block_m, True, qw),
+                     topk_ids, topk_weight, x, sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids,
+                     q.view(torch.float8_e4m3fnuz), scale, out, rows, n_sort, capacity)
     assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
+    assert bool((out[:rows] == 0).all()) and bool(out[rows:].isnan().all())
     q0, scale0 = moe_a8w4._quantize(x, rows, cols, "bf16")
     assert torch.equal(q[:rows], q0.view(torch.uint8))
     assert torch.equal(scale[:rows].view(torch.int32), scale0.view(torch.int32))
@@ -478,9 +551,25 @@ def test_stream_row_quant_bitexact(cols):
     amax = xf.abs().amax(-1, keepdim=True)
     ref_scale = amax / torch.full_like(amax, 240.0)
     ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
-    assert float(ref_scale[2]) < 2.0 ** -126 and float(ref_scale[4]) == 0.25
+    assert float(ref_scale[2]) < 2.0 ** -126 and float(ref_scale[4]) == 0.25 and float(ref_scale[5]) == 7 / 32
     assert torch.equal(scale[:rows].view(-1, 1), ref_scale)
-    assert torch.equal(q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8))
+    exact = (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    naive = (xf * (torch.ones_like(ref_scale) / ref_scale)).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    assert torch.equal(q[:rows], exact) and bool((exact[5] != naive[5]).any())
+    counts = torch.bincount(topk_ids.flatten().long(), minlength=experts)
+    padded = (counts + block_m - 1) // block_m * block_m
+    total = int(padded.sum())
+    assert num_valid.tolist() == [total, rows]
+    loc = loc_ids.flatten().long()
+    route = torch.arange(rows * TOPK, dtype=torch.int32)
+    assert torch.equal(sorted_ids[loc], (route // TOPK) | ((route % TOPK) << 24))
+    assert torch.equal(sorted_weights[loc], topk_weight.flatten())
+    assert torch.equal(sorted_experts[loc // block_m], topk_ids.flatten())
+    assert torch.equal(sorted_experts[:total // block_m],
+                       torch.repeat_interleave(torch.arange(experts, dtype=torch.int32), padded // block_m))
+    filler = torch.ones(total, dtype=torch.bool)
+    filler[loc] = False
+    assert bool((sorted_ids[:total][filler] == rows).all()) and bool((sorted_weights[:total][filler] == 0).all())
 
 
 @pytest.mark.parametrize("inter, block_m", [(320, 32), (160, 64)], ids=["tp2_bm32", "tp4_bm64"])
@@ -554,8 +643,8 @@ def test_decode_topk_variants(topk, tokens, path):
     """topk≠11：topk=8 是偶数，槽对 Down 3 个 wave 两轮、第二轮两个 wave 的槽对整对无效，且 M=16 时 Gate/Up 恰为
     2560 个 WG（按 >= 走预量化）；topk=17 大于 16，核内量化的 Down 改为 4 个 wave 轮流取槽，末轮 3 个槽无效。
 
-    基本测试与 bench 的 Qwen 是 topk=11：槽对只有末对缺高半；MiMo 的 topk=8 也有整对无效的槽对，但 Gate/Up 的 WG 数
-    不在 2560 上；两者都不超过 16，核内量化的 Down 每个槽一个 wave。
+    基本测试与 bench 的 Qwen 是 topk=11：槽对只有末对缺高半；MiMo 的 topk=8 走按 expert 去重的 decode（M=1 用单槽 Down），
+    不经过槽对 Down；两者都不超过 16，核内量化的 Down 每个槽一个 wave。
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = oracle.make_inputs(tokens, HIDDEN, 33, topk, seed=94 + topk)
@@ -599,13 +688,96 @@ def test_decode_down_fallback_w2_4gib():
     oracle.assert_close(out, ref)
 
 
+# 按 expert 去重的 decode（H=4096、I_pad%128==0、M≥2）的两种分派：M·I_pad 小时两个 kernel（逐路由 Gate/Up 顺带写计划并清零
+# out，Down 在 WG 内量化 mid），其余四个 kernel（x 行量化 + 计划 + 清零 → 去重 Gate/Up → mid 行量化 → 去重 Down）。
+_DEDUP_PATHS = {
+    "dd2": ["a8w4_gateup_decode_plan", "a8w4_down_decode_dd"],
+    "dd4": ["a8w4_row_quant_plan_decode", "a8w4_gateup_decode_dd", "a8w4_row_quant_decode", "a8w4_down_decode_dd"],
+}
+
+
+@functools.cache
+def _mimo_small_weights(inter):
+    """去重 decode 用例共用的 MiMo 形状权重（H=4096、topk=8 用），E 缩到 12：每个 expert 平均分到 2M/3 条路由。"""
+    w = oracle.make_weights(12, MIMO_HIDDEN, inter, seed=200 + inter)
+    return w, _a8w4_prepare(w)
+
+
+def _spy_dedup(monkeypatch):
+    """记录去重路径各 kernel 的构建参数（每组路由数、去重 Gate/Up 的 wave 数、Down 是否在 WG 内量化）。"""
+    seen = {}
+
+    def wrap(name, fields):
+        original = getattr(moe_a8w4, name)
+
+        def spy(*args):
+            seen.update({key: args[i] for key, i in fields.items()})
+            return original(*args)
+
+        monkeypatch.setattr(moe_a8w4, name, spy)
+
+    wrap("_gateup_plan_kernel", dict(group=4))
+    wrap("_row_quant_plan", dict(group=2))
+    wrap("_gateup_dd_kernel", dict(group=3, waves=4))
+    wrap("_down_dd_kernel", dict(down_group=3, quant=5))
+    return seen
+
+
+@pytest.mark.parametrize("inter, tokens, path, group, waves", [
+    (256, 2, "dd2", 2, None), (256, 11, "dd2", 2, None), (256, 12, "dd4", 2, 8), (256, 16, "dd4", 2, 8),
+    (256, 17, "dd4", 3, 4), (512, 5, "dd2", 2, None), (512, 6, "dd4", 2, 8), (384, 2, "dd4", 2, 8),
+], ids=["i256_m2", "i256_m11", "i256_m12", "i256_m16", "i256_m17", "i512_m5", "i512_m6", "i384_m2"])
+def test_decode_dedup_dispatch(monkeypatch, inter, tokens, path, group, waves):
+    """按 expert 去重的 decode 各交界的端到端结果、kernel 序列与构建参数：M·I_pad 跨过 3072 时两个 kernel 改为四个
+    （I256 的 M=11/12、I512 的 M=5/6）；M=16/17 每组路由数 2→3、去重 Gate/Up 每 WG 8→4 个 wave；I384（I_pad%256≠0，
+    Down 不能在 WG 内量化）M=2 也走四个 kernel。M=1 一侧（原 decode）由 bench 的 mimo_*_m1 覆盖。
+
+    E 缩到 12（topk=8）：每个 expert 平均分到 2M/3 条路由，组满 2 / 3 条、尾组不满、同一 token 的各条路由分在不同组里原子
+    累加都会出现；MiMo 的 E256 在小 M 时几乎每组只有 1 条路由。bench 的 MiMo 只有 2 的幂与 48，也不断言 kernel 序列；
+    基本测试的 MiMo decode 只有 M=5 / 24。
+    """
+    seen = _spy_dedup(monkeypatch)
+    w, prepared = _mimo_small_weights(inter)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, MIMO_HIDDEN, 12, MIMO_TOPK, seed=210 + tokens, shared=False)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(_DEDUP_PATHS[path])
+    oracle.assert_close(out, ref)
+    assert (seen["group"], seen.get("waves"), seen["down_group"], seen["quant"]) == (group, waves, group, path == "dd2")
+
+
+@functools.cache
+def _mimo_e256_weights():
+    """MiMo TP8 满规模权重（E=256、H=4096、I=256），只给去重 decode 与流式的交界用例。"""
+    w = oracle.make_weights(MIMO_EXPERTS, MIMO_HIDDEN, 256, seed=230)
+    return w, _a8w4_prepare(w)
+
+
+@pytest.mark.parametrize("tokens", [48, 49], ids=["m48", "m49"])
+def test_decode_dedup_stream_boundary(tokens):
+    """M>32 时按 expert 去重的 decode 只在每个 expert 平均不超过 1.5 条路由（2·M·topk ≤ 3E）时继续用：MiMo TP8（E256、
+    topk8、I256）M=48 仍走去重的四个 kernel，M=49 改走流式（自写 prep 排序、排序块 16，Down 原子累加、没有 route_sum）。
+
+    交界由 E 决定，只能用满规模的 E=256；bench 只有 M=48 与 64，也不断言 kernel 序列。
+    """
+    w, prepared = _mimo_e256_weights()
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, MIMO_HIDDEN, MIMO_EXPERTS, MIMO_TOPK, seed=230 + tokens,
+                                                  shared=False)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    if tokens == 48:
+        _assert_path(_DEDUP_PATHS["dd4"])
+    else:
+        _assert_path(["a8w4_stream_prep"] + _stream_path(16, False))
+        assert "a8w4_route_sum" not in moe_a8w4.last_path
+    oracle.assert_close(out, ref)
+
+
 # ── 3.4 流式与 prefill：交界、grid 收缩、tile 参数 ────────────────────────────────────────────────────
 
 def test_grid_shrink_boundary_e513():
     """E=513 满规模下流式 Gate/Up、Down 的 grid 收缩（M·topk <= E 时 task 数取 M·topk）交界两侧：M=46（506）、M=47（517）。
 
     基本测试（E=33 / 256）不在交界上；bench 在 33–63 只有 M=48（528 条路由 > E，不收缩，与 M=47 同侧）。这两个 M 的路由数
-    少于 4E/3，排序块取 32（aiter 对 block 16 会换用另一种排序），与 bench 的 M=48 同一路径。
+    少于 4E/3，排序块取 32，与 bench 的 M=48 同一路径。
     """
     w = oracle.make_weights(513, HIDDEN, 320, seed=31)
     prepared = _a8w4_prepare(w)
@@ -737,6 +909,35 @@ def test_decode_graph_replay(tokens, path):
     oracle.assert_close(out, ref)
 
 
+@pytest.mark.parametrize("tokens, path", [(5, "dd2"), (24, "dd4")], ids=["m5_dd2", "m24_dd4"])
+def test_decode_dedup_graph_replay(tokens, path):
+    """按 expert 去重的 decode 两种分派都可被 CUDA graph 捕获并重放：计划、out 清零与原子累加都在被捕获的 kernel 里，
+    重放时按新写入的路由重新规划（路径内分配的 plan / mid / xq 由 graph 持有）。
+
+    基本测试与 bench 都是 eager 调用；test_decode_graph_replay 只测原 decode 的三种分派。
+    """
+    w, prepared = _mimo_small_weights(256)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, MIMO_HIDDEN, 12, MIMO_TOPK, seed=260 + tokens, shared=False)
+    out = torch.empty_like(x)
+    moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)  # 在捕获外编译
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
+    _assert_path(_DEDUP_PATHS[path])
+    x2, topk_weight2, topk_ids2 = oracle.make_inputs(tokens, MIMO_HIDDEN, 12, MIMO_TOPK, seed=261 + tokens,
+                                                     shared=False)
+    x.copy_(x2)
+    topk_weight.copy_(topk_weight2)
+    topk_ids.copy_(topk_ids2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = oracle.reference(x2, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight2, topk_ids2,
+                           activation="fp8")
+    oracle.assert_close(out, ref)
+
+
 # ── 3.6 报错与非目标形状回退 ───────────────────────────────────────────────────────────────────────────
 
 def test_rejects_bad_inputs():
@@ -804,8 +1005,8 @@ def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_r
     （I=1024：排序块 32 放得下，64 放不下，后者若误选共享 tile 会在构建 kernel 时报错；默认分派的流式只到排序块 32，
     这里临时调大 STREAM_MAX_ROWS 让 M=300 走排序块 64）。
 
-    前两类只有目标形状（H=2560 / 4096，I=192–512）：MiMo 的 H=4096 只覆盖 decode 上限的一侧（与 h4096_decode 相同），
-    其余上限碰不到；E=5、topk=2 控制耗时。
+    前两类只有目标形状（H=2560 / 4096，I=192–512）：MiMo 的 H=4096 decode 按 expert 去重（I_pad%128==0），h4096_decode
+    （I=64）测原 decode kernel 在 H 上限的一侧，其余上限碰不到；E=5、topk=2 控制耗时。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage import a8w4_common, a8w4_stream
 
@@ -819,6 +1020,57 @@ def test_shape_fallbacks(monkeypatch, hidden, inter, tokens, path, shared, max_r
     if shared is not None:
         block_m = moe_a8w4._stream_block_m(tokens, 2, 5)
         assert (a8w4_stream.down_stream_lds(inter, block_m, W=4) <= a8w4_common.LDS_BYTES) == shared
+
+
+# ── 3.7 路由与输出的变体：同 token 重复 expert、原地输出 ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("case", ["dedup_m5", "dedup_m24", "stream_atomic", "stream_route_sum"])
+def test_duplicate_ids_keep_every_route(case):
+    """同一 token 的几个槽选同一 expert：按 expert 去重的 decode（两个 / 四个 kernel，同一 token 的几条路由可能落进同一组）
+    与流式路径（自写 prep 排序给每条路由一行；I<512 的 Down 原子累加、I≥512 的 route_sum）都把每个槽各算一次再相加，
+    与逐槽相加的参考一致。
+
+    输入生成的路由互不重复，基本测试与 bench 碰不到；原 decode 的重复见 test_decode_duplicate_and_int64_ids，prefill 的
+    aiter 排序只保留最后一个槽（入口文档「未覆盖」）。
+    """
+    if case.startswith("dedup"):
+        (w, prepared), hidden, experts, topk, shared = _mimo_small_weights(256), MIMO_HIDDEN, 12, MIMO_TOPK, False
+        tokens, path = (5, _DEDUP_PATHS["dd2"]) if case == "dedup_m5" else (24, _DEDUP_PATHS["dd4"])
+    elif case == "stream_atomic":
+        (w, prepared), hidden, experts, topk, shared = _decode_weights(320), HIDDEN, 33, TOPK, True
+        tokens, path = 64, ["a8w4_stream_prep"] + _stream_path(32, True)
+    else:
+        (w, prepared), hidden, experts, topk, shared = _small_weights(512, 1024), 512, 5, 2, True
+        tokens, path = 48, ["a8w4_stream_prep"] + _stream_path(32, False) + ["a8w4_route_sum"]
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, experts, topk, seed=240 + tokens, shared=shared)
+    topk_ids[::2, 1] = topk_ids[::2, 0]
+    if topk > 2:
+        topk_ids[::3, topk - 2] = topk_ids[::3, 0]
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(path)
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("case", ["dedup", "stream"])
+def test_inplace_output(case):
+    """output 就是 hidden_states（原地）：按 expert 去重的 decode 在 M·I 小时本走两个 kernel（逐路由 Gate/Up 一边读 x、
+    一边清零 out，会读到已清零的 x），这时改走四个 kernel（计划 kernel 每行先读完 x 再清零）；流式的 prep 也在同一个
+    WG 里先读完 x 的行再清零 out。结果与按原输入算的参考一致。
+
+    前两类的 output 都另行分配。
+    """
+    if case == "dedup":
+        (w, prepared), hidden, experts, topk, shared = _mimo_small_weights(256), MIMO_HIDDEN, 12, MIMO_TOPK, False
+        tokens, path = 5, _DEDUP_PATHS["dd4"]
+    else:
+        (w, prepared), hidden, experts, topk, shared = _decode_weights(320), HIDDEN, 33, TOPK, True
+        tokens, path = 64, ["a8w4_stream_prep"] + _stream_path(32, True)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, hidden, experts, topk, seed=250 + tokens, shared=shared)
+    ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids, activation="fp8")
+    assert moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=x) is x
+    _assert_path(path)
+    assert oracle.path_activation(moe_a8w4.last_path) == "fp8"
+    oracle.assert_close(x, ref)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
