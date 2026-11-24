@@ -1024,9 +1024,10 @@ def test_decode_dedup_graph_replay(tokens, path):
 
 def test_rejects_bad_inputs():
     """不支持的输入直接报错：权重 / scale dtype、形状、E8M0 的 NaN 码、H 或 I 不对齐、非 BF16 激活、hidden 不匹配，
-    以及 Down 的 BLOCK_M·I_pad 不是 4096 的倍数（BM32 配 I320 / 192，构建 kernel 时报错而不是静默算错）。
+    以及 Down 的 BLOCK_M·I_pad 不是 4096 的倍数（BM32 配 I320 / 192，构建 kernel 时报错而不是静默算错）；
+    swiglu_limit 为负、NaN、±inf 报 ValueError，不是实数报 TypeError，0 与 -0.0 关闭截断（输出与不传逐位相同）。
 
-    基本测试与 bench 只给合法输入，且只用默认 block_m=64。
+    基本测试与 bench 只给合法输入，且只用默认 block_m=64、不传 swiglu_limit。
     """
     from pyhip.ops.moe.flydsl.moe_gemm_2stage.a8w4_gemm2 import compile_a8w4_gemm2
 
@@ -1059,6 +1060,15 @@ def test_rejects_bad_inputs():
         moe_a8w4.fused_moe_a8w4(x.half(), prepared, topk_weight, topk_ids)
     with pytest.raises(ValueError):
         moe_a8w4.fused_moe_a8w4(x[:, :256].contiguous(), prepared, topk_weight, topk_ids)
+    for limit in (-1.0, -1e-30, math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError):
+            moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, swiglu_limit=limit)
+    for limit in ("10", None, 10j, torch.tensor(10.0)):
+        with pytest.raises(TypeError):
+            moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, swiglu_limit=limit)
+    off = moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids)
+    for limit in (0, -0.0):
+        assert torch.equal(moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, swiglu_limit=limit), off)
     for inter in (320, 192):
         with pytest.raises(AssertionError, match="4096"):
             compile_a8w4_gemm2(N=HIDDEN, K=inter, TOPK=TOPK, BLOCK_TILE_SIZE_M=32)

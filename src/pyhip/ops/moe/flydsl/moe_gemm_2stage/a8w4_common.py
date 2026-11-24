@@ -121,6 +121,22 @@ def store_vector(buffer, vector, voffset_bytes, soffset_bytes):
     )
 
 
+def swiglu_clamp(gate, up, limit):
+    """SwiGLU limit of DeepSeek-V4.1 on the dequantized f32 gate / up values: ``min(gate, limit)`` and
+    ``up`` clamped to ``[-limit, limit]`` (NaN-ignoring min / max). ``limit`` is a compile-time constant;
+    0 returns the values unchanged and emits no instructions."""
+    if limit <= 0:
+        return gate, up
+    top = fx.Float32(limit)
+    return fx.minnumf(gate, top), fx.minnumf(fx.maxnumf(up, fx.Float32(-limit)), top)
+
+
+def swiglu_kernel_name(base, limit):
+    """Kernel symbol of a Gate/Up kernel: FlyDSL's default (``<base>_0``) without a SwiGLU limit, ``<base>_swiglu``
+    with one."""
+    return f"{base}_swiglu" if limit > 0 else None
+
+
 def lane_offsets(tid, K):
     """Loop-invariant per-lane byte offsets ``(weight, delta)`` of a wave's 16-row block.
 

@@ -275,7 +275,7 @@ def _block_head(blk, block_m, M, lane, p_sorted_ids, p_sorted_experts, p_num_val
 
 
 def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4), QUANT=False, SHARE=True,
-                               E=None, SYNC=1, W_AUX=0):
+                               E=None, SYNC=1, W_AUX=0, SWIGLU_LIMIT=0.0):
     """Build the streaming A8W4 Gate/Up launcher.
 
     ``N`` = 2 * I (gate rows ``[0, I)``, up rows ``[I, 2I)``, ``I % (16 * G * W) == 0``), ``K`` = hidden
@@ -287,7 +287,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     exchanged through LDS): out FP8 [M * TOPK, I], out_scale f32 [M * TOPK]. With ``SHARE`` and ``W > 1``
     the waves of a workgroup load the block's activations once into LDS (ring of ``2 * SYNC`` 64-K steps,
     step k + SYNC written during step k, one barrier every ``SYNC`` steps) instead of each wave reading all
-    of them.
+    of them. ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``a8w4_common.swiglu_clamp``).
     """
     I = N // 2
     if QUANT:
@@ -326,6 +326,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 for v in range(4):
                     g = gate[v] * gate_scale[v] * x_scale[s]
                     u = up[v] * up_scale[v] * x_scale[s]
+                    g, u = a8w4.swiglu_clamp(g, u, SWIGLU_LIMIT)
                     t = rocdl.exp2(T.f32, _raw(g * _LOG2_EXP1))
                     row.append(fx.Float32((g * rocdl.rcp(T.f32, 1.0 + t)) * u))
                 per_sub.append(row)
@@ -465,7 +466,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
         else:
             store_f32(S, block, channels, values, M, p_out)
 
-    @flyc.kernel(known_block_size=[64 * W, 1, 1])
+    @flyc.kernel(known_block_size=[64 * W, 1, 1], name=a8w4.swiglu_kernel_name("a8w4_gateup_stream", SWIGLU_LIMIT))
     def a8w4_gateup_stream(
         p_x: fx.Pointer,
         p_w: fx.Pointer,

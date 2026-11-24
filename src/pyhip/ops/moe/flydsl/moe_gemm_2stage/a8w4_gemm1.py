@@ -5,9 +5,9 @@
 FP8 activations are gathered by sorted id into double-buffered LDS exactly as in
 ``gemm1.py``; the weight operand is read from the ``a8w4_common`` layout 16 bytes per lane (two
 adjacent rows of a 16-row block per load), decoded to FP8 in registers and fed to MFMA 16x16x32
-FP8. The per-channel factor and the per-token activation scale are applied in the epilogue, then
-SiLU(gate) * up is written as float32 by (token, slot): the intermediate is quantized from f32 so
-its FP8 rounding matches the reference.
+FP8. The per-channel factor and the per-token activation scale are applied in the epilogue (then the
+SwiGLU limit, if any), then SiLU(gate) * up is written as float32 by (token, slot): the intermediate is
+quantized from f32 so its FP8 rounding matches the reference.
 
 Tile: a CTA (4 waves) owns one sorted block: its valid rows lead the block, so it computes the
 first TILE_M rows only (BM 64: the valid rows rounded up to 16; other multiples of 64: BM/2 when
@@ -62,7 +62,7 @@ from .common import make_gemm_helpers
 
 
 def compile_a8w4_gemm1(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, TILE_K=256, E=None
+    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, TILE_K=256, E=None, SWIGLU_LIMIT=0.0
 ):
     """Build the A8W4 Gate/Up launcher.
 
@@ -71,6 +71,7 @@ def compile_a8w4_gemm1(
     Launch arguments: x FP8 [M, K], w and w_delta (``a8w4_common`` layout, uint8), out f32
     [M, TOPK, I] (``M * TOPK * I * 4 < 2**31``), sorted_ids, sorted_weights (unused),
     sorted_expert_ids, num_valid_ids, w_scale f32 [E, N], x_scale f32 [M], then M, task_num, stream.
+    ``SWIGLU_LIMIT`` > 0 clamps the dequantized gate and up before SiLU (``a8w4_common.swiglu_clamp``).
     """
     BM, BN = BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N
     assert BN in (128, 256), "BLOCK_TILE_SIZE_N must be 128 or 256"
@@ -509,12 +510,13 @@ def compile_a8w4_gemm1(
                 cg_items = []
                 cu_items = []
                 for v in range_constexpr(4):
-                    cg_items.append(cg[v] * sg_v[v] * a_sc)
-                    cu_items.append(cu[v] * su_v[v] * a_sc)
+                    g, u = a8w4.swiglu_clamp(cg[v] * sg_v[v] * a_sc, cu[v] * su_v[v] * a_sc, SWIGLU_LIMIT)
+                    cg_items.append(g)
+                    cu_items.append(u)
                 c_gate_frag[None, m, n].store(Vec.from_elements(cg_items, fx.Float32))
                 c_up_frag[None, m, n].store(Vec.from_elements(cu_items, fx.Float32))
 
-    @flyc.kernel
+    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_prefill", SWIGLU_LIMIT))
     def a8w4_gateup_prefill(
         p_input: fx.Pointer,
         p_weight: fx.Pointer,

@@ -9,7 +9,8 @@ MFMA 16x16x32 FP8 with the activation of one token broadcast to all 16 rows of t
   channels of one route ``(token, slot)``: wave ``w`` reduces 16 gate (``w`` even) or up rows over
   one half of K. The token row is quantized per row to FP8 inside the workgroup (``scale =
   amax / 240``, IEEE division, round to nearest even, as ``a8w4_quant``); the per-channel factor and
-  the activation scale are applied in the epilogue, which writes ``SiLU(gate) * up`` as float32.
+  the activation scale are applied in the epilogue, which writes ``SiLU(gate) * up`` as float32
+  (with a SwiGLU limit, gate and up clamped first: ``a8w4_common.swiglu_clamp``).
 * Down (``compile_a8w4_down_decode``): grid ``(H / 16, M)``. A workgroup owns 16 output channels of
   one token and sums all its ``TOPK`` experts: wave ``w`` takes slots ``w, w + WAVES, ...``,
   quantizes those intermediate rows to FP8 (same arithmetic) and scales by the channel factor, the
@@ -194,7 +195,7 @@ def _wave_index(tid):
     return fx.Int32(rocdl.readfirstlane(T.i32, _raw(tid // 64)))
 
 
-def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None):
+def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_LIMIT=0.0):
     """Launcher ``(x, x_scale, topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``.
 
     ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``).
@@ -204,6 +205,7 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None):
     of channel block 0 also write the expert-dedup plan entry of their route (``a8w4_decode_dedup``, plan
     int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its share of its token's row of y BF16
     [M, ZERO_COLS], for ``a8w4_decode_dedup.compile_a8w4_down_decode_dd``; without ``PLAN`` plan / y are unused.
+    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``a8w4_common.swiglu_clamp``).
     """
     I = N // 2
     assert I % 16 == 0 and K % 512 == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
@@ -234,7 +236,7 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None):
         red: fx.Array[fx.Float32, 4, 16]
         lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
 
-    @flyc.kernel
+    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode", SWIGLU_LIMIT))
     def a8w4_gateup_decode(
         p_x: fx.Pointer,
         p_x_scale: fx.Pointer,
@@ -361,6 +363,7 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None):
             ]
             gate = (parts[0] + parts[2]) * ws_gate * scale
             up = (parts[1] + parts[3]) * ws_up * scale
+            gate, up = a8w4.swiglu_clamp(gate, up, SWIGLU_LIMIT)
             tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
             out = fx.make_view(fxh._as_ptr(p_out, fx.Float32) + fx.Int64(route) * I, fx.make_layout(I, 1))
             out[channel] = (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up

@@ -16,7 +16,7 @@ and exits unless it leads. A leader stages the group's FP8 token rows in LDS, re
 16-channel block once and runs the MFMAs with route ``m`` of the group in A rows ``m`` and ``8 + m``
 (see "Block pairs" in ``a8w4_decode``), so a fused shared expert chosen by every token is read
 ``ceil(M / GROUP)`` times instead of ``M`` times. Outputs are ``SiLU(gate) * up`` as float32 per route,
-bit-identical to the per-route kernel.
+bit-identical to the per-route kernel (with the same SwiGLU limit).
 
 ``compile_a8w4_down_decode_dd`` is the Down counterpart on the same plan: grid ``(N / (64 * CB), M * TOPK)``,
 four waves of ``CB`` 16-channel blocks each read the expert's blocks once (block-pair 16-byte loads) for the
@@ -299,18 +299,20 @@ def _gateup_group(c, tid, lane, wave, j, count, members, expert, M, p_x, p_x_sca
                     + _lds_load(part_base, (base + cm + 8) * 4, fx.Float32, 1, 4)[0])
     gate = _tree_sum(sums[0::2]) * ws_gate * x_scale
     up = _tree_sum(sums[1::2]) * ws_up * x_scale
+    gate, up = a8w4.swiglu_clamp(gate, up, c["SWIGLU_LIMIT"])
     tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
     value = fx.Float32((gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up)
     out_rsrc = _rsrc(_address(p_out), M * (TOPK * I * 4))
     _store(out_rsrc, [value.bitcast(fx.Uint32)], e_ok.select((e_route * I + j * 16 + cr) * 4, fx.Int32(_DROP)))
 
 
-def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4):
+def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=0.0):
     """Launcher ``(x, x_scale, topk_ids, plan, w, w_delta, w_scale, out, M, stream)``.
 
     Arguments and output of ``compile_a8w4_gateup_decode(PREQUANT=True)`` plus ``plan`` from
     ``compile_a8w4_row_quant_plan`` (same ``GROUP``): x FP8 [M, K] with x_scale f32 [M]; topk_ids int32
     [M, TOPK]; out f32 [M, TOPK, I]. ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K.
+    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``a8w4_common.swiglu_clamp``).
     """
     I = N // 2
     assert I % 16 == 0 and K % (128 * WAVES) == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
@@ -321,7 +323,7 @@ def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4):
     c = dict(GROUP=GROUP, K=K, TOPK=TOPK, I=I, N=N, NJ=I // 16, KB=KB, KQ=a8w4.delta_dwords(K), KB_PART=KB_PART,
              PAIRS=KB_PART // 2, XS=K + 16, X_PIECES=X_PIECES, WAVES=WAVES,
              X_LOADS=(GROUP * X_PIECES + 64 * WAVES - 1) // (64 * WAVES),
-             W_BYTES=a8w4.weight_bytes(N, K), D_BYTES=a8w4.delta_bytes(N, K))
+             W_BYTES=a8w4.weight_bytes(N, K), D_BYTES=a8w4.delta_bytes(N, K), SWIGLU_LIMIT=SWIGLU_LIMIT)
     NJ = c["NJ"]
 
     @fx.struct
@@ -330,7 +332,7 @@ def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4):
         part: fx.Array[fx.Float32, WAVES * 2 * GROUP * 16 + 4, 16]
         lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
 
-    @flyc.kernel
+    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode_dd", SWIGLU_LIMIT))
     def a8w4_gateup_decode_dd(
         p_x: fx.Pointer,
         p_x_scale: fx.Pointer,

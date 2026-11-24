@@ -5,7 +5,8 @@
 ``prepare_a8w4_weights`` converts standard MXFP4 weights once (at load time) into the private
 layout of ``moe_gemm_2stage/a8w4_common.py``; ``fused_moe_a8w4`` runs the whole MoE:
 Opus ``moe_sorting``, per-row FP8 quantization of the input, the A8W4 Gate/Up kernel
-(SiLU(gate) * up -> f32), per-row FP8 quantization of the intermediate, the A8W4 Down kernel
+(SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the
+intermediate, the A8W4 Down kernel
 (routing weight applied; also records each route's sorted row) and ``sorted_sum``.
 Token counts up to ``DECODE_MAX_M`` skip the sorting and use the decode kernels of
 ``moe_gemm_2stage/a8w4_decode.py`` (Gate/Up per route, Down
@@ -19,6 +20,8 @@ the prefill Down from hidden 4096 on), more rows per expert the prefill kernels.
 """
 
 import functools
+import math
+import numbers
 from dataclasses import dataclass
 
 import torch
@@ -202,11 +205,11 @@ def prepare_a8w4_weights(w1, w1_scale, w2, w2_scale):
 
 
 @functools.cache
-def _gateup_kernel(N, K, topk, block_m, block_n, tile_k, experts):
+def _gateup_kernel(N, K, topk, block_m, block_n, tile_k, experts, limit=0.0):
     from .moe_gemm_2stage.a8w4_gemm1 import compile_a8w4_gemm1
 
     return compile_a8w4_gemm1(N=N, K=K, TOPK=topk, BLOCK_TILE_SIZE_M=block_m,
-                              BLOCK_TILE_SIZE_N=block_n, TILE_K=tile_k, E=experts)
+                              BLOCK_TILE_SIZE_N=block_n, TILE_K=tile_k, E=experts, SWIGLU_LIMIT=limit)
 
 
 @functools.cache
@@ -241,11 +244,11 @@ def _decode_fits(H, I, topk, paired):
 
 
 @functools.cache
-def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq):
+def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit=0.0):
     from .moe_gemm_2stage.a8w4_decode import (compile_a8w4_down_decode, compile_a8w4_down_decode_pq,
                                               compile_a8w4_gateup_decode)
 
-    gateup = compile_a8w4_gateup_decode(N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq)
+    gateup = compile_a8w4_gateup_decode(N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, SWIGLU_LIMIT=limit)
     if down_pq:
         # More tokens: 16-byte loads of slot pairs.
         return gateup, compile_a8w4_down_decode_pq(N=H, K=I, TOPK=topk, WAVES=_decode_waves(topk, True))
@@ -253,17 +256,18 @@ def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq):
 
 
 @functools.cache
-def _gateup_plan_kernel(N1, H, topk, gateup_pq, group):
+def _gateup_plan_kernel(N1, H, topk, gateup_pq, group, limit=0.0):
     from .moe_gemm_2stage.a8w4_decode import compile_a8w4_gateup_decode
 
-    return compile_a8w4_gateup_decode(N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, PLAN=(group, DECODE_MAX_M, H))
+    return compile_a8w4_gateup_decode(N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, PLAN=(group, DECODE_MAX_M, H),
+                                      SWIGLU_LIMIT=limit)
 
 
 @functools.cache
-def _gateup_dd_kernel(N1, H, topk, group, waves):
+def _gateup_dd_kernel(N1, H, topk, group, waves, limit=0.0):
     from .moe_gemm_2stage.a8w4_decode_dedup import compile_a8w4_gateup_decode_dd
 
-    return compile_a8w4_gateup_decode_dd(N=N1, K=H, TOPK=topk, GROUP=group, WAVES=waves)
+    return compile_a8w4_gateup_decode_dd(N=N1, K=H, TOPK=topk, GROUP=group, WAVES=waves, SWIGLU_LIMIT=limit)
 
 
 @functools.cache
@@ -297,7 +301,7 @@ def _overlaps(a, b):
     return a0 < b0 + b.numel() * b.element_size() and b0 < a0 + a.numel() * a.element_size()
 
 
-def _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, down_cb):
+def _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, down_cb, limit):
     """Decode with expert deduplication (``a8w4_decode_dedup``): Down reads each expert's weights once per group
     of its routes and adds into the zeroed output. While M * I stays below DECODE_DEDUP_GATEUP_MIN_MI the
     per-route Gate/Up also writes the plan and zeroes the output (two kernels; not when the output overlaps the
@@ -317,7 +321,7 @@ def _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, 
         else:
             xq, xs = hidden_states, topk_weight
         _launch("a8w4_gateup_decode_plan" + ("_pq" if gateup_pq else ""),
-                _gateup_plan_kernel(2 * I, H, topk, gateup_pq, group), xq, xs, topk_ids, weights.w1,
+                _gateup_plan_kernel(2 * I, H, topk, gateup_pq, group, limit), xq, xs, topk_ids, weights.w1,
                 weights.w1_delta, weights.w1_scale, mid, plan, output, M)
         quant = True
     else:
@@ -327,8 +331,8 @@ def _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, 
                 _row_quant_plan(H, topk, group, DECODE_MAX_M if M <= DECODE_MAX_M else DECODE_DEDUP_MAX_M),
                 hidden_states, xq, xs, topk_ids, plan, output, M)
         waves = 8 if M <= DECODE_DEDUP_GATEUP_WIDE_MAX_M and H % 1024 == 0 else 4
-        _launch("a8w4_gateup_decode_dd", _gateup_dd_kernel(2 * I, H, topk, group, waves), xq, xs, topk_ids, plan,
-                weights.w1, weights.w1_delta, weights.w1_scale, mid, M)
+        _launch("a8w4_gateup_decode_dd", _gateup_dd_kernel(2 * I, H, topk, group, waves, limit), xq, xs, topk_ids,
+                plan, weights.w1, weights.w1_delta, weights.w1_scale, mid, M)
         quant = False
     mq, ms = (mid, topk_weight) if quant else _quantize_decode(mid, M * topk, I, False)
     _launch("a8w4_down_decode_dd", _down_dd_kernel(H, I, topk, group, down_cb, quant), mq, ms, topk_ids, topk_weight,
@@ -336,7 +340,7 @@ def _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, 
     return output
 
 
-def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output):
+def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output, limit):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     I = weights.inter_padded
@@ -346,14 +350,14 @@ def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output):
         topk_weight = topk_weight.to(torch.float32).contiguous()
     down_cb = _down_dd_blocks(H, I)
     if M >= DECODE_DEDUP_MIN_M and H >= DECODE_DEDUP_MIN_H and down_cb:
-        return _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, down_cb)
+        return _fused_moe_decode_dd(hidden_states, weights, topk_weight, topk_ids, output, down_cb, limit)
     # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
     gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
     # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets; larger weights or
     # shapes the slot-pair kernel does not support take the single-slot Down.
     down_pq = (M >= DECODE_PREQUANT_MIN_M and weights.w2.numel() * weights.w2.element_size() < 2**32
                and _decode_fits(H, I, topk, True))
-    gateup, down = _decode_kernels(2 * I, H, I, topk, gateup_pq, down_pq)
+    gateup, down = _decode_kernels(2 * I, H, I, topk, gateup_pq, down_pq, limit)
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
     if gateup_pq:
         xq, xs = _quantize_decode(hidden_states, M, H, True)
@@ -393,7 +397,7 @@ def _stream_fused_quant(inter, block_m, hidden=0):
 
 
 @functools.cache
-def _stream_gateup_kernel(N, K, topk, block_m, experts):
+def _stream_gateup_kernel(N, K, topk, block_m, experts, limit=0.0):
     from .moe_gemm_2stage.a8w4_stream import compile_a8w4_gateup_stream
 
     # Fused quantization: one workgroup of four waves per block covers all of I and quantizes the intermediate
@@ -407,7 +411,7 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts):
         tile = dict(G=1, W=8 if block_m > 16 and (N // 2) % 128 == 0 else 4,
                     PREFETCH=(STREAM_GATEUP_PREFETCH, STREAM_GATEUP_PREFETCH), SYNC=STREAM_GATEUP_SYNC)
     return compile_a8w4_gateup_stream(N=N, K=K, TOPK=topk, BLOCK_M=block_m, E=experts, W_AUX=STREAM_GATEUP_W_AUX,
-                                      **tile)
+                                      SWIGLU_LIMIT=limit, **tile)
 
 
 @functools.cache
@@ -544,7 +548,7 @@ def _launch(name, kernel, *args):
     last_path.append(name)
 
 
-def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output):
+def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output, limit):
     from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 
     from .moe_gemm_2stage import sorted_sum
@@ -567,7 +571,7 @@ def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output):
         xs = torch.empty((M,), dtype=torch.float32, device=device)
         _launch("a8w4_row_quant_bf16", _stream_quant_kernel(H), hidden_states, xq, xs, M)
     task_num = sorted_experts.numel()
-    gateup = _stream_gateup_kernel(2 * I, H, topk, block_m, E)
+    gateup = _stream_gateup_kernel(2 * I, H, topk, block_m, E, limit)
     routing = (sorted_ids, sorted_experts, num_valid)
     if not _stream_fused_quant(I, block_m, H):
         mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
@@ -602,8 +606,17 @@ def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output):
     return output
 
 
+def _swiglu_limit(value):
+    """``swiglu_limit`` of ``fused_moe_a8w4`` as a float, 0.0 when off."""
+    if not isinstance(value, numbers.Real):
+        raise TypeError(f"swiglu_limit must be a real number, got {type(value).__name__}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"swiglu_limit must be finite and >= 0 (0 disables it), got {value!r}")
+    return float(value) if value > 0 else 0.0
+
+
 def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None,
-                   block_m=None, block_n=None, tile_k=None):
+                   block_m=None, block_n=None, tile_k=None, swiglu_limit=0.0):
     """A8W4 MoE forward: BF16 ``hidden_states`` [M, H] -> BF16 [M, H].
 
     ``weights`` comes from ``prepare_a8w4_weights``; ``topk_weight`` float32 [M, topk] is applied
@@ -623,6 +636,13 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     (``block_m * I_padded % 4096 == 0``, e.g. 64 or 128); ``block_n`` (default 128) / ``tile_k`` are
     the Gate/Up N tile (128 or 256, dividing 2 * padded I into whole gate/up halves) and K tile (128
     or 256; default 128 for M > 2048, where its lower LDS and register use raise occupancy, else 256).
+
+    ``swiglu_limit`` is the SwiGLU limit of DeepSeek-V4.1 (config ``swiglu_limit``, 10 for V4.1-Flash; the
+    ``Expert`` of its inference/model.py): when > 0 every Gate/Up kernel computes
+    ``SiLU(gate.clamp(max=L)) * up.clamp(-L, L)`` on the dequantized f32 gate / up values (after the weight
+    and activation scales). 0 (default) turns it off and runs exactly the kernels without it; otherwise
+    the limit is a compile-time constant (kernels compiled per value, names ending in ``_swiglu``). Must
+    be finite and >= 0 (``ValueError``).
     """
     from aiter.fused_moe import moe_sorting
 
@@ -633,6 +653,7 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     M, H = hidden_states.shape
     if H != weights.hidden:
         raise ValueError(f"hidden size {H} does not match the weights ({weights.hidden})")
+    limit = _swiglu_limit(swiglu_limit)
     topk = topk_ids.shape[1]
     E, I = weights.experts, weights.inter_padded
     if output is None:
@@ -641,10 +662,10 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     if block_m is None and block_n is None and tile_k is None:
         if ((M <= DECODE_MAX_M or _dedup_beyond_decode(M, H, I, topk, E))
                 and _decode_fits(H, I, topk, False)):
-            return _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output)
+            return _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output, limit)
         many_rows = M * topk > _stream_max_rows(H, I) * E
         if M > DECODE_MAX_M and not many_rows:
-            return _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output)
+            return _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output, limit)
         tile_k = 128 if many_rows else 256
     block_m = 64 if block_m is None else block_m
     block_n = 128 if block_n is None else block_n
@@ -666,7 +687,7 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
 
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
     _launch(f"a8w4_gateup_prefill_bm{block_m}_bn{block_n}_tk{tile_k}",
-            _gateup_kernel(2 * I, H, topk, block_m, block_n, tile_k, E), xq, weights.w1,
+            _gateup_kernel(2 * I, H, topk, block_m, block_n, tile_k, E, limit), xq, weights.w1,
             weights.w1_delta, mid, *routing, weights.w1_scale, xs, M, grid)
     mq, ms = _quantize(mid, M * topk, I, "f32")
     routes = torch.empty((grid * block_m, H), dtype=torch.bfloat16, device=hidden_states.device)

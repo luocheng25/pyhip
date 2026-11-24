@@ -1,20 +1,19 @@
 # MoE A8W4（fp8 ptpc 激活 × mxfp4 权重）gfx942 新算子：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-24 06:08）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc。第三轮（用户 11-23）：Qwen TP2/TP4 与 MiMo-V2.6-Flash TP8/TP4（H4096 E256 topk8，I=256/512）每个 M（1…32768 的 2 的幂及 48）的耗时 ≤ min(R1 M8, tingqli refactor/a8w4 最快配置) × 1.02，以 cmp3 同卡同协议对比验收；误差门限 err≤4.5%（与 tingqli 同级）（1.06× 相对冻结基线）· 已完成 14 个里程碑（含本提交 M13） · 最佳累计 1.123× · 下一步：写报告
+> 由 mf 生成（11-24 13:30）· 目标：Qwen3.8-Flash-Next MoE（H2560，E513=512 routed+1 融合 shared，topk11，I=320/192，SiLU）在 MI308X 上实现 mxfp4 权重的两阶段 FlyDSL MoE（激活按 token 量化 fp8）：功能正确，decode 接近访存上限、prefill 接近算力上限，各档基本达到 aiter fp8 ptpc。第三轮（用户 11-23）：Qwen TP2/TP4 与 MiMo-V2.6-Flash TP8/TP4（H4096 E256 topk8，I=256/512）每个 M（1…32768 的 2 的幂及 48）的耗时 ≤ min(R1 M8, tingqli refactor/a8w4 最快配置) × 1.02，以 cmp3 同卡同协议对比验收；误差门限 err≤4.5%（与 tingqli 同级）。DeepSeek 支持（用户 11-24）：DeepSeek-V4.1-Flash-1017 TP4（H5120 E384 topk6，I=576，swiglu_limit=10）加 SwiGLU 截断与 hidden 5120 decode，逐点 ≤ tingqli 最快配置（I 补零到 768）× 1.02；算子级精度评测（真实 FP4 权重）中本算子误差 ≤ 每 32 元素 UE8M0 FP8 参考的 1.5 倍（1.06× 相对冻结基线）· 已完成 15 个里程碑（含本提交 M14） · 最佳累计 1.123× · 下一步：M15 度量契约：bench 与用例加入 DeepSeek-V4.1-Flash TP4（H5120 E384 topk6 I576，swiglu_limit=10，17 个 case）
 <!-- /mf:summary -->
-
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
      做什么 · 整体怎么做 · 为什么这样做 · 做到什么程度 · 风险与下一步。
      正文 ≤150 行；一行只说一件事（≤120 字，链接地址不计）；每节第一句是结论；只写当前设计（过程写在提交信息里）；
      接口细节、报错清单、数据格式留在代码 docstring，这里只给链接。这些注释读者看不到，也不计入篇幅。 -->
-
 ## 1. 目标与范围
 <!-- ≤8 行：做什么；输入 / 输出、目标硬件与形状；验收（性能对照谁、精度参考谁）；不做什么。 -->
-本任务在 MI308X（gfx942）上做 Qwen3.8-Flash-Next 与 MiMo-V2.6-Flash MoE 的 A8W4 FlyDSL 算子，按 M 分 decode / 流式 / prefill 三条路径。
+本任务在 MI308X（gfx942）上做 Qwen3.8-Flash-Next、MiMo-V2.6-Flash 与 DeepSeek-V4.1-Flash MoE 的 A8W4 FlyDSL 算子，按 M 分三条路径。
 - Qwen3.8：H2560，E513（512 routed + 1 个融合 shared，每个 token 的第 11 个槽位固定选它），topk11，I=320（TP2）/ 192（TP4，160 补零）。
-- MiMo-V2.6-Flash：H4096，E256（均匀路由，无 shared），topk8，I=256（TP8）/ 512（TP4）；两个模型都是 SiLU。
-- 输入输出：bf16 进出，输入须为有限值；权重为标准 mxfp4（fp4x2 + e8m0 scale），加载时一次性转成私有布局；激活按行动态量化成 fp8 e4m3fnuz。
+- MiMo-V2.6-Flash：H4096，E256（均匀路由，无 shared），topk8，I=256（TP8）/ 512（TP4）。
+- DeepSeek-V4.1-Flash：只做 TP4，H5120，E384（shared 不融合），topk6，I=576；SiLU 前截断 gate ≤ 10、|up| ≤ 10（`swiglu_limit`）。
+- 输入输出：bf16 进出，输入与权重须为有限值；权重为标准 mxfp4（fp4x2 + e8m0 scale），加载时一次性转成私有布局；激活按行动态量化成 fp8 e4m3fnuz。
 - 底座：aiter gfx9_fp8 两阶段 FlyDSL MoE（逐字节移植，供 `tuned_moe` 用）；A8W4 prefill 由它改写，decode 与流式新写。
 - 性能验收：Qwen 每个 case ≤ 1.05× aiter fp8 ptpc；两个模型每个 M ≤ min(R1 第一轮实现, tingqli refactor/a8w4 最快配置) × 1.02。
 - 精度验收：对照同量化点的独立 fp32 Torch 参考，calc_diff ≤ 1e-3 且 max|out−ref| ≤ 4.5%·max|ref|（与 tingqli 同级），无 NaN / Inf。
@@ -29,8 +28,7 @@
 fused_moe_a8w4（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 CUDA graph 捕获）：
   decode：[行量化(x)] → Gate/Up decode（WG 管一条路由）→ mid f32 → [行量化(mid)] → Down decode（WG 管一个 token，LDS 内相加）→ out
   decode 去重：行量化(x) + 计划 + 清零 out → Gate/Up 与 Down（组首 WG 管同 expert 的 2–3 条路由）→ bf16x2 原子加进 out
-  流式：prep（自写排序 BM16/32/64 + 行量化(x) [+ 清零 out]）→ 流式 Gate/Up → mid（f32，或在尾部直接量化成 fp8）
-    → [行量化(mid)] → 流式 Down（BM64 非原子、H≥4096 时换 prefill Down）→ 原子加进 out，或 routes bf16 → route_sum → out
+  流式：prep（排序 BM16/32/64 + 行量化(x) [+ 清零 out]）→ Gate/Up → [行量化(mid)] → Down → 原子加进 out，或 routes → route_sum
   prefill：[流式 prep（H≥2560 且 M·topk≤24576）| Opus 排序 BM64 → 行量化(x，loc_ids 置 −1)] → Gate/Up（gather xq 行）
     → mid f32 → 行量化(mid) → Down（× 通道因子 × ms × 路由权重，写 loc_ids）→ routes → sorted_sum（底座）按 loc_ids 相加 → out
 ```
@@ -46,6 +44,7 @@ fused_moe_a8w4（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 CUDA g
 | 超过流式上限 | prefill：BM64·BN128·TK128；块少时 Down 把 H 切给 2 / 4 个 WG | 多行按块共用权重；切分补满末轮 WG |
 | （prefill）H≥2560 且 M·topk≤24576 | 排序与 x 量化改用流式 prep（一次 launch） | TP2 M2048 快 2.1%；路由多则 prep 慢 |
 | 给了 tile 参数；decode 不支持的 M ≤ 32 | prefill；TK 默认 M>2048 取 128，否则 256 | tile 参数只对 prefill 有意义 |
+- DeepSeek TP4（H5120、I576）：M≤32 decode 放不下 → prefill（TK256），33–3072 流式（BM16–64，Down 不用原子），≥3073 prefill（TK128）。
 
 核心 kernel 骨架（[kernels.md](kernels.md) 每节先给 Gluon 风格的分阶段写法，写明放置、预取与 barrier，再给任务划分与逐拍流水线；decode 的块对 / 槽对映射见 [a8w4_decode.py](a8w4_decode.py)）：
 ```text
@@ -61,6 +60,7 @@ decode Down：grid (H/16, M)，wave 按槽取（槽对版一条 16 B 覆盖两�
 流式 Down：grid (H/(16·R·W), 排序块)，每 wave R 个 16 通道块 × 全部 I；本块激活驻留 VGPR（BM≥32 或 H4096·I≤256 时 4 wave 经 LDS 共享）
   逐个通道块：权重提前 4 块 → 解码 → 两条 MFMA 链 → × 通道因子 × 行 scale → bf16 写 routes，或两块凑一次原子加进 out
 ```
+截断（`swiglu_limit` L>0）：四类 Gate/Up 收尾在乘完通道因子与 xs 后、SiLU 前令 gate ≤ L、|up| ≤ L；L 是编译期常量（kernel 名加 `_swiglu`），L=0 时 IR 不变。
 
 ## 3. 关键决策
 <!-- 3–6 条；“为什么”给一个关键数字。 -->
@@ -216,7 +216,7 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 | 去重计划 kernel：x 量化逐位、清零 out、计划的条数与组员（跨段、尾组不满） | 同上；随机路由少碰跨段 | `decode_plan_quant_bitexact` | 通过 |
 | 流式 prep 量化（QW4 / 1）、清零、排序格式；Gate/Up 尾部量化 | 同上 | `stream_row_quant_bitexact` ×4、`stream_fused_quant_bitexact` ×2 | 通过 |
 | A8W4 prepare 布局逐字节；delta 11 / 12 边界 | 端到端看不出；随机权重碰不到 | `prepare_layout_bitexact`、`delta_flush_boundary` | 通过 |
-| A8W4 报错：dtype、形状、E8M0 NaN、H / I 不对齐、BM·I_pad 非 4096 倍数、hidden 不符 | 前两类只给合法输入 | `rejects_bad_inputs` | 通过 |
+| A8W4 报错：dtype、形状、E8M0 NaN、H/I 不对齐、BM·I_pad 非 4096 倍数、hidden 不符、swiglu_limit 非法 | 只给合法输入 | `rejects_bad_inputs` | 通过 |
 | 底座变体：per-tensor/BF16、SwiGLU、8x1 族、N512、K640、M·topk≤E | 只测 PTPC、SiLU、Qwen 形状 | `fp8_*_variants`、`fp8_swiglu` ×2 | 通过 |
 | 底座 batch1 清零写满、graph 重放（排序、loc_ids、任务表） | 基本只跑 eager、不查两侧 | `fp8_batch1_clear_graph` ×4、`fp8_graph_replay` ×2 | 通过 |
 | 底座报错：K 非 256 倍数、Gate/Up、Down 的 M 不同 | 只走合法配置 | `fp8_gateup_rejects_incomplete_k` ×4、`fp8_split_m_tile_rejected` | 通过 |
@@ -227,7 +227,8 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - I_pad > 1024：prefill Down 的 64·I_pad 超过 64 KiB，走 prefill 时（超过流式上限、给 tile 参数、decode 不支持）构建即报错，入口不检查。
 - 未测的交界：流式排序块 16 / 32（路由 4E/3）与 32 / 64（28 行）、去重 decode 的 M ≤ 64 上限（要 E ≥ 342）；去重 Down 在 WG 内量化 mid 只靠端到端判据。
 - w2 真超过 4 GiB：只用 stride 0 视图验证分派与单槽 Down，没在大权重上跑过 64 位 expert 寻址；这个回退也没有性能 case。
-- 含 NaN 的输入、M·topk·I_pad·4 ≥ 2^31（入口不检查）、gfx950 与同进程多卡、底座 per-tensor 预清零（正常路由触发不到）：不测。
+- 截断的数值：各类 Gate/Up kernel 的截断数值用例、基本测试中的截断主路径 M15 补（随参考加 swiglu_limit 参数）；DeepSeek 还没有 bench case。
+- 含 NaN 的输入或权重（截断用 min/max，与 torch.clamp 不同）、M·topk·I_pad·4 ≥ 2^31（入口不检查）、gfx950 与同进程多卡、底座 per-tensor 预清零（正常路由触发不到）：不测。
 - tuned_moe 的调优缓存、剪枝与非 FlyDSL 路径在 `test_tuned_moe.py` / `test_moe.py`（两个旧用例起点即失败），不在本文件里。
 
 ## 6. 风险与待定
@@ -244,7 +245,6 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - 参考与测试：[pyhip.testing.moe_a8w4](../../../../testing/moe_a8w4.py)；三类测试（含性能测试）在 [test_moe_a8w4.py](../../../../../../tests/ops/moe/test_moe_a8w4.py)，说明见 [tests/ops/moe/README.md](../../../../../../tests/ops/moe/README.md)。
 - 底座：[tuned_moe.py](../../tuned_moe.py) 的 `_run_fly` / `_configs`；kernel 同 [aiter gfx9_fp8 @ca6bc0f851](https://github.com/ROCm/aiter/tree/ca6bc0f8518796024a0e7856211394a1a8c24820/aiter/ops/flydsl/kernels/moe_gemm_2stage/gfx9_fp8)，调用链见 [fused_moe_gfx942.py](https://github.com/ROCm/aiter/blob/ca6bc0f8518796024a0e7856211394a1a8c24820/aiter/ops/flydsl/fused_moe_gfx942.py)。
 - 里程碑（每个提交写了改了什么、为什么）：
-
 <!-- mf:roadmap -->
 - M0 ✅ 已推送 · 功能 · 底座：aiter gfx9_fp8 替换 pyhip moe_gemm_2st… · [提交](https://github.com/luocheng25/pyhip/commit/aca23ec23286bb8136d4c1644491dc7d132489a0)
 - M1 ✅ 已推送 · 功能 · A8W4 功能版：底座 prefill 两段 kernel 换 mxfp4 权重 · [提交](https://github.com/luocheng25/pyhip/commit/78962639bc4e8cdde5b337b6e05ee7ecef02dc99)
@@ -260,7 +260,9 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - M11 ✅ 已推送 · 性能 · MiMo 小 / 中 M（8–2048）追上 tingqli：decode /… · 1.056× 对 M10a（预期 1.04×） · [提交](https://github.com/luocheng25/pyhip/commit/492d90e4f1b69b25b8ae19cf67b2d96b3a463ad0)
 - M12 ✅ 已推送 · 性能 · 大 M prefill（≥1024）追上 R1 / tingqli：Gate/… · 1.063× 对 M11（预期 1.03×） · [提交](https://github.com/luocheng25/pyhip/commit/9681cb98cf28de854e59d2dcf6aab3a332115ea6)
 - M10a ✅ 已推送 · 维护 · 用例的路径断言改为检查关键 kernel 顺序（第三轮去掉 route_sum… · [提交](https://github.com/luocheng25/pyhip/commit/4a637c36d275f778cf6eeab43a4c62190a4f1cf4)
-- M13 ✅ 本提交 · 维护 · prefill M≈2048 排序与 x 量化合并（复用流式 prep），针对… · 1.000× 对 M12（预期 1×）
+- M13 ✅ 已推送 · 维护 · prefill M≈2048 排序与 x 量化合并（复用流式 prep），针对… · 1.000× 对 M12（预期 1×） · [提交](https://github.com/luocheng25/pyhip/commit/a641da286511f3f8b703f90b3f9a1ea66b18301a)
+- M14 ✅ 本提交 · 功能 · SwiGLU 截断：fused_moe_a8w4 加 swiglu_limit…
+- M15 · 暂定 · 维护 · 度量契约：bench 与用例加入 DeepSeek-V4.1-Flash TP…
 
-下一步（本提交的承诺）：写报告
+下一步（本提交的承诺）：M15 度量契约：bench 与用例加入 DeepSeek-V4.1-Flash TP4（H5120 E384 topk6 I576，swiglu_limit=10，17 个 case）
 <!-- /mf:roadmap -->
