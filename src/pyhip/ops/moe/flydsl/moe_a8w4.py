@@ -95,6 +95,13 @@ STREAM_PREFILL_DOWN = 1
 # few blocks (M ~2048) otherwise leave the last round of workgroups mostly idle (MiMo M2048 Down -10%).
 # Padded I below 256 (short Down steps) gains nothing from it and stays unsplit.
 DOWN_MIN_WGS = 1000
+# The prefill kernels take the streaming path's prep (one launch: sorting, input quantization, loc_ids) instead of
+# Opus moe_sorting and the row kernel while M * topk stays at or below this, for hidden 2560 and above with
+# H % 512 == 0 (measured at 2560 and 4096; smaller hidden sizes keep Opus). Each sorting workgroup histograms every
+# route, so the prep grows with the square of the routes: measured in one process, M2048 MiMo TP8 (16384 routes)
+# 0.988x, Qwen TP2 (22528) 0.979x, MiMo TP4 1.00x the time; MiMo TP8 M4096 / 8192 / 16384 1.01x / 1.03x / 1.06x,
+# Qwen TP2 M8192 1.02x.
+PREFILL_PREP_MAX_ROUTES = 24576
 
 # Kernels launched by the most recent ``fused_moe_a8w4`` call, in order. Kernels of the A8W4 op are
 # named ``a8w4_*`` (FP8 activations) or ``a16w4_*`` (BF16 activations); tests pick the reference by it.
@@ -601,7 +608,8 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
 
     ``weights`` comes from ``prepare_a8w4_weights``; ``topk_weight`` float32 [M, topk] is applied
     in Down; ``topk_ids`` int32 [M, topk] in ``[0, E)`` (a fused shared expert is an ordinary
-    expert id), distinct within a token (the sorted paths keep one route of a repeated id). The input
+    expert id), distinct within a token (with a repeated id the Opus-sorted prefill keeps one route, the other
+    paths every route). The input
     and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
     E4M3FNUZ with ``scale = amax / 240`` and ``q = RNE(x / scale)``. SiLU only, no expert mask /
     bias; ``M * topk * I_padded * 4 < 2**31``. Issues no host synchronization. Unless a tile option is
@@ -642,13 +650,17 @@ def fused_moe_a8w4(hidden_states, weights, topk_weight, topk_ids, *, output=None
     block_n = 128 if block_n is None else block_n
     tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k
 
-    sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
-        topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False)[:4]
-    last_path.append("moe_sorting_opus")
-    # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
-    # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
-    loc_ids = torch.empty((M, topk), dtype=torch.int32, device=hidden_states.device)
-    xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
+    if H >= 2560 and H % 512 == 0 and M * topk <= PREFILL_PREP_MAX_ROUTES:
+        sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = _stream_prep(
+            hidden_states, topk_weight, topk_ids, E, block_m, output, zero=False)
+    else:
+        sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
+            topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False)[:4]
+        last_path.append("moe_sorting_opus")
+        # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
+        # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
+        loc_ids = torch.empty((M, topk), dtype=torch.int32, device=hidden_states.device)
+        xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
 

@@ -26,7 +26,7 @@ global → VGPR 直读，还是经 LDS 共享 / 双缓冲）与**预取距离**�
 # M：token 数；H：hidden；I：中间维（补零后）；E：expert 数；TOPK：每个 token 的路由数。路由 route = token·TOPK + slot。
 # x / out：bf16 [M, H] 的输入与输出。xq / xs：x 按行量化后的 fp8 [M, H] 与 f32 scale [M]。
 # mid：f32 [M, TOPK, I]（= SiLU(gate)·up）；mq / ms：mid 按行量化后的 fp8 [M·TOPK, I] 与 f32 [M·TOPK]。
-# 排序输出（prefill 用 aiter moe_sorting，流式用自写的 stream_prep，格式相同；int32，权重 f32）：排序块 e = 同一 expert
+# 排序输出（流式与路由不多的 prefill 用自写的 stream_prep，其余 prefill 用 aiter moe_sorting，格式相同；int32，权重 f32）：排序块 e = 同一 expert
 #   （sorted_expert_ids[e]）的 BM 个排序行；sorted_ids[排序行] = token | slot << 24，token ≥ M 的是填充行（只在每个
 #   expert 的末块尾部）；sorted_weights[排序行] = 该路由的路由权重；num_valid = 排序行总数（含填充行）：grid 按排序块
 #   数的上界发射，e·BM ≥ num_valid 的 CTA 直接退出；loc_ids[token, slot] = 该路由排序后的行号（< 0 表示没有这条路由，
@@ -70,8 +70,9 @@ global → VGPR 直读，还是经 LDS 共享 / 双缓冲）与**预取距离**�
 #   流式（M > 32 且 M·TOPK ≤ R·E；R = 22，H ≥ 4096 为 48，H2560 且排序块 64 尾部量化为 56）：stream_prep(排序 + 量化 x
 #     [+ 清零 out]) → gateup_stream（带尾部量化，或另跑 row_quant_fp8）→ down_stream（I < 512：原子累加进 out；
 #     否则写 routes → route_sum；排序块 64 且 H ≥ 4096 时换 down_prefill）→ out
-#   prefill（其余，含 decode 放不下的 M ≤ 32）：moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1) → gateup_prefill
-#     → row_quant_fp8(mid) → down_prefill（并写有效路由的 loc_ids）→ sorted_sum → out
+#   prefill（其余，含 decode 放不下的 M ≤ 32）：H ≥ 2560 且 M·TOPK ≤ 24576（PREFILL_PREP_MAX_ROUTES）时
+#     stream_prep(排序 + 量化 x，不清零 out)，否则 moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1)；之后都是
+#     gateup_prefill → row_quant_fp8(mid) → down_prefill（并写有效路由的 loc_ids）→ sorted_sum → out
 ```
 
 ## A8W4 Gate/Up prefill（[a8w4_gemm1.py](a8w4_gemm1.py#L426)）
@@ -951,7 +952,8 @@ I1024 BM64 要 73 KiB 所以不共享）；激活占 S·I/64·4 个 VGPR（BM64�
 I = 512 时加上 K512 的激活反而更慢，所以分派只在 I < 512 时用。
 
 ## 流式 prep（排序 + 输入量化 + 清零）与 route_sum（[a8w4_stream.py](a8w4_stream.py#L649)）
-流式档用一次 launch 的 prep 代替 aiter moe_sorting 与输入量化：排序结果格式相同（但同一 token 重复的 expert 每条路由都保留），
+流式档（以及 H ≥ 2560、M·topk ≤ 24576 的 prefill 档）用一次 launch 的 prep 代替 aiter moe_sorting 与输入量化：排序结果格式相同
+（但同一 token 重复的 expert 每条路由都保留），
 量化与 quant_row 逐位一致；Down 原子累加时同一次 launch 顺带把 out 清零。I ≥ 512 时 Down 写 routes，route_sum 代替底座
 sorted_sum（同顺序同舍入）。
 

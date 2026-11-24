@@ -232,8 +232,8 @@ def test_fp8_prefill_bf16(kernels):
 # 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行（H≥4096 为 48，H2560 排序块 64 自带量化为 56）的
 # 流式路径：排序块 32 由区域 1、16 / 32 / 64 由 bench 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位
 # （用例名带 ``stream``）、排序块 64 换 prefill Down 及其切分，以及 grid 收缩与 graph。
-# prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数与 graph。非目标形状的回退见
-# ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
+# prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数、graph，以及排序用流式 prep 还是 Opus 的
+# 路由数上限（``test_prefill_prep_routes_limit``）。非目标形状的回退见 ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 # decode 三种分派（x、mid 是否先用独立 kernel 预量化）各自的 Gate/Up 与 Down kernel。
@@ -860,6 +860,30 @@ def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
     oracle.assert_close(out, ref)
 
 
+@pytest.mark.parametrize("tokens, first, duplicate", [
+    (200, "a8w4_stream_prep", False), (201, "moe_sorting_opus", False), (200, "a8w4_stream_prep", True),
+], ids=["m200_prep", "m201_opus", "m200_prep_duplicate_ids"])
+def test_prefill_prep_routes_limit(monkeypatch, tokens, first, duplicate):
+    """hidden≥2560 的 prefill 在 M·topk ≤ ``PREFILL_PREP_MAX_ROUTES`` 时用流式 prep（一次 launch 排序、量化 x、写 loc_ids）
+    代替 Opus 排序 + x 行量化，超过上限仍用 Opus：上限临时调成 400，H2560、E=5、topk=2 的 M=200 / 201（400 / 402 条路由）
+    在交界两侧；prep 分支给同一 token 的重复 expert 每个槽各一行，结果与逐槽相加的参考一致（Opus 分支只留后一槽，见
+    test_prefill_duplicate_ids_keep_last_route）。
+
+    基本测试与 bench 的 prefill 不在交界上、不断言排序用哪个 kernel，生成的路由也不重复；真实上限 24576 在 topk=2 时要
+    M=12288，调小上限以控制耗时。
+    """
+    monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", 400)
+    w, prepared = _small_weights(2560, 64)
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, 2560, 5, 2, seed=330 + tokens, shared=False)
+    if duplicate:
+        topk_ids[::2, 1] = topk_ids[::2, 0]
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path([first] + _prefill_path(128))
+    other = "moe_sorting_opus" if first == "a8w4_stream_prep" else "a8w4_stream_prep"
+    assert other not in moe_a8w4.last_path, moe_a8w4.last_path
+    oracle.assert_close(out, ref)
+
+
 @pytest.mark.parametrize("inter, options", [
     (256, dict(block_m=128, block_n=256)),
 ], ids=["bm128_bn256"])
@@ -1088,8 +1112,8 @@ def test_duplicate_ids_keep_every_route(case):
     与流式路径（自写 prep 排序给每条路由一行；I<512 的 Down 原子累加、I≥512 的 route_sum）都把每个槽各算一次再相加，
     与逐槽相加的参考一致。
 
-    输入生成的路由互不重复，基本测试与 bench 碰不到；原 decode 的重复见 test_decode_duplicate_and_int64_ids，prefill 的
-    aiter 排序只保留最后一个槽（入口文档「未覆盖」）。
+    输入生成的路由互不重复，基本测试与 bench 碰不到；原 decode 的重复见 test_decode_duplicate_and_int64_ids，prefill 用流式
+    prep 时也逐槽相加（test_prefill_prep_routes_limit），用 aiter 排序时只保留最后一个槽（test_prefill_duplicate_ids_keep_last_route）。
     """
     if case.startswith("dedup"):
         (w, prepared), hidden, experts, topk, shared = _mimo_small_weights(256), MIMO_HIDDEN, 12, MIMO_TOPK, False
@@ -1110,17 +1134,19 @@ def test_duplicate_ids_keep_every_route(case):
 
 
 def test_prefill_duplicate_ids_keep_last_route():
-    """prefill 遇到同一 token 的两个槽选同一 expert：aiter 排序只保留后一个槽，前一个槽的 loc 保持输入行量化写的 -1、
-    被 sorted_sum 跳过（不读未初始化的行、不重复相加），结果等于把前一个槽的路由权重置 0 的参考。
+    """Opus 排序的 prefill（hidden<2560 或路由数超过 PREFILL_PREP_MAX_ROUTES）遇到同一 token 的两个槽选同一 expert：aiter
+    排序只保留后一个槽，前一个槽的 loc 保持输入行量化写的 -1、被 sorted_sum 跳过（不读未初始化的行、不重复相加），结果等于
+    把前一个槽的路由权重置 0 的参考。
 
-    输入生成的路由互不重复，基本测试与 bench 碰不到；decode、流式（逐槽相加）见 test_duplicate_ids_keep_every_route。
+    输入生成的路由互不重复，基本测试与 bench 碰不到；decode、流式、用流式 prep 的 prefill（逐槽相加）见
+    test_duplicate_ids_keep_every_route 与 test_prefill_prep_routes_limit。
     """
     w, prepared = _small_weights(512, 64)
     x, topk_weight, topk_ids = oracle.make_inputs(200, 512, 5, 2, seed=320, shared=False)
     topk_ids[::2, 1] = topk_ids[::2, 0]
     out = torch.full_like(x, float("nan"))
     moe_a8w4.fused_moe_a8w4(x, prepared, topk_weight, topk_ids, output=out)
-    _assert_path(_prefill_path(128))
+    _assert_path(["moe_sorting_opus"] + _prefill_path(128))
     kept = topk_weight.clone()
     kept[::2, 0] = 0
     ref = oracle.reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], kept, topk_ids, activation="fp8")
