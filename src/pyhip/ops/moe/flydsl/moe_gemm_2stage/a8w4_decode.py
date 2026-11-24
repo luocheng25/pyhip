@@ -53,9 +53,9 @@ _LUT_BYTES = 8 * (_MAX_DELTA + 1)
 
 
 def gateup_decode_fits(K):
-    """Whether ``compile_a8w4_gateup_decode`` supports hidden size ``K``: one thread per 16-byte piece
-    of the FP8 token row, at most 256 pieces."""
-    return K % 512 == 0 and K // 16 <= 256
+    """Whether ``compile_a8w4_gateup_decode`` supports hidden size ``K`` (4 waves; the threads stage the FP8 token
+    row's 16-byte pieces in as many rounds as needed)."""
+    return K % 512 == 0
 
 
 def down_decode_fits(K, TOPK, WAVES, paired):
@@ -216,7 +216,7 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_
     NJ = I // 16
     X_DWORDS = K // 2 // 256  # bf16 pairs per thread
     X_CHUNKS = K // 16  # 16-byte pieces of an FP8 row
-    assert X_CHUNKS <= 256
+    X_LOADS = (X_CHUNKS + 255) // 256  # of them per thread (pieces tid + 256 u)
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     if PLAN is not None:
@@ -271,12 +271,18 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_
         x_off = (lane // 32) * 64 + ((lane % 32) // 8) * 16
         # The token row does not depend on the expert id: issue it first.
         if const_expr(PREQUANT):
-            # One coalesced 16-byte piece per thread, staged in LDS (MFMA operands are broadcast reads);
+            # Coalesced 16-byte pieces tid + 256 u, staged in LDS (MFMA operands are broadcast reads);
             # threads past the row issue no load (whole waves skip it).
             x_row = _global_ptr(p_x, fx.Int64, 16) + fx.Int64(token) * (K // 8)
-            x_piece = fx.full(2, 0, fx.Int64)
-            if tid < X_CHUNKS:
-                x_piece = fx.ptr_load(x_row + tid * 2, result_type=Vec.make_type(2, fx.Int64))
+            x_pieces = []
+            for u in range_constexpr(X_LOADS):
+                piece = tid
+                if const_expr(u > 0):
+                    piece = tid + 256 * u
+                x_piece = fx.full(2, 0, fx.Int64)
+                if piece < X_CHUNKS:
+                    x_piece = fx.ptr_load(x_row + piece * 2, result_type=Vec.make_type(2, fx.Int64))
+                x_pieces.append(x_piece)
             scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_x_scale))[token]
         else:
             x_row = fx.make_view(
@@ -311,8 +317,12 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_
         rocdl.sched_barrier(0)
 
         if const_expr(PREQUANT):
-            if tid < X_CHUNKS:
-                _lds_store(xq_base, tid * 16, x_piece, fx.Int64, 16)
+            for u in range_constexpr(X_LOADS):
+                piece = tid
+                if const_expr(u > 0):
+                    piece = tid + 256 * u
+                if piece < X_CHUNKS:
+                    _lds_store(xq_base, piece * 16, x_pieces[u], fx.Int64, 16)
             gpu.barrier()
         else:
             # Quantize the token row: thread `tid` owns bf16 pairs tid + 256 * m.
