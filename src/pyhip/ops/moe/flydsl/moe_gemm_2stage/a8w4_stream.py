@@ -275,7 +275,7 @@ def _block_head(blk, block_m, M, lane, p_sorted_ids, p_sorted_experts, p_num_val
 
 
 def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4), QUANT=False, SHARE=True,
-                               E=None, SYNC=1, W_AUX=0, SWIGLU_LIMIT=0.0):
+                               E=None, SYNC=1, W_AUX=0, SWIGLU_LIMIT=0.0, ACT_STEPS=1):
     """Build the streaming A8W4 Gate/Up launcher.
 
     ``N`` = 2 * I (gate rows ``[0, I)``, up rows ``[I, 2I)``, ``I % (16 * G * W) == 0``), ``K`` = hidden
@@ -287,7 +287,10 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     exchanged through LDS): out FP8 [M * TOPK, I], out_scale f32 [M * TOPK]. With ``SHARE`` and ``W > 1``
     the waves of a workgroup load the block's activations once into LDS (ring of ``2 * SYNC`` 64-K steps,
     step k + SYNC written during step k, one barrier every ``SYNC`` steps) instead of each wave reading all
-    of them. ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``a8w4_common.swiglu_clamp``).
+    of them. ``ACT_STEPS`` > 1 (with ``SHARE``): each lane loads 16 (or 8) bytes covering ``ACT_STEPS`` 64-K steps
+    of one row, one load per lane every ``ACT_STEPS`` steps instead of every step (fewer vector memory
+    instructions); ``SYNC`` becomes ``ACT_STEPS``, the loads run two groups ahead and a group is written at the
+    end of the group before it. ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``a8w4_common.swiglu_clamp``).
     """
     I = N // 2
     if QUANT:
@@ -302,8 +305,16 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
     # LOADER bytes per 64-K step; with more waves the rest write a scratch slot that nobody reads.
     SHARE = SHARE and W > 1
     SLOT = BLOCK_M * 64
-    LOADER = max(4, SLOT // (64 * W))
-    LOADERS = SLOT // (64 * LOADER)
+    if ACT_STEPS > 1:
+        assert SHARE and not QUANT, "ACT_STEPS > 1 needs the light-wave tile with shared activations"
+        assert ACT_STEPS & (ACT_STEPS - 1) == 0 and KB % ACT_STEPS == 0, f"K={K} with ACT_STEPS={ACT_STEPS}"
+        SYNC = ACT_STEPS
+        LOADER = ACT_STEPS * SLOT // (64 * W)
+        assert LOADER * 64 * W == ACT_STEPS * SLOT, f"BLOCK_M={BLOCK_M}, W={W}: {ACT_STEPS} steps per load"
+        LOADERS = W
+    else:
+        LOADER = max(4, SLOT // (64 * W))
+        LOADERS = SLOT // (64 * LOADER)
     assert not SHARE or LOADER in (4, 8, 16), f"BLOCK_M={BLOCK_M} with W={W} waves: {LOADER} bytes per lane"
     assert SYNC <= min(PREFETCH), f"SYNC={SYNC}: the activations of step k + SYNC must be in flight at step k"
     RING = 2 * SYNC
@@ -385,7 +396,35 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 d = [_load(d_rsrc, d_voff, (rb * KQ + kb // 4) * a8w4.D_BLOCK_BYTES, 1, W_AUX)[0] for rb in rbs]
             return w, d
 
-        if SHARE:
+        if SHARE and ACT_STEPS > 1:
+            # The same ring, filled ACT_STEPS steps at a time: of the block's rows of ACT_STEPS * 64 bytes, lane L
+            # loads bytes L * LOADER .. + LOADER - 1 (all in one row and one 64-K step) and writes them to that step.
+            span_log2 = (ACT_STEPS * 64).bit_length() - 1
+            idx = (wave * 64 + lane) * LOADER
+            ld_sub = idx >> (span_log2 + 4)
+            ld_row = (idx >> span_log2) & 15
+            off = idx & ((1 << span_log2) - 1)
+            within = off & 63
+            token = block.token[0]
+            for s in range(1, S):
+                token = (ld_sub == s).select(block.token[s], token)
+            token = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(ld_row * 4), _raw(token)))
+            ld_voff = (ld_sub < S).select(token * K + off, fx.Int32(_DROP))
+            ld_lds = (act_lds + (off >> 6) * SLOT + ld_sub * 1024 + ld_row * 64
+                      + (((within >> 4) ^ ((ld_row >> 1) & 3)) << 4) + (within & 15))
+            row = lane & 15
+            rd_lds = act_lds + row * 64 + (((lane >> 4) ^ ((row >> 1) & 3)) << 4)
+
+            def load_a(kb):
+                return _load(x_rsrc, ld_voff, kb * 64, LOADER // 4)
+
+            def write_a(kb, words):
+                _lds_store(ld_lds + (kb % RING) * SLOT, words)
+
+            def read_a(kb):
+                xs = [_lds_load4(rd_lds + (kb % RING) * SLOT + s * 1024) for s in range(S)]
+                return [(_pack64(x[0], x[1]), _pack64(x[2], x[3])) for x in xs]
+        elif SHARE:
             # The block's FP8 rows of one 64-K step, [sub-block][row][64 B] with the 16-byte chunks of row t
             # XOR-swizzled by (t >> 1) & 3, staged in a ring of two LDS slots. Each lane of the workgroup
             # loads LOADER bytes of it; lane 16b + t then reads its 16 bytes of row t.
@@ -427,16 +466,25 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
         # 64-K steps in flight (fewer with more sub-blocks to bound VGPRs). Activations are issued
         # first in each step so waiting for them never waits for later weights.
         P = min(PREFETCH[0] if S == 1 else PREFETCH[1], KB)
-        acts = {kb: load_a(kb) for kb in range(P)}
+        if ACT_STEPS > 1:
+            # Groups 0 and 1 of ACT_STEPS steps; group g + 2 is issued at the start of group g.
+            acts = {kb: load_a(kb) for kb in range(0, min(2 * ACT_STEPS, KB), ACT_STEPS)}
+        else:
+            acts = {kb: load_a(kb) for kb in range(P)}
         stages = [load_w(kb) for kb in range(P)]
         if SHARE:
-            for kb in range(min(SYNC, KB)):
+            for kb in range(0, min(SYNC, KB), ACT_STEPS):
                 write_a(kb, acts.pop(kb))
             _lds_barrier()
         acc = [[_zeros() for _ in range(S)] for _ in rbs]
         deltas = None
         for kb in range(KB):
-            if kb + P < KB:
+            if ACT_STEPS > 1:
+                if kb % ACT_STEPS == 0 and kb + 2 * ACT_STEPS < KB:
+                    acts[kb + 2 * ACT_STEPS] = load_a(kb + 2 * ACT_STEPS)
+                if kb + P < KB:
+                    stages.append(load_w(kb + P))
+            elif kb + P < KB:
                 acts[kb + P] = load_a(kb + P)
                 stages.append(load_w(kb + P))
             w, d = stages[kb]
@@ -445,7 +493,7 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 deltas = d
             if SHARE:
                 # Step k + SYNC goes into the slot of step k - SYNC, read before the last barrier.
-                if kb + SYNC < KB:
+                if ACT_STEPS == 1 and kb + SYNC < KB:
                     write_a(kb + SYNC, acts.pop(kb + SYNC))
                 b = read_a(kb)
             else:
@@ -456,6 +504,9 @@ def compile_a8w4_gateup_stream(*, N, K, TOPK, BLOCK_M, G=4, W=1, PREFETCH=(6, 4)
                 for s in range(S):
                     for c in range(2):
                         acc[i][s] = _mfma(ops[c], b[s][c], acc[i][s])
+            if ACT_STEPS > 1 and (kb + 1) % ACT_STEPS == 0 and kb + 1 < KB:
+                # The next group goes into the slots of the previous one, read before the last barrier.
+                write_a(kb + 1, acts.pop(kb + 1))
             if SHARE and kb + 1 < KB and (kb + 1) % SYNC == 0:
                 _lds_barrier()
             rocdl.sched_barrier(0)

@@ -280,11 +280,12 @@ def test_fp8_prefill_bf16(kernels):
 # I=160→192 补零已由区域 1 覆盖，E=513 的各个 M 档由 bench 覆盖，这里不重复。
 # M≤32 的 decode 路径：Qwen 的核内量化（M=3）、MiMo 的按 expert 去重（M=5 / 24）与 DeepSeek H5120 的 Gate/Up 去重（M=8）
 # 由区域 1、各分派由 bench（M=1、2、4…32，另有 48）覆盖，这里只测分派交界、topk 与路由输入的变体、CUDA graph、行量化与
-# 去重计划逐位、w2≥4 GiB 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行（H≥4096 为 48，H2560 排序块 64 自带量化为 56）的
-# 流式路径：排序块 32 由区域 1、16 / 32 / 64 由 bench 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位
+# 去重计划逐位、w2≥4 GiB 回退（用例名带 ``decode``）。M>32 且每个 expert 平均不超过 22 行（H≥4096 为 48，H2560 排序块 64 自带量化为 56，
+# H5120 路由多时为 16）的流式路径：排序块 32 由区域 1、16 / 32 / 64 由 bench 覆盖，这里只测与 decode、prefill 的交界、prep 与尾部量化逐位
 # （用例名带 ``stream``）、排序块 64 换 prefill Down 及其切分，以及 grid 收缩与 graph。
 # prefill 路径：默认 tile 由区域 1 与 bench 覆盖，这里只测半块变体的交界、tile 参数、graph，以及排序用流式 prep 还是 Opus 的
-# 路由数上限（``test_prefill_prep_routes_limit``）。非目标形状的回退见 ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
+# 路由数上限（``test_prefill_prep_routes_limit``）。H5120 才生效的门槛（流式 16 行、prep 路由数、XCD 分块、Down 两段）与排布变体的逐位一致
+# 见 3.4 末尾。非目标形状的回退见 ``test_shape_fallbacks``；同 token 重复 expert 与原地输出见 3.7。
 # SwiGLU 截断（``swiglu_limit``）：区域 1 只测 DeepSeek 的去重 decode（M=8）与流式排序块 32，其余各类 Gate/Up kernel 与“gate 只截上侧”见 3.8。
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -850,24 +851,35 @@ def test_decode_dedup_stream_boundary(tokens):
     oracle.assert_close(out, ref)
 
 
-@pytest.mark.parametrize("tokens, case", [(7, "np"), (12, "pp"), (8, "w2_4gib"), (32, "wide"), (33, "stream")],
-                         ids=["m7_np", "m12_pp_two_rounds", "m8_w2_4gib", "m32_wide", "m33_stream"])
+@functools.cache
+def _ds_e256_weights():
+    """H5120、I576 的 E=256 权重（只给 test_decode_wide_hidden 的 M=33 用：每个 expert 平均 0.77 条路由）。"""
+    w = oracle.make_weights(256, DS_HIDDEN, DS_INTER, seed=280)
+    return w, _a8w4_prepare(w)
+
+
+@pytest.mark.parametrize("tokens, case", [(7, "np"), (12, "pp"), (8, "w2_4gib"), (32, "wide"), (33, "stream"),
+                                          (33, "e256_stream")],
+                         ids=["m7_np", "m12_pp_two_rounds", "m8_w2_4gib", "m32_wide", "m33_stream",
+                              "e256_m33_stream_bm16"])
 def test_decode_wide_hidden(monkeypatch, tokens, case):
     """H5120（DeepSeek 形状，E=24）decode 的分派与回退：M=7 仍逐路由（Down 预量化槽对；M=8 起 Gate/Up 按 expert 去重，
     见基本测试）；去重门槛调到 33 时 M=12 的 Gate/Up WG 数 12·6·36 = 2592 ≥ 2560，改读预量化的 x：K=5120 的 fp8 行
     分两轮 16 B 片装进 LDS（第二轮只有前 64 个线程）；w2 ≥ 4 GiB（stride 0 视图，同 test_decode_down_fallback_w2_4gib）时
-    M=8 不走去重，Down 改用单槽核内量化版；E=24 时 M=32 仍走去重 decode，M=33 改走流式（M>32 只在每个 expert 平均不超过
-    1.5 条路由时才可能留在 decode，这里是 8.25 条）。
+    M=8 不走去重，Down 改用单槽核内量化版；H5120 的 decode 只到 M=32（``DECODE_WIDE_MAX_M``）：E=24 时 M=32 仍走去重
+    decode、M=33 改走流式；E=256 的 M=33 每个 expert 平均只有 0.77 条路由（去重 decode 的 ≤1.5 条条件满足）也走流式，
+    且路由少于 4E/3 时排序块仍取 16（H5120 由自写 prep 排序）。
 
-    默认分派下 H5120 的 M≥8 先走去重，逐路由的预量化 Gate/Up（两轮装载）只有调门槛才走得到；bench 的 DeepSeek 只有 2 的幂
-    与 48、不断言 kernel，没有 M=7、33；基本测试与 bench 的 w2 都远小于 4 GiB。
+    默认分派下 H5120 的 M≥8 先走去重，逐路由的预量化 Gate/Up（两轮装载）只有调门槛才走得到；bench 的 DeepSeek 只有 E=384
+    的 2 的幂与 48、不断言 kernel，没有 M=7、33；基本测试与 bench 的 w2 都远小于 4 GiB。E=256 的 M=32 与 E=24 同路径，不重复。
     """
-    w, prepared = _ds_weights()
+    w, prepared = _ds_e256_weights() if case == "e256_stream" else _ds_weights()
+    experts = prepared.experts
     if case == "pp":
         monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_DEDUP_MIN_M", 33)
     elif case == "w2_4gib":
         prepared = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(1 << 32))
-    x, topk_weight, topk_ids = oracle.make_inputs(tokens, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=270 + tokens,
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, DS_HIDDEN, experts, DS_TOPK, seed=270 + tokens,
                                                   shared=False)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     if case == "wide":
@@ -875,12 +887,15 @@ def test_decode_wide_hidden(monkeypatch, tokens, case):
     elif case == "stream":
         gateup = next(name for name in moe_a8w4.last_path if name.startswith("a8w4_gateup"))
         assert "a8w4_stream_prep" in moe_a8w4.last_path and "_stream_bm" in gateup, moe_a8w4.last_path
+    elif case == "e256_stream":
+        assert 2 * tokens * DS_TOPK <= 3 * experts and 3 * tokens * DS_TOPK < 4 * experts
+        _assert_path(["a8w4_stream_prep"] + _stream_path(16, False) + ["a8w4_route_sum"])
     else:
         _assert_path(_DECODE_PATHS["nn" if case == "w2_4gib" else case])
     oracle.assert_close(out, ref)
 
 
-# ── 3.4 流式与 prefill：交界、grid 收缩、tile 参数 ────────────────────────────────────────────────────
+# ── 3.4 流式与 prefill：交界、grid 收缩、tile 参数、H5120 门槛与排布变体 ──────────────────────────────
 
 def test_grid_shrink_boundary_e513():
     """E=513 满规模下流式 Gate/Up、Down 的 grid 收缩（M·topk <= E 时 task 数取 M·topk）交界两侧：M=46（506）、M=47（517）。
@@ -938,8 +953,8 @@ def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
     """排序块 64、Down 不原子累加（I≥512）且 H≥4096 时，流式 Gate/Up 之后改用 prefill Down（顺带写 loc_ids）+ route_sum；
     prefill Down 按排序块数把 hidden 切给 1 / 2 / 4 个 WG（E=5、M=100 共 5 个块，``DOWN_MIN_WGS`` 取 5 / 8 / 默认 1000）。
 
-    基本测试的 MiMo TP4 M1600 走 prefill，其 prefill 只用到切分 4（I≥256）与 1（I_pad=192）；bench 的 mimo_tp4_m1024 与
-    ds_tp4_m2048 走这条路径，但各只一种切分、不断言 kernel 序列。E=5、topk=2 控制耗时。
+    基本测试的 MiMo TP4 M1600 走 prefill，其 prefill 只用到切分 4（I≥256）与 1（I_pad=192）；bench 只有 mimo_tp4_m1024 走这条
+    路径（ds_tp4 的流式到不了排序块 64），只一种切分、不断言 kernel 序列。E=5、topk=2 控制耗时。
     """
     monkeypatch.setattr(moe_a8w4, "DOWN_MIN_WGS", min_wgs)
     assert moe_a8w4._down_split(100, 2, 5, 4096, 512, 64) == nsplit
@@ -1018,6 +1033,150 @@ def test_prefill_half_block_boundary(filler, options, block_m, tile_k):
     x, topk_weight, _ = oracle.make_inputs(tokens, 512, 9, 2, seed=132)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
     _assert_path(_prefill_path(tile_k, block_m=block_m))
+    oracle.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("kernel, nsplit, two_pass, xcd", [
+    ("gateup", None, None, moe_a8w4.GATEUP_XCD_CHUNK_H5120), ("down", 4, True, 0),
+    ("down", 4, True, moe_a8w4.DOWN_XCD_CHUNK_H5120), ("down", 1, True, moe_a8w4.DOWN_XCD_CHUNK_H5120),
+], ids=["gateup_xcd", "down_two_pass", "down_two_pass_xcd_split4", "down_two_pass_xcd_split1"])
+def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd):
+    """H5120 prefill 的两种排布变体与原 kernel 在同一排序、同一输入下逐位一致：按 XCD 分块的 1-D grid（XCD_CHUNK > 0：Gate/Up
+    每块 1 个排序块的 9 个 N tile、Down 每块 4 个相邻排序块连同其 hidden 分段，轮流发给 4 个 XCD）的 mid、routes 与 loc_ids，
+    以及 Down 的 A 分两段经 LDS（TWO_PASS：K=576 的 9 个 64 列块分 5 + 4）。对照是 2-D grid、一段搬运、hidden 切 4 段的 kernel。
+
+    路由按 expert 构造（E=24 各有 32、33、64、65、96、97、1、20 与 16 个 12 行，M=100）：Down 半块分支（第 32 行是填充 / 有效）
+    两侧与 Gate/Up 的各种有效行数都有；Opus 排序的 task 数 34 不是 4、16 的倍数，排布越过 task 数的 WG 须直接退出；Down 切 4 段
+    与不切各一例。基本测试与 bench 只按误差判据比较，排布漏算、重算或少写 loc_ids 不一定看得出（XCD 分块只在路由 ≥16384、
+    即 bench 的 ds_tp4 M≥4096 时开）；一段搬运的 K=576 只在估计 WG ≤ 80（M≤3 且给 tile 参数）时用。
+    """
+    from aiter.fused_moe import moe_sorting
+
+    w, prepared = _ds_weights()
+    E, H, inter, topk = DS_EXPERTS, DS_HIDDEN, prepared.inter_padded, DS_TOPK
+    counts = torch.tensor([32, 33, 64, 65, 96, 97, 1, 20] + [12] * 16)
+    flat = torch.repeat_interleave(torch.arange(E), counts)
+    M = flat.numel() // topk
+    # 按 expert 排好的路由折成 topk 列：每个 expert 至多 M 行，所以同一 token 的 topk 个 expert 互不相同。
+    topk_ids = flat.view(topk, M).T.to(torch.int32).contiguous()
+    x, topk_weight, _ = oracle.make_inputs(M, H, E, topk, seed=136, shared=False)
+    sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
+        topk_ids, topk_weight, E, H, x.dtype, 64, accumulate=False)[:4]
+    routing, task_num = (sorted_ids, sorted_weights, sorted_experts, num_valid), sorted_experts.numel()
+    assert task_num % 4 != 0, task_num
+    xq, xs = moe_a8w4._quantize(x, M, H, "bf16", fill=torch.empty((M, topk), dtype=torch.int32))
+
+    def gateup(chunk):
+        mid = torch.full((M, topk, inter), float("nan"))
+        moe_a8w4._launch("gateup", moe_a8w4._gateup_kernel(2 * inter, H, topk, 64, 128, 128, E, 0.0, chunk), xq,
+                         prepared.w1, prepared.w1_delta, mid, *routing, prepared.w1_scale, xs, M, task_num)
+        return mid
+
+    def down(split, two, chunk):
+        routes = torch.full((task_num * 64, H), float("nan"), dtype=torch.bfloat16)
+        loc = torch.full((M, topk), -1, dtype=torch.int32)
+        moe_a8w4._launch("down", moe_a8w4._down_kernel(H, inter, topk, 64, E, split, two, chunk), mq, prepared.w2,
+                         prepared.w2_delta, routes, *routing, prepared.w2_scale, ms, loc, M, task_num)
+        return routes.view(torch.int16), loc
+
+    mid = gateup(0)
+    assert not bool(mid.isnan().any())
+    if kernel == "gateup":
+        assert torch.equal(gateup(xcd).view(torch.int32), mid.view(torch.int32))
+        return
+    mq, ms = moe_a8w4._quantize(mid, M * topk, inter, "f32")
+    routes, loc = down(4, False, 0)
+    assert bool((loc >= 0).all())
+    other_routes, other_loc = down(nsplit, two_pass, xcd)
+    assert torch.equal(other_routes, routes) and torch.equal(other_loc, loc)
+
+
+@pytest.mark.parametrize("tokens, block_m, steps", [(40, 16, 4), (64, 32, 2)], ids=["m40_bm16", "m64_bm32"])
+def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
+    """H5120 的流式 Gate/Up（轻 wave：每个 wave 一个 gate 块与同号 up 块，4 个 wave 经 LDS 环共享激活）每 lane 一次 16 B 加载
+    覆盖 ACT_STEPS 个 64-K 步（排序块 16 / 32 为 4 / 2 步，提前两组发、在上一组末尾写进 LDS）：分派给 K=5120 的 tile 确实是
+    4 / 2 步，mid 与同一排序、同一输入下 ACT_STEPS=1（每步每 lane 4 / 8 B、每 2 步一次 barrier）的 kernel 逐位一致。
+    E=24 的 M=40 / 64 是分派实际用排序块 16 / 32 的 M；排序块 32 时有效子块数 1、2 都有（下面断言尾块不到 16 行与超过 16 行的
+    expert 都有）。
+
+    基本测试（DeepSeek M=64）与 bench 的 ds_tp4 M48–1024 走这个 kernel，但只按误差判据比较，看不出个别元素的差异。
+    """
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage import a8w4_stream
+
+    compile_stream, seen = a8w4_stream.compile_a8w4_gateup_stream, {}
+
+    def spy(**options):
+        seen.update(options)
+        return compile_stream(**options)
+
+    monkeypatch.setattr(a8w4_stream, "compile_a8w4_gateup_stream", spy)
+    w, prepared = _ds_weights()
+    E, inter = prepared.experts, prepared.inter_padded
+    assert moe_a8w4._stream_block_m(tokens, DS_TOPK, E, DS_HIDDEN) == block_m
+    moe_a8w4._stream_gateup_kernel.__wrapped__(2 * inter, DS_HIDDEN, DS_TOPK, block_m, E)  # 只读出分派给的 tile，不 launch
+    assert (seen["ACT_STEPS"], seen["W"], seen["G"]) == (steps, 4, 1) and not seen.get("QUANT"), seen
+    kernels = [moe_a8w4._stream_gateup_kernel(2 * inter, DS_HIDDEN, DS_TOPK, block_m, E, 0.0),
+               compile_stream(**(seen | dict(ACT_STEPS=1)))]
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, DS_HIDDEN, E, DS_TOPK, seed=450 + tokens, shared=False)
+    tail = torch.bincount(topk_ids.flatten().long(), minlength=E) % block_m
+    assert block_m == 16 or (bool(((tail > 0) & (tail <= 16)).any()) and bool((tail > 16).any())), tail
+    sorted_ids, _, sorted_experts, num_valid, _, xq, xs = moe_a8w4._stream_prep(
+        x, topk_weight, topk_ids, E, block_m, torch.empty_like(x), zero=False)
+    mids = []
+    for kernel in kernels:
+        mids.append(torch.full((tokens, DS_TOPK, inter), float("nan")))
+        moe_a8w4._launch("gateup", kernel, xq, prepared.w1, prepared.w1_delta, mids[-1], sorted_ids, sorted_experts,
+                         num_valid, prepared.w1_scale, xs, xs, tokens, sorted_experts.numel())
+    assert not bool(mids[0].isnan().any())
+    assert torch.equal(mids[0].view(torch.int32), mids[1].view(torch.int32))
+
+
+# case -> (M, tile 参数, 调小的门槛, 按序出现的关键 kernel, prefill 的 (Gate/Up XCD_CHUNK, Down TWO_PASS, Down XCD_CHUNK))；
+# 形状都是 DeepSeek H5120、E24、topk6、I576；门槛都调到恰好等于交界一侧的值（M=3 的 18 条路由与估计 WG 72，M=4 的 24 条）。
+_H5120_PREFILL_LIMITS = dict(PREFILL_PREP_MAX_ROUTES_H5120=18, XCD_MIN_ROUTES_H5120=24, DOWN_TWO_PASS_MIN_WGS=72)
+_H5120_LIMIT_CASES = {
+    "rows16_stream": (64, {}, dict(STREAM_H5120_MIN_ROUTES=384),
+                      ["a8w4_stream_prep"] + _stream_path(32, False) + ["a8w4_route_sum"], None),
+    "rows_over16_prefill": (65, {}, dict(STREAM_H5120_MIN_ROUTES=390), ["a8w4_stream_prep"] + _prefill_path(128),
+                            (0, True, 0)),
+    "routes_below_stream": (65, {}, dict(STREAM_H5120_MIN_ROUTES=391),
+                            ["a8w4_stream_prep"] + _stream_path(32, False) + ["a8w4_route_sum"], None),
+    "prep_one_pass": (3, dict(block_m=64, tile_k=128), _H5120_PREFILL_LIMITS,
+                      ["a8w4_stream_prep"] + _prefill_path(128), (0, False, 0)),
+    "opus_xcd_two_pass": (4, dict(block_m=64, tile_k=128), _H5120_PREFILL_LIMITS,
+                          ["moe_sorting_opus"] + _prefill_path(128),
+                          (moe_a8w4.GATEUP_XCD_CHUNK_H5120, True, moe_a8w4.DOWN_XCD_CHUNK_H5120)),
+}
+
+
+@pytest.mark.parametrize("case", list(_H5120_LIMIT_CASES))
+def test_h5120_dispatch_limits(monkeypatch, case):
+    """hidden≥5120 才生效的分派门槛，交界两侧的关键 kernel、prefill kernel 的构建参数与端到端结果：路由数达到
+    ``STREAM_H5120_MIN_ROUTES`` 时流式上限从 48 行降到 ``STREAM_MAX_ROWS_H5120`` = 16 行（M=64 恰 16 行仍流式、M=65 的 16.25 行
+    改走 prefill；门槛比路由数多 1 时 M=65 仍流式）；prefill 在路由数 ≤ ``PREFILL_PREP_MAX_ROUTES_H5120`` 时用流式 prep、超过用
+    Opus，路由数 ≥ ``XCD_MIN_ROUTES_H5120`` 时 Gate/Up 与 Down 按 XCD 分块，估计 WG（块数 × hidden 切分）超过
+    ``DOWN_TWO_PASS_MIN_WGS`` 时 Down 的 A 分两段（M=3 为 18 × 4 = 72，等于门槛仍一段；M=4 为 24 × 4 = 96）。
+
+    真实门槛中 4096、12288、16384 条路由在 E=24 上要 M≥683 才碰到（两侧已都是 prefill），估计 WG 恰为 80 碰不到（M=3 / 4 为
+    72 / 96），这里把门槛调到 M=3–65 的交界上，以控制耗时；bench 的 ds_tp4 只有 E=384 的 2 的幂与 48，不断言 kernel 与构建参数；
+    基本测试不在这些交界上。
+    """
+    tokens, options, limits, path, built = _H5120_LIMIT_CASES[case]
+    for name, value in limits.items():
+        monkeypatch.setattr(moe_a8w4, name, value)
+    seen = {}
+    for name, fields in (("_gateup_kernel", dict(gateup_xcd=8)), ("_down_kernel", dict(two_pass=6, down_xcd=7))):
+        def spy(*args, original=getattr(moe_a8w4, name), fields=fields):
+            seen.update({key: args[i] for key, i in fields.items()})
+            return original(*args)
+
+        monkeypatch.setattr(moe_a8w4, name, spy)
+    w, prepared = _ds_weights()
+    x, topk_weight, topk_ids = oracle.make_inputs(tokens, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=440 + tokens,
+                                                  shared=False)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
+    _assert_path(path)
+    assert ((seen["gateup_xcd"], seen["two_pass"], seen["down_xcd"]) == built) if built else not seen, seen
     oracle.assert_close(out, ref)
 
 

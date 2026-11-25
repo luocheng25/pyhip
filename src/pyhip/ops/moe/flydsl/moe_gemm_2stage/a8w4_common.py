@@ -33,6 +33,7 @@ from .common import BufferTensor
 W_BLOCK_BYTES = 512
 D_BLOCK_BYTES = 128
 LDS_BYTES = 64 * 1024  # LDS of one workgroup on gfx942
+XCDS = 4  # XCDs of an MI308X; workgroup L of a launch runs on XCD L % XCDS
 
 
 def delta_dwords(K):

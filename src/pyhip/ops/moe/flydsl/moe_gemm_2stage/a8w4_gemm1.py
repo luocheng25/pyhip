@@ -62,7 +62,7 @@ from .common import make_gemm_helpers
 
 
 def compile_a8w4_gemm1(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, TILE_K=256, E=None, SWIGLU_LIMIT=0.0
+    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, BLOCK_TILE_SIZE_N=128, TILE_K=256, E=None, SWIGLU_LIMIT=0.0, XCD_CHUNK=0
 ):
     """Build the A8W4 Gate/Up launcher.
 
@@ -72,6 +72,9 @@ def compile_a8w4_gemm1(
     [M, TOPK, I] (``M * TOPK * I * 4 < 2**31``), sorted_ids, sorted_weights (unused),
     sorted_expert_ids, num_valid_ids, w_scale f32 [E, N], x_scale f32 [M], then M, task_num, stream.
     ``SWIGLU_LIMIT`` > 0 clamps the dequantized gate and up before SiLU (``a8w4_common.swiglu_clamp``).
+    ``XCD_CHUNK`` > 0: a 1-D grid whose workgroup ``L`` (dispatched to XCD ``L % XCDS``) takes the next
+    (sorted block, N tile) of chunks of ``XCD_CHUNK`` consecutive blocks dealt to the XCDs in turn, so the N tiles
+    of a block (same activation rows) and neighbouring blocks of an expert (same weights) share an L2.
     """
     BM, BN = BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N
     assert BN in (128, 256), "BLOCK_TILE_SIZE_N must be 128 or 256"
@@ -90,6 +93,8 @@ def compile_a8w4_gemm1(
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     fp8 = fx.Float8E4M3FNUZ
+    NUM_N_BLOCKS = (N + BN - 1) // BN
+    CHUNK = XCD_CHUNK * NUM_N_BLOCKS  # workgroups of one XCD chunk
 
     @fx.struct
     class GemmBuffers:
@@ -531,8 +536,15 @@ def compile_a8w4_gemm1(
         M: fx.Int32,
     ):
         tid = gpu.thread_idx.x
-        blk_n = gpu.block_idx.x
-        e_idx = gpu.block_idx.y
+        if const_expr(XCD_CHUNK > 0):
+            wg = fx.Int32(gpu.block_idx.x)
+            step = wg // a8w4.XCDS
+            work = ((step // CHUNK) * a8w4.XCDS + wg % a8w4.XCDS) * CHUNK + step % CHUNK
+            blk_n = work % NUM_N_BLOCKS
+            e_idx = work // NUM_N_BLOCKS
+        else:
+            blk_n = gpu.block_idx.x
+            e_idx = gpu.block_idx.y
 
         in_ptr = fx.recast_iter(fp8, fxh._as_ptr(p_input))
         arg_p_input = fx.make_view(in_ptr, fx.make_layout((M, K), (K, 1)))
@@ -623,6 +635,11 @@ def compile_a8w4_gemm1(
         num_n_blocks = fxh.div_up(N, BN)
         if const_expr(E is not None) and M * TOPK <= E:
             task_num = M * TOPK
+        if const_expr(XCD_CHUNK > 0):
+            per = a8w4.XCDS * XCD_CHUNK
+            grid = ((task_num + (per - 1)) // per * (a8w4.XCDS * CHUNK), 1, 1)
+        else:
+            grid = (num_n_blocks, task_num, 1)
         a8w4_gateup_prefill(
             p_input,
             p_weight,
@@ -636,6 +653,6 @@ def compile_a8w4_gemm1(
             p_a_scale,
             M,
             **({"value_attrs": {"rocdl.waves_per_eu": WAVES_PER_EU}} if WAVES_PER_EU else {}),
-        ).launch(grid=(num_n_blocks, task_num, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=grid, block=(256, 1, 1), stream=stream)
 
     return launch
